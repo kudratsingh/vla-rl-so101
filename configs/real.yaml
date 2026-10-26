@@ -1,27 +1,58 @@
 # Real SO-101. Mac runs the client; GPU box runs the policy server.
+#
+# Units. The canonical joint vector (policy action and observed state, sim and real) is 6 absolute
+# joint angles in RADIANS of the sim model (SO-ARM100 so101_new_calib.urdf), order: shoulder_pan,
+# shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper. Keys ending in _deg below are those
+# SAME canonical angles in degrees - not LeRobot units (LeRobot's gripper is 0-100).
+# LeRobot <-> canonical conversion: src/robot/units.py. Safety: src/robot/safety.py.
 preset: real
 
 robot:
   type: so101_follower
-  port: /dev/tty.usbmodemXXXX        # lerobot-find-port
-  calibration_dir: ~/.cache/huggingface/lerobot/calibration
-  control_hz: 15
+  id: so101_follower                 # LeRobot calibration file = <calibration_dir>/<id>.json
+  port: /dev/tty.usbmodemXXXX        # lerobot-find-port  (wo06_calibrate.py find-port --write)
+  # LeRobot 0.4.4 default for a so101_follower; lerobot-calibrate writes here too
+  calibration_dir: ~/.cache/huggingface/lerobot/calibration/robots/so_follower
+  use_degrees: true                  # LeRobot arm joints in degrees (required by units.py)
+  control_hz: 15                     # Hz; sim CONTROL_HZ
+  units:                             # LeRobot -> canonical; verify with wo06_calibrate.py verify
+    arm_sign: [1, 1, 1, 1, 1]        # q_rad = deg2rad(sign * lerobot_deg + offset_deg)
+    arm_offset_deg: [0.0, 0.0, 0.0, 0.0, 0.0]
+    gripper_closed_rad: -0.174533    # rad at LeRobot gripper 0 (closed)  = URDF lower limit
+    gripper_open_rad: 1.74533        # rad at LeRobot gripper 100 (open)  = URDF upper limit
   safety:
-    joint_limits_deg: {}              # filled from calibration
-    workspace_box_m: {x: [0.10, 0.40], y: [-0.20, 0.20], z: [0.00, 0.25]}
-    max_joint_step_deg: 4.0
-    max_velocity_deg_s: 60.0
-    deadman_frame_timeout_ms: 300
+    joint_limits_deg: {}             # deg, canonical, {joint: [lo, hi]}; only NARROWS the URDF
+                                     # limits minus urdf_limit_margin_deg. wo06_calibrate.py check --write-limits
+    urdf_limit_margin_deg: 5.0       # deg kept clear of each URDF joint limit
+    workspace_box_m: {x: [0.10, 0.40], y: [-0.20, 0.20], z: [0.00, 0.25]}  # m, TCP in robot base frame
+    max_joint_step_deg: 4.0          # deg per command, every joint (hard ceiling 10)
+    max_velocity_deg_s: 60.0         # deg/s, every joint (hard ceiling 180); 60 deg/s = 4 deg/step at 15 Hz
+    max_tracking_error_deg: 20.0     # deg, |last command - measured| on an arm joint -> deadman (stall)
+    deadman_frame_timeout_ms: 300    # ms, frame older than this -> deadman (hold)
+
+teleop:
+  leader: null                       # only with a leader arm, e.g.
+                                     # {type: so101_leader, id: so101_leader, port: /dev/tty.usbmodemYYYY,
+                                     #  calibration_dir: ~/.cache/huggingface/lerobot/calibration/teleoperators/so_leader}
+  episodes_per_task: 5
+  episode_time_s: 30                 # s, max per episode (Ctrl-C ends one early)
+  dataset_root: data/real_teleop     # local root; git-ignored
+  hub_repo: KudratSingh22/vla-rl-so101-real-teleop
+  instructions:                      # per-episode language task (keep in sync with the sim templates)
+    PickPlace: pick up the cube and place it in the bowl
+    Push: push the cube to the target
+    Stack: stack the red cube on the blue cube
 
 cameras:
   front:
     index: 0
-    width: 640
-    height: 480
+    width: 640                       # px, streamed resolution
+    height: 480                      # px
     fps: 30
     intrinsics: null                  # filled in WO-06
     pose: front_left_45               # must equal sim camera pose
-    crop_to: 128
+    crop_to: 224                     # px, policy image side (OpenVLA-OFT input); = sim env.image_size
+    fov_deg: 60                      # deg, sim camera fov; must equal configs/sim.yaml env.camera.fov_deg
   wrist:
     index: 1
     enabled: false
