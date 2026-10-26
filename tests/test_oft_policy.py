@@ -291,3 +291,32 @@ def test_save_load_roundtrip(cfg: dict[str, Any], tmp_path: Path) -> None:
     rl = build_policy(cfg, "cpu", adapter=tmp_path / "adapter", lora_only=True)
     names = [n for n, p in rl.named_parameters() if p.requires_grad]
     assert names and all("lora_" in n for n in names)
+
+
+def test_from_pretrained_path_adds_proprio_projector(tmp_path: Path) -> None:
+    """The real-checkpoint branch of load_model: a saved base WITHOUT proprio (like openvla-7b)
+    loads with a fresh proprio projector, SDPA and the bidirectional hook."""
+    cfg = oft_model.tiny_config(BOUNDS, BOUNDS)
+    cfg.use_proprio = False
+    torch.manual_seed(0)
+    base = oft_model.OpenVLAForActionPrediction(cfg)
+    assert base.proprio_projector is None
+    base.save_pretrained(tmp_path / "base")
+    model = oft_model.load_model(
+        checkpoint=str(tmp_path / "base"),
+        revision=None,
+        action_bounds=BOUNDS,
+        proprio_bounds=BOUNDS,
+        dtype=torch.float32,
+    ).eval()
+    assert model.proprio_projector is not None
+    assert model.language_model.config._attn_implementation == "sdpa"
+    for k, v in base.state_dict().items():
+        assert torch.equal(model.state_dict()[k], v), k
+    pre = _pre()
+    obs = _obs(2, seed=6)
+    with torch.no_grad():
+        logits = oft_model.action_logits(
+            model, pre.build_inputs(INSTR[:2], obs["image"], obs["state"]), 48
+        )
+    assert logits.shape == (2, 48, 256) and bool(torch.isfinite(logits).all())
