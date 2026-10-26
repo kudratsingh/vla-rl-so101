@@ -48,6 +48,10 @@ class FakeBus:
         self.calls.append(("enable_torque", None))
         self.torque_enabled = True
 
+    def disconnect(self, disable_torque: bool = True) -> None:
+        self.calls.append(("disconnect", disable_torque))
+        self.follower.connected = False
+
     def disable_torque(self, motors: Any = None, num_retry: int = 0) -> None:
         self.calls.append(("disable_torque", None))
         if self.fail_disable:
@@ -74,6 +78,7 @@ class FakeFollower:
         self.sent: list[dict[str, float]] = []
         self.fail_read = False
         self.fail_write = False
+        self.fail_connect = False
 
     def positions_lerobot(self) -> dict[str, float]:
         return {k.removesuffix(".pos"): v for k, v in self.pos.items()}
@@ -90,6 +95,8 @@ class FakeFollower:
         assert calibrate is False, "the driver must never auto-calibrate"
         self.connected = True
         self.bus.disable_torque()  # like SOFollower.configure(): torque off ... torque on
+        if self.fail_connect:
+            raise ConnectionError("Failed to write 'P_Coefficient'")
         self.bus.enable_torque()
 
     def disconnect(self) -> None:

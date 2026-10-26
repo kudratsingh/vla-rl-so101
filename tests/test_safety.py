@@ -172,6 +172,9 @@ def test_invalid_inputs_fail_safe() -> None:
     # FK failure fails closed
     f = SafetyFilter(f.config, lambda _q: np.array([np.nan, 0, 0]), Deadman(0.3))
     assert f.filter(q(wrist_flex=1), q(), now=0.0).status == "rejected"
+    # a broken clock cannot earn a full step
+    f = make_filter()
+    assert f.filter(q(wrist_flex=1), q(), now=float("nan")).status == "deadman"
     # unreadable joints: deadman, torque off, no command
     f = make_filter()
     r = f.filter(q(), [0, 0, 0, float("inf"), 0, 0], now=0.0)

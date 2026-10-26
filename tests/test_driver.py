@@ -103,6 +103,15 @@ def test_refuses_uncalibrated_arm() -> None:
     assert not fol.bus.torque_enabled and not fol.connected
 
 
+def test_connect_failure_leaves_arm_limp_and_port_closed() -> None:
+    fol = FakeFollower()
+    fol.fail_connect = True
+    with pytest.raises(ConnectionError):
+        make(fol).connect()
+    assert not fol.bus.torque_enabled and not fol.connected
+    assert ("disconnect", False) in fol.bus.calls
+
+
 def test_torque_off_failure_is_loud(caplog: pytest.LogCaptureFixture) -> None:
     fol = FakeFollower()
     drv = make(fol)

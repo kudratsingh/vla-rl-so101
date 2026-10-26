@@ -154,7 +154,16 @@ class So101Driver:
                 "--preset real calibrate --device follower`"
             )
         install_hold_on_torque_enable(self.follower.bus)
-        self.follower.connect(calibrate=False)
+        try:
+            self.follower.connect(calibrate=False)
+        except BaseException:
+            log.critical("follower connect failed: torque off, closing the port")
+            self.torque_off()
+            try:
+                self.follower.bus.disconnect(disable_torque=False)
+            except Exception as e:  # noqa: BLE001 - best effort; the original error is raised
+                log.warning("closing the port failed too: %s", e)
+            raise
         self._connected = True
         if not self.follower.is_calibrated:
             self.torque_off()

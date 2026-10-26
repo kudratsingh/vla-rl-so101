@@ -285,6 +285,9 @@ class SafetyFilter:
     def filter(self, target: npt.ArrayLike, measured: npt.ArrayLike, now: float) -> SafetyResult:
         if self.deadman.tripped:
             return SafetyResult(None, "deadman")
+        if not math.isfinite(now):
+            self.deadman.trip(f"invalid control-loop time {now!r}", DeadmanResponse.HOLD)
+            return SafetyResult(None, "deadman")
         q_meas = np.asarray(measured, dtype=np.float64).reshape(-1)
         if q_meas.shape != (NUM_JOINTS,) or not np.all(np.isfinite(q_meas)):
             self.deadman.trip(f"invalid joint reading {q_meas}", DeadmanResponse.TORQUE_OFF)
