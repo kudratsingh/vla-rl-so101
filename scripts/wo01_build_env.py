@@ -57,7 +57,9 @@ class LazyRecorder:
         if self.rec is None:
             size = int(self.cfg["env"]["image_size"])
             if image_hw != (size, size):
-                print(f"WARNING: env renders {image_hw}, cfg env.image_size={size}; recording {image_hw}")
+                print(
+                    f"WARNING: env renders {image_hw}, cfg env.image_size={size}; recording {image_hw}"
+                )
             self.rec = DemoRecorder.from_config(self.cfg, image_hw=image_hw, overwrite=True)
         elif self.rec.image_hw != image_hw:
             raise ValueError(f"image size changed between tasks: {self.rec.image_hw} -> {image_hw}")

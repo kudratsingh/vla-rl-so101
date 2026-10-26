@@ -15,6 +15,7 @@ the demo seeds, success = env success check at any step.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import shutil
 import statistics
@@ -210,12 +211,30 @@ def evaluate(
     return out
 
 
+def dataset_image_hw(cfg: Config) -> tuple[int, int]:
+    """(H, W) of the front camera as recorded in the dataset (not assumed from a constant)."""
+    _, root = dataset_location(cfg)
+    info = json.loads((root / "meta" / "info.json").read_text())
+    h, w = info["features"][IMAGE_KEY]["shape"][:2]
+    return int(h), int(w)
+
+
 def estimate(
-    measured_device: str, step_s: float, measured_batch: int, chunk_s: float | None
+    measured_device: str,
+    step_s: float,
+    measured_batch: int,
+    chunk_s: float | None,
+    measured_hw: tuple[int, int],
 ) -> dict[str, Any]:
-    """Wall-clock / $ for the full smoke (`sim` preset) on this Mac's MPS and on an RTX 4090."""
+    """Wall-clock / $ for the full smoke (`sim` preset) on this Mac's MPS and on an RTX 4090.
+
+    SmolVLA resizes every camera image to 512x512 (with padding) before its vision encoder, so
+    step time barely depends on the recorded resolution; the measured and target H x W are
+    recorded anyway so the estimate states what it was measured on.
+    """
     sim = load_config("sim")
     sm = sim.get("smoke", {})
+    size = int(sim["env"]["image_size"])
     steps = int(sm.get("steps", sim["sft"]["steps"]))
     batch = int(sm.get("batch_size", sim["sft"]["batch_size"]))
     episodes = int(sm.get("eval_episodes", 10))
@@ -229,8 +248,14 @@ def estimate(
     local_h = train_h + eval_h
     gpu_h = local_h / RTX4090_SPEEDUP.get(measured_device, 1.0)
     return {
-        "full_smoke": {"steps": steps, "batch_size": batch, "eval_episodes_per_task": episodes},
+        "full_smoke": {
+            "steps": steps,
+            "batch_size": batch,
+            "eval_episodes_per_task": episodes,
+            "image_hw": [size, size],
+        },
         "measured_device": measured_device,
+        "measured_image_hw": list(measured_hw),
         "measured_step_s": step_s,
         "measured_batch_size": measured_batch,
         "local_h": round(local_h, 3),
@@ -302,7 +327,8 @@ def main() -> int:
             run.results["eval"] = results
             del policy, pre, post
         chunk = [r["chunk_inference_s"] for r in results.values() if r["chunk_inference_s"]]
-        est = estimate(device, step_s, batch_size, statistics.median(chunk) if chunk else None)
+        chunk_s = statistics.median(chunk) if chunk else None
+        est = estimate(device, step_s, batch_size, chunk_s, dataset_image_hw(cfg))
         run.results["estimate"] = est
         if not args.keep_checkpoint and cfg["preset"] == "tiny":
             shutil.rmtree(run.dir / "train" / "checkpoints")  # ~1-2 GB of plumbing-only weights
@@ -320,8 +346,14 @@ def main() -> int:
     fs = est["full_smoke"]
     print(
         f"full smoke estimate (sim preset: {fs['steps']} steps x batch {fs['batch_size']},"
-        f" {fs['eval_episodes_per_task']} eval eps/task), from {device} step time:"
+        f" {fs['eval_episodes_per_task']} eval eps/task, {fs['image_hw'][0]}x{fs['image_hw'][1]}"
+        f" camera), from {device} step time at {est['measured_image_hw'][0]}x"
+        f"{est['measured_image_hw'][1]} inputs:"
     )
+    if est["measured_image_hw"] != fs["image_hw"]:
+        print(
+            "  NOTE: measured at a different input size than the sim preset (SmolVLA resizes to 512)"
+        )
     print(f"  this machine ({device}): {est['local_h']:.2f} h")
     print(
         f"  RTX 4090 @ ${RTX4090_USD_PER_H}/h: {est['rtx4090_h']:.2f} h = ${est['rtx4090_usd']:.2f}"
