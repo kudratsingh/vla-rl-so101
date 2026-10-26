@@ -61,7 +61,9 @@ class VLAPolicy(Protocol):
         ...
 
     # --- SFT ---------------------------------------------------------------------------------
-    def sft_loss(self, batch: SFTBatch) -> tuple[Tensor, dict[str, float]]: ...
+    def sft_loss(
+        self, batch: SFTBatch, *, augment: bool = True
+    ) -> tuple[Tensor, dict[str, float]]: ...
 
     # --- RL (src.rl.policy_api.RLPolicy) -----------------------------------------------------
     def sample(

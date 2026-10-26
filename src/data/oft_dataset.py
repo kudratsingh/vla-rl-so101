@@ -109,8 +109,8 @@ def synthetic_frames(
     out: list[dict[str, Any]] = []
     for instr in instructions:
         for _ in range(episodes_per_instruction):
-            start = torch.rand(6, generator=g) - 0.5
-            step = (torch.rand(6, generator=g) - 0.5) * 0.05
+            start = (torch.rand(6, generator=g) - 0.5) * 0.8  # inside every joint's bounds
+            step = (torch.rand(6, generator=g) - 0.5) * 0.02
             acts = torch.stack([start + t * step for t in range(frames_per_episode)])
             for t in range(frames_per_episode):
                 idx = [min(t + k, frames_per_episode - 1) for k in range(chunk_len)]

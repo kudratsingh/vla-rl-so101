@@ -163,12 +163,13 @@ class OpenVLAOFTPolicy(nn.Module):
         return self.act_batch(batch, [instruction])[0].cpu().numpy()
 
     # ------------------------------------------------------------------------ SFT
-    def sft_loss(self, batch: SFTBatch) -> tuple[Tensor, dict[str, float]]:
+    def sft_loss(self, batch: SFTBatch, *, augment: bool = True) -> tuple[Tensor, dict[str, float]]:
+        """Cross-entropy on the 256-bin action slice (the distribution RL samples from)."""
         inputs = self.inputs(
             {"image": batch.images, "state": batch.states},
             batch.instructions,
             batch.actions,
-            train=True,
+            train=augment,
         )
         assert inputs.targets is not None
         logits = self.action_logits(inputs)
