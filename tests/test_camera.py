@@ -16,26 +16,30 @@ from src.robot.camera import (
     PolicyImagePipeline,
     calibrate_intrinsics,
     fov_crop_window,
+    sim_mismatches,
 )
 from src.robot.yamlio import set_yaml_value
 
 
 def test_real_camera_config_matches_sim() -> None:
     real, sim = real_cfg(), load_config("sim")
-    front = real["cameras"]["front"]
-    assert front["crop_to"] == sim["env"]["image_size"]
-    assert front["fov_deg"] == sim["env"]["camera"]["fov_deg"]
-    assert front["pose"] == sim["env"]["camera"]["pose"]
+    assert real["cameras"]["front"]["crop_to"] == 224  # OpenVLA-OFT input (lead, 2026-10-26)
+    # this branch's sim.yaml still says image_size 128; WO-01 moves it to 224
+    assert [m for m in sim_mismatches(real, sim) if "crop_to" not in m] == []
+    bad = {"env": {"image_size": 128, "camera": {"fov_deg": 50, "pose": "front_left_45"}}}
+    assert len(sim_mismatches(real, bad)) == 2
     assert real["robot"]["control_hz"] == 15
 
 
 def test_uncalibrated_pipeline_centre_square() -> None:
-    pipe = PolicyImagePipeline.from_config(real_cfg())  # intrinsics: null in the repo config
+    cfg = real_cfg()
+    pipe = PolicyImagePipeline.from_config(cfg)  # intrinsics: null in the repo config
     assert not pipe.calibrated and pipe.window == (80, 0, 560, 480)
     frame = np.zeros((480, 640, 3), np.uint8)
     frame[:, :80] = 255  # left margin outside the crop
     out = pipe(frame)
-    assert out.shape == (128, 128, 3) and out.dtype == np.uint8 and out.max() == 0
+    side = cfg["cameras"]["front"]["crop_to"]  # size comes from the config
+    assert out.shape == (side, side, 3) and out.dtype == np.uint8 and out.max() == 0
     with pytest.raises(ValueError):
         pipe(np.zeros((480, 640), np.uint8))
 
@@ -48,18 +52,18 @@ def test_calibrated_crop_matches_sim_fov() -> None:
         2 * half, abs=1
     )
     assert (x0 + x1) / 2 == pytest.approx(330, abs=1) and (y0 + y1) / 2 == pytest.approx(235, abs=1)
-    pipe = PolicyImagePipeline(640, 480, 128, 60.0, intr)
+    pipe = PolicyImagePipeline(640, 480, 224, 60.0, intr)
     frame = np.zeros((480, 640, 3), np.uint8)
     cv2.circle(frame, (330, 235), 6, (255, 255, 255), -1)  # principal point -> image centre
     out = pipe(frame)
     ys, xs = np.nonzero(out[..., 0] > 60)
-    assert xs.mean() == pytest.approx(63.5, abs=1.5) and ys.mean() == pytest.approx(63.5, abs=1.5)
+    assert xs.mean() == pytest.approx(111.5, abs=2) and ys.mean() == pytest.approx(111.5, abs=2)
     # a lens narrower than the sim fov cannot be matched by cropping
     with pytest.raises(ValueError, match="too narrow"):
-        PolicyImagePipeline(640, 480, 128, 60.0, Intrinsics(600, 600, 320, 240, (), 640, 480))
+        PolicyImagePipeline(640, 480, 224, 60.0, Intrinsics(600, 600, 320, 240, (), 640, 480))
     # undistortion path runs and keeps the shape
     dist = Intrinsics(400, 400, 320, 240, (-0.2, 0.05, 0.0, 0.0, 0.0), 640, 480)
-    assert PolicyImagePipeline(640, 480, 128, 60.0, dist)(frame).shape == (128, 128, 3)
+    assert PolicyImagePipeline(640, 480, 224, 60.0, dist)(frame).shape == (224, 224, 3)
     assert Intrinsics.from_dict(dist.to_dict()) == dist
 
 

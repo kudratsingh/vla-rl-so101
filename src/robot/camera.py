@@ -1,7 +1,8 @@
 """The exact image the policy sees from the real front camera. Shared by WO-06 and WO-07.
 
 Pipeline: real RGB frame (``cameras.front`` width x height) -> uint8 (S, S, 3) with
-S = ``cameras.front.crop_to`` (must equal the sim's ``env.image_size``):
+S = ``cameras.front.crop_to`` from the config (224, OpenVLA-OFT's input; must equal the sim's
+``env.image_size`` - ``sim_mismatches`` checks):
 
 1. Undistort with the calibrated intrinsics, keeping the same K (the sim camera is a distortion-free
    pinhole).
@@ -107,6 +108,19 @@ def fov_crop_window(
             "configs/real.yaml (and re-render sim data)."
         )
     return x0, y0, x1, y1
+
+
+def sim_mismatches(real_cfg: Config, sim_cfg: Config, camera: str = "front") -> list[str]:
+    """Where the real camera config disagrees with the sim camera the policy was trained on."""
+    cam = real_cfg["cameras"][camera]
+    env = sim_cfg.get("env", {})
+    sim_cam = env.get("camera", {})
+    pairs = [
+        ("crop_to vs env.image_size", cam.get("crop_to"), env.get("image_size")),
+        ("fov_deg vs env.camera.fov_deg", cam.get("fov_deg"), sim_cam.get("fov_deg")),
+        ("pose vs env.camera.pose", cam.get("pose"), sim_cam.get("pose")),
+    ]
+    return [f"{what}: real {a!r} != sim {b!r}" for what, a, b in pairs if a != b]
 
 
 class PolicyImagePipeline:
@@ -284,7 +298,10 @@ def calibrate_intrinsics(
             img_pts.append(corners)
     if size is None or len(img_pts) < min_views:
         raise ValueError(f"board found in {len(img_pts)} images; need >= {min_views}")
-    rms, k, dist, _, _ = cv2.calibrateCamera(obj_pts, img_pts, size, np.eye(3), np.zeros(5))
+    # k3 fixed at 0: with a dozen webcam views it only overfits
+    rms, k, dist, _, _ = cv2.calibrateCamera(
+        obj_pts, img_pts, size, np.eye(3), np.zeros(5), flags=cv2.CALIB_FIX_K3
+    )
     d = np.asarray(dist, dtype=np.float64).ravel()[:5]
     intr = Intrinsics(
         fx=float(k[0, 0]),
