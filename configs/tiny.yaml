@@ -1,0 +1,40 @@
+# CPU-only preset. Must run end to end in <2 minutes on any machine. Never used for results.
+preset: tiny
+device: cpu
+seed: 0
+
+env:
+  name: so101_tabletop
+  tasks: [PickPlace]
+  num_envs: 2
+  image_size: 64
+  max_episode_steps: 20
+  randomize: false
+
+data:
+  demos_per_task: 2
+  dataset_root: data/demos
+
+policy:
+  base: toy            # 2-layer MLP stand-in; real bases: openvla_oft | pi05 | smolvla
+  lora_rank: 4
+
+sft:
+  steps: 20
+  batch_size: 2
+  lr: 1e-3
+
+rl:
+  samples_per_prompt: 4
+  rollout_batch: 2
+  steps: 10
+  clip_low: 0.2
+  clip_high: 0.28
+  temperature: 1.6
+  kl_coef: 0.0
+  dynamic_sampling: true
+
+eval:
+  episodes_per_cell: 4
+  seeds: [0]
+  cells: [seen]

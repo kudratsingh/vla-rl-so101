@@ -1,0 +1,36 @@
+# rl tier (A100 80 GB). WO-04/05 GRPO from the WO-02 SFT checkpoint.
+#
+# VRAM budget (agent fills measured numbers in WO-03):
+#   base model bf16 (7B)            ~14 GB
+#   LoRA params + optimizer         ~1 GB
+#   activations @ rollout_batch     ~?? GB
+#   N envs × 128×128 RGB + physics  ~?? GB
+#   headroom                        ≥8 GB
+preset: rl
+device: cuda
+seed: 0
+inherit: configs/sim.yaml
+
+policy:
+  checkpoint: null          # WO-02 SFT checkpoint (HF id)
+
+rl:
+  algorithm: grpo           # ADR-0002
+  samples_per_prompt: 8
+  rollout_envs: 32
+  rollout_batch: 64
+  steps: 300
+  lr: 1e-5
+  clip_low: 0.2
+  clip_high: 0.28
+  temperature: 1.6
+  kl_coef: 0.0
+  dynamic_sampling: true
+  eval_every: 25
+  checkpoint_every: 50
+  early_stop_check_at_frac: 0.25   # WO-04 note: flat by here → stop and diagnose
+
+cost:
+  gpu: A100-80GB
+  usd_per_hour: 1.79
+  estimated_hours: null     # agent fills before every run

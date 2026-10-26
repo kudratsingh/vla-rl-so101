@@ -1,0 +1,42 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python / tooling
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+
+# data, weights, run outputs (rule 7: never in git; run records are the exception)
+/data/
+/checkpoints/
+/outputs/
+/runs/*/*
+!/runs/*/record.json
+wandb/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.hdf5
+
+# media
+*.mp4
+*.gif
+docs/assets/camera-match/*.png
+
+# local machine
+.DS_Store
+.idea/
+.vscode/
+.claude/settings.local.json
+.claude/worktrees/

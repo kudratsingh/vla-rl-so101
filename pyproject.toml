@@ -1,0 +1,49 @@
+[project]
+name = "vla-rl-so101"
+version = "0.0.1"
+description = "Single-GPU RL post-training of a VLA, deployed to a real SO-101"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "numpy",
+  "pyyaml",
+  "pydantic>=2",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+# Agent pins exact versions in WO-01 and records them in docs/ENVIRONMENT.md.
+gpu = [
+  "torch==2.5.*",
+  "torchvision",
+  "torchcodec",
+  "mani_skill",            # pin exact 3.0.0bX
+  "transformers",
+  "peft",
+  "accelerate",
+  "huggingface_hub",
+  "datasets",
+  "grpcio",
+  "grpcio-tools",
+  "wandb",
+]
+robot = [
+  "grpcio",
+  "opencv-python",
+  "huggingface_hub",
+  # lerobot[feetech] at the pinned commit — add as a git dependency in WO-01
+]
+dev = ["pytest", "ruff", "black", "mypy"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.black]
+line-length = 100
+
+[tool.mypy]
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

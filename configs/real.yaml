@@ -1,0 +1,37 @@
+# Real SO-101. Mac runs the client; GPU box runs the policy server.
+preset: real
+
+robot:
+  type: so101_follower
+  port: /dev/tty.usbmodemXXXX        # lerobot-find-port
+  calibration_dir: ~/.cache/huggingface/lerobot/calibration
+  control_hz: 15
+  safety:
+    joint_limits_deg: {}              # filled from calibration
+    workspace_box_m: {x: [0.10, 0.40], y: [-0.20, 0.20], z: [0.00, 0.25]}
+    max_joint_step_deg: 4.0
+    max_velocity_deg_s: 60.0
+    deadman_frame_timeout_ms: 300
+
+cameras:
+  front:
+    index: 0
+    width: 640
+    height: 480
+    fps: 30
+    intrinsics: null                  # filled in WO-06
+    pose: front_left_45               # must equal sim camera pose
+    crop_to: 128
+  wrist:
+    index: 1
+    enabled: false
+
+server:
+  host: <runpod-ip>
+  port: 50051
+  policy_checkpoint: null             # HF id of SFT or SFT+RL LoRA
+
+eval:
+  trials_per_cell: 50
+  cells: [seen, shifted, unseen_objects]
+  grid: docs/assets/placement-grid-a3.pdf

@@ -1,0 +1,39 @@
+# dev tier (RTX 4090). WO-01 env/oracle/demos, WO-02 SFT + eval.
+preset: sim
+device: cuda
+seed: 0
+
+env:
+  name: so101_tabletop
+  tasks: [PickPlace, Push, Stack]
+  num_envs: 64
+  image_size: 128
+  max_episode_steps: 150
+  randomize: false          # WO-06 may flip this for the randomized retrain
+  camera:
+    pose: front_left_45     # resolved to extrinsics in src/env/cameras.py; must match real
+    fov_deg: 60
+
+data:
+  demos_per_task: 10
+  dataset_root: data/demos
+  hub_repo: kudratsingh/vla-rl-so101-demos
+
+policy:
+  base: openvla_oft         # per ADR-0001; fallback pi05
+  checkpoint: null          # HF id, filled in WO-02
+  lora_rank: 32
+  action_chunk: 8
+  precision: bf16
+
+sft:
+  steps: 2000
+  batch_size: 8
+  lr: 5e-5
+  warmup_steps: 100
+
+eval:
+  episodes_per_cell: 100
+  seeds: [0, 1, 2]
+  cells: [seen, shifted, unseen_objects]
+  protocol_hash: null       # filled by src/eval/protocol.py at freeze time
