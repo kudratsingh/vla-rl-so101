@@ -21,6 +21,7 @@ dist/
 /outputs/
 /runs/*/*
 !/runs/*/record.json
+/runs/*-tiny-*/
 wandb/
 *.safetensors
 *.ckpt
