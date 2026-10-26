@@ -133,6 +133,11 @@ def _ensure_local(repo_id: str, root: Path) -> None:
     """The episode sidecar is read before LeRobot opens the dataset: pull it from the Hub once."""
     if (root / "meta" / "info.json").is_file():
         return
+    if repo_id.startswith("local/"):
+        raise FileNotFoundError(
+            f"no demo dataset at {root}; record it first: uv run scripts/wo01_build_env.py "
+            "--preset <preset> (or pass --synthetic for a smoke run)"
+        )
     from huggingface_hub import snapshot_download
 
     snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=str(root))
