@@ -1872,6 +1872,24 @@ wheels = [
 ]
 
 [[package]]
+name = "timm"
+version = "0.9.16"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "pyyaml" },
+    { name = "safetensors" },
+    { name = "torch", version = "2.6.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "torch", version = "2.6.0+cu124", source = { registry = "https://download.pytorch.org/whl/cu124" }, marker = "sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.21.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "torchvision", version = "0.21.0+cu124", source = { registry = "https://download.pytorch.org/whl/cu124" }, marker = "sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c5/ba/3d5f3381dc291d21114e707b39791f483431361f61402483d9839b61350d/timm-0.9.16.tar.gz", hash = "sha256:891e54f375d55adf31a71ab0c117761f0e472f9f3971858ecdd1e7376b7071e6", size = 2121824, upload-time = "2024-02-19T19:33:45.468Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/68/99/2018622d268f6017ddfa5ee71f070bad5d07590374793166baa102849d17/timm-0.9.16-py3-none-any.whl", hash = "sha256:bf5704014476ab011589d3c14172ee4c901fd18f9110a928019cac5be2945914", size = 2249737, upload-time = "2024-02-19T19:33:42.542Z" },
+]
+
+[[package]]
 name = "tokenizers"
 version = "0.22.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2203,6 +2221,8 @@ gpu = [
     { name = "grpcio" },
     { name = "grpcio-tools" },
     { name = "peft" },
+    { name = "timm" },
+    { name = "transformers" },
     { name = "wandb" },
 ]
 robot = [
@@ -2236,12 +2256,14 @@ requires-dist = [
     { name = "pyyaml" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "sapien", specifier = "==3.0.3" },
+    { name = "timm", marker = "extra == 'gpu'", specifier = "==0.9.16" },
     { name = "torch", marker = "sys_platform != 'linux'", specifier = "==2.6.0" },
     { name = "torch", marker = "sys_platform == 'linux'", specifier = "==2.6.0", index = "https://download.pytorch.org/whl/cu124" },
     { name = "torchcodec", specifier = "==0.2.1" },
     { name = "torchvision", marker = "sys_platform != 'linux'", specifier = "==0.21.0" },
     { name = "torchvision", marker = "sys_platform == 'linux'", specifier = "==0.21.0", index = "https://download.pytorch.org/whl/cu124" },
     { name = "tqdm" },
+    { name = "transformers", marker = "extra == 'gpu'", specifier = "==4.57.6" },
     { name = "types-pyyaml", marker = "extra == 'dev'" },
     { name = "types-tqdm", marker = "extra == 'dev'" },
     { name = "wandb", marker = "extra == 'gpu'" },

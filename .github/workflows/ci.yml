@@ -22,7 +22,7 @@ jobs:
         with:
           version: "0.13.5"
           enable-cache: true
-      - run: uv sync --frozen --extra dev
+      - run: uv sync --frozen --extra dev --extra gpu   # gpu: transformers/timm/peft for policy tests
       - run: uv run ruff check src tests scripts
       - run: uv run black --check src tests scripts
       - run: uv run mypy
