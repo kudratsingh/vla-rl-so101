@@ -43,10 +43,12 @@ finish() {
   echo "[job] exit rc=$rc at stage $(cat "$STAGE_FILE" 2>/dev/null)"
   upload "final (rc=$rc)"
   echo "[job] terminating pod $RUNPOD_POD_ID"
-  curl -fsS -X DELETE "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" \
+  # the pod-scoped key is accepted by REST v2 and GraphQL (REST v1 answers 403)
+  curl -fsS -X DELETE "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID" \
     -H "Authorization: Bearer $RUNPOD_API_KEY" \
-    || curl -fsS -X DELETE "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID" \
-      -H "Authorization: Bearer $RUNPOD_API_KEY"
+    || curl -fsS https://api.runpod.io/graphql -H "Authorization: Bearer $RUNPOD_API_KEY" \
+      -H 'Content-Type: application/json' \
+      -d "{\"query\":\"mutation { podTerminate(input: {podId: \\\"$RUNPOD_POD_ID\\\"}) }\"}"
 }
 trap finish EXIT
 
