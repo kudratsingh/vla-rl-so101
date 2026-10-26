@@ -252,7 +252,11 @@ def test_entry_script_tiny_writes_run_record(
     script = _load_script()
     monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
     cfg_path = tmp_path / "tiny_short.yaml"
-    cfg_path.write_text(f"inherit: {REPO / 'configs' / 'tiny.yaml'}\nrl:\n  steps: 3\n")
+    # 3 steps puts the flat-run check at step 1, where eval noise alone can trip it (seen on the
+    # Linux CI runner); this test is about the run record, so the kill switch is off
+    cfg_path.write_text(
+        f"inherit: {REPO / 'configs' / 'tiny.yaml'}\nrl:\n  steps: 3\n  early_stop_on_flat: false\n"
+    )
     summary = script.main(["--preset", "tiny", "--config", str(cfg_path), "--seed", "1"])
     (run_dir,) = (tmp_path / "runs").iterdir()
     record = json.loads((run_dir / "record.json").read_text())
