@@ -90,6 +90,9 @@ def make_env(
             bool(env_cfg.get("randomize", False)), env_cfg.get("randomization")
         ),
     }
+    if not render:
+        # no renderer at all for state-only envs: no Vulkan needed (GPU-less CI); macOS overrides
+        make_kwargs["render_backend"] = "none"
     make_kwargs.update(kwargs)
     env_id = TASK_ENV_IDS[task]
     if device.startswith("cuda"):
