@@ -73,3 +73,4 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["needs_render: builds image-producing envs; skipped without a Vulkan render device"]

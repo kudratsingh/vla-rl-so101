@@ -9,17 +9,18 @@ started before its predecessors merge is listed here, marked **out of order**, b
 
 | WO | State | Branch / PR | Notes |
 |---|---|---|---|
-| 01 | in progress | `wo-01-sim-env` | Oracle benchmark met on branch (seen, 100 ep/task: PickPlace 100%, Push 99%, Stack 100%; run `20261026T194952Z-wo01-sim-8ad7`). Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). SmolVLA smoke running on Mac MPS; PR after it. |
+| 01 | done (benchmark met), PR open | `wo-01-sim-env` | See benchmarks. Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). |
 | 02 | in progress, **out of order** (started before WO-01 merged) | `wo-02-sft` | Uses WO-01's code (merged into its branch) and the Hub demos above. LoRA SFT (sim.yaml budget: 2000 steps) running on RunPod pod `iqrmjox6ws0e66` since 2026-10-26 20:18 UTC; owner-approved, WO-02 spend cap $15. If WO-01 review changes env/oracle/camera, the demos and this SFT are redone. |
-| 03 | PR open, awaiting owner review | #4 | **Out of order** (started before WO-01/02). CPU only, toy env; benchmark met on branch. |
+| 03 | done, merged after owner review | #4 (merged) | **Out of order** (started before WO-01/02). CPU only, toy env. |
 | 06 | part 1 merged, part 2 waits for the arm | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. |
-| 04, 05, 07, 08, 09 | not started | | |
+| 04 | not started; blocked on WO-02's SFT checkpoint | | Owner settings recorded below; applied as WO-04's first commit. Noted here before it starts. |
+| 05, 07, 08, 09 | not started | | |
 
 ## Benchmarks met
 
 | WO | Met on | Evidence (run id / PR) |
 |---|---|---|
-| 01 | | |
+| 01 | 2026-10-26 | Oracle, seen cell, 100 episodes/task, Mac CPU: PickPlace 100%, Push 99%, Stack 100% (run `20261026T194952Z-wo01-sim-8ad7`, which also recorded the 10 demos/task: 30 episodes, 1968 frames, pushed privately to `KudratSingh22/vla-rl-so101-demos`). SmolVLA smoke, 2000 steps x batch 8 on Mac MPS, 10 seen episodes/task: PickPlace 50%, Push 20%, Stack 0% (single run; run `20261026T195329Z-wo01-sim-b326`). `tiny` preset build: 6.9 s on CPU. |
 | 02 | | |
 | 03 | 2026-10-26 | tiny toy GRPO, seeds 0/1/2: greedy eval 0.301/0.102/0.191 -> 0.988/1.000/0.996 of optimum 1.0 in 100 steps (>=0.95 by step 20/20/25), bit-identical reruns, ~3.5 s CPU each; runs 20261026T193248Z-wo03-tiny-s0-be5126, -193252Z-…-s1-cf3b6d, -193255Z-…-s2-d11eb5 (reruns -fe1afa/-812773/-8c72b6); branch `wo-03-rl-loop` @ 051f1e6 |
 | 04 | | |
@@ -41,6 +42,17 @@ Running total: $0 settled; WO-02 pod running (max $5.34 by its 6 h self-delete c
 
 - (none)
 
+## Owner decisions in effect
+
+- 2026-10-26 WO-02 SFT is LoRA only, on the sim.yaml budget (2000 steps), RTX 4090 tier, pinned
+  CUDA 12.4.1 image; WO-02 spend cap $15; target 20-60% on seen positions (not max success).
+  Below 20% -> up to two more SFT attempts, then the pi0.5 switch (ADR-0001); above 60% -> cut
+  steps or demos.
+- 2026-10-26 Every paid run: probe first, then an explicit go on the posted probe numbers before
+  the full run (job-script approval gate). WO-04's RL runs (~$135) must not start without it.
+- 2026-10-26 WO-04 settings: LoRA lr 5e-5 (not 1e-5); kill switch evaluates 64 episodes/task at
+  step 0 and at the 25% check and stops only if the improvement is under 3 points; ppo_mini_batch 64.
+
 ## Decisions taken by the agent (one line each, link ADR if any)
 
 - 2026-10-26 Python 3.11 kept; LeRobot pinned to 0.4.4, the last release supporting 3.11 (0.5+ needs ≥3.12).
@@ -61,3 +73,10 @@ Running total: $0 settled; WO-02 pod running (max $5.34 by its 6 h self-delete c
 - 2026-10-26 WO-03 loss aggregation = upstream SimpleVLA-RL dp_rob.py: per-trajectory token-mean, then mean over the mini-batch (not DAPO token-mean); advantage = (r - mean) / (unbiased std + 1e-6).
 - 2026-10-26 WO-03 dynamic sampling drops all-equal groups and refills per env batch, capped at `max_rollout_rounds` (upstream: whole rounds, uncapped).
 - 2026-10-26 WO-03 rl preset made cost-aware (owner budget ~$200): 16 prompts x 8 per step and sampler log-probs reused as old log-probs; estimated 25 h / ~$45 per seed vs ~$227 at the upstream 64 prompts (`scripts/wo03_rl.py --preset rl --estimate`; estimates only).
+- 2026-10-26 Policy camera 224x224 (OpenVLA-OFT input size), 40 deg vertical fov at 0.70 m
+  (real webcam must cover >= 40 deg vertical; C920-class qualifies); real.yaml matches.
+- 2026-10-26 Sim 300 Hz / control 15 Hz; PhysX position iterations 25; jaw collision meshes split
+  into convex slabs (upstream hull filled the jaw gap).
+- 2026-10-26 make_env defaults to one env on CPU (64 serial envs exhausted MoltenVK descriptor pools).
+- 2026-10-26 lerobot 0.4.4 hands torchcodec 0.2.1 a file object; src/data/recorder.py shims it to
+  open local files by path. Candidate for a pin-upgrade WO later.

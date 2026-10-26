@@ -12,7 +12,7 @@ All versions below are pinned. Changing any of them is a work order of its own.
 | ManiSkill3 | `mani-skill==3.0.1` (stable, 2026-04-21) | Replaces the kit's 3.0.0bX beta. GPU-parallel sim + render. mplib (motion planner) is Linux-only, so the oracle uses IK |
 | SAPIEN | 3.0.3 | Required by ManiSkill3 pin; first macOS wheels in 3.0.2 |
 | LeRobot | 0.4.4, `8fff0fde7c79f23a93d845d1a50e985de01f8b8a` (tag v0.4.4, 2026-02-27) | APIs move between releases; dataset format v3.0 (its CODEBASE_VERSION) |
-| SO-101 robot model | TheRobotStudio/SO-ARM100 (Apache-2.0), `Simulation/SO101/so101_new_calib.urdf`; SHA: see `src/env/assets/so101/README.md` | Vendored into `src/env/assets/so101/` |
+| SO-101 robot model | TheRobotStudio/SO-ARM100 (Apache-2.0), `Simulation/SO101/so101_new_calib.urdf` @ `a758567c3978dfeefe282ede0500085a48fe8f78` (edits listed in `src/env/assets/so101/README.md`) | Vendored into `src/env/assets/so101/` |
 | lerobot-sim2real / squint | not vendored | lerobot-sim2real has NO license on GitHub; "squint" could not be located on GitHub |
 | OpenVLA-OFT | `e4287e94541f459edc4feabc4e181f537cd569a8` (moojink/openvla-oft, MIT, 2025-09-09) + HF checkpoint id; recorded in WO-01, installed in WO-02/03 | Base model. Pins torch==2.2.0 and a transformers fork (moojink/transformers-openvla-oft, 4.40.x) that conflicts with SmolVLA's transformers; resolved in WO-02 as a separate uv extra |
 | openpi (fallback) | `215abfb217dbac7d5f1273282331b9b1866c0479` (Physical-Intelligence/openpi, 2026-08-24); recorded in WO-01, installed in WO-02/03 | π0.5 LoRA path |
