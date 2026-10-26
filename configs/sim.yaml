@@ -7,12 +7,27 @@ env:
   name: so101_tabletop
   tasks: [PickPlace, Push, Stack]
   num_envs: 64
-  image_size: 128
-  max_episode_steps: 150
+  image_size: 224           # OpenVLA-OFT input size; render at 224 rather than upsample 128
+  max_episode_steps: 150    # 10 s at 15 Hz; oracle needs ~50-80 steps
   randomize: false          # WO-06 may flip this for the randomized retrain
+  randomization:            # used only when randomize: true (defaults in src/env/randomization.py)
+    object_color_jitter: 0.08
+    object_physics: true
+    lighting: true
+    camera_pos_jitter_m: 0.02
+    camera_target_jitter_m: 0.01
+    camera_roll_jitter_rad: 0.02
+    camera_fov_jitter_deg: 1.5
+    robot_color: true
+    action_latency_max_steps: 2
+    reconfigure_every: 10
   camera:
     pose: front_left_45     # resolved to extrinsics in src/env/cameras.py; must match real
-    fov_deg: 60
+    fov_deg: 40             # VERTICAL fov (SAPIEN fovy); square image so horizontal = vertical
+    # Resolved extrinsics, robot base frame (m): x forward, y robot's left, z up, table top z=0.
+    # 45° azimuth (front-left), 45° down, 0.70 m from the centre of the seen spawn region.
+    eye: [0.555, 0.350, 0.495]
+    target: [0.205, 0.0, 0.0]
 
 data:
   demos_per_task: 10

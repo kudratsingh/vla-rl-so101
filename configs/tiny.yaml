@@ -8,7 +8,7 @@ env:
   tasks: [PickPlace]
   num_envs: 2
   image_size: 64
-  max_episode_steps: 20
+  max_episode_steps: 150   # oracle needs ~50-80 steps at 15 Hz
   randomize: false
 
 data:
