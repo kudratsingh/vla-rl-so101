@@ -17,7 +17,7 @@ env:
 data:
   demos_per_task: 10
   dataset_root: data/demos
-  hub_repo: kudratsingh/vla-rl-so101-demos
+  hub_repo: KudratSingh22/vla-rl-so101-demos
 
 policy:
   base: openvla_oft         # per ADR-0001; fallback pi05
