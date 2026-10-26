@@ -4,8 +4,16 @@ Updated: 2026-10-26
 
 ## Current work order
 
-WO-01 — in progress on `wo-01-sim-env`. Env/tasks/oracle and dataset/SmolVLA scripts being built
-in parallel; pins resolved (see `docs/ENVIRONMENT.md`).
+Independent WOs run in parallel (owner decision 2026-10-26, CLAUDE.md "Operating mode"). Any WO
+started before its predecessors merge is listed here, marked **out of order**, before work begins.
+
+| WO | State | Branch / PR | Notes |
+|---|---|---|---|
+| 01 | in progress | `wo-01-sim-env` | Oracle benchmark met on branch (seen, 100 ep/task: PickPlace 100%, Push 99%, Stack 100%; run `20261026T194952Z-wo01-sim-8ad7`). Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). SmolVLA smoke running on Mac MPS; PR after it. |
+| 02 | in progress, **out of order** (started before WO-01 merged) | `wo-02-sft` | Uses WO-01's code (merged into its branch) and the Hub demos above. LoRA SFT (sim.yaml budget: 2000 steps) running on RunPod pod `iqrmjox6ws0e66` since 2026-10-26 20:18 UTC; owner-approved, WO-02 spend cap $15. If WO-01 review changes env/oracle/camera, the demos and this SFT are redone. |
+| 03 | PR open, awaiting owner review | #4 | **Out of order** (started before WO-01/02). CPU only, toy env; benchmark met on branch. |
+| 06 | part 1 merged, part 2 waits for the arm | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. |
+| 04, 05, 07, 08, 09 | not started | | |
 
 ## Benchmarks met
 
@@ -25,9 +33,9 @@ in parallel; pins resolved (see `docs/ENVIRONMENT.md`).
 
 | Run id | WO | GPU | Hours | $ | Approved by owner |
 |---|---|---|---|---|---|
-| | | | | | |
+| pod `iqrmjox6ws0e66` (WO-02 probe + SFT + eval) | 02 | RTX 4090, $0.89/h | running | — | yes, 2026-10-26 (WO-02 cap $15) |
 
-Running total: $0.
+Running total: $0 settled; WO-02 pod running (max $5.34 by its 6 h self-delete cap).
 
 ## Blockers and decisions pending the owner
 
