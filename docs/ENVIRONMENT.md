@@ -71,7 +71,7 @@ SmolVLA can run on the Mac CPU/MPS for smoke tests only.
 
 | What | Where |
 |---|---|
-| Demos / real datasets | HF Hub `kudratsingh/vla-rl-so101-*` (LeRobotDataset v2 format) |
+| Demos / real datasets | HF Hub `KudratSingh22/vla-rl-so101-*` (LeRobotDataset v2 format) |
 | Checkpoints | HF Hub (private) or RunPod network volume; never git |
 | Run records | `runs/<id>/record.json` committed; metrics/logs ignored |
 
