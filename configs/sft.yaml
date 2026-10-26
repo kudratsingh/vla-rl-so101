@@ -26,7 +26,7 @@ policy:
     workspace_z: [-0.01, 0.25]    # table .. above the rest pose (TCP z 0.18)
     max_tilt_deg: 75
     trim_quantile: 0.005
-    wrist_roll: [-1.5708, 1.5708] # pi window: parallel gripper is 180-deg symmetric, yaw in +-45 deg
+    wrist_roll: [-2.05, 2.05]     # covers the oracle demos (max abs 2.01 rad, Stack roll accumulates); 0.94 deg/bin
     gripper: [-0.17, 0.6]         # src/env/robot.py GRIPPER_CLOSED / GRIPPER_OPEN
     include_qpos:
       - [0.0, -1.30, 0.60, 1.30, 0.0, 0.0]   # REST_QPOS (episode start)

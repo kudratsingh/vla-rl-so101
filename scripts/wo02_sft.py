@@ -61,7 +61,7 @@ def load_data(
         frames = synthetic_frames(
             [SYNTHETIC_INSTRUCTIONS[t] for t in tasks],
             episodes_per_instruction=n,
-            frames_per_episode=int(cfg["env"].get("max_episode_steps", 20)),
+            frames_per_episode=int(cfg["data"].get("synthetic_frames_per_episode", 20)),
             chunk_len=chunk,
             seed=int(cfg.get("seed", 0)),
         )
