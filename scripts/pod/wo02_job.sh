@@ -10,7 +10,7 @@ source /root/runpod.env
 export PATH="$HOME/.local/bin:$PATH"
 export HF_TOKEN="$(cat /root/.hf_token)"
 export HUB_REPO="${HUB_REPO:-KudratSingh22/vla-rl-so101-sft}"
-CFG=configs/sft.yaml
+CFG="${SFT_CFG:-configs/sft.yaml}"
 STAGE_FILE=/workspace/stage
 # soft deadline 20 min before the hard cap, so results are uploaded before the pod disappears
 DEADLINE=$(( $(cat /root/pod_start_epoch) + SPEND_CAP_SECONDS - 1200 ))
