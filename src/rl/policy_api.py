@@ -1,24 +1,34 @@
-"""What the GRPO loop needs from a policy. WO-02's VLA wrapper implements `RLPolicy`.
+"""What the GRPO loop needs from a policy. WO-02's VLA wrapper implements `RLPolicy` structurally.
 
-Action representation (OpenVLA-OFT as used by SimpleVLA-RL): one policy *decision* looks at one
-observation and emits an action chunk of C env steps x A action dims; every dim of every step is
-one discrete token from n_bins bins (OpenVLA-OFT: C=8, n_bins=256, the bins being the last 256 ids
-of the LLaMA vocab; our arm has A=6). So a decision is C*A tokens, and the RL loss is per token:
+Action representation (OpenVLA-OFT under SimpleVLA-RL's head, @7c51662): one policy *decision*
+(query) looks at one observation and decodes a whole action chunk in ONE forward pass (parallel
+decoding): C=8 env steps x A=6 dims = 48 discrete tokens, each one of n_bins=256 bins over the
+normalised [-1, 1] range (vocab ids 31744..31999; only the 256-wide logit slice [..., -320:-64]
+is used). The RL loss and the clip-higher ratio are per token. The loop sees bin indices:
 
-    tokens, log_probs, entropy : (B, C, A)      B = decisions in the batch
+    tokens, log_probs, entropy : (B, C, A)   B = decisions in the batch; token (c, a) is OFT's
+                                             flat position c * A + a (chunk-major, as dp_rob.py
+                                             reshapes), i.e. OFT's (B, C*A) viewed as (B, C, A)
     actions                    : (B, C, A) float32, env units (absolute joint targets, radians)
+
+The rollout stores the raw policy observation + instruction of every decision (CPU) and the
+trainer calls `log_prob` on them later; one decision executes up to C env steps (fewer at
+episode end, the rest is masked). The wrapper re-runs its own preprocessing each call.
 
 Contract for implementers (each violation is a silent GRPO bug, so the trainer measures them):
   * `log_prob` must score tokens with the same tempered distribution `sample` drew them from:
-    log_softmax(logits / temperature) over the n_bins action bins, same token->bin mapping.
-    Upstream divides by the rollout temperature in both places (dp_rob.py `logits.div(temperature)`).
-    Checked by the trainer's `logprob_mismatch` and `first_minibatch_max_abs_log_ratio` metrics.
-  * `log_prob` must be deterministic given its inputs in both train() and eval() mode: LoRA
-    dropout 0, no other dropout active, no batch-composition-dependent layers. Otherwise the PPO
-    ratio is != 1 before any update and the clip fires on noise.
+    log_softmax(logits[..., 256 action bins] / temperature), same token->bin mapping. Upstream
+    divides by the rollout temperature in both places (dp_rob.py `logits.div(temperature)`).
+    Measured by `train/first_minibatch_max_abs_log_ratio` (old vs new log-prob before the first
+    optimizer step: must be ~0) and, with recompute on, `train/logprob_mismatch`.
+  * Preprocessing must be deterministic (center crop yes, random-crop augmentation no) and
+    `log_prob` deterministic in both train() and eval() mode: LoRA dropout 0, no other dropout.
+  * A batch may mix instructions of different token lengths (several tasks); the wrapper pads
+    (upstream asserts one shared prompt length per micro-batch, so pad or bucket inside).
   * temperature == 0 means greedy (argmax) sampling, used for eval; log_probs are then of the
     untempered distribution and are not used.
-  * Only LoRA (adapter) parameters may require grad (ADR-0002).
+  * Only LoRA (adapter) parameters may require grad (ADR-0002). `save` writes the adapter;
+    loading a checkpoint is the builder's job (policy.checkpoint), not the loop's.
   * Inputs may arrive on any device (rollout buffers live on CPU); the policy moves them to its
     own device. Outputs are on the policy's device.
 """
