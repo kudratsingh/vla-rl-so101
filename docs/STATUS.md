@@ -9,7 +9,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 
 | WO | State | Branch / PR | Notes |
 |---|---|---|---|
-| 01 | done (benchmark met), PR open | `wo-01-sim-env` | See benchmarks. Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). |
+| 01 | done, merged | #7 (merged) | See benchmarks. Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). |
 | 02 | in progress, **out of order** (started before WO-01 merged) | `wo-02-sft` | Uses WO-01's code (merged into its branch) and the Hub demos above. LoRA SFT (sim.yaml budget: 2000 steps) running on RunPod pod `iqrmjox6ws0e66` since 2026-10-26 20:18 UTC; owner-approved, WO-02 spend cap $15. If WO-01 review changes env/oracle/camera, the demos and this SFT are redone. |
 | 03 | done, merged after owner review | #4 (merged) | **Out of order** (started before WO-01/02). CPU only, toy env. |
 | 06 | part 1 merged, part 2 waits for the arm | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. |
@@ -48,6 +48,9 @@ Running total: $0 settled; WO-02 pod running (max $5.34 by its 6 h self-delete c
   CUDA 12.4.1 image; WO-02 spend cap $15; target 20-60% on seen positions (not max success).
   Below 20% -> up to two more SFT attempts, then the pi0.5 switch (ADR-0001); above 60% -> cut
   steps or demos.
+- 2026-10-26 Checkpoint selection: in band = 20-60% seen success on >= 2 of 3 tasks. If the final
+  checkpoint lands above 60%, take the earliest swept checkpoint inside the band before any
+  retrain (scripts/pod/wo02_job.sh `select` stage).
 - 2026-10-26 Every paid run: probe first, then an explicit go on the posted probe numbers before
   the full run (job-script approval gate). WO-04's RL runs (~$135) must not start without it.
 - 2026-10-26 WO-04 settings: LoRA lr 5e-5 (not 1e-5); kill switch evaluates 64 episodes/task at

@@ -118,4 +118,5 @@ def test_wo02_sft_probe_saves_nothing(fake_runs: type[FakeRun]) -> None:
     run = fake_runs.instances[-1]
     assert out["steps_run"] == 6 and run.work_order == "WO-02-probe"
     assert not (run.dir / "checkpoints").exists()
-    assert out["s_per_step_median"] > 0 and out["extrapolated"]["hours"] > 0
+    # hours are rounded to 3 decimals: a fast CPU makes tiny's 20-step extrapolation round to 0
+    assert out["s_per_step_median"] > 0 and out["extrapolated"]["s_per_step"] > 0

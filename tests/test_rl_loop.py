@@ -223,7 +223,8 @@ def test_config_validation() -> None:
         GRPOConfig.from_config(_cfg(rollout_envs=6))
     with pytest.raises(ValueError, match="unknown"):
         GRPOConfig.from_config(_cfg(clip_ratio=0.2))
-    with pytest.raises(ImportError, match="openvla_oft"):
+    # WO-02 provides the OpenVLA-OFT builder; it refuses a config without the base checkpoint
+    with pytest.raises(ValueError, match="policy.checkpoint"):
         build_policy({"policy": {"base": "openvla_oft"}}, "cpu")
 
 
