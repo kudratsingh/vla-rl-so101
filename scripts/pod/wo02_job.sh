@@ -83,8 +83,30 @@ assert tuple(img.shape) == (4, 224, 224, 3) and img.float().std() > 1, img.shape
 assert info["success"].shape == (4,)
 print("[job] GPU sim + render ok")
 EOF
-then SIM_DEVICE=cuda; EVAL_ENVS=50; fi
+then
+  # the oracle was tuned on the CPU sim; evaluate policies on the GPU sim only if the oracle
+  # still succeeds there (>= 90% per task, seen cell)
+  if uv run scripts/wo01_oracle_eval.py --preset sim --device cuda --num-envs 20 --episodes 20 \
+      --cells seen --out /workspace/oracle_gpu.json && uv run python - <<'EOF'
+import json
+res = json.load(open("/workspace/oracle_gpu.json"))["results"]
+rates = {t: c["seen"]["rate"] for t, c in res.items()}
+print("[job] oracle on GPU sim:", rates)
+raise SystemExit(0 if min(rates.values()) >= 0.9 else 1)
+EOF
+  then SIM_DEVICE=cuda; EVAL_ENVS=50; fi
+fi
 echo "[job] eval sim device: $SIM_DEVICE ($EVAL_ENVS envs)"
+
+# START_AT=sweep SFT_RUN=runs/<id>: evaluate an existing (or still running) SFT run; skips the
+# probe, the approval gate and training (that run was already approved)
+if [ "${START_AT:-setup}" = sweep ]; then
+  RUN="$SFT_RUN"
+  while pgrep -f "scripts/wo02_sft.py" >/dev/null; do sleep 30; done
+  [ -f "$RUN/record.json" ] && [ -d "$RUN/checkpoints" ] || { echo "[job] no SFT run at $RUN"; exit 31; }
+  echo "[job] resuming at sweep for SFT run: $RUN"
+  upload "SFT checkpoints"
+else
 
 stage probe
 run_until_deadline uv run scripts/wo02_sft.py --preset sim --config "$CFG" --probe-steps 20 || exit 20
@@ -110,6 +132,7 @@ run_until_deadline uv run scripts/wo02_sft.py --preset sim --config "$CFG" || ex
 RUN=$(ls -d runs/*-wo02-sim-* | sort | tail -1)
 echo "[job] SFT run: $RUN"
 upload "SFT checkpoints"
+fi
 
 stage sweep
 for CK in "$RUN"/checkpoints/step_*; do
