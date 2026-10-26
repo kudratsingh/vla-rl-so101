@@ -142,22 +142,38 @@ for CK in "$RUN"/checkpoints/step_*; do
 done
 
 stage select
-# owner's target: 20-60% on seen positions (not max success) -> most tasks in band, then mean nearest 40%
+# Owner rules (2026-10-26). In band = 20-60% seen success on >= 2 of 3 tasks (WO-02 benchmark).
+# Final checkpoint in band -> use it. Otherwise the EARLIEST swept checkpoint in band (the owner's
+# rule when the final one lands above 60%), before any retrain. None in band -> no full eval; the
+# report decides (below: up to two more SFT attempts, then pi0.5; above: cut steps or demos).
 BEST=$(uv run python - "$RUN/sweep.txt" <<'EOF'
 import json, sys
-best = None
+rows = []
 for line in open(sys.argv[1]):
     ck, ev = line.split()
-    rows = json.load(open(f"{ev}/eval.json"))["rows"]
-    rates = [r["pooled"] for r in rows if r["cell"] == "seen"]
-    in_band = sum(0.2 <= x <= 0.6 for x in rates)
-    key = (in_band, -abs(sum(rates) / len(rates) - 0.4))
-    print(f"[job] {ck}: seen {[round(x, 3) for x in rates]} in-band {in_band}", file=sys.stderr)
-    if best is None or key > best[0]:
-        best = (key, ck)
-print(best[1])
+    rates = [r["pooled"] for r in json.load(open(f"{ev}/eval.json"))["rows"] if r["cell"] == "seen"]
+    in_band = sum(0.2 <= x <= 0.6 for x in rates) >= 2
+    side = "in band" if in_band else ("above" if sum(x > 0.6 for x in rates) >= 2 else "below")
+    rows.append((ck, in_band, side))
+    print(f"[job] {ck}: seen {[round(x, 3) for x in rates]} -> {side}", file=sys.stderr)
+rows.sort()  # step_000500 < step_001000 < ... (zero-padded)
+final = rows[-1]
+if final[1]:
+    pick, why = final[0], "final checkpoint in band"
+elif any(r[1] for r in rows):
+    pick, why = next(r[0] for r in rows if r[1]), f"final {final[2]} -> earliest checkpoint in band"
+else:
+    pick, why = "", f"no checkpoint in band (final {final[2]})"
+print(f"[job] selection: {why}", file=sys.stderr)
+print(pick)
 EOF
 ) || exit 50
+if [ -z "$BEST" ]; then
+  echo "none" > "$RUN/selected_checkpoint.txt"
+  echo "[job] no checkpoint in the 20-60% band; skipping the full eval"
+  stage done
+  exit 0
+fi
 echo "$BEST" > "$RUN/selected_checkpoint.txt"
 echo "[job] selected: $BEST"
 
