@@ -1,0 +1,157 @@
+{
+  "run_id": "20261026T194952Z-wo01-sim-8ad7",
+  "work_order": "WO-01",
+  "script": "scripts/wo01_build_env.py",
+  "argv": [
+    "--preset",
+    "sim",
+    "--device",
+    "cpu"
+  ],
+  "preset": "sim",
+  "config_hash": "62944f72232e05ceb5ff93570671945c69832b72cbf0678f8e9cb8ba2add3bcd",
+  "config": {
+    "preset": "sim",
+    "device": "cpu",
+    "seed": 0,
+    "env": {
+      "name": "so101_tabletop",
+      "tasks": [
+        "PickPlace",
+        "Push",
+        "Stack"
+      ],
+      "num_envs": 64,
+      "image_size": 224,
+      "max_episode_steps": 150,
+      "randomize": false,
+      "randomization": {
+        "object_color_jitter": 0.08,
+        "object_physics": true,
+        "lighting": true,
+        "camera_pos_jitter_m": 0.02,
+        "camera_target_jitter_m": 0.01,
+        "camera_roll_jitter_rad": 0.02,
+        "camera_fov_jitter_deg": 1.5,
+        "robot_color": true,
+        "action_latency_max_steps": 2,
+        "reconfigure_every": 10
+      },
+      "camera": {
+        "pose": "front_left_45",
+        "fov_deg": 40,
+        "eye": [
+          0.555,
+          0.35,
+          0.495
+        ],
+        "target": [
+          0.205,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    "data": {
+      "demos_per_task": 10,
+      "dataset_root": "data/demos",
+      "hub_repo": "KudratSingh22/vla-rl-so101-demos"
+    },
+    "policy": {
+      "base": "openvla_oft",
+      "checkpoint": null,
+      "lora_rank": 32,
+      "action_chunk": 8,
+      "precision": "bf16"
+    },
+    "sft": {
+      "steps": 2000,
+      "batch_size": 8,
+      "lr": "5e-5",
+      "warmup_steps": 100
+    },
+    "eval": {
+      "episodes_per_cell": 100,
+      "seeds": [
+        0,
+        1,
+        2
+      ],
+      "cells": [
+        "seen",
+        "shifted",
+        "unseen_objects"
+      ],
+      "protocol_hash": null
+    }
+  },
+  "git": {
+    "commit": "0dffe5160178d443f1e5e7eb2b87835aae419973",
+    "branch": "wo-01-sim-env",
+    "dirty": true
+  },
+  "device": {
+    "device": "cpu",
+    "host": "Kudrats-MacBook-Pro-3.local",
+    "os": "macOS-26.5.2-arm64-arm-64bit",
+    "torch": "2.6.0",
+    "name": "Apple M3 Pro",
+    "runpod_pod_id": null
+  },
+  "start_utc": "2026-10-26T19:49:53Z",
+  "end_utc": "2026-10-26T19:52:42Z",
+  "wall_clock_s": 169.41,
+  "hourly_usd": 0.0,
+  "estimated_usd": 0.0,
+  "actual_usd": 0.0,
+  "status": "ok",
+  "results": {
+    "image_hw": [
+      224,
+      224
+    ],
+    "tasks": {
+      "PickPlace": {
+        "episodes": 100,
+        "oracle_successes": 100,
+        "oracle_success_rate": 1.0,
+        "demos_recorded": 10,
+        "failed_demos_filled": 0,
+        "mean_episode_len": 72.63,
+        "env_steps": 7263,
+        "num_envs": 1,
+        "wall_s": 76.29
+      },
+      "Push": {
+        "episodes": 100,
+        "oracle_successes": 99,
+        "oracle_success_rate": 0.99,
+        "demos_recorded": 10,
+        "failed_demos_filled": 0,
+        "mean_episode_len": 53.0,
+        "env_steps": 5300,
+        "num_envs": 1,
+        "wall_s": 40.16
+      },
+      "Stack": {
+        "episodes": 100,
+        "oracle_successes": 100,
+        "oracle_success_rate": 1.0,
+        "demos_recorded": 10,
+        "failed_demos_filled": 0,
+        "mean_episode_len": 70.28,
+        "env_steps": 7028,
+        "num_envs": 1,
+        "wall_s": 52.9
+      }
+    },
+    "dataset": {
+      "repo_id": "KudratSingh22/vla-rl-so101-demos",
+      "root": "data/demos/vla-rl-so101-demos",
+      "episodes": 30,
+      "frames": 1968,
+      "hub_url": "https://huggingface.co/datasets/KudratSingh22/vla-rl-so101-demos",
+      "hub_private": true
+    }
+  }
+}
