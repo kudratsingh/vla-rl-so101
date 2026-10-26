@@ -1,0 +1,50 @@
+# CPU smoke for WO-02 (`scripts/wo02_sft.py --preset tiny`, `scripts/wo02_eval.py --preset tiny`):
+# a randomly initialised tiny OFT (same token layout, 64 px towers, 2-layer Llama) on <= 2 demos.
+inherit: configs/tiny.yaml
+
+policy:
+  base: openvla_oft
+  tiny_random: true
+  checkpoint: null
+  adapter: null
+  precision: fp32
+  action_dim: 6
+  action_chunk: 8
+  center_crop_scale: 0.9
+  lora_rank: 4
+  lora_alpha: 4
+  lora_dropout: 0.0
+  lora_lm_head: true
+  train_proprio_projector: true
+  norm:
+    source: fixed           # no URDF needed; same order as src.env.JOINT_NAMES
+    low: [-1.29, -1.75, -1.11, -1.56, -1.62, -0.18]
+    high: [1.28, 0.93, 1.69, 1.66, 1.62, 0.65]
+
+data:
+  demos_per_task: 2
+  cell: seen
+  synthetic: false          # --synthetic generates random frames (no WO-01 env needed)
+
+sft:
+  steps: 20
+  batch_size: 4
+  micro_batch_size: 2
+  grad_checkpointing: true  # exercise the ViT-block + Llama checkpointing path on CPU
+  lr: 1.0e-3
+  lr_milestones: [15]
+  lr_gamma: 0.1
+  warmup_steps: 0
+  weight_decay: 0.0
+  grad_clip: 1.0
+  image_aug: true
+  checkpoint_every: 10
+  log_every: 5
+  num_workers: 0
+  stop_l1: null
+
+cost:
+  gpu: cpu
+  usd_per_hour: 0.0
+  est_s_per_step: 1.0
+  setup_hours: 0.0

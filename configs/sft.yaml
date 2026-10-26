@@ -1,0 +1,64 @@
+# WO-02 few-shot SFT of OpenVLA-OFT (ADR-0001). `scripts/wo02_sft.py --preset sim` (4090 or A100);
+# `scripts/wo02_eval.py --preset sim --adapter <dir>`. Overrides sim.yaml's placeholder `sft:`.
+inherit: configs/sim.yaml
+
+policy:
+  base: openvla_oft
+  checkpoint: openvla/openvla-7b                     # MIT (LLM weights: Llama 2 licence); 15.1 GB bf16
+  revision: 47a0ec7fc4ec123775a391911046cf33cf9ed83f # HF commit, pinned
+  adapter: null             # SFT output dir or Hub id (user/repo@rev); eval + RL load it
+  tiny_random: false
+  precision: bf16
+  action_dim: 6             # = src/policy/oft/vendor/constants.py ACTION_DIM
+  action_chunk: 8           # = NUM_ACTIONS_CHUNK; 8 steps @ 15 Hz = 0.53 s open loop
+  center_crop_scale: 0.9    # area kept by the crop (random in SFT, centred at eval/RL)
+  lora_rank: 32
+  lora_alpha: 16            # OFT: min(rank, 16)
+  lora_dropout: 0.0         # RL needs deterministic log-probs
+  lora_lm_head: true        # OFT/SimpleVLA-RL adapters (peft 0.11 "all-linear") included lm_head
+  train_proprio_projector: true   # new 6->4096->4096 MLP, trained in full during SFT, frozen in RL
+  norm:                     # action/proprio bounds (src/policy/norm_bounds.py), NOT demo min/max
+    source: workspace
+    urdf: src/env/assets/so101/so101.urdf
+    tip_link: tcp_link
+    workspace_x: [0.08, 0.33]     # protocol SHIFTED_REGION x [0.13, 0.28] +- 5 cm
+    workspace_y: [-0.155, 0.155]  # protocol SHIFTED_REGION y [-0.105, 0.105] +- 5 cm
+    workspace_z: [-0.01, 0.25]    # table .. above the rest pose (TCP z 0.18)
+    max_tilt_deg: 75
+    trim_quantile: 0.005
+    wrist_roll: [-1.5708, 1.5708] # pi window: parallel gripper is 180-deg symmetric, yaw in +-45 deg
+    gripper: [-0.17, 0.6]         # src/env/robot.py GRIPPER_CLOSED / GRIPPER_OPEN
+    include_qpos:
+      - [0.0, -1.30, 0.60, 1.30, 0.0, 0.0]   # REST_QPOS (episode start)
+    margin_rad: 0.05
+    max_deg_per_bin: 1.0
+    samples: 400000
+    seed: 0
+
+data:
+  demos_per_task: 10
+  cell: seen
+  synthetic: false
+
+sft:
+  steps: 20000              # cap; checkpoints every 2.5k, pick the one in the 20-60% band
+  batch_size: 8             # OFT per-GPU batch
+  micro_batch_size: auto    # auto: 8 on >= 40 GB GPUs, else 4 (+ grad checkpointing)
+  grad_checkpointing: auto  # auto: on when micro_batch_size < batch_size
+  lr: 5.0e-4                # OFT LoRA lr
+  lr_milestones: [15000]    # MultiStepLR, x lr_gamma (OFT: 10x decay late in training)
+  lr_gamma: 0.1
+  warmup_steps: 0           # OFT uses none (overrides sim.yaml's 100)
+  weight_decay: 0.0
+  grad_clip: 1.0
+  image_aug: true
+  checkpoint_every: 2500
+  log_every: 10
+  num_workers: 4
+  stop_l1: null             # optional early stop on train normalised-L1 (OFT used 0.01)
+
+cost:                       # dev tier; scripts/wo02_sft.py --probe-steps measures s/step
+  gpu: A100-80GB
+  usd_per_hour: 1.79
+  est_s_per_step: 0.6       # estimate (ADR-0001); replace with the probe's number
+  setup_hours: 0.5          # pod start, uv sync, 15 GB checkpoint download
