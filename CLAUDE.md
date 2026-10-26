@@ -15,9 +15,10 @@ $300 arm — with SFT-only vs SFT+RL tables on seen positions, shifted positions
 
 ## Operating mode: fast
 
-- Build order is the work orders, WO-01 → WO-09, in sequence. Do not skip ahead, do not gold-plate.
-- One work order = one branch = one PR. Start the next WO only when the current one's completion
-  benchmark (below) is met and recorded in `docs/STATUS.md`.
+- Build order is the work orders, WO-01 → WO-09. Do not gold-plate.
+- One work order = one branch = one PR. A WO whose inputs don't depend on an unfinished WO may run
+  in parallel (owner, 2026-10-26: e.g. WO-03 on the toy env, WO-06 robot-side code). A WO is done
+  only when its completion benchmark (below) is met and recorded in `docs/STATUS.md`.
 - **No independent review pass by default.** Self-check against the WO's benchmark, run the test
   suite, open the PR. The owner reviews only WO-03 and WO-04 (the RL loop) because a silent bug
   there burns GPU dollars.
@@ -32,8 +33,9 @@ $300 arm — with SFT-only vs SFT+RL tables on seen positions, shifted positions
 ## Hard rules
 
 1. **No paid runs without the owner's explicit, per-run approval.** You produce the config, a CPU
-   dry run on the `tiny` preset, and a cost estimate (GPU type × hours × RunPod price). The owner
-   launches. Every run gets a run record (`runs/<id>/record.json`: config hash, git commit, GPU,
+   dry run on the `tiny` preset, and a cost estimate (GPU type × hours × RunPod price). On the
+   owner's explicit "go" for that run, the agent launches it via the RunPod connector and stops /
+   deletes the pod when it ends (owner, 2026-10-26). Every run gets a run record (`runs/<id>/record.json`: config hash, git commit, GPU,
    start/end, dollars).
 2. **Pin everything.** Versions in `docs/ENVIRONMENT.md` and `pyproject.toml` are frozen. Upgrading
    any pinned dependency is its own work order with a stated reason.
