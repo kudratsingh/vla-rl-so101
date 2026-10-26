@@ -35,7 +35,9 @@ $300 arm — with SFT-only vs SFT+RL tables on seen positions, shifted positions
 1. **No paid runs without the owner's explicit, per-run approval.** You produce the config, a CPU
    dry run on the `tiny` preset, and a cost estimate (GPU type × hours × RunPod price). On the
    owner's explicit "go" for that run, the agent launches it via the RunPod connector and stops /
-   deletes the pod when it ends (owner, 2026-10-26). Every run gets a run record (`runs/<id>/record.json`: config hash, git commit, GPU,
+   deletes the pod when it ends (owner, 2026-10-26). Every paid run starts with a short probe;
+   the full run waits behind an approval gate in the pod job script until the owner gives an
+   explicit go on the posted probe numbers (step time, projected hours and $). Every run gets a run record (`runs/<id>/record.json`: config hash, git commit, GPU,
    start/end, dollars).
 2. **Pin everything.** Versions in `docs/ENVIRONMENT.md` and `pyproject.toml` are frozen. Upgrading
    any pinned dependency is its own work order with a stated reason.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WO-02 on one RunPod GPU pod: setup -> probe -> LoRA SFT (sim.yaml budget) -> checkpoint sweep
+# WO-02 on one RunPod GPU pod: setup -> probe -> owner approval -> LoRA SFT (sim.yaml budget) -> checkpoint sweep
 # (seen cell) -> full protocol eval of the checkpoint in the 20-60% band -> upload to the Hub ->
 # terminate this pod. Launched over SSH from the repo root on the pod:
 #   nohup bash scripts/pod/wo02_job.sh > /workspace/job.log 2>&1 &
@@ -55,12 +55,13 @@ trap finish EXIT
 stage setup
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
   ffmpeg libvulkan1 git >/dev/null || exit 10
-# NVIDIA Vulkan ICD for SAPIEN rendering if the container runtime did not mount one
-if [ ! -f /usr/share/vulkan/icd.d/nvidia_icd.json ] && [ ! -f /etc/vulkan/icd.d/nvidia_icd.json ]; then
-  mkdir -p /usr/share/vulkan/icd.d
-  echo '{"file_format_version":"1.0.0","ICD":{"library_path":"libGLX_nvidia.so.0","api_version":"1.3.0"}}' \
-    > /usr/share/vulkan/icd.d/nvidia_icd.json
-fi
+# Vulkan for SAPIEN rendering. RunPod mounts an ICD at /etc/vulkan/icd.d pointing at
+# libGLX_nvidia.so.0, which cannot create an instance headless (driver 595.91.07, pod
+# iqrmjox6ws0e66); NVIDIA's EGL library exposes the same Vulkan driver and works. SAPIEN only
+# checks /usr/share/vulkan/icd.d/nvidia_icd.json, and otherwise substitutes its own GLX-based file.
+mkdir -p /usr/share/vulkan/icd.d
+echo '{"file_format_version":"1.0.1","ICD":{"library_path":"libEGL_nvidia.so.0","api_version":"1.4.329"}}' \
+  > /usr/share/vulkan/icd.d/nvidia_icd.json
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync --frozen --extra gpu --extra dev || exit 11
 uv run python -c "import torch; assert torch.cuda.is_available(); print('[job] gpu', torch.cuda.get_device_name())" || exit 12
@@ -87,6 +88,22 @@ echo "[job] eval sim device: $SIM_DEVICE ($EVAL_ENVS envs)"
 
 stage probe
 run_until_deadline uv run scripts/wo02_sft.py --preset sim --config "$CFG" --probe-steps 20 || exit 20
+
+# Probe -> owner approval gate (owner rule, 2026-10-26): no full run without an explicit go given
+# AFTER the probe numbers are posted. The agent posts them and, on the owner's go, creates
+# /workspace/APPROVED over SSH. No approval within APPROVAL_WAIT_S -> exit (upload + self-delete).
+stage await-approval
+grep "full run .* extrapolated" /workspace/job.log | tail -1
+APPROVAL_WAIT_S="${APPROVAL_WAIT_S:-1800}"
+t0=$(date +%s)
+until [ -f /workspace/APPROVED ]; do
+  if [ $(( $(date +%s) - t0 )) -ge "$APPROVAL_WAIT_S" ]; then
+    echo "[job] no owner approval within $((APPROVAL_WAIT_S / 60)) min; stopping"
+    exit 21
+  fi
+  sleep 15
+done
+echo "[job] approved: $(cat /workspace/APPROVED)"
 
 stage sft
 run_until_deadline uv run scripts/wo02_sft.py --preset sim --config "$CFG" || exit 30

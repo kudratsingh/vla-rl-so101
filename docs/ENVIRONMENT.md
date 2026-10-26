@@ -48,8 +48,12 @@ uv run python -c "import mani_skill, torch; print(torch.cuda.is_available())"
 uv run scripts/wo01_build_env.py --preset tiny   # CPU smoke must pass before any GPU work
 ```
 
-Vulkan is required by SAPIEN for rendering; RunPod's CUDA images ship it. If `vulkaninfo` fails,
-install `libvulkan1 mesa-vulkan-drivers` and set `VK_ICD_FILENAMES` to the NVIDIA ICD.
+Vulkan is required by SAPIEN for rendering. On RunPod (driver 595.91.07, `nvidia/cuda:12.4.1` image,
+pod env `NVIDIA_DRIVER_CAPABILITIES=all`) the runtime mounts `/etc/vulkan/icd.d/nvidia_icd.json`
+pointing at `libGLX_nvidia.so.0`, which cannot create an instance headless
+(`ERROR_INCOMPATIBLE_DRIVER`). Point the ICD at NVIDIA's EGL library instead, at the path SAPIEN
+checks: `/usr/share/vulkan/icd.d/nvidia_icd.json` with `"library_path": "libEGL_nvidia.so.0"`
+(`scripts/pod/wo02_job.sh` does this). Verified: GPU sim (`physx_cuda`) and CPU sim both render.
 
 ## Install — Mac (control, calibration, deploy)
 
