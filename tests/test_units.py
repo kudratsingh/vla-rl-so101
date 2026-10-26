@@ -73,10 +73,14 @@ def test_bad_inputs() -> None:
 
 
 def _lerobot_bus(calibration: dict[str, tuple[int, int]]) -> object:
-    """lerobot 0.4.4's own FeetechMotorsBus, exactly as SOFollower(use_degrees=True) builds it.
-    Constructing it does not open the port (scservo_sdk PortHandler only stores the name)."""
+    """lerobot 0.4.4's own FeetechMotorsBus with the motors SOFollower(use_degrees=True) builds.
+
+    Only the generic SerialMotorsBus constructor runs: no serial port object, and no need for the
+    feetech SDK (not installed in CI). ``_normalize`` / ``_unnormalize`` are lerobot's own code.
+    """
     from lerobot.motors import Motor, MotorCalibration, MotorNormMode
     from lerobot.motors.feetech import FeetechMotorsBus
+    from lerobot.motors.motors_bus import SerialMotorsBus
 
     motors = {
         n: Motor(
@@ -88,7 +92,9 @@ def _lerobot_bus(calibration: dict[str, tuple[int, int]]) -> object:
         n: MotorCalibration(id=i + 1, drive_mode=0, homing_offset=0, range_min=lo, range_max=hi)
         for i, (n, (lo, hi)) in enumerate(calibration.items())
     }
-    return FeetechMotorsBus(port="/dev/null-never-opened", motors=motors, calibration=cal)
+    bus = FeetechMotorsBus.__new__(FeetechMotorsBus)
+    SerialMotorsBus.__init__(bus, port="/dev/null-never-opened", motors=motors, calibration=cal)
+    return bus
 
 
 def test_mapping_matches_lerobot_normalization() -> None:
