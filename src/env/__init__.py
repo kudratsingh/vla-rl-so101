@@ -72,8 +72,12 @@ def make_env(
     if cell not in CELLS:
         raise ValueError(f"unknown cell {cell!r}; expected one of {CELLS}")
     env_cfg = cfg.get("env", {})
-    n = int(num_envs if num_envs is not None else env_cfg.get("num_envs", 1))
     device = str(cfg.get("device", "cpu"))
+    if num_envs is None:
+        # cfg env.num_envs sizes the GPU-parallel env; on CPU envs run serially (no speedup) and
+        # each holds a renderer, and 64 of them exhaust MoltenVK's Vulkan descriptor pools
+        num_envs = int(env_cfg.get("num_envs", 1)) if device.startswith("cuda") else 1
+    n = int(num_envs)
     make_kwargs: dict[str, Any] = {
         "obs_mode": "rgb" if render else "state_dict",
         "control_mode": "pd_joint_pos",

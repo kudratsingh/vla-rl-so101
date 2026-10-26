@@ -75,10 +75,11 @@ def run_task(
     demos: int,
     eval_episodes: int,
     allow_failed: bool,
+    num_envs: int | None,
 ) -> dict[str, Any]:
     make_env, policy_obs, make_oracle = api
     t_start = time.monotonic()
-    env = make_env(cfg, task, cell="seen", render=True)
+    env = make_env(cfg, task, num_envs=num_envs, cell="seen", render=True)
     oracle = make_oracle(task, env)
     n = int(getattr(env.unwrapped, "num_envs", 1))
     max_steps = int(cfg["env"]["max_episode_steps"])
@@ -200,11 +201,18 @@ def main() -> int:
         default=None,
         help="min oracle episodes per task (default: eval.episodes_per_cell)",
     )
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=None,
+        help="parallel envs (default: make_env's — cfg env.num_envs on cuda, 1 on cpu)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.preset, args.config)
     if args.device:
         cfg["device"] = args.device
+    num_envs = args.num_envs
     demos = int(cfg["data"]["demos_per_task"])
     eval_episodes = args.eval_episodes
     if eval_episodes is None:
@@ -227,6 +235,7 @@ def main() -> int:
                 demos=demos,
                 eval_episodes=eval_episodes,
                 allow_failed=allow_failed,
+                num_envs=num_envs,
             )
             run.log_metrics(task=task, **stats[task])
         recorder = recorders.rec
