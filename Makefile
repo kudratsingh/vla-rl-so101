@@ -8,7 +8,7 @@ export MVK_CONFIG_LOG_LEVEL ?= 0
 endif
 
 setup:
-	uv sync --extra dev
+	uv sync --extra dev --extra gpu --extra smolvla
 
 check:
 	uv run ruff check src tests scripts
