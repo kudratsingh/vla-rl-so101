@@ -139,7 +139,7 @@ class OpenVLAOFTPolicy(nn.Module):
     ) -> OFTInputs:
         built = self.pre.build_inputs(
             list(instructions),
-            obs["image"],
+            obs["image"].to(self._device),  # crop/jitter/resize on the GPU when there is one
             obs["state"],
             actions,
             train=train,
