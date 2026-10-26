@@ -24,15 +24,32 @@ sft:
   batch_size: 2
   lr: 1e-3
 
-rl:
+rl:                          # GRPO on the WO-03 toy task; keys documented in src/rl/trainer.py
+  env: toy                   # src/rl/toy_env.py instead of ManiSkill
   samples_per_prompt: 4
-  rollout_batch: 2
-  steps: 10
+  rollout_envs: 64           # 16 groups per env batch
+  rollout_batch: 32          # groups per update -> 128 trajectories (2 env batches)
+  max_rollout_rounds: 3
+  steps: 100
+  lr: 1e-2
+  ppo_mini_batch: 32         # trajectories per optimizer step -> 4 steps per update
+  micro_batch: 256
   clip_low: 0.2
   clip_high: 0.28
   temperature: 1.6
   kl_coef: 0.0
   dynamic_sampling: true
+  eval_every: 10
+  eval_episodes: 256
+  checkpoint_every: 50
+  early_stop_check_at_frac: 0.25
+
+toy:                         # synthetic verification task + 2-layer policy (src/rl/toy_*.py)
+  grid_size: 5
+  max_episode_steps: 6
+  chunk_len: 2
+  n_bins: 3
+  hidden: 64
 
 eval:
   episodes_per_cell: 4

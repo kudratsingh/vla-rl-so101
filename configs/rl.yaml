@@ -1,11 +1,46 @@
 # rl tier (A100 80 GB). WO-04/05 GRPO from the WO-02 SFT checkpoint.
 #
-# VRAM budget (agent fills measured numbers in WO-03):
-#   base model bf16 (7B)            ~14 GB
-#   LoRA params + optimizer         ~1 GB
-#   activations @ rollout_batch     ~?? GB
-#   N envs × 128×128 RGB + physics  ~?? GB
-#   headroom                        ≥8 GB
+# VRAM budget, A100-80GB (79 GiB usable). EVERY NUMBER IS A WO-03 ESTIMATE, NOT A MEASUREMENT;
+# WO-04 replaces each with torch.cuda.max_memory_allocated() / nvidia-smi from the first run.
+# Rollout and update alternate, so the peak is the larger phase, not the sum of both.
+#   item                                       est. GiB  derivation
+#   base model bf16 (OpenVLA-OFT ~7.54B)        14.0     7.54e9 params x 2 B (Llama-2-7B 6.74B
+#                                                        + DINOv2-L 0.30B + SigLIP-400M 0.43B + proj)
+#   LoRA r=32 all-linear + grads + AdamW         1.5     ~100M params (OpenVLA paper: 97.6M at
+#                                                        r=32) x fp32 (4 B param + 4 B grad + 8 B m,v)
+#   update activations @ micro_batch=8          18       per decision ~2.2 GiB: LLM ~40 B x s=340
+#                                                        tokens (256 img + ~35 prompt + 48 action)
+#                                                        x h=4096 x 32 layers = 1.65 GiB, SDPA (no
+#                                                        s^2 term) + vision towers ~0.6 GiB (LoRA on
+#                                                        them too); no grad checkpointing
+#   rollout-phase activations @ 32 envs         (3)      one no-grad forward x 32 (OFT parallel
+#                                                        decoding, no KV cache) + 32x340x32064 bf16
+#                                                        logits; NOT concurrent with the update
+#   ManiSkill GPU envs, 3 tasks x 32 @ 128^2     6       ~2 GiB per env instance (PhysX GPU buffers
+#                                                        + Vulkan renderer + targets); one per task
+#   rollout buffer (obs, tokens, log-probs)      0       kept in host RAM: 128 traj x 19 decisions
+#                                                        x 49 KB image = ~0.12 GB CPU
+#   CUDA context + allocator slack               2.5
+#   -------------------------------------------------
+#   peak (update phase)                         ~42      14 + 1.5 + 18 + 6 + 2.5
+#   headroom                                    ~37      >= 8 required. Room to raise micro_batch
+#                                                        to 16 (~60 GiB peak) once WO-04 has
+#                                                        measured; eager attention would add
+#                                                        ~0.6 GiB per decision (5*a*s^2*layers).
+# rollout_envs=32 fits by this estimate (64 would too: +~3 GiB rollout-phase, +~1 GiB/env).
+#
+# Wall-clock / $ (estimates; `uv run scripts/wo03_rl.py --preset rl --estimate` recomputes from
+# cost.throughput below). Per step, worst case (every episode runs the full 150 steps):
+#   trained trajectories   16 prompts x K=8                      =    128
+#   episodes generated     128 x 1.25 refill                     =    160
+#   env actions            160 x 150                             = 24,000 -> / 250 per s =  96 s
+#   decisions trained      128 x ceil(150 / 8) = 128 x 19        =  2,432 -> / 12 per s  = 203 s
+#   old log-prob recompute off (sampler log-probs reused)                                =   0 s
+#   step                                                                          = 299 s = 5.0 min
+#   evals: steps {0, 25, ..., 300} = 13 x 3 tasks x 32 ep x 150 actions / 250 per s =     0.21 h
+#   run: 300 x 299 s + 0.21 h = 25.1 h x $1.79 = ~$45 per seed (~$135 for 3 seeds)
+# The upstream-sized batch (64 prompts, recompute on) is 384 + 324 + 811 s = 25 min/step, ~127 h,
+# ~$227 per seed -- over the whole ~$200 project budget -- hence rollout_batch 16 here.
 preset: rl
 device: cuda
 seed: 0
@@ -14,23 +49,44 @@ inherit: configs/sim.yaml
 policy:
   checkpoint: null          # WO-02 SFT checkpoint (HF id)
 
-rl:
-  algorithm: grpo           # ADR-0002
-  samples_per_prompt: 8
-  rollout_envs: 32
-  rollout_batch: 64
+rl:                         # GRPO, ADR-0002; every key is documented in src/rl/trainer.py
+  algorithm: grpo
+  samples_per_prompt: 8     # K
+  rollout_envs: 32          # parallel envs per env batch (4 groups); one env instance per task
+  rollout_batch: 16         # prompts (groups) per update -> 128 trajectories (upstream: 64)
+  max_rollout_rounds: 3     # dynamic-sampling refill cap, in multiples of one full round
   steps: 300
   lr: 1e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  ppo_epochs: 1
+  ppo_mini_batch: 64        # trajectories per optimizer step -> 2 steps per update (upstream 4)
+  micro_batch: 8            # decisions per forward/backward; memory only, gradient unchanged
   clip_low: 0.2
   clip_high: 0.28
   temperature: 1.6
-  kl_coef: 0.0
+  kl_coef: 0.0              # must stay 0 (no reference model)
   dynamic_sampling: true
+  # Upstream recomputes old log-probs with an extra no-grad forward. OFT's sampler log-probs come
+  # from the same single forward (eval mode, same temperature), so we reuse them (-25% step time).
+  # train/first_minibatch_max_abs_log_ratio still measures sampler-vs-update agreement every step;
+  # if it is > ~0.05 at step 1 (precision/mode differ), set this to true.
+  recompute_old_log_probs: false
   eval_every: 25
+  eval_episodes: 32         # per task, greedy, fixed seeds; the kill switch reads this
   checkpoint_every: 50
-  early_stop_check_at_frac: 0.25   # WO-04 note: flat by here → stop and diagnose
+  early_stop_check_at_frac: 0.25   # WO-04 note: flat by here -> stop and diagnose
+  early_stop_on_flat: true
+  group_reset_check: error  # identical reset seeds must give identical scenes
 
 cost:
   gpu: A100-80GB
   usd_per_hour: 1.79
-  estimated_hours: null     # agent fills before every run
+  estimated_hours: null     # agent fills before every run (from --estimate, then measured)
+  throughput:               # ESTIMATES (WO-02 research + WO-03 FLOP count); WO-04 measures
+    rollout_actions_per_s: 250     # batched OFT sampling + sim, env actions/s (est. 230-285:
+                                   # ~4.8 TFLOP per 8-action query, compute-bound)
+    forward_decisions_per_s: 30    # no-grad log-prob forward per decision (recompute only)
+    update_decisions_per_s: 12     # forward + activation-grad backward (~2.5x a forward)
+    mean_episode_frac: 1.0         # mean episode length / max_episode_steps (1.0 = worst case)
+    rollout_overhead: 1.25         # episodes generated per trained one (dynamic-sampling refill)

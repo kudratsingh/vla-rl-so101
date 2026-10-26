@@ -20,6 +20,7 @@ def cfg() -> dict:
 
 
 @pytest.mark.parametrize("task", TASKS)
+@pytest.mark.needs_render
 def test_task_builds_steps_and_reports(cfg: dict, task: str) -> None:
     env = make_env(cfg, task, num_envs=2)
     try:
@@ -133,6 +134,7 @@ def test_delta_controller_available(cfg: dict) -> None:
         env.close()
 
 
+@pytest.mark.needs_render
 def test_front_camera_frames_whole_workspace() -> None:
     """Project the workspace bounds (all cells' object region, bowl rim, gripper up to 13 cm)
     with the env's own camera matrices; everything must land inside the image with a margin."""
