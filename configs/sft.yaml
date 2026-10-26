@@ -1,4 +1,4 @@
-# WO-02 few-shot SFT of OpenVLA-OFT (ADR-0001). `scripts/wo02_sft.py --preset sim` (4090 or A100);
+# WO-02 few-shot SFT of OpenVLA-OFT (ADR-0001). `scripts/wo02_sft.py --preset sim` (RTX 4090; A100 only if VRAM forces it);
 # `scripts/wo02_eval.py --preset sim --adapter <dir>`. Overrides sim.yaml's placeholder `sft:`.
 inherit: configs/sim.yaml
 
@@ -40,25 +40,22 @@ data:
   cell: seen
   synthetic: false
 
-sft:
-  steps: 20000              # cap; checkpoints every 2.5k, pick the one in the 20-60% band
-  batch_size: 8             # OFT per-GPU batch
+sft:                        # steps (2000), batch_size (8), lr (5e-5), warmup_steps (100) come from
+                            # sim.yaml's sft block, the owner's budget; LoRA only (ADR-0001, PLAN non-goals)
   micro_batch_size: auto    # auto: 8 on >= 40 GB GPUs, else 4 (+ grad checkpointing)
   grad_checkpointing: auto  # auto: on when micro_batch_size < batch_size
-  lr: 5.0e-4                # OFT LoRA lr
-  lr_milestones: [15000]    # MultiStepLR, x lr_gamma (OFT: 10x decay late in training)
+  lr_milestones: []         # constant lr after warmup over the 2000-step budget
   lr_gamma: 0.1
-  warmup_steps: 0           # OFT uses none (overrides sim.yaml's 100)
   weight_decay: 0.0
   grad_clip: 1.0
   image_aug: true
-  checkpoint_every: 2500
+  checkpoint_every: 500     # 4 checkpoints; pick the one in the 20-60% band on seen positions
   log_every: 10
   num_workers: 4
-  stop_l1: null             # optional early stop on train normalised-L1 (OFT used 0.01)
+  stop_l1: null
 
-cost:                       # dev tier; scripts/wo02_sft.py --probe-steps measures s/step
-  gpu: A100-80GB
-  usd_per_hour: 1.79
-  est_s_per_step: 0.6       # estimate (ADR-0001); replace with the probe's number
-  setup_hours: 0.5          # pod start, uv sync, 15 GB checkpoint download
+cost:                       # dev tier (WO-02 / ENVIRONMENT.md); --probe-steps measures s/step
+  gpu: RTX-4090
+  usd_per_hour: 0.89
+  est_s_per_step: 1.8       # estimate: bf16 + grad checkpointing, micro-batch 4 x 2; replaced by the probe
+  setup_hours: 0.5          # image pull, apt, uv sync, 15 GB checkpoint download

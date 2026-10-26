@@ -66,23 +66,23 @@ def test_settings_auto_micro_batch_and_schedule() -> None:
     cfg = load_config("sim", "configs/sft.yaml")
     assert resolve_micro_batch(cfg["sft"], 8, "cpu") == (8, False)
     s = SFTSettings.from_cfg(cfg, "cpu")
-    assert (s.lr, s.lr_milestones, s.warmup_steps, s.steps) == (5e-4, (15000,), 0, 20000)
+    assert (s.lr, s.lr_milestones, s.warmup_steps, s.steps) == (5e-5, (), 100, 2000)
     assert resolve_micro_batch(
         {"micro_batch_size": 4, "grad_checkpointing": "auto"}, 8, "cuda"
     ) == (4, True)
     p = torch.nn.Parameter(torch.zeros(1))
-    opt, sched = make_optimizer(
-        [p], SFTSettings(**{**s.__dict__, "lr_milestones": (3,), "steps": 5})
-    )
+    opt, sched = make_optimizer([p], SFTSettings(**{**s.__dict__, "warmup_steps": 2, "steps": 6}))
     lrs = []
-    for _ in range(5):
+    for _ in range(6):
         opt.step()
         sched.step()
         lrs.append(sched.get_last_lr()[0])
-    assert lrs[:2] == [5e-4, 5e-4] and lrs[-1] == pytest.approx(5e-5)
+    # linear warmup from 0.1 * lr over 2 steps (0.1 + 0.9 * 1/2 = 0.55 after one), then constant:
+    # no decay milestones inside the 2000-step budget
+    assert lrs[0] == pytest.approx(5e-5 * 0.55) and lrs[1:] == pytest.approx([5e-5] * 5)
     est = estimate_cost(cfg)
-    assert est["hours"] == pytest.approx(20000 * 0.6 / 3600 + 0.5, abs=1e-3)
-    assert est["usd"] == pytest.approx(est["hours"] * 1.79, abs=0.01)
+    assert est["hours"] == pytest.approx(2000 * 1.8 / 3600 + 0.5, abs=1e-3)
+    assert est["usd"] == pytest.approx(est["hours"] * 0.89, abs=0.01)
 
 
 def test_wo02_sft_tiny_end_to_end(fake_runs: type[FakeRun]) -> None:
