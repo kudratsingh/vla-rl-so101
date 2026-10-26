@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # FFmpeg 4.4 for torchcodec 0.2.1; Mesa's CPU Vulkan driver so SAPIEN can render without a GPU
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg libvulkan1 mesa-vulkan-drivers
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.5"
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+      - run: uv run ruff check src tests scripts
+      - run: uv run black --check src tests scripts
+      - run: uv run mypy
+      - run: uv run pytest -q

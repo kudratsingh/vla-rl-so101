@@ -2,26 +2,28 @@
 
 All versions below are pinned. Changing any of them is a work order of its own.
 
-## Pin table (fill exact values in WO-01; the agent records the resolved commit/version here)
+## Pin table (resolved in WO-01 from `uv.lock`; upstream SHAs recorded here)
 
 | Component | Pin | Why |
 |---|---|---|
-| Python | 3.11.x | ManiSkill3 + LeRobot + verl all support it; 3.12/3.14 untested with SAPIEN wheels |
+| Python | 3.11.x | ManiSkill3 + LeRobot support it; LeRobot 0.4.4 is the LAST release supporting 3.11 (0.5.0+ requires >=3.12) |
 | CUDA image | `nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04` | Matches current torch wheels |
-| PyTorch | 2.5.x + cu124 | OpenVLA-OFT and verl tested here |
-| ManiSkill3 | `mani_skill==3.0.0bX` (record exact) | GPU-parallel sim + render; SO-101 assets |
-| SAPIEN | as required by ManiSkill3 pin | — |
-| LeRobot | git commit (record SHA) | APIs move between releases; sim2real repos pin commits |
-| lerobot-sim2real / squint | git commit (record SHA) | Source of SO-101 ManiSkill assets and system-ID tools; vendored into `src/env/` |
-| OpenVLA-OFT | git commit (record SHA) + HF checkpoint id | Base model |
-| openpi (fallback) | git commit (record SHA) | π0.5 LoRA path |
-| SimpleVLA-RL / verl | git commit (record SHA) | GRPO recipe; vendored into `src/rl/` |
-| RLinf (optional) | git commit (record SHA) | Only if π0.5 path is chosen |
-| transformers / peft | match OpenVLA-OFT requirements | LoRA |
-| torchcodec | latest compatible with torch pin | Video decode (never PyAV) |
+| PyTorch | 2.6.0 (+cu124 on Linux from the PyTorch cu124 index; PyPI CPU/MPS build on macOS); torchvision 0.21.0 | Every LeRobot release since 0.3 requires torchcodec>=0.2.1, and torchcodec 0.2.x pairs with torch 2.6, so the kit's 2.5.x pin was not satisfiable |
+| ManiSkill3 | `mani-skill==3.0.1` (stable, 2026-04-21) | Replaces the kit's 3.0.0bX beta. GPU-parallel sim + render. mplib (motion planner) is Linux-only, so the oracle uses IK |
+| SAPIEN | 3.0.3 | Required by ManiSkill3 pin; first macOS wheels in 3.0.2 |
+| LeRobot | 0.4.4, `8fff0fde7c79f23a93d845d1a50e985de01f8b8a` (tag v0.4.4, 2026-02-27) | APIs move between releases; dataset format v3.0 (its CODEBASE_VERSION) |
+| SO-101 robot model | TheRobotStudio/SO-ARM100 (Apache-2.0), `Simulation/SO101/so101_new_calib.urdf`; SHA: see `src/env/assets/so101/README.md` | Vendored into `src/env/assets/so101/` |
+| lerobot-sim2real / squint | not vendored | lerobot-sim2real has NO license on GitHub; "squint" could not be located on GitHub |
+| OpenVLA-OFT | `e4287e94541f459edc4feabc4e181f537cd569a8` (moojink/openvla-oft, MIT, 2025-09-09) + HF checkpoint id; recorded in WO-01, installed in WO-02/03 | Base model. Pins torch==2.2.0 and a transformers fork (moojink/transformers-openvla-oft, 4.40.x) that conflicts with SmolVLA's transformers; resolved in WO-02 as a separate uv extra |
+| openpi (fallback) | `215abfb217dbac7d5f1273282331b9b1866c0479` (Physical-Intelligence/openpi, 2026-08-24); recorded in WO-01, installed in WO-02/03 | π0.5 LoRA path |
+| SimpleVLA-RL / verl | `7c51662df27b586f9e8a1ab35fcf849f2b8852f9` (PRIME-RL/SimpleVLA-RL, MIT, 2026-01-06); recorded in WO-01, installed in WO-02/03 | GRPO recipe; vendored into `src/rl/` |
+| RLinf (optional) | `fab7f407fbc611085eb163962e3c89c0ab424c1a` (RLinf/RLinf, 2026-10-26); recorded in WO-01, installed in WO-02/03 | Only if π0.5 path is chosen |
+| transformers / peft | transformers 4.57.6 / peft 0.21.2 (SmolVLA side) | LoRA |
+| huggingface-hub / datasets | 0.35.3 / 4.8.5 | From `uv.lock` |
+| torchcodec | 0.2.1 | Video decode (never PyAV). Needs FFmpeg 4-7 shared libs. No CUDA torchcodec wheel exists for 0.2.x on the cu124 index; CPU decode is used |
 | feetech-servo-sdk (via LeRobot) | from LeRobot pin | SO-101 bus |
-| grpcio | 1.6x | Policy serving |
-| uv | latest | Lock file committed |
+| grpcio | 1.85.0 | Policy serving |
+| uv | 0.13.5 | Lock file committed |
 
 Record resolved pins in `uv.lock` and in this table.
 
@@ -39,6 +41,7 @@ Presets map to tiers: `tiny` (CPU, any machine, <2 min), `sim` (dev), `rl` (rl),
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
+apt-get install -y ffmpeg      # torchcodec (Ubuntu 22.04 ships FFmpeg 4.4)
 git clone <repo> && cd vla-rl-so101
 uv sync --extra gpu            # torch cu124, mani_skill, lerobot, peft, torchcodec, verl deps
 uv run python -c "import mani_skill, torch; print(torch.cuda.is_available())"
@@ -51,11 +54,15 @@ install `libvulkan1 mesa-vulkan-drivers` and set `VK_ICD_FILENAMES` to the NVIDI
 ## Install — Mac (control, calibration, deploy)
 
 ```bash
-brew install uv
+brew install uv molten-vk ffmpeg@7   # ffmpeg@7 is keg-only; FFmpeg 9 is too new for torchcodec 0.2.1
+source scripts/mac_env.sh      # VK_ICD_FILENAMES (MoltenVK, so SAPIEN can render) + DYLD_FALLBACK_LIBRARY_PATH (ffmpeg@7)
 uv sync --extra robot          # lerobot robot extras, feetech sdk, grpcio, opencv; no torch-cuda
 uv run lerobot-find-port       # find the Waveshare board
 uv run lerobot-calibrate --robot.type=so101_follower --robot.port=/dev/tty.usbmodemXXXX
 ```
+
+`make` targets export these env vars automatically. ManiSkill CPU sim + rendering works on
+Apple Silicon this way (used for the `tiny` preset and oracle runs).
 
 Policy inference for OpenVLA-OFT runs on the GPU box and is served to the Mac over gRPC;
 SmolVLA can run on the Mac CPU/MPS for smoke tests only.
@@ -71,7 +78,7 @@ SmolVLA can run on the Mac CPU/MPS for smoke tests only.
 
 | What | Where |
 |---|---|
-| Demos / real datasets | HF Hub `KudratSingh22/vla-rl-so101-*` (LeRobotDataset v2 format) |
+| Demos / real datasets | HF Hub `KudratSingh22/vla-rl-so101-*` (LeRobotDataset v3.0 format, one multi-task dataset) |
 | Checkpoints | HF Hub (private) or RunPod network volume; never git |
 | Run records | `runs/<id>/record.json` committed; metrics/logs ignored |
 

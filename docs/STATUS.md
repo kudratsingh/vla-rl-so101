@@ -1,10 +1,11 @@
 # Status
 
-Updated: (agent fills on every PR)
+Updated: 2026-10-26
 
 ## Current work order
 
-WO-01 — not started.
+WO-01 — in progress on `wo-01-sim-env`. Env/tasks/oracle and dataset/SmolVLA scripts being built
+in parallel; pins resolved (see `docs/ENVIRONMENT.md`).
 
 ## Benchmarks met
 
@@ -34,4 +35,18 @@ Running total: $0.
 
 ## Decisions taken by the agent (one line each, link ADR if any)
 
-- (none)
+- 2026-10-26 Python 3.11 kept; LeRobot pinned to 0.4.4, the last release supporting 3.11 (0.5+ needs ≥3.12).
+- 2026-10-26 PyTorch 2.6.0 instead of 2.5.x: every LeRobot ≥0.3 needs torchcodec ≥0.2.1, which pairs with torch 2.6.
+- 2026-10-26 ManiSkill 3.0.1 (stable) instead of a 3.0.0bX beta; SAPIEN 3.0.3 (macOS wheels).
+- 2026-10-26 LeRobotDataset v3.0 (lerobot 0.4.4 native), one multi-task dataset with a per-episode
+  sidecar for task family/seed/cell, instead of v2 per-task directories — LeRobot trains from one repo_id.
+- 2026-10-26 SO-101 model vendored from TheRobotStudio/SO-ARM100 (Apache-2.0). lerobot-sim2real has
+  no license, so nothing is copied from it; "squint" could not be found.
+- 2026-10-26 Action space: absolute joint-position targets in radians, LeRobot so101_follower joint
+  names/order — matches the real arm's interface, so WO-07 needs no IK on a 5-DoF arm.
+- 2026-10-26 Oracle uses IK (pytorch_kinematics), not mplib: mplib has no macOS wheels.
+- 2026-10-26 Mac runs ManiSkill CPU sim + rendering via MoltenVK (`brew install molten-vk`);
+  torchcodec needs `brew install ffmpeg@7`. `scripts/mac_env.sh` / Makefile set the env vars.
+- 2026-10-26 SmolVLA smoke (WO-01 item 5) runs on the Mac (MPS), as ENVIRONMENT.md allows — no paid run.
+- 2026-10-26 OpenVLA-OFT needs torch 2.2 + a transformers 4.40 fork that conflicts with SmolVLA's
+  transformers; to be resolved in WO-02 as a separate uv extra declared conflicting.

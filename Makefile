@@ -1,5 +1,12 @@
 .PHONY: setup check smoke tiny
 
+# Mac: Vulkan via MoltenVK for SAPIEN, FFmpeg 7 for torchcodec (see scripts/mac_env.sh)
+ifeq ($(shell uname),Darwin)
+export VK_ICD_FILENAMES ?= /opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+export DYLD_FALLBACK_LIBRARY_PATH ?= /opt/homebrew/opt/ffmpeg@7/lib
+export MVK_CONFIG_LOG_LEVEL ?= 0
+endif
+
 setup:
 	uv sync --extra dev
 

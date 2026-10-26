@@ -3,36 +3,61 @@ name = "vla-rl-so101"
 version = "0.0.1"
 description = "Single-GPU RL post-training of a VLA, deployed to a real SO-101"
 requires-python = ">=3.11,<3.12"
+# Resolved pins and the reason for each live in docs/ENVIRONMENT.md. uv.lock is the source of truth.
 dependencies = [
   "numpy",
   "pyyaml",
   "pydantic>=2",
   "tqdm",
+  "gymnasium",
+  "torch==2.6.0",
+  "torchvision==0.21.0",
+  "torchcodec==0.2.1",       # torch 2.6 pairing; video decode (never PyAV, rule 6)
+  "mani-skill==3.0.1",
+  "sapien==3.0.3",           # first SAPIEN line with macOS wheels is 3.0.2
+  "lerobot==0.4.4",          # last release supporting Python 3.11; LeRobotDataset v3.0
+  "huggingface_hub",
 ]
 
 [project.optional-dependencies]
-# Agent pins exact versions in WO-01 and records them in docs/ENVIRONMENT.md.
+smolvla = ["lerobot[smolvla]==0.4.4"]
 gpu = [
-  "torch==2.5.*",
-  "torchvision",
-  "torchcodec",
-  "mani_skill",            # pin exact 3.0.0bX
-  "transformers",
-  "peft",
   "accelerate",
-  "huggingface_hub",
-  "datasets",
+  "peft",
   "grpcio",
   "grpcio-tools",
   "wandb",
+  # OpenVLA-OFT / SimpleVLA-RL deps land in WO-02/03 (transformers fork conflicts with smolvla)
 ]
 robot = [
+  "lerobot[feetech]==0.4.4",
   "grpcio",
   "opencv-python",
-  "huggingface_hub",
-  # lerobot[feetech] at the pinned commit — add as a git dependency in WO-01
 ]
-dev = ["pytest", "ruff", "black", "mypy"]
+dev = ["pytest", "ruff", "black", "mypy", "types-PyYAML", "types-tqdm"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu124", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu124", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv]
+# owner's Mac (control + CPU dev) and the RunPod GPU box
+environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [tool.ruff]
 line-length = 100
@@ -44,6 +69,7 @@ line-length = 100
 [tool.mypy]
 strict = true
 files = ["src"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
