@@ -68,6 +68,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     parser.add_argument("--seeds", nargs="+", type=int, default=None)
     parser.add_argument("--episodes", type=int, default=None, help="per (task, cell, seed)")
     parser.add_argument("--num-envs", type=int, default=None)
+    parser.add_argument(
+        "--sim-device",
+        choices=["cuda", "cpu"],
+        default=None,
+        help="sim backend, independent of the policy device (default: cfg device; cpu is serial)",
+    )
     args = parser.parse_args(argv)
     cfg = load_config(args.preset, args.config or default_config(args.preset))
     device = str(cfg.get("device", "cpu"))
@@ -86,8 +92,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     num_envs = int(args.num_envs or cfg["env"].get("num_envs", 16))
     max_steps = int(cfg["env"].get("max_episode_steps", 150))
 
+    sim_cfg = {**cfg, "device": args.sim_device} if args.sim_device else cfg
+
     def make_env(task: str, cell: str, n: int) -> Any:
-        return env_mod.make_env(cfg, task, num_envs=n, cell=cell)
+        return env_mod.make_env(sim_cfg, task, num_envs=n, cell=cell)
 
     with runs.Run(work_order="WO-02-eval", script=__file__, cfg=cfg, device=device) as run:
 
