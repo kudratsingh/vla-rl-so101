@@ -2,6 +2,7 @@
 
     uv run scripts/wo03_rl.py --preset tiny [--seed N]      # CPU, toy env + 2-layer LoRA policy
     uv run scripts/wo03_rl.py --preset rl                   # A100: VLA + ManiSkill (WO-04, paid)
+    uv run scripts/wo03_rl.py --preset rl --estimate        # print hours / $ only, run nothing
 
 `rl.env: toy` selects the synthetic env (src/rl/toy_env.py); anything else uses src.env.make_env.
 The policy comes from the registry in src/rl/policy_api.py keyed by `policy.base`. Both real
@@ -14,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import random
 import subprocess
 import sys
@@ -30,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import REPO_ROOT, Config, add_config_args, config_hash, load_config
 from src.rl.policy_api import build_policy
 from src.rl.rollout import ObsFn
-from src.rl.trainer import EnvFactory, GRPOConfig, GRPOTrainer
+from src.rl.trainer import EnvFactory, GRPOConfig, GRPOTrainer, eval_steps
 
 log = logging.getLogger("wo03_rl")
 
@@ -68,6 +70,43 @@ def _new_run_record(cfg: Config, run_id: str, device: str) -> dict[str, Any]:
     }
 
 
+# --- cost estimate (cfg cost.throughput constants; WO-04 replaces them with measurements) ---
+def estimate_cost(cfg: Config) -> dict[str, float]:
+    """Hours and dollars for one run. The arithmetic is spelled out in configs/rl.yaml."""
+    rl = GRPOConfig.from_config(cfg)
+    tp = cfg["cost"]["throughput"]
+    chunk = int(cfg["policy"]["action_chunk"])
+    ep_len = float(cfg["env"]["max_episode_steps"]) * float(tp["mean_episode_frac"])
+    trained = rl.rollout_batch * rl.samples_per_prompt
+    episodes = trained * float(tp["rollout_overhead"])  # dynamic-sampling refill
+    actions = episodes * ep_len
+    decisions = trained * math.ceil(ep_len / chunk)
+    rollout_s = actions / float(tp["rollout_actions_per_s"])
+    recompute_s = (
+        decisions / float(tp["forward_decisions_per_s"]) if rl.recompute_old_log_probs else 0.0
+    )
+    update_s = rl.ppo_epochs * decisions / float(tp["update_decisions_per_s"])
+    step_s = rollout_s + recompute_s + update_s
+    eval_episodes = math.ceil(rl.eval_episodes / rl.rollout_envs) * rl.rollout_envs
+    n_evals = len(eval_steps(rl))
+    eval_s = n_evals * len(cfg["env"]["tasks"]) * eval_episodes * ep_len
+    eval_s /= float(tp["rollout_actions_per_s"])
+    hours = (rl.steps * step_s + eval_s) / 3600.0
+    return {
+        "episodes_per_step": episodes,
+        "actions_per_step": actions,
+        "decisions_trained_per_step": float(decisions),
+        "rollout_s_per_step": rollout_s,
+        "recompute_s_per_step": recompute_s,
+        "update_s_per_step": update_s,
+        "step_min": step_s / 60.0,
+        "evals": float(n_evals),
+        "eval_h": eval_s / 3600.0,
+        "hours": hours,
+        "dollars": hours * float(cfg["cost"]["usd_per_hour"]),
+    }
+
+
 # --- wiring --------------------------------------------------------------------------------
 def build_env(cfg: Config) -> tuple[EnvFactory, ObsFn, int]:
     """(env factory, obs -> policy-obs fn, max episode steps) for the configured env."""
@@ -95,6 +134,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     add_config_args(parser)
     parser.add_argument("--device", default=None, help="override cfg device (cpu, cuda, cuda:1)")
     parser.add_argument("--seed", type=int, default=None, help="override cfg seed")
+    parser.add_argument("--estimate", action="store_true", help="print hours/$ and exit")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -105,6 +145,15 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         cfg["device"] = args.device
     device, seed = str(cfg["device"]), int(cfg["seed"])
     rl = GRPOConfig.from_config(cfg)  # validate before touching envs or weights
+    if args.estimate:
+        est = estimate_cost(cfg)
+        gpu = cfg["cost"]["gpu"]
+        for key, value in est.items():
+            print(f"{key:>28}: {value:,.2f}")
+        print(
+            f"estimated: {gpu} x {est['hours']:.1f} h = ${est['dollars']:.0f} (config {config_hash(cfg)[:12]})"
+        )
+        return est
     seed_everything(seed)
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")

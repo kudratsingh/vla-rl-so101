@@ -72,7 +72,7 @@ class GRPOConfig:
     grad_clip: float = 1.0
     ppo_epochs: int = 1
     ppo_mini_batch: int = 128  # trajectories per optimizer step
-    micro_batch: int = 16  # decisions (chunks) per forward/backward; memory knob only
+    micro_batch: int = 8  # decisions (chunks) per forward/backward; memory knob only
     clip_low: float = 0.2
     clip_high: float = 0.28
     adv_eps: float = ADV_EPS
@@ -120,8 +120,9 @@ class GRPOConfig:
             raise ValueError("samples_per_prompt must be >= 2 (GRPO needs a group baseline)")
         if self.rollout_envs % k:
             raise ValueError(f"rollout_envs={self.rollout_envs} must be a multiple of K={k}")
-        if min(self.rollout_batch, self.steps, self.ppo_epochs, self.micro_batch) < 1:
-            raise ValueError("rollout_batch, steps, ppo_epochs, micro_batch must be >= 1")
+        counts = (self.rollout_batch, self.steps, self.ppo_epochs, self.micro_batch)
+        if min(*counts, self.eval_every, self.eval_episodes, self.checkpoint_every) < 1:
+            raise ValueError("batch/step/epoch/eval/checkpoint counts must be >= 1")
         if self.ppo_mini_batch < k or self.ppo_mini_batch % k:
             raise ValueError("ppo_mini_batch (trajectories) must be a positive multiple of K")
         if not (0 < self.clip_low < 1 and self.clip_high > 0):
@@ -132,6 +133,16 @@ class GRPOConfig:
             raise ValueError("early_stop_check_at_frac must be in (0, 1]")
         if self.group_reset_check not in ("error", "warn", "off"):
             raise ValueError("group_reset_check must be error|warn|off")
+
+
+def kill_switch_step(rl: GRPOConfig) -> int:
+    return max(1, math.ceil(rl.early_stop_check_at_frac * rl.steps))
+
+
+def eval_steps(rl: GRPOConfig) -> set[int]:
+    """Steps after which the loop evaluates: 0, every `eval_every`, the kill-switch step, last."""
+    every = set(range(rl.eval_every, rl.steps + 1, rl.eval_every))
+    return {0, kill_switch_step(rl), rl.steps} | every
 
 
 def is_flat_run(baseline: float, current: float, min_improvement: float = 0.0) -> bool:
@@ -397,7 +408,8 @@ class GRPOTrainer:
         self._log({"kind": "eval", "step": 0, **baseline})
         log.info("step 0 eval success %.3f", baseline["eval/success"])
         history: list[tuple[int, float]] = [(0, baseline["eval/success"])]
-        check_step = max(1, math.ceil(rl.early_stop_check_at_frac * rl.steps))
+        check_step = kill_switch_step(rl)
+        evals = eval_steps(rl)
         stopped_flat = False
         step = 0
         try:
@@ -409,7 +421,7 @@ class GRPOTrainer:
                     row["train/update_skipped"] = 1.0
                 else:
                     row.update(self.update(batch))
-                if step % rl.eval_every == 0 or step == check_step or step == rl.steps:
+                if step in evals:
                     row.update(self.evaluate())
                     history.append((step, row["eval/success"]))
                 if step == check_step and is_flat_run(

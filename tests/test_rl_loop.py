@@ -227,13 +227,29 @@ def test_config_validation() -> None:
         build_policy({"policy": {"base": "openvla_oft"}}, "cpu")
 
 
-def test_entry_script_tiny_writes_run_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _load_script() -> Any:
     spec = importlib.util.spec_from_file_location("wo03_rl", REPO / "scripts" / "wo03_rl.py")
     assert spec is not None and spec.loader is not None
     script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(script)
+    return script
+
+
+def test_cost_estimate_matches_rl_yaml_arithmetic() -> None:
+    est = _load_script().estimate_cost(load_config("rl"))
+    # configs/rl.yaml: 16 x 8 = 128 trained, x 1.25 = 160 episodes x 150 = 24,000 actions / 250
+    # = 96 s; 128 x 19 = 2,432 decisions / 12 = 202.7 s; 13 evals x 3 x 32 x 150 / 250 = 748.8 s
+    assert est["actions_per_step"] == 24_000
+    assert est["decisions_trained_per_step"] == 2_432
+    assert est["evals"] == 13
+    assert est["hours"] == pytest.approx((300 * (96 + 2432 / 12) + 748.8) / 3600)
+    assert est["dollars"] == pytest.approx(est["hours"] * 1.79)
+
+
+def test_entry_script_tiny_writes_run_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = _load_script()
     monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
     cfg_path = tmp_path / "tiny_short.yaml"
     cfg_path.write_text(f"inherit: {REPO / 'configs' / 'tiny.yaml'}\nrl:\n  steps: 3\n")
