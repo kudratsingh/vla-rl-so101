@@ -30,7 +30,7 @@ def _deep_merge(base: Config, override: Config) -> Config:
 def _load_yaml(path: Path) -> Config:
     raw = yaml.safe_load(path.read_text()) or {}
     if not isinstance(raw, dict):
-        raise ValueError(f"{path}: top level must be a mapping")
+        raise TypeError(f"{path}: top level must be a mapping")
     parent = raw.pop("inherit", None)
     if parent is None:
         return raw
