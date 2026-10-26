@@ -50,3 +50,28 @@ Running total: $0.
 - 2026-10-26 SmolVLA smoke (WO-01 item 5) runs on the Mac (MPS), as ENVIRONMENT.md allows — no paid run.
 - 2026-10-26 OpenVLA-OFT needs torch 2.2 + a transformers 4.40 fork that conflicts with SmolVLA's
   transformers; to be resolved in WO-02 as a separate uv extra declared conflicting.
+
+## WO-02 (branch `wo-02-sft`)
+
+- Built: vendored OpenVLA-OFT (`src/policy/oft/`), `OpenVLAOFTPolicy` (act / SFT loss / RLPolicy
+  methods, structural match to WO-03's `src/rl/policy_api.py`), LeRobot v3.0 → OFT data path,
+  workspace-derived normalisation bounds, `scripts/wo02_sft.py` (+ `--probe-steps`),
+  `src/eval/sim_eval.py` + `scripts/wo02_eval.py`. CPU tiny SFT runs in ~5 s; 23 tests pass.
+- Blocked on the WO-01 merge (lazy imports until then): `src.data.recorder`, `src.runs`,
+  `src.env` (`make_env`, `policy_obs`), `src.eval.protocol`, the SO-101 URDF, and the demo
+  dataset on the Hub. Protocol freeze still to do in WO-02 once it lands (eval episode seeds are
+  derived in `src/eval/sim_eval.py:episode_seeds`; consider moving them into the protocol first).
+- Pending owner: approve the GPU runs (probe ≈ $0.25, SFT 20k-step cap ≈ $6–7 on A100-80GB vs
+  ≈ $8.5–10.5 on RTX 4090, checkpoint sweep + full eval ≈ $2–3). Recommend the A100 (cheaper per
+  run, no OOM risk). Cost line: `estimated: A100-80GB × 3.9 h = $7.0` (SFT, worst case).
+
+Decisions taken by the agent (WO-02):
+
+- 2026-10-26 OpenVLA-OFT on stock transformers 4.57.6 + timm 0.9.16 with a bidirectional 4-D mask
+  hook, not the moojink fork (bit-identical on CPU; no uv conflicts). See ADR-0001.
+- 2026-10-26 Token layout keeps OFT's `▁` (29871) before the action slots in SFT, eval and RL alike.
+- 2026-10-26 SFT loss = CE on the 256-bin action slice (the distribution RL samples), not full vocab.
+- 2026-10-26 Action/proprio bounds from joint limits ∩ reachable workspace (≤1°/bin), not demo min/max.
+- 2026-10-26 Proprio on; proprio projector trained in full during SFT, frozen during RL (LoRA-only).
+- 2026-10-26 LoRA targets every Linear incl. lm_head (peft 0.11 "all-linear", as upstream adapters).
+- 2026-10-26 CI syncs the `gpu` extra too, so policy tests run (`uv sync --frozen --extra dev --extra gpu`).
