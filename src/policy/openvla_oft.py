@@ -249,7 +249,9 @@ class OpenVLAOFTPolicy(nn.Module):
 
 # ----------------------------------------------------------------------------- builders
 def resolve_adapter(spec: str | Path | None) -> Path | None:
-    """Local adapter dir, or a Hub repo id (`user/repo` or `user/repo@revision`)."""
+    """Local adapter dir, or a Hub model repo: `user/repo[@rev]` (adapter at the repo root) or
+    `user/repo/path/in/repo[@rev]` (only that folder is downloaded), e.g. a WO-02 checkpoint
+    `KudratSingh22/vla-rl-so101-sft/wo02/<pod>/runs/<run>/checkpoints/step_004000`."""
     if spec is None or str(spec) == "":
         return None
     path = Path(spec)
@@ -257,8 +259,20 @@ def resolve_adapter(spec: str | Path | None) -> Path | None:
         return path
     from huggingface_hub import snapshot_download
 
-    repo, _, rev = str(spec).partition("@")
-    return Path(snapshot_download(repo_id=repo, revision=rev or None))
+    ref, _, rev = str(spec).partition("@")
+    parts = [p for p in ref.split("/") if p]
+    if len(parts) < 2:
+        raise FileNotFoundError(f"adapter {spec!r} is neither a local dir nor a Hub user/repo id")
+    repo, sub = "/".join(parts[:2]), "/".join(parts[2:])
+    root = Path(
+        snapshot_download(
+            repo_id=repo, revision=rev or None, allow_patterns=[f"{sub}/*"] if sub else None
+        )
+    )
+    out = root / sub if sub else root
+    if not (out / "adapter_config.json").is_file():
+        raise FileNotFoundError(f"no PEFT adapter (adapter_config.json) at {spec!r} ({out})")
+    return out
 
 
 def resolve_bounds(cfg: Config, adapter_dir: Path | None) -> tuple[NormBounds, NormBounds]:
@@ -351,9 +365,27 @@ def build_policy(
     )
 
 
+def assert_deterministic(model: nn.Module) -> None:
+    """RL contract (src/rl/policy_api.py): `log_prob` in train() mode must equal `sample`'s eval()
+    scores, so no dropout / drop-path / attention dropout may be active anywhere (incl. the LoRA
+    dropout of a loaded SFT adapter). Otherwise every PPO ratio carries noise."""
+    active = []
+    for name, mod in model.named_modules():
+        p = float(getattr(mod, "p", 0.0)) if isinstance(mod, nn.Dropout) else 0.0
+        p = max(p, float(getattr(mod, "drop_prob", 0.0) or 0.0))  # timm DropPath
+        attn = getattr(mod, "attention_dropout", 0.0)  # HF attention modules hold a float
+        p = max(p, float(attn) if isinstance(attn, (int, float)) else 0.0)
+        if p > 0.0:
+            active.append(f"{name or type(mod).__name__} (p={p})")
+    if active:
+        raise ValueError(f"RL needs a deterministic forward; active dropout in: {active[:5]}")
+
+
 def build_rl_policy(cfg: Config, device: str) -> OpenVLAOFTPolicy:
     """WO-03 builder: SFT adapter (`policy.adapter`) loaded, only LoRA weights require grad."""
     pc = OFTPolicyConfig.from_cfg(cfg)
     if pc.adapter is None and not pc.tiny_random:
         raise ValueError("RL starts from the WO-02 SFT checkpoint: set policy.adapter")
-    return build_policy(cfg, device, is_trainable=True, lora_only=True)
+    policy = build_policy(cfg, device, is_trainable=True, lora_only=True)
+    assert_deterministic(policy)
+    return policy

@@ -19,7 +19,13 @@ from src.policy.base import SFTBatch, VLAPolicy
 from src.policy.oft import model as oft_model
 from src.policy.oft.actions import ACTION_VOCAB_BEGIN, ActionBins, NormBounds
 from src.policy.oft.preprocess import PAD_ID, SPACE_ID, STOP_ID, OFTPreprocessor, ToyPromptTokenizer
-from src.policy.openvla_oft import OpenVLAOFTPolicy, build_policy
+from src.policy.openvla_oft import (
+    OpenVLAOFTPolicy,
+    assert_deterministic,
+    build_policy,
+    build_rl_policy,
+    resolve_adapter,
+)
 
 INSTR = [
     "pick up the red cube and place it in the bowl",
@@ -320,3 +326,46 @@ def test_from_pretrained_path_adds_proprio_projector(tmp_path: Path) -> None:
             model, pre.build_inputs(INSTR[:2], obs["image"], obs["state"]), 48
         )
     assert logits.shape == (2, 48, 256) and bool(torch.isfinite(logits).all())
+
+
+def test_resolve_adapter_hub_subfolder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`user/repo/path@rev` downloads only that folder (WO-04 pulls the selected SFT checkpoint
+    out of the WO-02 runs repo); a bare `user/repo` keeps meaning the repo root."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_snapshot_download(**kw: Any) -> str:
+        calls.append(kw)
+        sub = (kw["allow_patterns"] or ["/*"])[0][:-2]
+        (tmp_path / sub).mkdir(parents=True, exist_ok=True)
+        (tmp_path / sub / "adapter_config.json").write_text("{}")
+        return str(tmp_path)
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    sub = "wo02/pod/runs/r1/checkpoints/step_004000"
+    out = resolve_adapter(f"KudratSingh22/vla-rl-so101-sft/{sub}@abc123")
+    assert out == tmp_path / sub
+    assert calls[-1] == {
+        "repo_id": "KudratSingh22/vla-rl-so101-sft",
+        "revision": "abc123",
+        "allow_patterns": [f"{sub}/*"],
+    }
+    assert resolve_adapter("user/repo") == tmp_path and calls[-1]["allow_patterns"] is None
+    assert resolve_adapter(str(tmp_path)) == tmp_path and len(calls) == 2  # local dir: no download
+    with pytest.raises(FileNotFoundError):
+        resolve_adapter("not-a-repo")
+
+
+def test_rl_policy_refuses_stochastic_forward(cfg: dict[str, Any], tmp_path: Path) -> None:
+    """log_prob runs in train() mode, so any active dropout would put noise into every PPO ratio."""
+    assert_deterministic(build_rl_policy(cfg, "cpu"))  # the RL builder runs this itself
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Dropout(0.1))
+    with pytest.raises(ValueError, match="dropout"):
+        assert_deterministic(model)
+    # an SFT adapter trained with LoRA dropout cannot be loaded for RL
+    sft = build_policy({**cfg, "policy": {**cfg["policy"], "lora_dropout": 0.1}}, "cpu")
+    sft.save(tmp_path / "sft")
+    rl_cfg = {**cfg, "policy": {**cfg["policy"], "adapter": str(tmp_path / "sft")}}
+    with pytest.raises(ValueError, match="lora_dropout"):
+        build_rl_policy(rl_cfg, "cpu")
