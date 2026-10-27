@@ -1,7 +1,11 @@
 # rl tier (A100 80 GB). WO-04/05 GRPO from the WO-02 SFT checkpoint.
+# Inherits configs/sft.yaml so the policy block (base checkpoint + revision, precision, crop,
+# LoRA layout) is exactly the one the SFT adapter was trained with; norm bounds come from the
+# adapter's own norm_stats.json. The SFT checkpoint is passed per run:
+#   uv run scripts/wo03_rl.py --preset rl --seed N --adapter <dir | user/repo/path/in/repo[@rev]>
 #
 # VRAM budget, A100-80GB (79 GiB usable). EVERY NUMBER IS A WO-03 ESTIMATE, NOT A MEASUREMENT;
-# WO-04 replaces each with torch.cuda.max_memory_allocated() / nvidia-smi from the first run.
+# the WO-04 probe (`--probe-steps`, scripts/pod/wo04_job.sh) prints torch peak + device-wide use.
 # Rollout and update alternate, so the peak is the larger phase, not the sum of both.
 #   item                                       est. GiB  derivation
 #   base model bf16 (OpenVLA-OFT ~7.54B)        14.0     7.54e9 params x 2 B (Llama-2-7B 6.74B
@@ -14,12 +18,13 @@
 #                                                        s^2 term) + vision towers ~0.6 GiB (LoRA on
 #                                                        them too); no grad checkpointing
 #   rollout-phase activations @ 32 envs         (3)      one no-grad forward x 32 (OFT parallel
-#                                                        decoding, no KV cache) + 32x340x32064 bf16
-#                                                        logits; NOT concurrent with the update
-#   ManiSkill GPU envs, 3 tasks x 32 @ 128^2     6       ~2 GiB per env instance (PhysX GPU buffers
+#                                                        decoding, no KV cache) + 32x48x32064 bf16
+#                                                        action-slot logits; NOT concurrent with the update
+#   ManiSkill GPU envs, 3 tasks x 32 @ 224^2     6       ~2 GiB per env instance (PhysX GPU buffers
 #                                                        + Vulkan renderer + targets); one per task
-#   rollout buffer (obs, tokens, log-probs)      0       kept in host RAM: 128 traj x 19 decisions
-#                                                        x 49 KB image = ~0.12 GB CPU
+#                                                        (WO-03 sized this at 128^2; sim.yaml renders 224)
+#   rollout buffer (obs, tokens, log-probs)      0       kept in host RAM: <= 12 env batches x 32
+#                                                        x 19 decisions x 150 KB image = ~1.1 GB CPU
 #   CUDA context + allocator slack               2.5
 #   -------------------------------------------------
 #   peak (update phase)                         ~42      14 + 1.5 + 18 + 6 + 2.5
@@ -29,6 +34,8 @@
 #                                                        ~0.6 GiB per decision (5*a*s^2*layers).
 # rollout_envs=32 fits by this estimate (64 would too: +~3 GiB rollout-phase, +~1 GiB/env).
 #
+# SUPERSEDED by the WO-04 probes + owner amendment (docs/adr/0002, 2026-10-27): the measured
+# throughput is in cost.throughput below and the amended run is 150 steps at horizon 120.
 # Wall-clock / $ (estimates; `uv run scripts/wo03_rl.py --preset rl --estimate` recomputes from
 # cost.throughput below). Per step, worst case (every episode runs the full 150 steps):
 #   trained trajectories   16 prompts x K=8                      =    128
@@ -37,26 +44,52 @@
 #   decisions trained      128 x ceil(150 / 8) = 128 x 19        =  2,432 -> / 12 per s  = 203 s
 #   old log-prob recompute off (sampler log-probs reused)                                =   0 s
 #   step                                                                          = 299 s = 5.0 min
-#   evals: steps {0, 25, ..., 300} = 13 x 3 tasks x 32 ep x 150 actions / 250 per s =     0.21 h
-#   run: 300 x 299 s + 0.21 h = 25.1 h x $1.79 = ~$45 per seed (~$135 for 3 seeds)
+#   evals: steps {0, 25, ..., 300}: 11 x 32 + 2 x 64 (step 0 + kill-switch step 75) = 480 ep/task
+#          x 3 tasks x 150 actions / 250 per s                                     =     0.24 h
+#   run: 300 x 299 s + 0.24 h = 25.1 h x $1.79 = ~$45 per seed (~$135 for 3 seeds)
 # The upstream-sized batch (64 prompts, recompute on) is 384 + 324 + 811 s = 25 min/step, ~127 h,
 # ~$227 per seed -- over the whole ~$200 project budget -- hence rollout_batch 16 here.
+#
+# RTX 4090 ($0.89/h) vs A100-80GB ($1.79/h, the rl tier in docs/ENVIRONMENT.md). Derived from the
+# one measurement we have (WO-02 4090 probe: 1.55-1.58 s per SFT step, batch 8, grad checkpointing,
+# bf16); everything else is an ESTIMATE that the WO-04 probe replaces:
+#   one SFT sample = one RL decision (same 256 patches + proprio + prompt + 48 action tokens)
+#   FLOPs: forward ~2 x 7.5e9 x ~340 tokens = ~5.1 TFLOP; LoRA backward ~1 forward (activation
+#     grads only, base frozen); grad checkpointing +1 forward -> SFT sample ~15.3 TFLOP
+#   4090 achieved: 8 x 15.3 / 1.565 s = ~78 TFLOP/s (~47% of 165 dense bf16)
+#     -> update with grad ckpt 5.1 decisions/s (measured-derived); rollout 78 / 5.1 = 15
+#        decisions/s = ~122 env actions/s
+#     -> step 24,000 / 122 + 2,432 / 5.1 = 197 + 477 s = 11.2 min; 300 steps + evals = ~57 h
+#        x $0.89 = ~$50 per seed. VRAM: 14 weights + 1.5 LoRA/Adam + 2.5 context + ~6 for
+#        3 x 32 GPU envs = ~24 GB before any activation: does NOT fit the preset on 24 GB
+#        (would need fewer envs per task -> more env batches -> slower still).
+#   A100 at the same ~47% MFU (147 of 312 TFLOP/s): update without ckpt (2 forwards) 14.4
+#     decisions/s (this file assumes 12), rollout 29 decisions/s = ~230 actions/s (assumes 250)
+#     -> 104 + 169 s = 4.6 min/step; 300 steps + evals = ~23 h x $1.79 = ~$41 per seed.
+#   => A100 stays: same $ within the error of these estimates (~$41-45 vs ~$50), less than half the
+#      wall-clock, and the only one of the two with VRAM headroom. H100 PCIe ($2.89/h) breaks even
+#      at >= 1.61x A100 speed (unmeasured).
+#   ADR-0002 reopens the recipe if a run is > 12 h on an A100; every estimate here is ~2x that.
 preset: rl
 device: cuda
 seed: 0
-inherit: configs/sim.yaml
+inherit: configs/sft.yaml
 
 policy:
-  checkpoint: null          # WO-02 SFT checkpoint (HF id)
+  adapter: KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000
+                            # WO-02 SFT base: attempt 4 step 4000 (seen 18/16/6%), meets the amended
+                            # rule 3 (>=10% on >=2 tasks); --adapter overrides
 
 rl:                         # GRPO, ADR-0002; every key is documented in src/rl/trainer.py
   algorithm: grpo
-  samples_per_prompt: 8     # K
-  rollout_envs: 32          # parallel envs per env batch (4 groups); one env instance per task
-  rollout_batch: 16         # prompts (groups) per update -> 128 trajectories (upstream: 64)
+  samples_per_prompt: 16    # K. Owner rule (ADR-0002 amendment 1): the confirming probe (pod
+                            # gzxhwhjhdtc1kc) still dropped 72% of K=8 groups (> 60%) -> 16
+  rollout_envs: 32          # parallel envs per env batch (2 groups at K=16); one env per task
+  rollout_batch: 8          # prompts (groups) per update -> 128 trajectories, as at K=8 x 16
+                            # (agent proposal, owner to confirm in PR #11; upstream: 64 x 8)
   max_rollout_rounds: 3     # dynamic-sampling refill cap, in multiples of one full round
-  steps: 300
-  lr: 1e-5
+  steps: 150                # owner amendment (ADR-0002): was 300
+  lr: 5e-5                  # LoRA (owner, WO-04; was 1e-5)
   weight_decay: 0.01
   grad_clip: 1.0
   ppo_epochs: 1
@@ -64,29 +97,44 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   micro_batch: 8            # decisions per forward/backward; memory only, gradient unchanged
   clip_low: 0.2
   clip_high: 0.28
-  temperature: 1.6
+  temperature: 1.0          # owner amendment (ADR-0002): 1.6 dropped 92-93% of groups
   kl_coef: 0.0              # must stay 0 (no reference model)
   dynamic_sampling: true
-  # Upstream recomputes old log-probs with an extra no-grad forward. OFT's sampler log-probs come
-  # from the same single forward (eval mode, same temperature), so we reuse them (-25% step time).
-  # train/first_minibatch_max_abs_log_ratio still measures sampler-vs-update agreement every step;
-  # if it is > ~0.05 at step 1 (precision/mode differ), set this to true.
-  recompute_old_log_probs: false
+  # Upstream recomputes old log-probs with an extra no-grad forward. The WO-04 probes measured
+  # first-minibatch |log ratio| max 0.196 (A100) / 0.149 (H100) with sampler log-probs reused,
+  # well over the 0.05 bar, so it is on (owner amendment, ADR-0002).
+  recompute_old_log_probs: true
   eval_every: 25
-  eval_episodes: 32         # per task, greedy, fixed seeds; the kill switch reads this
+  eval_episodes: 32         # per task, greedy, fixed seeds: the periodic evals
   checkpoint_every: 50
-  early_stop_check_at_frac: 0.25   # WO-04 note: flat by here -> stop and diagnose
+  # Kill switch (owner, WO-04; amended): step 0 and step ceil(0.25 x 150) = 38 both evaluate 64
+  # greedy episodes per task on the same seeds; stop at 38 if the trained tasks' mean success
+  # rose by < 0.03 (3 points).
+  early_stop_check_at_frac: 0.25
   early_stop_on_flat: true
+  early_stop_eval_episodes: 64
+  early_stop_min_improvement: 0.03
+  require_nonzero_baseline: true  # CLAUDE.md rule 3: abort if the step-0 eval is 0 on every task
   group_reset_check: error  # identical reset seeds must give identical scenes
+  # Owner amendment (ADR-0002): RL rollouts on PickPlace + Push only; Stack (0/64 at step 0, every
+  # group all-zero) is eval-only. Evals still cover all three tasks; the kill switch compares the
+  # trained tasks' mean (eval/success_train).
+  train_tasks: [PickPlace, Push]
+  # RL rollout + in-training eval horizon (owner amendment, ADR-0002); the protocol eval
+  # (scripts/wo02_eval.py) keeps env.max_episode_steps = 150.
+  max_episode_steps: 120
 
 cost:
   gpu: A100-80GB
   usd_per_hour: 1.79
-  estimated_hours: null     # agent fills before every run (from --estimate, then measured)
-  throughput:               # ESTIMATES (WO-02 research + WO-03 FLOP count); WO-04 measures
-    rollout_actions_per_s: 250     # batched OFT sampling + sim, env actions/s (est. 230-285:
-                                   # ~4.8 TFLOP per 8-action query, compute-bound)
-    forward_decisions_per_s: 30    # no-grad log-prob forward per decision (recompute only)
-    update_decisions_per_s: 12     # forward + activation-grad backward (~2.5x a forward)
-    mean_episode_frac: 1.0         # mean episode length / max_episode_steps (1.0 = worst case)
-    rollout_overhead: 1.25         # episodes generated per trained one (dynamic-sampling refill)
+  est_s_per_step: null      # sft.yaml's SFT estimate does not apply to RL
+  setup_hours: 0.5          # image pull, apt, uv sync, 15 GB checkpoint download (as sft.yaml)
+  estimated_hours: null     # agent fills before every run (from --estimate, then the probe)
+  throughput:               # A100-80GB, MEASURED 2026-10-27 on pod u87r9sjnwig58d (WO-02 attempt 4)
+    rollout_actions_per_s: 86      # RL rollout (sampling, 32 GPU envs, 224 px): 44.5 s per 32 x 120
+                                   # batch (pod gzxhwhjhdtc1kc); 55.9 s per 32 x 150 (5rdd45j801bk5b)
+    forward_decisions_per_s: 31    # no-grad forward ~1/3 of an update (est.; recompute is off)
+    update_decisions_per_s: 10.3   # SFT probe 0.774 s per 8-decision step, LoRA, no grad-ckpt (was est. 12)
+    mean_episode_frac: 1.0         # mean episode length / max_episode_steps (base succeeds ~13%)
+    rollout_overhead: 3.0          # episodes generated per trained one: the refill cap
+                                   # (max_rollout_rounds) bound every K=8 probe step -> worst case

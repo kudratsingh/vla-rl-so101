@@ -126,3 +126,13 @@ Running total (finished pods): WO-02 ~$13.56 of its $15 cap; WO-04 ~$6.38; total
 - 2026-10-27 WO-04 kill switch compares the trained-task mean (`eval/success_train`); Stack is
   evaluated and reported but cannot trip or pass it (owner confirmed on PR #11).
 - 2026-10-27 WO-04 K=16 keeps 128 trajectories per update (8 prompts), not 256 (owner confirmed).
+
+## WO-04 (PR #11, owner-approved 2026-10-27; seed runs from `wo-04-seeds`)
+
+- 2026-10-26 Owner settings implemented: LoRA lr 5e-5; kill switch = 64 greedy episodes/task at step 0 and at the 25% check (step 38 of 150 since ADR-0002 amendment 1) on the same seeds, stop only if the gain is < 0.03; periodic evals stay 32/task; ppo_mini_batch 64.
+- 2026-10-26 configs/rl.yaml inherits configs/sft.yaml (RL policy block = the one the SFT adapter was trained with); the adapter comes from `--adapter` / `SFT_ADAPTER` (dir or Hub `user/repo/path[@rev]`).
+- 2026-10-26 Trainer aborts if the step-0 eval is 0% on every task (CLAUDE.md rule 3), before any RL step and before the approval gate.
+- 2026-10-26 Group-reset check: joint state must match to 1e-4 rad; images may differ in <= 0.1% of values (GPU-sim sub-scene offsets can flip silhouette pixels; CPU sim is bit-identical, different seeds differ in >= 4.5%).
+- 2026-10-26 build_rl_policy refuses any active dropout (incl. a loaded adapter's LoRA dropout): log_prob runs in train() mode.
+- 2026-10-26 SIGTERM (pod soft deadline) saves a `step_N_interrupted` checkpoint and finalises the run record.
+- 2026-10-27 GPU from measured probes (original settings): A100 $108 vs H100 $206 per 300-step seed -> A100 (owner's 10% rule). Amended settings, A100: $55.6 per 150-step seed at K=8; K=16 worst case $59 (`--estimate`).

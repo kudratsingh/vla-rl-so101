@@ -28,3 +28,75 @@ rollout and update phases alternate on the same card; parallel env count set by 
 
 GRPO shows no improvement after 2 full runs on a base with 20–60% success; or rollout throughput
 makes a run >12 h on an A100 (then consider RLinf's pipelined mode or an H100).
+
+## Amendment 1 (2026-10-27, owner, after the WO-04 probes)
+
+Two probes (seed 0, 3 GRPO steps each, WO-02 attempt-4 `step_004000` base, then-current
+`configs/rl.yaml`: K = 8, 16 prompts, temperature 1.6, sampler log-probs reused, horizon 150,
+rollouts on all three tasks, 300 steps). Logs and `record.json`: Hub
+`KudratSingh22/vla-rl-so101-rl`, `wo04/seed0/<pod>/`.
+
+| | A100-SXM4-80GB (pod 5rdd45j801bk5b) | H100 80GB HBM3 (pod nz8fp6rckh1yfe) |
+|---|---|---|
+| s/step, median (max) | 716.4 (722.6) | 611.5 (612.7) |
+| rollout per 32-env batch / update | 55.9 s / 45.6 s | 48.9 s / 24.8 s |
+| greedy eval per batch | 52.7 s | 46.7 s |
+| SFT baseline, 64 greedy eps/task (PickPlace / Push / Stack) | 0.109 / 0.141 / 0.000 | 0.109 / 0.125 / 0.000 |
+| groups dropped (all-equal reward) | 93% | 92% |
+| first-minibatch \|log ratio\| max / mean | 0.1958 / 0.01325 | 0.1488 / 0.01309 |
+| VRAM: torch peak allocated; device in use | 39.2 GB; 46.7 of 85.0 GB | 39.1 GB; 46.5 of 85.1 GB |
+| projected 300-step run | 60.4 h = $108.04 @ $1.79/h | 51.5 h = $205.64 @ $3.99/h |
+| kill-switch stop (step 75) | 15.2 h = $27.19 | 13.0 h = $51.76 |
+
+Reading: (1) with 92–93% of groups all-equal, every step hit the dynamic-sampling refill cap, so
+rollout time dominated and almost no signal reached the update; (2) the sampler-vs-update log
+ratio is ~3–4× the 0.05 bar, so reusing sampler log-probs is not safe; (3) Stack is 0/64, so its
+groups are always all-zero; (4) the A100 is under the owner's "H100 only if within ~10% of the
+A100 $" rule ($108 vs $206 per seed).
+
+Owner decisions (2026-10-27), now in `configs/rl.yaml`:
+
+- **Temperature 1.0** (was ≈1.6): more groups with mixed outcomes at a ~10–14% base.
+- **RL on PickPlace + Push; Stack eval-only** (`rl.train_tasks`). Evals still cover all three
+  tasks; the kill switch compares the trained-task mean (`eval/success_train`) — the agent's
+  reading of "Stack eval-only", flagged for the owner in PR #11.
+- **`recompute_old_log_probs: true`** (measured log ratio above).
+- **RL horizon 120** (`rl.max_episode_steps`) for training rollouts and in-training evals; the
+  protocol eval (`scripts/wo02_eval.py`, `docs/eval_protocol.md`) keeps 150.
+- **150 steps; kill switch at step 38** (ceil(0.25 × 150); 64 greedy episodes/task, stop if the
+  trained-task mean rose < 3 points over step 0).
+- **K = 16 rule:** if the confirming probe still drops > 60% of groups, raise
+  `samples_per_prompt` to 16 before changing anything else. (With 32 envs per batch that is 2
+  groups per batch; keeping 128 trajectories per update means `rollout_batch` 8 — the agent's
+  proposal, to be confirmed with the owner when it triggers.)
+- **GPU:** A100-80GB.
+
+A confirming A100 probe with these settings runs before any seed; its numbers are below. The
+seeds wait for the owner's PR #11 review.
+
+### Confirming probe (2026-10-27, A100-SXM4-80GB, pod gzxhwhjhdtc1kc, US-KS-2, ~$1.5)
+
+Settings above with K = 8 × 16 prompts, seed 0, 3 GRPO steps (`wo04/seed0/gzxhwhjhdtc1kc/` on
+the Hub). The host is cgroup v1 (256 visible cores, 27.2-CPU quota); the job ran with 28 threads
+(the script's cap now reads the v1 quota too).
+
+| | value |
+|---|---|
+| SFT baseline, 64 greedy eps/task, horizon 120 (PickPlace / Push / Stack) | 0.125 / 0.141 / 0.016 (trained-task mean 0.133) |
+| groups dropped | **72%** (was 93%) |
+| s/step median (max) | 736.8 (757.4): rollout 44.5 s per 32-env batch × 12 (refill cap), update 202.7 s (incl. recompute) |
+| first-minibatch \|log ratio\| max / mean | 0.1318 / 0.00012 (mean was 0.01325 without recompute) |
+| VRAM | torch peak 39.3 GB allocated; device 46.8 of 85.1 GB |
+| projected 150-step run | 31.0 h = $55.57 per seed; kill-switch stop at step 38 = 8.0 h = $14.23 |
+
+Reading: temperature 1.0 lifted the surviving groups from 7% to 28%, so the update now gets real
+signal (update time 45.6 → 202.7 s is that signal, not overhead), but every step still hit the
+refill cap. Recompute cut the mean sampler/update disagreement ~100×; the max (0.13) is a few
+tokens (bf16 batch-shape numerics), bounded by the 0.2/0.28 clip.
+
+**K = 16 rule fired (72% > 60%)**, applied in `configs/rl.yaml`: `samples_per_prompt: 16`,
+`rollout_batch: 8` (128 trajectories per update, as before; 2 groups per 32-env batch). Cost
+model updated to the measured rollout rate (86 env actions/s) and the refill cap (3.0 episodes per
+trained one): worst case 13.1 min/step, 150 steps = 33.0 h = **$59 per seed** (`--estimate`);
+if 50–60% of K=16 groups survive, ~10–11.5 min/step = ~$46–52. The seed-0 pod's own probe (job
+stage `probe`, before its approval gate) measures the K=16 drop rate before any spend beyond ~$1.5.
