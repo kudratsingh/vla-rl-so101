@@ -1,7 +1,7 @@
 # ADR-0001: Base VLA model
 
-Status: proposed — OpenVLA-OFT few-shot SFT below the 20% bar after 3 attempts (2026-10-27);
-owner's decision path before any switch: receding-horizon recheck → 25 demos/task → π0.5 (see below)
+Status: proposed — OpenVLA-OFT few-shot SFT below the 20% bar after 4 attempts incl. 25 demos/task
+(2026-10-27). Per the owner's path the next candidate is π0.5, pending the owner's approval of a plan + cost.
 Date: 2026-10-26 (WO-02 implementation findings added the same day)
 Work order: WO-02
 
@@ -95,7 +95,8 @@ In band = 20–60% on ≥ 2 of 3 tasks. Best checkpoint per attempt (all checkpo
 |---|---|---|---|---|---|
 | 1 | lr 5e-5 (sim.yaml) | 2000 | 8 / 4 / 2% (step 1000) | 0.73 / 0.016 | 0.94 |
 | 2 | lr 5e-4 (OFT LoRA rate) | 2000 | 20 / 6 / 4% (step 2000, still rising) | 0.69 / 0.024 | 1.17 |
-| 3 | lr 5e-4, 8000 steps | 8000 | 22 / 4 / 4% (step 3000); plateau ~15 / ≤8 / ≤8% | 0.84 / 0.010 | ~3.2–4.0 |
+| 3 | lr 5e-4, 8000 steps | 8000 | 22 / 4 / 4% (step 3000); plateau ~15 / ≤8 / ≤8% | 0.84 / 0.010 | 4.01 |
+| 4 | 25 demos/task (A100) | 8000 | 18 / 16 / 6% (step 4000) | — | ~5.0 |
 
 Ruled out on the way (free, Mac): the 30 demos replay to success with zero joint-state drift
 (data ↔ env aligned); the SFT forward and the eval path give identical action tokens on demo
@@ -114,3 +115,12 @@ them — few-shot covariate shift, which more steps alone do not fix.
    stack — a separate openpi environment (conflicting pins), A100-only JAX LoRA, and a
    flow-matching RL path (RLinf Flow-SDE) that replaces WO-03/04's token-level GRPO.
 3. **π0.5 only if step 2 also fails**, with a plan and cost put to the owner first.
+
+### Outcome of the decision path (2026-10-27)
+
+- Step 1, receding horizon (execute 4 of 8): worse on every rechecked checkpoint — a3 step 3000
+  22/4/4% → 6/4/4%, a3 step 6000 18/4/8% → 0/4/0%, a2 step 2000 20/6/4% → 2/2/2% ($0.31).
+  Re-querying mid-chunk breaks the action continuity the chunked policy was trained on.
+- Step 2, 25 demos/task, 8000 steps (A100, lr 5e-4): best 18/16/6% (step 4000). More data helped
+  Push (≤ 8% → 16%) but no task reached 20%.
+- Step 3, π0.5: next per the owner's path; plan + cost go to the owner before any spend.
