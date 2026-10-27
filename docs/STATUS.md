@@ -54,6 +54,9 @@ Running total: $2.11 settled (RunPod billing); WO-02 cap $15.
   the full run (job-script approval gate). WO-04's RL runs (~$135) must not start without it.
 - 2026-10-26 WO-04 settings: LoRA lr 5e-5 (not 1e-5); kill switch evaluates 64 episodes/task at
   step 0 and at the 25% check and stops only if the improvement is under 3 points; ppo_mini_batch 64.
+- 2026-10-27 WO-04 GPU: prefer the H100 if its measured $ per seed is within ~10% of the A100's
+  (wall-clock matters); otherwise the A100. Decided from probe numbers on both, not estimates.
+- 2026-10-27 Leader arm ordered: WO-06 keeps the teleop recording step (5 real episodes/task).
 
 ## Decisions taken by the agent (one line each, link ADR if any)
 
