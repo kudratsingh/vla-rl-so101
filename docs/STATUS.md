@@ -13,7 +13,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 02 | in progress, **out of order** (started before WO-01 merged) | `wo-02-sft` | Uses WO-01's code (merged into its branch) and the Hub demos above. LoRA SFT (sim.yaml budget: 2000 steps) running on RunPod pod `iqrmjox6ws0e66` since 2026-10-26 20:18 UTC; owner-approved, WO-02 spend cap $15. If WO-01 review changes env/oracle/camera, the demos and this SFT are redone. |
 | 03 | done, merged after owner review | #4 (merged) | **Out of order** (started before WO-01/02). CPU only, toy env. |
 | 06 | part 1 merged, part 2 waits for the arm | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. |
-| 04 | not started; blocked on WO-02's SFT checkpoint | | Owner settings recorded below; applied as WO-04's first commit. Noted here before it starts. |
+| 04 | CPU prep done (settings, rl wiring, CPU smoke, pod job); paid runs wait for WO-02's selected SFT checkpoint + owner go | `wo-04-rl-sim` | **Out of order** (stacked on `wo-02-sft`). Decisions in the WO-04 block below. |
 | 05, 07, 08, 09 | not started | | |
 
 ## Benchmarks met
@@ -93,3 +93,14 @@ Running total: $0 settled; WO-02 pod running (max $5.34 by its 6 h self-delete c
   the 7.56B pretrained weights stay frozen (LoRA r32 on every Linear incl. lm_head).
 - 2026-10-26 RunPod Vulkan: the mounted GLX ICD fails headless; an EGL ICD at
   /usr/share/vulkan/icd.d/nvidia_icd.json fixes GPU and CPU sim rendering (ENVIRONMENT.md).
+
+## WO-04 (branch `wo-04-rl-sim`, CPU prep only; no paid run yet)
+
+- 2026-10-26 Owner settings implemented: LoRA lr 5e-5; kill switch = 64 greedy episodes/task at step 0 and at step 75 (25%) on the same seeds, stop only if the gain is < 0.03; periodic evals stay 32/task; ppo_mini_batch 64.
+- 2026-10-26 configs/rl.yaml inherits configs/sft.yaml (RL policy block = the one the SFT adapter was trained with); the adapter comes from `--adapter` / `SFT_ADAPTER` (dir or Hub `user/repo/path[@rev]`).
+- 2026-10-26 Trainer aborts if the step-0 eval is 0% on every task (CLAUDE.md rule 3), before any RL step and before the approval gate.
+- 2026-10-26 Group-reset check: joint state must match to 1e-4 rad; images may differ in <= 0.1% of values (GPU-sim sub-scene offsets can flip silhouette pixels; CPU sim is bit-identical, different seeds differ in >= 4.5%).
+- 2026-10-26 build_rl_policy refuses any active dropout (incl. a loaded adapter's LoRA dropout): log_prob runs in train() mode.
+- 2026-10-26 SIGTERM (pod soft deadline) saves a `step_N_interrupted` checkpoint and finalises the run record.
+- 2026-10-26 RTX 4090 vs A100 for RL (rl.yaml, estimates from the WO-02 4090 SFT probe): 4090 ~57 h / ~$50 per seed and does not fit 3 x 32 GPU envs + update in 24 GB; A100 ~23-25 h / ~$41-45 per seed. A100 kept; the probe measures.
+- 2026-10-26 Open for the owner: every estimate is ~2x ADR-0002's "> 12 h on an A100" reopen condition (H100 PCIe breaks even at >= 1.61x A100 speed, unmeasured).

@@ -47,6 +47,27 @@
 #   run: 300 x 299 s + 0.24 h = 25.1 h x $1.79 = ~$45 per seed (~$135 for 3 seeds)
 # The upstream-sized batch (64 prompts, recompute on) is 384 + 324 + 811 s = 25 min/step, ~127 h,
 # ~$227 per seed -- over the whole ~$200 project budget -- hence rollout_batch 16 here.
+#
+# RTX 4090 ($0.89/h) vs A100-80GB ($1.79/h, the rl tier in docs/ENVIRONMENT.md). Derived from the
+# one measurement we have (WO-02 4090 probe: 1.55-1.58 s per SFT step, batch 8, grad checkpointing,
+# bf16); everything else is an ESTIMATE that the WO-04 probe replaces:
+#   one SFT sample = one RL decision (same 256 patches + proprio + prompt + 48 action tokens)
+#   FLOPs: forward ~2 x 7.5e9 x ~340 tokens = ~5.1 TFLOP; LoRA backward ~1 forward (activation
+#     grads only, base frozen); grad checkpointing +1 forward -> SFT sample ~15.3 TFLOP
+#   4090 achieved: 8 x 15.3 / 1.565 s = ~78 TFLOP/s (~47% of 165 dense bf16)
+#     -> update with grad ckpt 5.1 decisions/s (measured-derived); rollout 78 / 5.1 = 15
+#        decisions/s = ~122 env actions/s
+#     -> step 24,000 / 122 + 2,432 / 5.1 = 197 + 477 s = 11.2 min; 300 steps + evals = ~57 h
+#        x $0.89 = ~$50 per seed. VRAM: 14 weights + 1.5 LoRA/Adam + 2.5 context + ~6 for
+#        3 x 32 GPU envs = ~24 GB before any activation: does NOT fit the preset on 24 GB
+#        (would need fewer envs per task -> more env batches -> slower still).
+#   A100 at the same ~47% MFU (147 of 312 TFLOP/s): update without ckpt (2 forwards) 14.4
+#     decisions/s (this file assumes 12), rollout 29 decisions/s = ~230 actions/s (assumes 250)
+#     -> 104 + 169 s = 4.6 min/step; 300 steps + evals = ~23 h x $1.79 = ~$41 per seed.
+#   => A100 stays: same $ within the error of these estimates (~$41-45 vs ~$50), less than half the
+#      wall-clock, and the only one of the two with VRAM headroom. H100 PCIe ($2.89/h) breaks even
+#      at >= 1.61x A100 speed (unmeasured).
+#   ADR-0002 reopens the recipe if a run is > 12 h on an A100; every estimate here is ~2x that.
 preset: rl
 device: cuda
 seed: 0
