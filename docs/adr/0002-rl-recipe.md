@@ -71,5 +71,32 @@ Owner decisions (2026-10-27), now in `configs/rl.yaml`:
   proposal, to be confirmed with the owner when it triggers.)
 - **GPU:** A100-80GB.
 
-A confirming A100 probe with these settings runs before any seed; its numbers are appended
-below. The seeds wait for the owner's PR #11 review.
+A confirming A100 probe with these settings runs before any seed; its numbers are below. The
+seeds wait for the owner's PR #11 review.
+
+### Confirming probe (2026-10-27, A100-SXM4-80GB, pod gzxhwhjhdtc1kc, US-KS-2, ~$1.5)
+
+Settings above with K = 8 × 16 prompts, seed 0, 3 GRPO steps (`wo04/seed0/gzxhwhjhdtc1kc/` on
+the Hub). The host is cgroup v1 (256 visible cores, 27.2-CPU quota); the job ran with 28 threads
+(the script's cap now reads the v1 quota too).
+
+| | value |
+|---|---|
+| SFT baseline, 64 greedy eps/task, horizon 120 (PickPlace / Push / Stack) | 0.125 / 0.141 / 0.016 (trained-task mean 0.133) |
+| groups dropped | **72%** (was 93%) |
+| s/step median (max) | 736.8 (757.4): rollout 44.5 s per 32-env batch × 12 (refill cap), update 202.7 s (incl. recompute) |
+| first-minibatch \|log ratio\| max / mean | 0.1318 / 0.00012 (mean was 0.01325 without recompute) |
+| VRAM | torch peak 39.3 GB allocated; device 46.8 of 85.1 GB |
+| projected 150-step run | 31.0 h = $55.57 per seed; kill-switch stop at step 38 = 8.0 h = $14.23 |
+
+Reading: temperature 1.0 lifted the surviving groups from 7% to 28%, so the update now gets real
+signal (update time 45.6 → 202.7 s is that signal, not overhead), but every step still hit the
+refill cap. Recompute cut the mean sampler/update disagreement ~100×; the max (0.13) is a few
+tokens (bf16 batch-shape numerics), bounded by the 0.2/0.28 clip.
+
+**K = 16 rule fired (72% > 60%)**, applied in `configs/rl.yaml`: `samples_per_prompt: 16`,
+`rollout_batch: 8` (128 trajectories per update, as before; 2 groups per 32-env batch). Cost
+model updated to the measured rollout rate (86 env actions/s) and the refill cap (3.0 episodes per
+trained one): worst case 13.1 min/step, 150 steps = 33.0 h = **$59 per seed** (`--estimate`);
+if 50–60% of K=16 groups survive, ~10–11.5 min/step = ~$46–52. The seed-0 pod's own probe (job
+stage `probe`, before its approval gate) measures the K=16 drop rate before any spend beyond ~$1.5.

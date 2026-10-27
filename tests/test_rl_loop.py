@@ -401,7 +401,9 @@ def test_flat_run_kill_switch_stops_the_run(tmp_path: Path) -> None:
 
 def test_config_validation() -> None:
     rl = GRPOConfig.from_config(load_config("rl"))  # the WO-04 preset must parse
-    assert (rl.samples_per_prompt, rl.clip_low, rl.clip_high) == (8, 0.2, 0.28)
+    assert (rl.clip_low, rl.clip_high) == (0.2, 0.28)
+    # owner's K=16 rule fired (confirming probe: 72% of K=8 groups dropped); 128 trajectories
+    assert (rl.samples_per_prompt, rl.rollout_batch, rl.rollout_envs) == (16, 8, 32)
     # owner amendment after the WO-04 probes (2026-10-27, ADR-0002)
     assert (rl.temperature, rl.recompute_old_log_probs, rl.steps) == (1.0, True, 150)
     assert (rl.train_tasks, rl.max_episode_steps) == (("PickPlace", "Push"), 120)
@@ -434,16 +436,17 @@ def _load_script() -> Any:
 
 def test_cost_estimate_matches_rl_yaml_arithmetic() -> None:
     est = _load_script().estimate_cost(load_config("rl"))
-    # configs/rl.yaml (A100 throughput measured 2026-10-27; amended preset): 16 x 8 = 128 trained,
-    # x 1.25 = 160 episodes x 120 (RL horizon) = 19,200 actions / 110 = 174.5 s; 128 x 15 = 1,920
-    # decisions / 10.3 = 186.4 s update + / 31 = 61.9 s old-log-prob recompute; 8 evals = 6 x 32
-    # + 2 x 64 (step 0 and the kill-switch step 38) = 320 episodes/task x 3 tasks x 120 / 110
-    assert est["actions_per_step"] == 19_200
+    # configs/rl.yaml (A100 throughput measured 2026-10-27; amended preset): 8 x 16 = 128 trained,
+    # x 3.0 (refill cap) = 384 episodes x 120 (RL horizon) = 46,080 actions / 86 = 535.8 s;
+    # 128 x 15 = 1,920 decisions / 10.3 = 186.4 s update + / 31 = 61.9 s old-log-prob recompute;
+    # 8 evals = 6 x 32 + 2 x 64 (step 0 and the kill-switch step 38) = 320 episodes/task x 3 tasks
+    # x 120 / 86
+    assert est["actions_per_step"] == 46_080
     assert est["decisions_trained_per_step"] == 1_920
     assert est["recompute_s_per_step"] == pytest.approx(1920 / 31)
     assert est["evals"] == 8 and est["eval_episodes_per_task"] == 320
     assert est["hours"] == pytest.approx(
-        (150 * (19_200 / 110 + 1920 / 10.3 + 1920 / 31) + 320 * 3 * 120 / 110) / 3600
+        (150 * (46_080 / 86 + 1920 / 10.3 + 1920 / 31) + 320 * 3 * 120 / 86) / 3600
     )
     assert est["dollars"] == pytest.approx(est["hours"] * 1.79)
 

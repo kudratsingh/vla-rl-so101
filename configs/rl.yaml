@@ -82,10 +82,11 @@ policy:
 
 rl:                         # GRPO, ADR-0002; every key is documented in src/rl/trainer.py
   algorithm: grpo
-  samples_per_prompt: 8     # K. Owner rule (ADR-0002 amendment): if a probe still drops > 60% of
-                            # groups, raise this to 16 before changing anything else
-  rollout_envs: 32          # parallel envs per env batch (4 groups); one env instance per task
-  rollout_batch: 16         # prompts (groups) per update -> 128 trajectories (upstream: 64)
+  samples_per_prompt: 16    # K. Owner rule (ADR-0002 amendment 1): the confirming probe (pod
+                            # gzxhwhjhdtc1kc) still dropped 72% of K=8 groups (> 60%) -> 16
+  rollout_envs: 32          # parallel envs per env batch (2 groups at K=16); one env per task
+  rollout_batch: 8          # prompts (groups) per update -> 128 trajectories, as at K=8 x 16
+                            # (agent proposal, owner to confirm in PR #11; upstream: 64 x 8)
   max_rollout_rounds: 3     # dynamic-sampling refill cap, in multiples of one full round
   steps: 150                # owner amendment (ADR-0002): was 300
   lr: 5e-5                  # LoRA (owner, WO-04; was 1e-5)
@@ -130,9 +131,10 @@ cost:
   setup_hours: 0.5          # image pull, apt, uv sync, 15 GB checkpoint download (as sft.yaml)
   estimated_hours: null     # agent fills before every run (from --estimate, then the probe)
   throughput:               # A100-80GB, MEASURED 2026-10-27 on pod u87r9sjnwig58d (WO-02 attempt 4)
-    rollout_actions_per_s: 110     # sweep: 1200 episodes (~150 steps each, 50 GPU envs, 224 px) in
-                                   # 1815 s incl. 8 model loads -> 98-122 env actions/s (was est. 250)
+    rollout_actions_per_s: 86      # RL rollout (sampling, 32 GPU envs, 224 px): 44.5 s per 32 x 120
+                                   # batch (pod gzxhwhjhdtc1kc); 55.9 s per 32 x 150 (5rdd45j801bk5b)
     forward_decisions_per_s: 31    # no-grad forward ~1/3 of an update (est.; recompute is off)
     update_decisions_per_s: 10.3   # SFT probe 0.774 s per 8-decision step, LoRA, no grad-ckpt (was est. 12)
     mean_episode_frac: 1.0         # mean episode length / max_episode_steps (base succeeds ~13%)
-    rollout_overhead: 1.25         # episodes generated per trained one (dynamic-sampling refill)
+    rollout_overhead: 3.0          # episodes generated per trained one: the refill cap
+                                   # (max_rollout_rounds) bound every K=8 probe step -> worst case
