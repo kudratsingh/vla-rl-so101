@@ -17,11 +17,17 @@
 # self-delete timer at the cap; size the cap from the probe's projection (+ ~1 h).
 set -uo pipefail
 source /root/runpod.env
-# Containers see every host core (128 on some A100 hosts) but get a cgroup CPU quota (~14);
-# size torch/OpenMP thread pools to the quota or CPU-side work (IK, data loading) crawls.
-if [ -z "${OMP_NUM_THREADS:-}" ] && read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null && [ "$q" != max ]; then
-  export OMP_NUM_THREADS=$(( (q + p - 1) / p )) MKL_NUM_THREADS=$(( (q + p - 1) / p ))
+# Containers see every host core (128-256 on some A100 hosts) but get a cgroup CPU quota
+# (~14-27); size torch/OpenMP thread pools to the quota or CPU-side work (IK, data loading)
+# crawls. cgroup v2 exposes cpu.max ("max" = none); v1 hosts (pod gzxhwhjhdtc1kc) cfs_quota_us.
+if [ -z "${OMP_NUM_THREADS:-}" ]; then
+  read -r q p 2>/dev/null < /sys/fs/cgroup/cpu.max \
+    || { q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null); }
+  if [ -n "${q:-}" ] && [ "$q" != max ] && [ "$q" -gt 0 ] 2>/dev/null; then
+    export OMP_NUM_THREADS=$(( (q + p - 1) / p )) MKL_NUM_THREADS=$(( (q + p - 1) / p ))
+  fi
 fi
+echo "[job] OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset} (nproc $(nproc))"
 export RUNPOD_POD_ID
 export PATH="$HOME/.local/bin:$PATH"
 HF_TOKEN="$(cat /root/.hf_token)"
