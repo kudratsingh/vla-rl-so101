@@ -9,7 +9,8 @@
 #     nohup bash scripts/pod/wo04_job.sh > /workspace/job.log 2>&1 &
 # SFT_ADAPTER: the WO-02-selected checkpoint (its selected_checkpoint.txt), as a Hub path
 #   user/repo/path/in/repo[@rev] or a local dir (src/policy/openvla_oft.py resolve_adapter).
-# Optional: HUB_REPO (results repo), RL_CFG (configs/rl.yaml), PROBE_STEPS (3), APPROVAL_WAIT_S
+# Optional: AUTO_MAX_DROP + AUTO_MAX_USD (owner-pre-approved automatic gate, see stage
+#   await-approval), HUB_REPO (results repo), RL_CFG (configs/rl.yaml), PROBE_STEPS (3), APPROVAL_WAIT_S
 #   (1800), UPLOAD_EVERY_S (7200), EVAL_SFT=1 (also run the full protocol on the SFT adapter here,
 #   for an SFT row on the same GPU sim; needed if the WO-02 full eval ran on the CPU sim).
 # Needs /root/runpod.env (RUNPOD_POD_ID, pod-scoped RUNPOD_API_KEY, SPEND_CAP_SECONDS; written by
@@ -164,6 +165,28 @@ grep "\[wo03_rl\] PROBE" /workspace/job.log | tail -6
 echo "[job] pod up $(( ($(date +%s) - $(cat /root/pod_start_epoch)) / 60 )) min so far (setup + checks + probe); soft deadline in $(( $(left) / 3600 )) h"
 # The agent posts the PROBE lines; on the owner's explicit go it creates /workspace/APPROVED over
 # SSH. No approval within APPROVAL_WAIT_S -> exit (upload + self-delete).
+# Owner pre-approval (2026-10-27, WO-04 seeds): pass the gate automatically when the probe drops
+# <= AUTO_MAX_DROP of groups AND projects <= AUTO_MAX_USD for the full run; otherwise stop here
+# (upload + self-delete) and the agent reports. Unset -> the manual gate below.
+if [ -n "${AUTO_MAX_DROP:-}" ] && [ -n "${AUTO_MAX_USD:-}" ]; then
+  PROBE_RUN=$(ls -d runs/*-wo04probe-rl-s"$SEED"-* 2>/dev/null | sort | tail -1)
+  if [ -n "$PROBE_RUN" ] && uv run python - "$PROBE_RUN/record.json" "$AUTO_MAX_DROP" "$AUTO_MAX_USD" <<'EOF'; then
+import json, sys
+r = json.load(open(sys.argv[1]))
+drop, usd = float(r["probe"]["frac_groups_dropped"]), float(r["projection"]["run_usd"])
+max_drop, max_usd = float(sys.argv[2]), float(sys.argv[3])
+ok = drop <= max_drop and usd <= max_usd
+print(f"[job] auto-gate: groups dropped {drop:.1%} (max {max_drop:.0%}), projected full run "
+      f"${usd:.2f} per seed (max ${max_usd:.2f}) -> {'PASS' if ok else 'STOP'}")
+raise SystemExit(0 if ok else 3)
+EOF
+    echo "owner pre-approved 2026-10-27: auto-gate passed (drop <= $AUTO_MAX_DROP, projected <= \$$AUTO_MAX_USD)" \
+      > /workspace/APPROVED
+  else
+    echo "[job] auto-gate: conditions not met (or no probe record); stopping for the owner"
+    exit 22
+  fi
+fi
 APPROVAL_WAIT_S="${APPROVAL_WAIT_S:-1800}"
 t0=$(date +%s)
 until [ -f /workspace/APPROVED ]; do
