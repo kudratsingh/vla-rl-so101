@@ -1,0 +1,7 @@
+# WO-02 SFT attempt 2 (owner, 2026-10-26): attempt 1 (lr 5e-5) was underfit -- ~60% action-token
+# accuracy on its own training frames, final train L1 0.016, seen success <= 8% on every checkpoint.
+# Only the learning rate changes, to OpenVLA-OFT's LoRA rate; the 2000-step budget stays.
+inherit: configs/sft.yaml
+
+sft:
+  lr: 5.0e-4

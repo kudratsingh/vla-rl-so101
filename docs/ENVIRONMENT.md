@@ -14,11 +14,11 @@ All versions below are pinned. Changing any of them is a work order of its own.
 | LeRobot | 0.4.4, `8fff0fde7c79f23a93d845d1a50e985de01f8b8a` (tag v0.4.4, 2026-02-27) | APIs move between releases; dataset format v3.0 (its CODEBASE_VERSION) |
 | SO-101 robot model | TheRobotStudio/SO-ARM100 (Apache-2.0), `Simulation/SO101/so101_new_calib.urdf` @ `a758567c3978dfeefe282ede0500085a48fe8f78` (edits listed in `src/env/assets/so101/README.md`) | Vendored into `src/env/assets/so101/` |
 | lerobot-sim2real / squint | not vendored | lerobot-sim2real has NO license on GitHub; "squint" could not be located on GitHub |
-| OpenVLA-OFT | `e4287e94541f459edc4feabc4e181f537cd569a8` (moojink/openvla-oft, MIT, 2025-09-09) + HF checkpoint id; recorded in WO-01, installed in WO-02/03 | Base model. Pins torch==2.2.0 and a transformers fork (moojink/transformers-openvla-oft, 4.40.x) that conflicts with SmolVLA's transformers; resolved in WO-02 as a separate uv extra |
+| OpenVLA-OFT | `e4287e94541f459edc4feabc4e181f537cd569a8` (moojink/openvla-oft, MIT, 2025-09-09); model code vendored from SimpleVLA-RL `7c51662` into `src/policy/oft/vendor/`; checkpoint `openvla/openvla-7b` @ `47a0ec7fc4ec123775a391911046cf33cf9ed83f` | Base model (ADR-0001). Runs on stock transformers 4.57.6 + a bidirectional-mask hook (bit-identical to the moojink transformers fork, which is NOT used); no flash-attn, bitsandbytes or TensorFlow |
 | openpi (fallback) | `215abfb217dbac7d5f1273282331b9b1866c0479` (Physical-Intelligence/openpi, 2026-08-24); recorded in WO-01, installed in WO-02/03 | π0.5 LoRA path |
 | SimpleVLA-RL / verl | `7c51662df27b586f9e8a1ab35fcf849f2b8852f9` (PRIME-RL/SimpleVLA-RL, MIT, 2026-01-06); recorded in WO-01, installed in WO-02/03 | GRPO recipe; vendored into `src/rl/` |
 | RLinf (optional) | `fab7f407fbc611085eb163962e3c89c0ab424c1a` (RLinf/RLinf, 2026-10-26); recorded in WO-01, installed in WO-02/03 | Only if π0.5 path is chosen |
-| transformers / peft | transformers 4.57.6 / peft 0.21.2 (SmolVLA side) | LoRA |
+| transformers / peft / timm | transformers 4.57.6 / peft 0.21.2 / timm 0.9.16 (`gpu` extra; transformers shared with `smolvla`) | LoRA; timm 0.9.x is required by the Prismatic vision code |
 | huggingface-hub / datasets | 0.35.3 / 4.8.5 | From `uv.lock` |
 | torchcodec | 0.2.1 | Video decode (never PyAV). Needs FFmpeg 4-7 shared libs. No CUDA torchcodec wheel exists for 0.2.x on the cu124 index; CPU decode is used |
 | feetech-servo-sdk (via LeRobot) | from LeRobot pin | SO-101 bus |
@@ -31,7 +31,7 @@ Record resolved pins in `uv.lock` and in this table.
 
 | Tier | Card | $/h | Used for |
 |---|---|---|---|
-| dev | RTX 4090 24 GB | 0.89 | WO-01 sim/oracle/demos, SmolVLA smoke, OpenVLA-OFT LoRA SFT (fits with 8-bit base + LoRA; verify), eval |
+| dev | RTX 4090 24 GB | 0.89 | WO-01 sim/oracle/demos, SmolVLA smoke, OpenVLA-OFT LoRA SFT in bf16 with gradient checkpointing (~19–21 GB est.; no 8-bit base), eval |
 | rl | A100 80 GB | 1.79 | WO-04/05 GRPO (VLA + sim + rollouts on one card) |
 | fast | H100 PCIe 80 GB | 2.89 | Only if A100 throughput makes a run >12 h |
 
@@ -48,8 +48,12 @@ uv run python -c "import mani_skill, torch; print(torch.cuda.is_available())"
 uv run scripts/wo01_build_env.py --preset tiny   # CPU smoke must pass before any GPU work
 ```
 
-Vulkan is required by SAPIEN for rendering; RunPod's CUDA images ship it. If `vulkaninfo` fails,
-install `libvulkan1 mesa-vulkan-drivers` and set `VK_ICD_FILENAMES` to the NVIDIA ICD.
+Vulkan is required by SAPIEN for rendering. On RunPod (driver 595.91.07, `nvidia/cuda:12.4.1` image,
+pod env `NVIDIA_DRIVER_CAPABILITIES=all`) the runtime mounts `/etc/vulkan/icd.d/nvidia_icd.json`
+pointing at `libGLX_nvidia.so.0`, which cannot create an instance headless
+(`ERROR_INCOMPATIBLE_DRIVER`). Point the ICD at NVIDIA's EGL library instead, at the path SAPIEN
+checks: `/usr/share/vulkan/icd.d/nvidia_icd.json` with `"library_path": "libEGL_nvidia.so.0"`
+(`scripts/pod/wo02_job.sh` does this). Verified: GPU sim (`physx_cuda`) and CPU sim both render.
 
 ## Install — Mac (control, calibration, deploy)
 

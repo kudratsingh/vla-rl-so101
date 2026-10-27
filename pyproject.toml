@@ -27,7 +27,11 @@ gpu = [
   "grpcio",
   "grpcio-tools",
   "wandb",
-  # OpenVLA-OFT / SimpleVLA-RL deps land in WO-02/03 (transformers fork conflicts with smolvla)
+  # OpenVLA-OFT runs vendored (src/policy/oft/vendor) on STOCK transformers + a bidirectional-mask
+  # hook, bit-identical to the moojink/transformers-openvla-oft fork; no fork, no uv conflicts
+  # with smolvla, no flash-attn / bitsandbytes / tensorflow (docs/adr/0001-base-model.md).
+  "transformers==4.57.6",
+  "timm==0.9.16",            # Prismatic code accepts only timm 0.9.10/11/12/16
 ]
 robot = [
   "lerobot[feetech]==0.4.4",
@@ -62,14 +66,20 @@ environments = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["src/policy/oft/vendor"]   # upstream code, kept verbatim (see its headers)
 
 [tool.black]
 line-length = 100
+extend-exclude = "src/policy/oft/vendor/"
 
 [tool.mypy]
 strict = true
 files = ["src"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "src.policy.oft.vendor.*"
+ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
