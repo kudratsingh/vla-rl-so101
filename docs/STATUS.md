@@ -10,10 +10,10 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | WO | State | Branch / PR | Notes |
 |---|---|---|---|
 | 01 | done (benchmark met), PR open | `wo-01-sim-env` | See benchmarks. Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). |
-| 02 | in progress, **out of order** (started before WO-01 merged) | `wo-02-sft` | Uses WO-01's code (merged into its branch) and the Hub demos above. LoRA SFT (sim.yaml budget: 2000 steps) running on RunPod pod `iqrmjox6ws0e66` since 2026-10-26 20:18 UTC; owner-approved, WO-02 spend cap $15. If WO-01 review changes env/oracle/camera, the demos and this SFT are redone. |
+| 02 | in progress, **out of order** (started before WO-01 merged) | `wo-02-sft` | SFT attempts 1 (lr 5e-5) and 2 (lr 5e-4), 2000 steps each: every checkpoint below the 20-60% band (best: attempt 2 step 2000, seen PickPlace 20% / Push 6% / Stack 4%). Attempt 3 (lr 5e-4, 8000 steps, owner-approved) running on pod `l3485bxmdj0fce` since 2026-10-27 00:57 UTC. Last attempt before the pi0.5 switch. WO-02 spend cap $15. |
 | 03 | done, merged after owner review | #4 (merged) | **Out of order** (started before WO-01/02). CPU only, toy env. |
 | 06 | part 1 merged, part 2 waits for the arm | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. |
-| 04 | not started; blocked on WO-02's SFT checkpoint | | Owner settings recorded below; applied as WO-04's first commit. Noted here before it starts. |
+| 04 | prep in progress, **out of order** (started 2026-10-27 before WO-02 merged) | `wo-04-rl-sim` (stacked on `wo-02-sft`) | CPU only: owner's WO-04 settings, `--preset rl` integration smoke (tiny OFT + real env), pod job with probe gate. No paid RL run until WO-02 has an in-band checkpoint and the owner gives a go on the probe numbers. |
 | 05, 07, 08, 09 | not started | | |
 
 ## Benchmarks met
@@ -34,9 +34,11 @@ started before its predecessors merge is listed here, marked **out of order**, b
 
 | Run id | WO | GPU | Hours | $ | Approved by owner |
 |---|---|---|---|---|---|
-| pod `iqrmjox6ws0e66` (WO-02 probe + SFT + eval) | 02 | RTX 4090, $0.89/h | running | — | yes, 2026-10-26 (WO-02 cap $15) |
+| pod `iqrmjox6ws0e66` (WO-02 SFT attempt 1: probe + 2000 steps + seen sweep) | 02 | RTX 4090, $0.89/h | 1.05 | 0.94 | yes, 2026-10-26 |
+| pod `efe7plxr06gaqc` (WO-02 SFT attempt 2: probe + 2000 steps + seen sweep) | 02 | RTX 4090, $0.89/h | 1.30 | 1.17 | yes, 2026-10-27 (go on probe 1.547 s/step) |
+| pod `l3485bxmdj0fce` (WO-02 SFT attempt 3: probe + 8000 steps + sweep + eval) | 02 | RTX 4090, $0.89/h | running | — | yes, 2026-10-27 (go on probe 1.575 s/step; 7 h cap, $6.23 max) |
 
-Running total: $0 settled; WO-02 pod running (max $5.34 by its 6 h self-delete cap).
+Running total: $2.11 settled (RunPod billing); WO-02 cap $15.
 
 ## Blockers and decisions pending the owner
 
