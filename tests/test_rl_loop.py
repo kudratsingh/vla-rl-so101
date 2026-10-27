@@ -15,10 +15,10 @@ import torch
 from src.config import Config, load_config
 from src.rl.grpo import group_advantages
 from src.rl.policy_api import PolicyObs, RLPolicy, RolloutStep, TokenLogProbs, build_policy
-from src.rl.rollout import collect_rollouts
+from src.rl.rollout import check_group_reset, collect_rollouts
 from src.rl.toy_env import ToyGridEnv, make_toy_env_factory, optimal_chunk, policy_obs
 from src.rl.toy_policy import ToyPolicy
-from src.rl.trainer import GRPOConfig, GRPOTrainer
+from src.rl.trainer import EVAL_SEED_BASE, GRPOConfig, GRPOTrainer, eval_schedule, is_flat_run
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -130,6 +130,30 @@ def test_rollout_groups_share_prompt_and_mask_unexecuted_actions() -> None:
     assert batch.action_mask[odd, last].tolist() == [True, False]
 
 
+def test_group_reset_check_tolerances() -> None:
+    """Joint state must match exactly; images may differ in <= 0.1% of values (GPU-sim pose
+    rounding at silhouettes) but not by an object-sized patch."""
+    g = torch.Generator().manual_seed(0)
+    image = torch.randint(0, 256, (1, 64, 64, 3), dtype=torch.uint8, generator=g).repeat(4, 1, 1, 1)
+    state = torch.rand(1, 6, generator=g).repeat(4, 1)
+    assert check_group_reset({"image": image, "state": state}, 2, "error") == 0.0
+    noisy = image.clone()
+    noisy[1, 10, 10] ^= 1  # one pixel off by one level: 3 of 12288 values (0.024%)
+    frac = check_group_reset({"image": noisy, "state": state}, 2, "error")
+    assert frac == pytest.approx(3 / (64 * 64 * 3))
+    moved = image.clone()
+    moved[3, 20:28, 20:28] = 0  # an 8x8 px patch (a cube at 64 px): 1.6% of values
+    with pytest.raises(RuntimeError, match="same seed differ"):
+        check_group_reset({"image": moved, "state": state}, 2, "error")
+    assert check_group_reset({"image": moved, "state": state}, 2, "warn") > 0.01
+    shifted = state.clone()
+    shifted[1, 0] += 1e-3  # 0.001 rad: the env's init-qpos noise is ~0.02 rad
+    with pytest.raises(RuntimeError, match="state"):
+        check_group_reset({"image": image, "state": shifted}, 2, "error")
+    shifted[1, 0] = state[1, 0] + 5e-5  # float rounding passes
+    assert check_group_reset({"image": image, "state": shifted}, 2, "error") == 0.0
+
+
 def test_group_reset_check_catches_envs_that_ignore_seeds() -> None:
     class SeedIgnoringEnv(ToyGridEnv):
         def reset(self, *, seed: Any = None, options: Any = None) -> Any:
@@ -204,6 +228,103 @@ def test_tiny_loop_improves_success_deterministically(tmp_path: Path) -> None:
     assert max(r["train/first_minibatch_max_abs_log_ratio"] for r in train) < 1e-5
 
 
+class _RecordingEnv:
+    """Pass-through env that logs every reset's seed list."""
+
+    def __init__(self, env: Any, resets: list[list[int]]) -> None:
+        self.env, self.resets = env, resets
+
+    def reset(self, *, seed: Any = None, options: Any = None) -> Any:
+        self.resets.append([int(s) for s in seed])
+        return self.env.reset(seed=seed, options=options)
+
+    def step(self, action: torch.Tensor) -> Any:
+        return self.env.step(action)
+
+    @property
+    def unwrapped(self) -> Any:
+        return self.env.unwrapped
+
+
+def test_kill_switch_evals_64_episodes_on_identical_seeds_periodic_32(tmp_path: Path) -> None:
+    """Owner, WO-04: step 0 and the 25% check evaluate early_stop_eval_episodes (64) per task on
+    the same seeds; the periodic evals keep eval_episodes (32)."""
+    cfg = _cfg(
+        steps=8,
+        eval_every=4,
+        rollout_envs=32,
+        rollout_batch=8,
+        eval_episodes=32,
+        early_stop_eval_episodes=64,
+        early_stop_on_flat=False,  # keep evaluating after the check step
+    )
+    rl = GRPOConfig.from_config(cfg)
+    assert eval_schedule(rl) == {0: 64, 2: 64, 4: 32, 8: 32}  # check step = ceil(0.25 * 8) = 2
+    tr = _trainer(cfg, tmp_path)
+    resets: list[list[int]] = []
+    factory = tr.env_factory
+    tr.env_factory = lambda task, n: _RecordingEnv(factory(task, n), resets)
+    seeds_by_eval: list[list[int]] = []
+    evaluate = tr.evaluate
+
+    def spy(episodes: int | None = None) -> dict[str, float]:
+        start = len(resets)
+        out = evaluate(episodes)
+        seeds_by_eval.append(sorted(s for r in resets[start:] for s in r))
+        return out
+
+    tr.evaluate = spy  # type: ignore[method-assign]
+    tr.run()
+    rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    per_task = {r["step"]: r["eval/episodes_per_task"] for r in rows if "eval/success" in r}
+    assert per_task == {0: 64.0, 2: 64.0, 4: 32.0, 8: 32.0}
+    seeds64 = [EVAL_SEED_BASE + i for i in range(64)]
+    assert seeds_by_eval[0] == seeds_by_eval[1] == seeds64  # baseline == check-step seeds
+    assert seeds_by_eval[2] == seeds_by_eval[3] == seeds64[:32]
+    train_seeds = [s for r in resets for s in r if s < EVAL_SEED_BASE]
+    assert train_seeds and max(train_seeds) < EVAL_SEED_BASE  # disjoint from the eval seeds
+
+
+def test_kill_switch_threshold_is_three_points(tmp_path: Path) -> None:
+    """Improvement 0.029 over step 0 stops the run at the check step; 0.031 continues."""
+    assert is_flat_run(0.5, 0.529, 0.03) and not is_flat_run(0.5, 0.531, 0.03)
+    assert GRPOConfig().early_stop_min_improvement == 0.03
+    for check_value, stops in ((0.529, True), (0.531, False)):
+        tr = _trainer(_cfg(steps=8, eval_every=100), tmp_path / str(check_value))
+        values = iter([0.5, check_value])  # step-0 baseline, step-2 check; later evals: last step
+
+        def fake_eval(episodes: int | None = None, it: Any = values) -> dict[str, float]:
+            return {"eval/success": next(it, 0.9), "eval/success/PickPlace": 0.5}
+
+        tr.evaluate = fake_eval  # type: ignore[method-assign]
+        summary = tr.run()
+        assert summary["stopped_flat"] is stops
+        assert summary["steps_completed"] == (2 if stops else 8)
+
+
+def test_zero_success_baseline_aborts_before_training(tmp_path: Path) -> None:
+    """CLAUDE.md rule 3: RL never starts from a 0%-success base."""
+    tr = _trainer(_cfg(steps=4), tmp_path)
+    tr.evaluate = lambda episodes=None: {  # type: ignore[method-assign]
+        "eval/success": 0.0,
+        "eval/success/PickPlace": 0.0,
+        "eval/episodes": 64.0,
+    }
+    with pytest.raises(RuntimeError, match="rule 3"):
+        tr.run()
+    rows = (tmp_path / "metrics.jsonl").read_text().splitlines()
+    assert [json.loads(r)["kind"] for r in rows] == ["eval"]  # no training step ran
+
+
+def test_probe_measures_without_saving(tmp_path: Path) -> None:
+    probe = _trainer(_cfg(), tmp_path).probe(3)
+    assert probe["baseline"]["eval/episodes_per_task"] == 256.0
+    assert len(probe["rows"]) == 3 and probe["s_per_step_median"] > 0
+    assert probe["rollout_episodes_per_hour"] > 0 and probe["eval_s_per_env_batch"] > 0
+    assert probe["first_minibatch_max_abs_log_ratio"] < 1e-5
+    assert not (tmp_path / "checkpoints").exists()
+
+
 def test_flat_run_kill_switch_stops_the_run(tmp_path: Path) -> None:
     cfg = _cfg(steps=20, lr=0.0, eval_every=100)  # lr 0: policy cannot change -> flat
     summary = _trainer(cfg, tmp_path).run()
@@ -217,6 +338,11 @@ def test_flat_run_kill_switch_stops_the_run(tmp_path: Path) -> None:
 def test_config_validation() -> None:
     rl = GRPOConfig.from_config(load_config("rl"))  # the WO-04 preset must parse
     assert (rl.samples_per_prompt, rl.clip_low, rl.clip_high, rl.temperature) == (8, 0.2, 0.28, 1.6)
+    # owner's WO-04 settings (2026-10-26)
+    assert (rl.lr, rl.ppo_mini_batch) == (5e-5, 64)
+    assert (rl.eval_episodes, rl.early_stop_eval_episodes) == (32, 64)
+    assert (rl.early_stop_min_improvement, rl.early_stop_check_at_frac) == (0.03, 0.25)
+    assert rl.early_stop_on_flat and rl.require_nonzero_baseline
     with pytest.raises(ValueError, match="kl_coef"):
         GRPOConfig.from_config(_cfg(kl_coef=0.01))
     with pytest.raises(ValueError, match="multiple of K"):
@@ -239,11 +365,12 @@ def _load_script() -> Any:
 def test_cost_estimate_matches_rl_yaml_arithmetic() -> None:
     est = _load_script().estimate_cost(load_config("rl"))
     # configs/rl.yaml: 16 x 8 = 128 trained, x 1.25 = 160 episodes x 150 = 24,000 actions / 250
-    # = 96 s; 128 x 19 = 2,432 decisions / 12 = 202.7 s; 13 evals x 3 x 32 x 150 / 250 = 748.8 s
+    # = 96 s; 128 x 19 = 2,432 decisions / 12 = 202.7 s; 13 evals = 11 x 32 + 2 x 64 (step 0 and
+    # the kill-switch step 75) = 480 episodes/task x 3 x 150 / 250 = 864 s
     assert est["actions_per_step"] == 24_000
     assert est["decisions_trained_per_step"] == 2_432
-    assert est["evals"] == 13
-    assert est["hours"] == pytest.approx((300 * (96 + 2432 / 12) + 748.8) / 3600)
+    assert est["evals"] == 13 and est["eval_episodes_per_task"] == 480
+    assert est["hours"] == pytest.approx((300 * (96 + 2432 / 12) + 864) / 3600)
     assert est["dollars"] == pytest.approx(est["hours"] * 1.79)
 
 
@@ -261,7 +388,63 @@ def test_entry_script_tiny_writes_run_record(
     summary = script.main(["--preset", "tiny", "--config", str(cfg_path), "--seed", "1"])
     (run_dir,) = (tmp_path / "runs").iterdir()
     record = json.loads((run_dir / "record.json").read_text())
-    assert record["status"] == "finished" and record["dollars"] == 0.0
+    assert record["status"] == "finished" and record["dollars"] == 0.0 and record["end_utc"]
     assert record["wo"] == "WO-03" and record["config"]["seed"] == 1
     assert record["summary"]["steps_completed"] == summary["steps_completed"] == 3
     assert (run_dir / "metrics.jsonl").exists()
+
+
+def test_entry_script_probe_prints_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    script = _load_script()
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    out = script.main(["--preset", "tiny", "--probe-steps", "2"])
+    (run_dir,) = (tmp_path / "runs").iterdir()
+    assert "-wo03probe-tiny-" in run_dir.name
+    record = json.loads((run_dir / "record.json").read_text())
+    assert record["status"] == "probe" and not (run_dir / "checkpoints").exists()
+    proj = record["projection"]
+    # projection = configs' step count x measured median s/step + scheduled evals x s/eval batch
+    rl = GRPOConfig.from_config(load_config("tiny"))
+    eval_batches = sum(-(-ep // rl.rollout_envs) for ep in eval_schedule(rl).values())
+    want = rl.steps * out["s_per_step_median"] + eval_batches * out["eval_s_per_env_batch"]
+    assert proj["run_h"] == pytest.approx(want / 3600)
+    assert proj["kill_switch_stop_h"] < proj["run_h"] <= proj["worst_case_h"]
+    printed = [
+        ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[wo03_rl] PROBE")
+    ]
+    assert any("projected" in ln and "per seed" in ln for ln in printed)
+
+
+def test_sigterm_saves_interrupted_checkpoint_and_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pod job's soft deadline (`timeout` -> SIGTERM) must not lose the steps since the last
+    checkpoint, and the run record must still be finalised."""
+    import os
+    import signal
+
+    script = _load_script()
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+    train_step = GRPOTrainer._train_step
+    calls: list[int] = []
+
+    def train_step_then_sigterm(self: GRPOTrainer) -> dict[str, Any]:
+        row = train_step(self)
+        calls.append(1)
+        if len(calls) == 3:  # the deadline hits during step 3
+            os.kill(os.getpid(), signal.SIGTERM)
+        return row
+
+    monkeypatch.setattr(GRPOTrainer, "_train_step", train_step_then_sigterm)
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(SystemExit):
+            script.main(["--preset", "tiny"])
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    (run_dir,) = (tmp_path / "runs").iterdir()
+    record = json.loads((run_dir / "record.json").read_text())
+    assert record["status"] == "interrupted" and record["end_utc"] and record["dollars"] == 0.0
+    assert (run_dir / "checkpoints" / "step_000003_interrupted" / "adapter").is_dir()

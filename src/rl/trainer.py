@@ -5,6 +5,10 @@
         -> recompute old log-probs -> group advantage -> PPO epochs x mini-batches on LoRA params
         -> [eval] -> [FLAT-RUN kill switch] -> [checkpoint] -> metrics.jsonl row
 
+Kill switch (owner, WO-04): the step-0 baseline and the eval at `early_stop_check_at_frac` of the
+steps both use `early_stop_eval_episodes` per task on the same seeds; the run stops there if the
+mean success rose by less than `early_stop_min_improvement`. Periodic evals use `eval_episodes`.
+
 Loop order and update adapted from PRIME-RL/SimpleVLA-RL @ 7c51662df27b586f9e8a1ab35fcf849f2b8852f9
 (MIT; file headers Apache-2.0, Copyright 2024 Bytedance Ltd.): verl/trainer/ppo/ray_trainer.py
 `RayTrainer.fit` (generate until `train_batch_size` groups survive the accuracy filter, truncate
@@ -31,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import statistics
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, fields
@@ -67,7 +72,7 @@ class GRPOConfig:
     rollout_batch: int = 64  # prompts (groups) per update -> rollout_batch * K trajectories
     max_rollout_rounds: int = 3  # dynamic-sampling refill cap, in full rounds; ours
     steps: int = 300
-    lr: float = 1e-5  # upstream 5e-6 full fine-tune; LoRA value is ours
+    lr: float = 5e-5  # upstream 5e-6 full fine-tune; LoRA value: owner, WO-04
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     ppo_epochs: int = 1
@@ -80,11 +85,13 @@ class GRPOConfig:
     dynamic_sampling: bool = True
     recompute_old_log_probs: bool = True
     eval_every: int = 25
-    eval_episodes: int = 32  # per task, greedy, fixed seeds
+    eval_episodes: int = 32  # per task, greedy, fixed seeds: the periodic evals
     checkpoint_every: int = 50
     early_stop_check_at_frac: float = 0.25  # WO-04: flat by here -> stop and diagnose
     early_stop_on_flat: bool = True
-    early_stop_min_improvement: float = 0.0
+    early_stop_eval_episodes: int = 64  # per task, step-0 baseline + check-step eval (owner, WO-04)
+    early_stop_min_improvement: float = 0.03  # stop if check - baseline < this (owner, WO-04)
+    require_nonzero_baseline: bool = True  # CLAUDE.md rule 3: never train from a 0%-success base
     group_reset_check: Literal["error", "warn", "off"] = "error"
 
     @classmethod
@@ -121,7 +128,8 @@ class GRPOConfig:
         if self.rollout_envs % k:
             raise ValueError(f"rollout_envs={self.rollout_envs} must be a multiple of K={k}")
         counts = (self.rollout_batch, self.steps, self.ppo_epochs, self.micro_batch)
-        if min(*counts, self.eval_every, self.eval_episodes, self.checkpoint_every) < 1:
+        evals = (self.eval_every, self.eval_episodes, self.early_stop_eval_episodes)
+        if min(*counts, *evals, self.checkpoint_every) < 1:
             raise ValueError("batch/step/epoch/eval/checkpoint counts must be >= 1")
         if self.ppo_mini_batch < k or self.ppo_mini_batch % k:
             raise ValueError("ppo_mini_batch (trajectories) must be a positive multiple of K")
@@ -139,15 +147,39 @@ def kill_switch_step(rl: GRPOConfig) -> int:
     return max(1, math.ceil(rl.early_stop_check_at_frac * rl.steps))
 
 
+def eval_schedule(rl: GRPOConfig) -> dict[int, int]:
+    """{step: eval episodes per task}. Every `eval_every` steps and the last step evaluate
+    `eval_episodes`; step 0 (baseline) and the kill-switch step evaluate `early_stop_eval_episodes`
+    (owner, WO-04), on the same seeds since `evaluate` always uses seeds EVAL_SEED_BASE + [0, n)."""
+    plan = {s: rl.eval_episodes for s in range(rl.eval_every, rl.steps + 1, rl.eval_every)}
+    plan[rl.steps] = rl.eval_episodes
+    plan[0] = rl.early_stop_eval_episodes
+    plan[kill_switch_step(rl)] = rl.early_stop_eval_episodes
+    return dict(sorted(plan.items()))
+
+
 def eval_steps(rl: GRPOConfig) -> set[int]:
     """Steps after which the loop evaluates: 0, every `eval_every`, the kill-switch step, last."""
-    every = set(range(rl.eval_every, rl.steps + 1, rl.eval_every))
-    return {0, kill_switch_step(rl), rl.steps} | every
+    return set(eval_schedule(rl))
 
 
-def is_flat_run(baseline: float, current: float, min_improvement: float = 0.0) -> bool:
-    """WO-04 kill switch: flat unless eval success rose by more than `min_improvement`."""
-    return not current > baseline + min_improvement
+def is_flat_run(baseline: float, current: float, min_improvement: float) -> bool:
+    """WO-04 kill switch (owner): flat iff the success gain over step 0 is under `min_improvement`
+    (0.03: +0.029 stops the run, +0.031 continues)."""
+    return current - baseline < min_improvement
+
+
+def cuda_memory_gb() -> dict[str, float]:
+    """Peak torch-allocated memory and current device-wide use (incl. PhysX / Vulkan), GB."""
+    if not torch.cuda.is_available():
+        return {}
+    free, total = torch.cuda.mem_get_info()
+    return {
+        "mem/torch_peak_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+        "mem/torch_peak_reserved_gb": torch.cuda.max_memory_reserved() / 1e9,
+        "mem/device_used_gb": (total - free) / 1e9,
+        "mem/device_total_gb": total / 1e9,
+    }
 
 
 class GRPOTrainer:
@@ -203,36 +235,62 @@ class GRPOTrainer:
             f.write(json.dumps(row, sort_keys=True) + "\n")
 
     # ------------------------------------------------------------------ eval
-    def evaluate(self) -> dict[str, float]:
-        """Greedy (temperature 0) success on fixed seeds, `eval_episodes` (rounded up) per task."""
+    def evaluate(self, episodes: int | None = None) -> dict[str, float]:
+        """Greedy (temperature 0) success over `episodes` per task (default `eval_episodes`).
+
+        Seeds are EVAL_SEED_BASE + [0, episodes) for every task, every call and every run seed, so
+        two evals with the same count see the same scenes. Envs run in batches of `rollout_envs`;
+        surplus envs of the last batch are not counted.
+        """
+        episodes = self.rl.eval_episodes if episodes is None else int(episodes)
         t0 = time.perf_counter()
         n = self.rl.rollout_envs
-        batches = math.ceil(self.rl.eval_episodes / n)
+        seeds = [EVAL_SEED_BASE + i for i in range(math.ceil(episodes / n) * n)]
         out: dict[str, float] = {}
         rates = []
+        batch_s = []
         for task in self.tasks:
             successes = []
-            for b in range(batches):
-                seeds = [EVAL_SEED_BASE + b * n + i for i in range(n)]
+            for b in range(0, len(seeds), n):
+                tb = time.perf_counter()
                 batch, _ = collect_rollouts(
                     self.policy,
                     self._env(task),
                     self.obs_fn,
-                    prompt_seeds=seeds,
+                    prompt_seeds=seeds[b : b + n],
                     group_size=1,
                     temperature=0.0,
                     max_episode_steps=self.max_episode_steps,
                     task=task,
                     group_reset_check="off",
                 )
+                batch_s.append(time.perf_counter() - tb)
                 successes.append(batch.rewards)
-            rate = float(torch.cat(successes).mean())
+            rate = float(torch.cat(successes)[:episodes].mean())
             out[f"eval/success/{task}"] = rate
             rates.append(rate)
         out["eval/success"] = sum(rates) / len(rates)
-        out["eval/episodes"] = float(batches * n * len(self.tasks))
+        out["eval/episodes_per_task"] = float(episodes)
+        out["eval/episodes"] = float(episodes * len(self.tasks))
+        out["eval/batch_s_median"] = statistics.median(batch_s)
         out["eval/time_s"] = time.perf_counter() - t0
         return out
+
+    def _check_baseline(self, baseline: dict[str, float]) -> None:
+        """CLAUDE.md rule 3: RL cannot rescue a 0%-success base (every group is all-zero)."""
+        if self.rl.require_nonzero_baseline and baseline["eval/success"] <= 0.0:
+            raise RuntimeError(
+                f"step-0 eval success is 0 on every task ({int(baseline['eval/episodes'])} "
+                "greedy episodes): RL cannot start from a 0%-success base (CLAUDE.md rule 3). "
+                "Fix SFT; do not launch RL."
+            )
+        for task in self.tasks:
+            if baseline[f"eval/success/{task}"] <= 0.0:
+                log.warning(
+                    "step-0 eval success is 0 on %s: its groups will be all-zero and dropped "
+                    "(rollout time spent for no gradient)",
+                    task,
+                )
 
     # ------------------------------------------------------------------ rollout
     def collect(self) -> tuple[RolloutBatch | None, dict[str, float]]:
@@ -290,7 +348,7 @@ class GRPOTrainer:
             "rollout/episodes": float(episodes),
             "rollout/episodes_per_hour": episodes / elapsed * 3600.0,
             "rollout/mean_episode_len": float(torch.cat(gen_len).float().mean()),
-            "rollout/group_reset_max_diff": reset_diff,
+            "rollout/group_reset_diff_frac": reset_diff,
             "rollout/time_s": elapsed,
         }
         if not kept:
@@ -344,6 +402,7 @@ class GRPOTrainer:
             "grad_norm": 0.0,
         }
         first_dev = 0.0
+        first_dev_sum = first_dev_n = 0.0
         n_opt = 0
         for epoch in range(rl.ppo_epochs):
             for start in range(0, n_traj, rl.ppo_mini_batch):
@@ -371,6 +430,8 @@ class GRPOTrainer:
                     if epoch == 0 and start == 0:  # params == rollout params: ratio must be 1
                         dev_tok = (out.log_probs.detach() - old).abs()[w > 0]
                         first_dev = max(first_dev, float(dev_tok.max()))
+                        first_dev_sum += float(dev_tok.sum())
+                        first_dev_n += dev_tok.numel()
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.params, rl.grad_clip)
                 self.optimizer.step()
                 sums["grad_norm"] += float(grad_norm)
@@ -386,43 +447,110 @@ class GRPOTrainer:
                 "train/optimizer_steps": float(n_opt),
                 "train/logprob_mismatch": mismatch,
                 "train/first_minibatch_max_abs_log_ratio": first_dev,
+                "train/first_minibatch_mean_abs_log_ratio": first_dev_sum / max(first_dev_n, 1),
                 "train/update_time_s": time.perf_counter() - t0,
             }
         )
         return stats
 
     # ------------------------------------------------------------------ checkpoint / loop
-    def save_checkpoint(self, step: int, eval_history: list[tuple[int, float]]) -> Path:
-        path = self.run_dir / "checkpoints" / f"step_{step:06d}"
+    def save_checkpoint(
+        self, step: int, eval_history: list[tuple[int, float]], suffix: str = ""
+    ) -> Path:
+        path = self.run_dir / "checkpoints" / f"step_{step:06d}{suffix}"
         self.policy.save(path / "adapter")
         torch.save(self.optimizer.state_dict(), path / "optimizer.pt")
         state = {"step": step, "next_prompt_seed": self._next_prompt, "eval_history": eval_history}
         (path / "trainer_state.json").write_text(json.dumps(state, indent=2))
         return path
 
+    def _train_step(self) -> dict[str, Any]:
+        batch, row = self.collect()
+        if batch is None:
+            log.warning("every group was all-equal; update skipped")
+            row["train/update_skipped"] = 1.0
+        else:
+            row.update(self.update(batch))
+        row.update(cuda_memory_gb())
+        return row
+
+    def probe(self, steps: int) -> dict[str, Any]:
+        """Measure the real loop for the pod job's probe -> approval gate: build the envs, run the
+        step-0 baseline eval (`early_stop_eval_episodes`, as `run` does), then `steps` RL steps.
+        Saves nothing; the policy is discarded afterwards (the full run restarts from the SFT
+        adapter). Step 1 carries CUDA warm-up, so timings use steps 2.. when there are any."""
+        rl = self.rl
+        out: dict[str, Any] = {"steps": steps, "trainable_params": self.num_trainable}
+        rows: list[dict[str, Any]] = []
+        try:
+            t0 = time.perf_counter()
+            for task in self.tasks:
+                self._env(task)
+            out["env_setup_s"] = time.perf_counter() - t0
+            baseline = self.evaluate(rl.early_stop_eval_episodes)
+            self._log({"kind": "probe_eval", "step": 0, **baseline})
+            out["baseline"] = baseline
+            self._check_baseline(baseline)
+            for step in range(1, steps + 1):
+                t0 = time.perf_counter()
+                row = self._train_step()
+                row["time/step_s"] = time.perf_counter() - t0
+                self._log({"kind": "probe", "step": step, **row})
+                self._console(step, row)
+                rows.append(row)
+        finally:
+            self.close()
+        timed = rows[1:] or rows
+
+        def total(key: str) -> float:
+            return float(sum(r.get(key, 0.0) for r in timed))
+
+        out.update(
+            {
+                "s_per_step_median": statistics.median(r["time/step_s"] for r in timed),
+                "s_per_step_max": max(r["time/step_s"] for r in timed),
+                "rollout_s_per_env_batch": total("rollout/time_s") / total("rollout/env_batches"),
+                "update_s_median": statistics.median(
+                    r.get("train/update_time_s", 0.0) for r in timed
+                ),
+                "rollout_episodes_per_hour": total("rollout/episodes")
+                / total("rollout/time_s")
+                * 3600.0,
+                "eval_s_per_env_batch": baseline["eval/batch_s_median"],
+                "frac_groups_dropped": total("rollout/frac_groups_dropped") / len(timed),
+                "first_minibatch_max_abs_log_ratio": max(
+                    r.get("train/first_minibatch_max_abs_log_ratio", 0.0) for r in rows
+                ),
+                "first_minibatch_mean_abs_log_ratio": max(
+                    r.get("train/first_minibatch_mean_abs_log_ratio", 0.0) for r in rows
+                ),
+                "group_reset_diff_frac": max(r["rollout/group_reset_diff_frac"] for r in rows),
+                "rows": rows,
+            }
+        )
+        out.update(cuda_memory_gb())
+        return out
+
     def run(self) -> dict[str, Any]:
         rl = self.rl
         t_start = time.perf_counter()
         log.info("GRPO: %d trainable params, rl=%s", self.num_trainable, asdict(rl))
-        baseline = self.evaluate()
-        self._log({"kind": "eval", "step": 0, **baseline})
-        log.info("step 0 eval success %.3f", baseline["eval/success"])
-        history: list[tuple[int, float]] = [(0, baseline["eval/success"])]
+        schedule = eval_schedule(rl)
         check_step = kill_switch_step(rl)
-        evals = eval_steps(rl)
         stopped_flat = False
         step = 0
+        history: list[tuple[int, float]] = []
         try:
+            baseline = self.evaluate(schedule[0])
+            self._log({"kind": "eval", "step": 0, **baseline})
+            log.info("step 0 eval success %.3f", baseline["eval/success"])
+            self._check_baseline(baseline)
+            history.append((0, baseline["eval/success"]))
             for step in range(1, rl.steps + 1):
                 t0 = time.perf_counter()
-                batch, row = self.collect()
-                if batch is None:
-                    log.warning("step %d: every group was all-equal; update skipped", step)
-                    row["train/update_skipped"] = 1.0
-                else:
-                    row.update(self.update(batch))
-                if step in evals:
-                    row.update(self.evaluate())
+                row = self._train_step()
+                if step in schedule:
+                    row.update(self.evaluate(schedule[step]))
                     history.append((step, row["eval/success"]))
                 if step == check_step and is_flat_run(
                     baseline["eval/success"], row["eval/success"], rl.early_stop_min_improvement
@@ -438,6 +566,13 @@ class GRPOTrainer:
                 self._console(step, row)
                 if stopped_flat:
                     break
+        except (KeyboardInterrupt, SystemExit):
+            # SIGTERM from the pod job's soft deadline (scripts/wo03_rl.py maps it to SystemExit):
+            # keep the weights trained since the last checkpoint (possibly mid-step)
+            if step >= 1:
+                path = self.save_checkpoint(step, history, suffix="_interrupted")
+                log.warning("interrupted during step %d; saved %s", step, path)
+            raise
         finally:
             self.close()
         return {
@@ -459,16 +594,16 @@ class GRPOTrainer:
             else ("continuing because rl.early_stop_on_flat=false")
         )
         log.warning(
-            "\n%s\nFLAT-RUN: eval success %.3f at step %d (%.0f%% of %d steps) has not improved "
-            "over the step-0 eval %.3f (min improvement %.3f).\nCheck rollout/frac_groups_dropped "
+            "\n%s\nFLAT-RUN: eval success %.3f at step %d (%.0f%% of %d steps) is less than %.3f "
+            "above the step-0 eval %.3f.\nCheck rollout/frac_groups_dropped "
             "(all-0 / all-1 groups), temperature, LoRA lr. %s.\n%s",
             bar,
             current,
             step,
             100 * self.rl.early_stop_check_at_frac,
             self.rl.steps,
-            baseline,
             self.rl.early_stop_min_improvement,
+            baseline,
             action,
             bar,
         )

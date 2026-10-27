@@ -17,11 +17,12 @@ receiving (ignored) actions; and the loop stops as soon as every env is done.
 
 The env must reset deterministically per seed: identical seeds must give identical initial states,
 otherwise a "group" does not share a prompt and the group baseline is wrong. `check_group_reset`
-verifies this on every batch at no cost.
+verifies this on every batch at no cost (tolerances in its docstring).
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -32,8 +33,13 @@ from torch import Tensor
 
 from src.rl.policy_api import RLPolicy
 
+log = logging.getLogger(__name__)
+
 ObsFn = Callable[[Any], dict[str, Tensor]]
 STORAGE = torch.device("cpu")  # rollout buffers live on CPU; the policy moves inputs as needed
+# check_group_reset tolerances (see its docstring)
+RESET_FLOAT_ATOL = 1e-4  # joint positions, rad
+RESET_IMAGE_DIFF_FRAC = 1e-3  # of an image's uint8 values
 
 
 class VecEnv(Protocol):
@@ -121,24 +127,43 @@ def _flag(x: Any, n: int) -> Tensor:
 def check_group_reset(
     obs: dict[str, Tensor], group_size: int, mode: Literal["error", "warn", "off"]
 ) -> float:
-    """Max over groups of the largest |obs_k - obs_0| at reset; raises in "error" mode if > 0.5.
+    """Largest fraction of one env's reset-observation values that differ from its group's first
+    env (max over groups, envs and keys; 0.0 = every group shares its initial observation).
 
-    Images are uint8 so any real scene difference (an object moved) gives a diff >> 0.5, while
-    identical seeds must give bit-identical observations with a deterministic renderer.
+    Fails ("error" raises, "warn" logs) if any float value (joint positions) differs by more than
+    RESET_FLOAT_ATOL, or more than RESET_IMAGE_DIFF_FRAC of an integer (uint8 image) observation
+    differs at all. Measured on the CPU sim (WO-04, 3 tasks, 64 and 224 px): identical seeds are
+    bit-identical; different seeds differ in >= 4.5% of the pixel values and >= 0.03 rad of qpos
+    (the init-qpos noise alone). The image allowance is for the GPU sim, which keeps every
+    sub-scene at its own world offset, so float32 pose rounding (~1e-6 m) can flip a few
+    silhouette pixels between identical sub-scenes; it is ~45x below a real scene difference.
     """
     if mode == "off" or group_size == 1:
         return 0.0
     worst = 0.0
-    for value in obs.values():
-        v = value.to(STORAGE, torch.float32)
-        grouped = v.view(-1, group_size, *v.shape[1:])
-        worst = max(worst, float((grouped - grouped[:, :1]).abs().max()))
-    if worst > 0.5 and mode == "error":
-        raise RuntimeError(
-            f"envs reset with the same seed differ (max |diff| = {worst:.3g}): a GRPO group would "
-            "not share its prompt. The env must draw its initial state from the per-env seed. "
-            "Set rl.group_reset_check=warn to override."
+    bad = []
+    for key, value in obs.items():
+        v = value.to(STORAGE)
+        grouped = v.reshape(-1, group_size, *v.shape[1:])
+        first = grouped[:, :1]
+        if v.is_floating_point():
+            differs = (grouped.float() - first.float()).abs() > RESET_FLOAT_ATOL
+            tol = 0.0
+        else:
+            differs = grouped != first
+            tol = RESET_IMAGE_DIFF_FRAC
+        frac = float(differs.reshape(grouped.shape[0], group_size, -1).float().mean(-1).max())
+        worst = max(worst, frac)
+        if frac > tol:
+            bad.append(f"{key}: {frac:.2%} of values differ (allowed {tol:.2%})")
+    if bad:
+        msg = (
+            f"envs reset with the same seed differ ({'; '.join(bad)}): a GRPO group would not "
+            "share its prompt. The env must draw its initial state from the per-env seed."
         )
+        if mode == "error":
+            raise RuntimeError(msg + " Set rl.group_reset_check=warn to override.")
+        log.warning(msg)
     return worst
 
 

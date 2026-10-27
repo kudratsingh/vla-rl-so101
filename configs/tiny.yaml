@@ -43,6 +43,7 @@ rl:                          # GRPO on the WO-03 toy task; keys documented in sr
   eval_episodes: 256
   checkpoint_every: 50
   early_stop_check_at_frac: 0.25
+  early_stop_eval_episodes: 256   # baseline + kill-switch evals; same as the periodic ones here
 
 toy:                         # synthetic verification task + 2-layer policy (src/rl/toy_*.py)
   grid_size: 5
