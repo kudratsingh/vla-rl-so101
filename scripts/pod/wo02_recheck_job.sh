@@ -6,6 +6,11 @@
 #   CKPTS="<hub sub-path> ..." EXEC_STEPS=4 nohup bash scripts/pod/wo02_recheck_job.sh > /workspace/job.log 2>&1 &
 set -uo pipefail
 source /root/runpod.env
+# Containers see every host core (128 on some A100 hosts) but get a cgroup CPU quota (~14);
+# size torch/OpenMP thread pools to the quota or CPU-side work (IK, data loading) crawls.
+if [ -z "${OMP_NUM_THREADS:-}" ] && read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null && [ "$q" != max ]; then
+  export OMP_NUM_THREADS=$(( (q + p - 1) / p )) MKL_NUM_THREADS=$(( (q + p - 1) / p ))
+fi
 export PATH="$HOME/.local/bin:$PATH"
 export HF_TOKEN="$(cat /root/.hf_token)"
 export HUB_REPO="${HUB_REPO:-KudratSingh22/vla-rl-so101-sft}"
