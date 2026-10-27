@@ -1,6 +1,7 @@
 # ADR-0001: Base VLA model
 
-Status: proposed (decide at end of WO-02, with measured SFT numbers)
+Status: proposed — OpenVLA-OFT few-shot SFT below the 20% bar after 3 attempts (2026-10-27);
+owner's decision path before any switch: receding-horizon recheck → 25 demos/task → π0.5 (see below)
 Date: 2026-10-26 (WO-02 implementation findings added the same day)
 Work order: WO-02
 
@@ -49,7 +50,8 @@ below 20% on seen positions after a reasonable tuning pass (≤3 SFT runs).
   decoding + chunking + the CE head.
 - **SFT recipe** (SimpleVLA-RL issue #10 = OFT `finetune.py --use_l1_regression False`): AdamW
   lr 5e-4, batch 8, MultiStepLR ×0.1, image aug, no warmup; 20k-step cap, checkpoint every 2.5k,
-  pick the checkpoint that lands in the 20–60% band on seen positions.
+  pick the checkpoint that lands in the 20–60% band on seen positions. *Superseded by the owner's
+  budget: LoRA only, 2000 steps (sim.yaml), then 8000 — see "Measured SFT results".*
 
 ## Why
 
@@ -84,3 +86,31 @@ RTX 4090: bf16 + checkpointing (Llama layers and ViT blocks), micro-batch 4 × 2
 
 OpenVLA-OFT SFT <20% on seen after 3 runs; or VRAM for OFT + sim + rollouts exceeding 80 GB at
 ≥8 parallel envs.
+
+## Measured SFT results (WO-02, RTX 4090, seen cell, 50 episodes/task, GPU sim, protocol `e9ce5bb4`)
+
+In band = 20–60% on ≥ 2 of 3 tasks. Best checkpoint per attempt (all checkpoints in STATUS/results):
+
+| Attempt | Change | Steps | Best seen (PickPlace / Push / Stack) | Train fit at end (token acc / L1) | $ |
+|---|---|---|---|---|---|
+| 1 | lr 5e-5 (sim.yaml) | 2000 | 8 / 4 / 2% (step 1000) | 0.73 / 0.016 | 0.94 |
+| 2 | lr 5e-4 (OFT LoRA rate) | 2000 | 20 / 6 / 4% (step 2000, still rising) | 0.69 / 0.024 | 1.17 |
+| 3 | lr 5e-4, 8000 steps | 8000 | 22 / 4 / 4% (step 3000); plateau ~15 / ≤8 / ≤8% | 0.84 / 0.010 | ~3.2–4.0 |
+
+Ruled out on the way (free, Mac): the 30 demos replay to success with zero joint-state drift
+(data ↔ env aligned); the SFT forward and the eval path give identical action tokens on demo
+frames (no preprocessing mismatch). Attempt 3 fits its demos far better than 1–2 yet closed-loop
+success plateaus: the policy reproduces 10 demos/task but does not recover once it drifts off
+them — few-shot covariate shift, which more steps alone do not fix.
+
+## Owner decision path (2026-10-27) and why
+
+1. **Receding-horizon recheck, eval only (≤ $0.5).** Re-score existing checkpoints executing 4
+   of the 8 predicted actions before re-querying. Not an SFT attempt: an inference setting that
+   directly targets compounding open-loop error. If ≥ 2 tasks land in the band, OpenVLA-OFT stays.
+2. **If not: 25 demos/task, one SFT run (8000 steps, lr 5e-4, ~$4) before π0.5.** CLAUDE.md rule 3
+   is amended from ≤ 10 to ≤ 25 demos/task — still few-shot. Why before π0.5: the failure mode is
+   data coverage, which more demos address directly and cheaply; π0.5 would replace the whole
+   stack — a separate openpi environment (conflicting pins), A100-only JAX LoRA, and a
+   flow-matching RL path (RLinf Flow-SDE) that replaces WO-03/04's token-level GRPO.
+3. **π0.5 only if step 2 also fails**, with a plan and cost put to the owner first.
