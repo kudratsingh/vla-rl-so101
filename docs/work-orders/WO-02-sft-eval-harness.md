@@ -19,6 +19,10 @@ SFT checkpoint at 20–60% success on seen positions for at least 2 of 3 tasks (
 command produces the full table from one invocation. If <20% after 3 SFT attempts, switch to π0.5
 per ADR-0001 and record why.
 
+**Amended by the owner 2026-10-27:** after four SFT attempts below the band, WO-02 closes with the
+full protocol table of the best checkpoint that meets the RL start rule (≥10% on ≥ 2 of 3 tasks,
+CLAUDE.md rule 3), reported as *below the original target band*; no π0.5 switch.
+
 ## Notes
 
 - 20–60% is deliberate: that is the band where RL has signal (0% cannot be rescued; >90% leaves

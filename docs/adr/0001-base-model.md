@@ -1,7 +1,7 @@
 # ADR-0001: Base VLA model
 
-Status: proposed — OpenVLA-OFT few-shot SFT below the 20% bar after 4 attempts incl. 25 demos/task
-(2026-10-27). Per the owner's path the next candidate is π0.5, pending the owner's approval of a plan + cost.
+Status: accepted (2026-10-27) — OpenVLA-OFT kept; no π0.5 switch (owner). SFT stayed below the original
+20–60% target band; RL starts from the attempt-4 checkpoint (step 4000, seen 18/16/6%) under the amended rule 3.
 Date: 2026-10-26 (WO-02 implementation findings added the same day)
 Work order: WO-02
 
@@ -124,3 +124,17 @@ them — few-shot covariate shift, which more steps alone do not fix.
 - Step 2, 25 demos/task, 8000 steps (A100, lr 5e-4): best 18/16/6% (step 4000). More data helped
   Push (≤ 8% → 16%) but no task reached 20%.
 - Step 3, π0.5: next per the owner's path; plan + cost go to the owner before any spend.
+
+## Owner decision (2026-10-27): keep OpenVLA-OFT, amend the RL start rule
+
+- **Do not switch to π0.5.**
+- **CLAUDE.md rule 3 amended:** RL may start from a checkpoint with ≥ 10% success on seen positions
+  on at least 2 of 3 tasks; the 20–60% band stays the target. Basis: SimpleVLA-RL (arXiv 2509.09674) failure-mode analysis: RL lifted a 100-trajectory SFT base from 7.3% to 25.4% (numbers as cited by the owner; they match a secondary summary of the paper, the primary table not re-checked) — RL
+  still adds signal from a low but nonzero base, while a 0% base gets no RL gain.
+- **Selected SFT checkpoint:** attempt 4 (25 demos/task, lr 5e-4, A100), step 4000 — sweep (seen,
+  50 episodes/task, seed 0) 18 / 16 / 6%, two tasks ≥ 10%. Hub:
+  `KudratSingh22/vla-rl-so101-sft` `wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000`.
+- **WO-02 closes** with the full protocol table for that checkpoint, labelled *below the original
+  target band* in results.md.
+- **What would reopen this:** WO-04's RL fails the kill switch from this base (< 3-point gain at the
+  25% check) — then revisit the base model (π0.5) with the owner.

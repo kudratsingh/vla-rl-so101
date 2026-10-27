@@ -42,9 +42,10 @@ $300 arm — with SFT-only vs SFT+RL tables on seen positions, shifted positions
 2. **Pin everything.** Versions in `docs/ENVIRONMENT.md` and `pyproject.toml` are frozen. Upgrading
    any pinned dependency is its own work order with a stated reason.
 3. **Few-shot regime.** SFT uses ≤25 demos per task (amended from ≤10 by the owner on 2026-10-27
-   after three ≤10-demo OpenVLA-OFT SFT attempts stayed below 20% — still few-shot; ADR-0001). RL only starts from a checkpoint with
-   nonzero success (target 20–60% on seen positions). RL cannot rescue a 0%-success base; if SFT
-   is at 0%, fix SFT, do not launch RL.
+   after three ≤10-demo OpenVLA-OFT SFT attempts stayed below 20% — still few-shot; ADR-0001).
+   RL may start from a checkpoint with ≥10% success on seen positions on at least 2 of 3 tasks
+   (owner amendment 2026-10-27; the 20–60% band stays the target; SimpleVLA-RL (arXiv 2509.09674) failure-mode analysis: RL lifted a 100-trajectory SFT base from 7.3% to 25.4% (numbers as cited by the owner; they match a secondary summary of the paper, the primary table not re-checked)).
+   RL cannot rescue a 0%-success base; if SFT is at 0%, fix SFT, do not launch RL.
 4. **Eval protocol is fixed before training.** `src/eval/protocol.py` defines: tasks, 100 episodes
    per cell in sim, 50 trials per cell on the real arm, cells = {seen positions, shifted positions,
    unseen objects}, 3 seeds in sim. Every reported number cites its protocol hash. Never change
