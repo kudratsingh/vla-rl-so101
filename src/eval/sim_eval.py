@@ -41,9 +41,18 @@ def _flag(x: Any, n: int) -> Tensor:
 
 @torch.no_grad()
 def run_batch(
-    act: ActFn, env: Any, obs_fn: ObsFn, seeds: Sequence[int], max_steps: int
+    act: ActFn,
+    env: Any,
+    obs_fn: ObsFn,
+    seeds: Sequence[int],
+    max_steps: int,
+    exec_steps: int | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """One batch of len(seeds) parallel episodes -> (success (N,) bool, length (N,) int)."""
+    """One batch of len(seeds) parallel episodes -> (success (N,) bool, length (N,) int).
+
+    `exec_steps` executes only the first N actions of each predicted chunk before re-querying the
+    policy (receding horizon); None executes the whole chunk. A policy setting, not protocol.
+    """
     n = len(seeds)
     raw, _ = env.reset(seed=list(seeds))
     obs = obs_fn(raw)
@@ -55,7 +64,8 @@ def run_batch(
     length = torch.zeros(n, dtype=torch.long)
     while bool(active.any()):
         chunk = act(obs, instructions)
-        for c in range(chunk.shape[1]):
+        horizon = chunk.shape[1] if exec_steps is None else min(exec_steps, chunk.shape[1])
+        for c in range(horizon):
             if not bool(active.any()):
                 break
             raw, _, terminated, truncated, info = env.step(chunk[:, c])
@@ -92,6 +102,7 @@ def evaluate(
     all_tasks: Sequence[str] | None = None,
     all_cells: Sequence[str] | None = None,
     log: Callable[[CellSeedResult], None] | None = None,
+    exec_steps: int | None = None,
 ) -> list[CellSeedResult]:
     """`episodes` per (task, cell, seed); one env per (task, cell), reused across seeds/batches."""
     task_ids, cell_ids = list(all_tasks or tasks), list(all_cells or cells)
@@ -108,7 +119,7 @@ def evaluate(
                     for start in range(0, episodes, batch):
                         chunk = want[start : start + batch]
                         pad = chunk + [chunk[-1] + episodes + i for i in range(batch - len(chunk))]
-                        s, ln = run_batch(act, env, obs_fn, pad, max_steps)
+                        s, ln = run_batch(act, env, obs_fn, pad, max_steps, exec_steps)
                         succ.append(s[: len(chunk)])
                         lens.append(ln[: len(chunk)])
                     s_all, l_all = torch.cat(succ), torch.cat(lens)

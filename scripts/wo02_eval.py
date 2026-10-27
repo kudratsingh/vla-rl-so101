@@ -69,6 +69,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     parser.add_argument("--episodes", type=int, default=None, help="per (task, cell, seed)")
     parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument(
+        "--exec-steps",
+        type=int,
+        default=None,
+        help="execute the first N actions of each chunk, then re-query (default: whole chunk)",
+    )
+    parser.add_argument(
         "--sim-device",
         choices=["cuda", "cpu"],
         default=None,
@@ -116,6 +122,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             all_tasks=list(protocol.TASKS),
             all_cells=list(protocol.CELLS),
             log=log,
+            exec_steps=args.exec_steps,
         )
         meta = {
             "policy": str(adapter or "tiny-random"),
@@ -123,6 +130,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             "protocol_version": protocol.PROTOCOL_VERSION,
             "protocol_hash": protocol.protocol_hash(),
             "protocol_complete": p["complete"],
+            "exec_steps": args.exec_steps,
+            "sim_device": str(sim_cfg.get("device", "cpu")),
             "plan": p,
             "run_id": run.id,
         }
