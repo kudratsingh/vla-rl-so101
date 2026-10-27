@@ -78,6 +78,24 @@ def test_run_batch_counts_success_and_lengths() -> None:
     assert not s.any() and ln.tolist() == [2] * 6
 
 
+def test_run_batch_receding_horizon_requeries_policy() -> None:
+    calls: list[int] = []
+
+    def counting_act(obs: Mapping[str, Tensor], instructions: Sequence[str]) -> Tensor:
+        calls.append(len(instructions))
+        return zero_act(obs, instructions)
+
+    # seeds 1, 2 never succeed -> episodes run to truncation at step 10
+    s, ln = run_batch(counting_act, FakeEnv("Push", 2), lambda o: o, [1, 2], max_steps=150)
+    assert len(calls) == 2 and ln.tolist() == [10, 10]  # whole 8-step chunks: 8 + 2
+    calls.clear()
+    s, ln = run_batch(
+        counting_act, FakeEnv("Push", 2), lambda o: o, [1, 2], max_steps=150, exec_steps=2
+    )
+    assert len(calls) == 5 and ln.tolist() == [10, 10]  # 2 steps per query: 10 / 2
+    assert not s.any()
+
+
 def test_evaluate_summarize_markdown() -> None:
     envs: list[FakeEnv] = []
 

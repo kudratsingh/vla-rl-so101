@@ -1,6 +1,7 @@
 # ADR-0001: Base VLA model
 
-Status: proposed (decide at end of WO-02, with measured SFT numbers)
+Status: accepted (2026-10-27) — OpenVLA-OFT kept; no π0.5 switch (owner). SFT stayed below the original
+20–60% target band; RL starts from the attempt-4 checkpoint (step 4000, seen 18/16/6%) under the amended rule 3.
 Date: 2026-10-26 (WO-02 implementation findings added the same day)
 Work order: WO-02
 
@@ -49,7 +50,8 @@ below 20% on seen positions after a reasonable tuning pass (≤3 SFT runs).
   decoding + chunking + the CE head.
 - **SFT recipe** (SimpleVLA-RL issue #10 = OFT `finetune.py --use_l1_regression False`): AdamW
   lr 5e-4, batch 8, MultiStepLR ×0.1, image aug, no warmup; 20k-step cap, checkpoint every 2.5k,
-  pick the checkpoint that lands in the 20–60% band on seen positions.
+  pick the checkpoint that lands in the 20–60% band on seen positions. *Superseded by the owner's
+  budget: LoRA only, 2000 steps (sim.yaml), then 8000 — see "Measured SFT results".*
 
 ## Why
 
@@ -84,3 +86,55 @@ RTX 4090: bf16 + checkpointing (Llama layers and ViT blocks), micro-batch 4 × 2
 
 OpenVLA-OFT SFT <20% on seen after 3 runs; or VRAM for OFT + sim + rollouts exceeding 80 GB at
 ≥8 parallel envs.
+
+## Measured SFT results (WO-02, RTX 4090, seen cell, 50 episodes/task, GPU sim, protocol `e9ce5bb4`)
+
+In band = 20–60% on ≥ 2 of 3 tasks. Best checkpoint per attempt (all checkpoints in STATUS/results):
+
+| Attempt | Change | Steps | Best seen (PickPlace / Push / Stack) | Train fit at end (token acc / L1) | $ |
+|---|---|---|---|---|---|
+| 1 | lr 5e-5 (sim.yaml) | 2000 | 8 / 4 / 2% (step 1000) | 0.73 / 0.016 | 0.94 |
+| 2 | lr 5e-4 (OFT LoRA rate) | 2000 | 20 / 6 / 4% (step 2000, still rising) | 0.69 / 0.024 | 1.17 |
+| 3 | lr 5e-4, 8000 steps | 8000 | 22 / 4 / 4% (step 3000); plateau ~15 / ≤8 / ≤8% | 0.84 / 0.010 | 4.01 |
+| 4 | 25 demos/task (A100) | 8000 | 18 / 16 / 6% (step 4000) | — | ~5.0 |
+
+Ruled out on the way (free, Mac): the 30 demos replay to success with zero joint-state drift
+(data ↔ env aligned); the SFT forward and the eval path give identical action tokens on demo
+frames (no preprocessing mismatch). Attempt 3 fits its demos far better than 1–2 yet closed-loop
+success plateaus: the policy reproduces 10 demos/task but does not recover once it drifts off
+them — few-shot covariate shift, which more steps alone do not fix.
+
+## Owner decision path (2026-10-27) and why
+
+1. **Receding-horizon recheck, eval only (≤ $0.5).** Re-score existing checkpoints executing 4
+   of the 8 predicted actions before re-querying. Not an SFT attempt: an inference setting that
+   directly targets compounding open-loop error. If ≥ 2 tasks land in the band, OpenVLA-OFT stays.
+2. **If not: 25 demos/task, one SFT run (8000 steps, lr 5e-4, ~$4) before π0.5.** CLAUDE.md rule 3
+   is amended from ≤ 10 to ≤ 25 demos/task — still few-shot. Why before π0.5: the failure mode is
+   data coverage, which more demos address directly and cheaply; π0.5 would replace the whole
+   stack — a separate openpi environment (conflicting pins), A100-only JAX LoRA, and a
+   flow-matching RL path (RLinf Flow-SDE) that replaces WO-03/04's token-level GRPO.
+3. **π0.5 only if step 2 also fails**, with a plan and cost put to the owner first.
+
+### Outcome of the decision path (2026-10-27)
+
+- Step 1, receding horizon (execute 4 of 8): worse on every rechecked checkpoint — a3 step 3000
+  22/4/4% → 6/4/4%, a3 step 6000 18/4/8% → 0/4/0%, a2 step 2000 20/6/4% → 2/2/2% ($0.31).
+  Re-querying mid-chunk breaks the action continuity the chunked policy was trained on.
+- Step 2, 25 demos/task, 8000 steps (A100, lr 5e-4): best 18/16/6% (step 4000). More data helped
+  Push (≤ 8% → 16%) but no task reached 20%.
+- Step 3, π0.5: next per the owner's path; plan + cost go to the owner before any spend.
+
+## Owner decision (2026-10-27): keep OpenVLA-OFT, amend the RL start rule
+
+- **Do not switch to π0.5.**
+- **CLAUDE.md rule 3 amended:** RL may start from a checkpoint with ≥ 10% success on seen positions
+  on at least 2 of 3 tasks; the 20–60% band stays the target. Basis: SimpleVLA-RL (arXiv 2509.09674) failure-mode analysis: RL lifted a 100-trajectory SFT base from 7.3% to 25.4% (numbers as cited by the owner; they match a secondary summary of the paper, the primary table not re-checked) — RL
+  still adds signal from a low but nonzero base, while a 0% base gets no RL gain.
+- **Selected SFT checkpoint:** attempt 4 (25 demos/task, lr 5e-4, A100), step 4000 — sweep (seen,
+  50 episodes/task, seed 0) 18 / 16 / 6%, two tasks ≥ 10%. Hub:
+  `KudratSingh22/vla-rl-so101-sft` `wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000`.
+- **WO-02 closes** with the full protocol table for that checkpoint, labelled *below the original
+  target band* in results.md.
+- **What would reopen this:** WO-04's RL fails the kill switch from this base (< 3-point gain at the
+  25% check) — then revisit the base model (π0.5) with the owner.

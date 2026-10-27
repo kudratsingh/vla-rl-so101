@@ -2,7 +2,7 @@
 
 ## What we are building
 
-A post-training pipeline that takes a pre-trained VLA, fine-tunes it on ≤10 demonstrations per
+A post-training pipeline that takes a pre-trained VLA, fine-tunes it on ≤25 demonstrations (≤10 until 2026-10-27, ADR-0001) per
 task (SFT), then improves it with reinforcement learning against a binary success reward in a
 GPU-parallel simulator (GRPO), on one GPU — and then deploys the result to a real SO-101 arm and
 measures whether the RL gain survives contact with reality.
