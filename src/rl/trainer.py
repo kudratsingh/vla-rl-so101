@@ -93,6 +93,9 @@ class GRPOConfig:
     early_stop_min_improvement: float = 0.03  # stop if check - baseline < this (owner, WO-04)
     require_nonzero_baseline: bool = True  # CLAUDE.md rule 3: never train from a 0%-success base
     group_reset_check: Literal["error", "warn", "off"] = "error"
+    train_tasks: tuple[str, ...] = ()  # RL rollouts on these only; () = every env task. Evals cover
+    #   every env task; the kill switch reads the trained tasks' mean (owner amendment, ADR-0002)
+    max_episode_steps: int = 0  # RL rollout + in-training eval horizon; 0 = env.max_episode_steps
 
     @classmethod
     def from_config(cls, cfg: Config) -> GRPOConfig:
@@ -115,6 +118,8 @@ class GRPOConfig:
                 kwargs[key] = value
             elif isinstance(default, str):
                 kwargs[key] = str(value)
+            elif isinstance(default, tuple):
+                kwargs[key] = tuple(str(v) for v in value)
             else:  # int/float; also parses PyYAML's string "1e-5"
                 kwargs[key] = type(default)(value)
         out = cls(**kwargs)
@@ -141,6 +146,8 @@ class GRPOConfig:
             raise ValueError("early_stop_check_at_frac must be in (0, 1]")
         if self.group_reset_check not in ("error", "warn", "off"):
             raise ValueError("group_reset_check must be error|warn|off")
+        if self.max_episode_steps < 0:
+            raise ValueError("max_episode_steps must be >= 0 (0 = env.max_episode_steps)")
 
 
 def kill_switch_step(rl: GRPOConfig) -> int:
@@ -204,7 +211,10 @@ class GRPOTrainer:
         self.env_factory = env_factory
         self.obs_fn = obs_fn
         self.tasks = list(tasks)
-        self.max_episode_steps = max_episode_steps
+        self.train_tasks = list(rl.train_tasks) or list(self.tasks)
+        if not set(self.train_tasks) <= set(self.tasks):
+            raise ValueError(f"rl.train_tasks {self.train_tasks} must be a subset of {self.tasks}")
+        self.max_episode_steps = rl.max_episode_steps or max_episode_steps
         self.run_dir = run_dir
         self.metrics_path = run_dir / "metrics.jsonl"
         self.params = policy.trainable_parameters()
@@ -270,6 +280,8 @@ class GRPOTrainer:
             out[f"eval/success/{task}"] = rate
             rates.append(rate)
         out["eval/success"] = sum(rates) / len(rates)
+        train = [out[f"eval/success/{t}"] for t in self.train_tasks]
+        out["eval/success_train"] = sum(train) / len(train)  # what the kill switch compares
         out["eval/episodes_per_task"] = float(episodes)
         out["eval/episodes"] = float(episodes * len(self.tasks))
         out["eval/batch_s_median"] = statistics.median(batch_s)
@@ -284,7 +296,7 @@ class GRPOTrainer:
                 "greedy episodes): RL cannot start from a 0%-success base (CLAUDE.md rule 3). "
                 "Fix SFT; do not launch RL."
             )
-        for task in self.tasks:
+        for task in self.train_tasks:
             if baseline[f"eval/success/{task}"] <= 0.0:
                 log.warning(
                     "step-0 eval success is 0 on %s: its groups will be all-zero and dropped "
@@ -308,7 +320,7 @@ class GRPOTrainer:
         reset_diff = 0.0
         n_batches = 0
         for _ in range(max_batches):
-            task = self.tasks[self._next_task % len(self.tasks)]
+            task = self.train_tasks[self._next_task % len(self.train_tasks)]
             self._next_task += 1
             seeds = list(range(self._next_prompt, self._next_prompt + groups_per_batch))
             self._next_prompt += groups_per_batch
@@ -480,7 +492,12 @@ class GRPOTrainer:
         Saves nothing; the policy is discarded afterwards (the full run restarts from the SFT
         adapter). Step 1 carries CUDA warm-up, so timings use steps 2.. when there are any."""
         rl = self.rl
-        out: dict[str, Any] = {"steps": steps, "trainable_params": self.num_trainable}
+        out: dict[str, Any] = {
+            "steps": steps,
+            "trainable_params": self.num_trainable,
+            "max_episode_steps": self.max_episode_steps,
+            "train_tasks": list(self.train_tasks),
+        }
         rows: list[dict[str, Any]] = []
         try:
             t0 = time.perf_counter()
@@ -552,11 +569,13 @@ class GRPOTrainer:
                 if step in schedule:
                     row.update(self.evaluate(schedule[step]))
                     history.append((step, row["eval/success"]))
+                # kill switch on the trained tasks' mean (eval-only tasks cannot move it by RL)
+                key = "eval/success_train"
                 if step == check_step and is_flat_run(
-                    baseline["eval/success"], row["eval/success"], rl.early_stop_min_improvement
+                    baseline[key], row[key], rl.early_stop_min_improvement
                 ):
                     stopped_flat = rl.early_stop_on_flat
-                    self._flat_run_warning(step, baseline["eval/success"], row["eval/success"])
+                    self._flat_run_warning(step, baseline[key], row[key])
                     row["event/flat_run"] = 1.0
                 if step % rl.checkpoint_every == 0 or step == rl.steps or stopped_flat:
                     self.save_checkpoint(step, history)

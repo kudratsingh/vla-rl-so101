@@ -18,7 +18,14 @@ from src.rl.policy_api import PolicyObs, RLPolicy, RolloutStep, TokenLogProbs, b
 from src.rl.rollout import check_group_reset, collect_rollouts
 from src.rl.toy_env import ToyGridEnv, make_toy_env_factory, optimal_chunk, policy_obs
 from src.rl.toy_policy import ToyPolicy
-from src.rl.trainer import EVAL_SEED_BASE, GRPOConfig, GRPOTrainer, eval_schedule, is_flat_run
+from src.rl.trainer import (
+    EVAL_SEED_BASE,
+    GRPOConfig,
+    GRPOTrainer,
+    eval_schedule,
+    is_flat_run,
+    kill_switch_step,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -294,12 +301,69 @@ def test_kill_switch_threshold_is_three_points(tmp_path: Path) -> None:
         values = iter([0.5, check_value])  # step-0 baseline, step-2 check; later evals: last step
 
         def fake_eval(episodes: int | None = None, it: Any = values) -> dict[str, float]:
-            return {"eval/success": next(it, 0.9), "eval/success/PickPlace": 0.5}
+            v = next(it, 0.9)  # the all-task mean stays flat: only the trained-task mean counts
+            return {"eval/success": 0.5, "eval/success_train": v, "eval/success/PickPlace": v}
 
         tr.evaluate = fake_eval  # type: ignore[method-assign]
         summary = tr.run()
         assert summary["stopped_flat"] is stops
         assert summary["steps_completed"] == (2 if stops else 8)
+
+
+def test_train_tasks_roll_out_only_trained_tasks_and_evaluate_all(tmp_path: Path) -> None:
+    """Owner amendment (ADR-0002): RL rollouts on rl.train_tasks only (Stack eval-only); evals
+    cover every env task and report the trained-task mean; rl.max_episode_steps sets the horizon."""
+    cfg = _cfg(steps=2, eval_every=100, train_tasks=["PickPlace", "Push"], max_episode_steps=4)
+    cfg["env"]["tasks"] = ["PickPlace", "Push", "Stack"]
+    tr = _trainer(cfg, tmp_path)
+    assert tr.max_episode_steps == 4  # overrides toy.max_episode_steps = 6
+    collected: list[str] = []
+    evaluated: list[str] = []
+    phase = {"name": "eval"}
+    factory = tr.env_factory
+
+    def spy_factory(task: str, n: int) -> Any:
+        return _TaskTaggedEnv(factory(task, n), task, phase, collected, evaluated)
+
+    tr.env_factory = spy_factory
+    collect, evaluate = tr.collect, tr.evaluate
+
+    def spy_collect() -> Any:
+        phase["name"] = "collect"
+        try:
+            return collect()
+        finally:
+            phase["name"] = "eval"
+
+    tr.collect = spy_collect  # type: ignore[method-assign]
+    out = evaluate(32)
+    assert set(evaluated) == {"PickPlace", "Push", "Stack"}
+    assert out["eval/success_train"] == pytest.approx(
+        (out["eval/success/PickPlace"] + out["eval/success/Push"]) / 2
+    )
+    tr.run()
+    assert collected and set(collected) == {"PickPlace", "Push"}
+    with pytest.raises(ValueError, match="subset"):
+        _trainer(_cfg(train_tasks=["Stack"]), tmp_path / "bad")
+
+
+class _TaskTaggedEnv(_RecordingEnv):
+    """Logs which task each reset belongs to, split by trainer phase (collect vs evaluate)."""
+
+    def __init__(
+        self,
+        env: Any,
+        task: str,
+        phase: dict[str, str],
+        collected: list[str],
+        evaluated: list[str],
+    ) -> None:
+        super().__init__(env, [])
+        self.task, self.phase, self.collected, self.evaluated = task, phase, collected, evaluated
+
+    def reset(self, *, seed: Any = None, options: Any = None) -> Any:
+        (self.collected if self.phase["name"] == "collect" else self.evaluated).append(self.task)
+        return super().reset(seed=seed, options=options)
 
 
 def test_zero_success_baseline_aborts_before_training(tmp_path: Path) -> None:
@@ -337,7 +401,11 @@ def test_flat_run_kill_switch_stops_the_run(tmp_path: Path) -> None:
 
 def test_config_validation() -> None:
     rl = GRPOConfig.from_config(load_config("rl"))  # the WO-04 preset must parse
-    assert (rl.samples_per_prompt, rl.clip_low, rl.clip_high, rl.temperature) == (8, 0.2, 0.28, 1.6)
+    assert (rl.samples_per_prompt, rl.clip_low, rl.clip_high) == (8, 0.2, 0.28)
+    # owner amendment after the WO-04 probes (2026-10-27, ADR-0002)
+    assert (rl.temperature, rl.recompute_old_log_probs, rl.steps) == (1.0, True, 150)
+    assert (rl.train_tasks, rl.max_episode_steps) == (("PickPlace", "Push"), 120)
+    assert kill_switch_step(rl) == 38
     # owner's WO-04 settings (2026-10-26)
     assert (rl.lr, rl.ppo_mini_batch) == (5e-5, 64)
     assert (rl.eval_episodes, rl.early_stop_eval_episodes) == (32, 64)
@@ -349,6 +417,8 @@ def test_config_validation() -> None:
         GRPOConfig.from_config(_cfg(rollout_envs=6))
     with pytest.raises(ValueError, match="unknown"):
         GRPOConfig.from_config(_cfg(clip_ratio=0.2))
+    with pytest.raises(ValueError, match="max_episode_steps"):
+        GRPOConfig.from_config(_cfg(max_episode_steps=-1))
     # WO-02 provides the OpenVLA-OFT builder; it refuses a config without the base checkpoint
     with pytest.raises(ValueError, match="policy.checkpoint"):
         build_policy({"policy": {"base": "openvla_oft"}}, "cpu")
@@ -364,15 +434,16 @@ def _load_script() -> Any:
 
 def test_cost_estimate_matches_rl_yaml_arithmetic() -> None:
     est = _load_script().estimate_cost(load_config("rl"))
-    # configs/rl.yaml (A100 throughput measured 2026-10-27): 16 x 8 = 128 trained, x 1.25 = 160
-    # episodes x 150 = 24,000 actions / 110 = 218.2 s; 128 x 19 = 2,432 decisions / 10.3 = 236.1 s;
-    # 13 evals = 11 x 32 + 2 x 64 (step 0 and the kill-switch step 75) = 480 episodes/task
-    # x 3 x 150 / 110 = 1963.6 s
-    assert est["actions_per_step"] == 24_000
-    assert est["decisions_trained_per_step"] == 2_432
-    assert est["evals"] == 13 and est["eval_episodes_per_task"] == 480
+    # configs/rl.yaml (A100 throughput measured 2026-10-27; amended preset): 16 x 8 = 128 trained,
+    # x 1.25 = 160 episodes x 120 (RL horizon) = 19,200 actions / 110 = 174.5 s; 128 x 15 = 1,920
+    # decisions / 10.3 = 186.4 s update + / 31 = 61.9 s old-log-prob recompute; 8 evals = 6 x 32
+    # + 2 x 64 (step 0 and the kill-switch step 38) = 320 episodes/task x 3 tasks x 120 / 110
+    assert est["actions_per_step"] == 19_200
+    assert est["decisions_trained_per_step"] == 1_920
+    assert est["recompute_s_per_step"] == pytest.approx(1920 / 31)
+    assert est["evals"] == 8 and est["eval_episodes_per_task"] == 320
     assert est["hours"] == pytest.approx(
-        (300 * (24_000 / 110 + 2432 / 10.3) + 480 * 3 * 150 / 110) / 3600
+        (150 * (19_200 / 110 + 1920 / 10.3 + 1920 / 31) + 320 * 3 * 120 / 110) / 3600
     )
     assert est["dollars"] == pytest.approx(est["hours"] * 1.79)
 

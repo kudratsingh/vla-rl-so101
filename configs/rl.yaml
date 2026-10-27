@@ -34,6 +34,8 @@
 #                                                        ~0.6 GiB per decision (5*a*s^2*layers).
 # rollout_envs=32 fits by this estimate (64 would too: +~3 GiB rollout-phase, +~1 GiB/env).
 #
+# SUPERSEDED by the WO-04 probes + owner amendment (docs/adr/0002, 2026-10-27): the measured
+# throughput is in cost.throughput below and the amended run is 150 steps at horizon 120.
 # Wall-clock / $ (estimates; `uv run scripts/wo03_rl.py --preset rl --estimate` recomputes from
 # cost.throughput below). Per step, worst case (every episode runs the full 150 steps):
 #   trained trajectories   16 prompts x K=8                      =    128
@@ -80,11 +82,12 @@ policy:
 
 rl:                         # GRPO, ADR-0002; every key is documented in src/rl/trainer.py
   algorithm: grpo
-  samples_per_prompt: 8     # K
+  samples_per_prompt: 8     # K. Owner rule (ADR-0002 amendment): if a probe still drops > 60% of
+                            # groups, raise this to 16 before changing anything else
   rollout_envs: 32          # parallel envs per env batch (4 groups); one env instance per task
   rollout_batch: 16         # prompts (groups) per update -> 128 trajectories (upstream: 64)
   max_rollout_rounds: 3     # dynamic-sampling refill cap, in multiples of one full round
-  steps: 300
+  steps: 150                # owner amendment (ADR-0002): was 300
   lr: 5e-5                  # LoRA (owner, WO-04; was 1e-5)
   weight_decay: 0.01
   grad_clip: 1.0
@@ -93,25 +96,32 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   micro_batch: 8            # decisions per forward/backward; memory only, gradient unchanged
   clip_low: 0.2
   clip_high: 0.28
-  temperature: 1.6
+  temperature: 1.0          # owner amendment (ADR-0002): 1.6 dropped 92-93% of groups
   kl_coef: 0.0              # must stay 0 (no reference model)
   dynamic_sampling: true
-  # Upstream recomputes old log-probs with an extra no-grad forward. OFT's sampler log-probs come
-  # from the same single forward (eval mode, same temperature), so we reuse them (-25% step time).
-  # train/first_minibatch_max_abs_log_ratio still measures sampler-vs-update agreement every step;
-  # if it is > ~0.05 at step 1 (precision/mode differ), set this to true.
-  recompute_old_log_probs: false
+  # Upstream recomputes old log-probs with an extra no-grad forward. The WO-04 probes measured
+  # first-minibatch |log ratio| max 0.196 (A100) / 0.149 (H100) with sampler log-probs reused,
+  # well over the 0.05 bar, so it is on (owner amendment, ADR-0002).
+  recompute_old_log_probs: true
   eval_every: 25
   eval_episodes: 32         # per task, greedy, fixed seeds: the periodic evals
   checkpoint_every: 50
-  # Kill switch (owner, WO-04): step 0 and step ceil(0.25 x 300) = 75 both evaluate 64 greedy
-  # episodes per task on the same seeds; stop at 75 if mean success rose by < 0.03 (3 points).
+  # Kill switch (owner, WO-04; amended): step 0 and step ceil(0.25 x 150) = 38 both evaluate 64
+  # greedy episodes per task on the same seeds; stop at 38 if the trained tasks' mean success
+  # rose by < 0.03 (3 points).
   early_stop_check_at_frac: 0.25
   early_stop_on_flat: true
   early_stop_eval_episodes: 64
   early_stop_min_improvement: 0.03
   require_nonzero_baseline: true  # CLAUDE.md rule 3: abort if the step-0 eval is 0 on every task
   group_reset_check: error  # identical reset seeds must give identical scenes
+  # Owner amendment (ADR-0002): RL rollouts on PickPlace + Push only; Stack (0/64 at step 0, every
+  # group all-zero) is eval-only. Evals still cover all three tasks; the kill switch compares the
+  # trained tasks' mean (eval/success_train).
+  train_tasks: [PickPlace, Push]
+  # RL rollout + in-training eval horizon (owner amendment, ADR-0002); the protocol eval
+  # (scripts/wo02_eval.py) keeps env.max_episode_steps = 150.
+  max_episode_steps: 120
 
 cost:
   gpu: A100-80GB

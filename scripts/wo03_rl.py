@@ -104,7 +104,8 @@ def estimate_cost(cfg: Config) -> dict[str, float]:
     rl = GRPOConfig.from_config(cfg)
     tp = cfg["cost"]["throughput"]
     chunk = int(cfg["policy"]["action_chunk"])
-    ep_len = float(cfg["env"]["max_episode_steps"]) * float(tp["mean_episode_frac"])
+    horizon = rl.max_episode_steps or int(cfg["env"]["max_episode_steps"])  # RL horizon
+    ep_len = float(horizon) * float(tp["mean_episode_frac"])
     trained = rl.rollout_batch * rl.samples_per_prompt
     episodes = trained * float(tp["rollout_overhead"])  # dynamic-sampling refill
     actions = episodes * ep_len
@@ -119,7 +120,7 @@ def estimate_cost(cfg: Config) -> dict[str, float]:
     n = rl.rollout_envs
     eval_episodes = sum(math.ceil(ep / n) * n for ep in schedule.values())  # per task, run total
     n_evals = len(schedule)
-    eval_s = len(cfg["env"]["tasks"]) * eval_episodes * ep_len
+    eval_s = len(cfg["env"]["tasks"]) * eval_episodes * ep_len  # evals cover every task
     eval_s /= float(tp["rollout_actions_per_s"])
     hours = (rl.steps * step_s + eval_s) / 3600.0
     return {
@@ -142,6 +143,8 @@ def project_from_probe(cfg: Config, probe: dict[str, Any], usd_per_hour: float) 
     """Hours / $ for one seed from the probe's measured times (configs/rl.yaml step count)."""
     rl = GRPOConfig.from_config(cfg)
     n, tasks = rl.rollout_envs, len(cfg["env"]["tasks"])
+    env_steps = int(cfg["env"]["max_episode_steps"])
+    horizon_scale = env_steps / (rl.max_episode_steps or env_steps)
     s_step = float(probe["s_per_step_median"])
     s_eval_batch = float(probe["eval_s_per_env_batch"])
     schedule = eval_schedule(rl)
@@ -169,8 +172,9 @@ def project_from_probe(cfg: Config, probe: dict[str, Any], usd_per_hour: float) 
         "kill_switch_step": check,
         "kill_switch_stop_h": (check * s_step + eval_s(check)) / 3600.0,
         "worst_case_h": (rl.steps * s_step_worst + eval_s(rl.steps)) / 3600.0,
-        # the final scripts/wo02_eval.py protocol eval at the probe's greedy rate (estimate)
-        "protocol_eval_h": protocol_episodes * s_eval_batch / n / 3600.0,
+        # the final scripts/wo02_eval.py protocol eval at the probe's greedy rate (estimate),
+        # scaled from the RL horizon to the protocol's env.max_episode_steps
+        "protocol_eval_h": protocol_episodes * s_eval_batch / n / 3600.0 * horizon_scale,
         "usd_per_hour": usd_per_hour,
     }
     for key in ("run", "kill_switch_stop", "worst_case", "protocol_eval"):
@@ -200,7 +204,8 @@ def print_probe(cfg: Config, probe: dict[str, Any], proj: dict[str, Any], gpu: s
     )
     baseline = (
         f"SFT baseline ({rl.early_stop_eval_episodes} greedy episodes/task): {tasks} "
-        f"(mean {base['eval/success']:.3f})"
+        f"(mean {base['eval/success']:.3f}; trained-task mean {base['eval/success_train']:.3f}, "
+        f"horizon {probe.get('max_episode_steps', '?')})"
     )
     checks = (
         f"checks: first-minibatch |log ratio| max {ratio:.4f} / mean "
