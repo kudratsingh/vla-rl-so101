@@ -17,12 +17,17 @@
 # self-delete timer at the cap; size the cap from the probe's projection (+ ~1 h).
 set -uo pipefail
 source /root/runpod.env
+# Containers see every host core (128 on some A100 hosts) but get a cgroup CPU quota (~14);
+# size torch/OpenMP thread pools to the quota or CPU-side work (IK, data loading) crawls.
+if [ -z "${OMP_NUM_THREADS:-}" ] && read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null && [ "$q" != max ]; then
+  export OMP_NUM_THREADS=$(( (q + p - 1) / p )) MKL_NUM_THREADS=$(( (q + p - 1) / p ))
+fi
 export RUNPOD_POD_ID
 export PATH="$HOME/.local/bin:$PATH"
 HF_TOKEN="$(cat /root/.hf_token)"
 export HF_TOKEN
 : "${SEED:?set SEED (one pod per seed: 0, 1 or 2)}"
-: "${SFT_ADAPTER:?set SFT_ADAPTER to the selected WO-02 checkpoint (Hub path or dir)}"
+SFT_ADAPTER="${SFT_ADAPTER:-KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000}"  # WO-02 base (owner 2026-10-27: a4 step 4000, seen 18/16/6%)
 export SEED SFT_ADAPTER
 export HUB_REPO="${HUB_REPO:-KudratSingh22/vla-rl-so101-rl}"
 CFG="${RL_CFG:-configs/rl.yaml}"

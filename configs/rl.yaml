@@ -74,7 +74,9 @@ seed: 0
 inherit: configs/sft.yaml
 
 policy:
-  adapter: null             # WO-02 SFT checkpoint (dir or Hub path); scripts pass --adapter
+  adapter: KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000
+                            # WO-02 SFT base: attempt 4 step 4000 (seen 18/16/6%), meets the amended
+                            # rule 3 (>=10% on >=2 tasks); --adapter overrides
 
 rl:                         # GRPO, ADR-0002; every key is documented in src/rl/trainer.py
   algorithm: grpo
@@ -117,10 +119,10 @@ cost:
   est_s_per_step: null      # sft.yaml's SFT estimate does not apply to RL
   setup_hours: 0.5          # image pull, apt, uv sync, 15 GB checkpoint download (as sft.yaml)
   estimated_hours: null     # agent fills before every run (from --estimate, then the probe)
-  throughput:               # ESTIMATES (WO-02 research + WO-03 FLOP count); WO-04 probe measures
-    rollout_actions_per_s: 250     # batched OFT sampling + sim, env actions/s (est. 230-285:
-                                   # ~5 TFLOP per 8-action query, compute-bound)
-    forward_decisions_per_s: 30    # no-grad log-prob forward per decision (recompute only)
-    update_decisions_per_s: 12     # forward + activation-grad backward (~2x a forward)
-    mean_episode_frac: 1.0         # mean episode length / max_episode_steps (1.0 = worst case)
+  throughput:               # A100-80GB, MEASURED 2026-10-27 on pod u87r9sjnwig58d (WO-02 attempt 4)
+    rollout_actions_per_s: 110     # sweep: 1200 episodes (~150 steps each, 50 GPU envs, 224 px) in
+                                   # 1815 s incl. 8 model loads -> 98-122 env actions/s (was est. 250)
+    forward_decisions_per_s: 31    # no-grad forward ~1/3 of an update (est.; recompute is off)
+    update_decisions_per_s: 10.3   # SFT probe 0.774 s per 8-decision step, LoRA, no grad-ckpt (was est. 12)
+    mean_episode_frac: 1.0         # mean episode length / max_episode_steps (base succeeds ~13%)
     rollout_overhead: 1.25         # episodes generated per trained one (dynamic-sampling refill)

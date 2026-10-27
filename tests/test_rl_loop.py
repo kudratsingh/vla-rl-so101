@@ -364,13 +364,16 @@ def _load_script() -> Any:
 
 def test_cost_estimate_matches_rl_yaml_arithmetic() -> None:
     est = _load_script().estimate_cost(load_config("rl"))
-    # configs/rl.yaml: 16 x 8 = 128 trained, x 1.25 = 160 episodes x 150 = 24,000 actions / 250
-    # = 96 s; 128 x 19 = 2,432 decisions / 12 = 202.7 s; 13 evals = 11 x 32 + 2 x 64 (step 0 and
-    # the kill-switch step 75) = 480 episodes/task x 3 x 150 / 250 = 864 s
+    # configs/rl.yaml (A100 throughput measured 2026-10-27): 16 x 8 = 128 trained, x 1.25 = 160
+    # episodes x 150 = 24,000 actions / 110 = 218.2 s; 128 x 19 = 2,432 decisions / 10.3 = 236.1 s;
+    # 13 evals = 11 x 32 + 2 x 64 (step 0 and the kill-switch step 75) = 480 episodes/task
+    # x 3 x 150 / 110 = 1963.6 s
     assert est["actions_per_step"] == 24_000
     assert est["decisions_trained_per_step"] == 2_432
     assert est["evals"] == 13 and est["eval_episodes_per_task"] == 480
-    assert est["hours"] == pytest.approx((300 * (96 + 2432 / 12) + 864) / 3600)
+    assert est["hours"] == pytest.approx(
+        (300 * (24_000 / 110 + 2432 / 10.3) + 480 * 3 * 150 / 110) / 3600
+    )
     assert est["dollars"] == pytest.approx(est["hours"] * 1.79)
 
 
