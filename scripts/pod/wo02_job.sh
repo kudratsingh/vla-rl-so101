@@ -65,8 +65,9 @@ echo '{"file_format_version":"1.0.1","ICD":{"library_path":"libEGL_nvidia.so.0",
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync --frozen --extra gpu --extra dev || exit 11
 uv run python -c "import torch; assert torch.cuda.is_available(); print('[job] gpu', torch.cuda.get_device_name())" || exit 12
-uv run hf download KudratSingh22/vla-rl-so101-demos --repo-type dataset \
-  --local-dir data/demos/vla-rl-so101-demos >/dev/null || exit 13
+DEMOS_REPO="${DEMOS_REPO:-KudratSingh22/vla-rl-so101-demos}"  # must match the config's data.hub_repo
+uv run hf download "$DEMOS_REPO" --repo-type dataset \
+  --local-dir "data/demos/${DEMOS_REPO##*/}" >/dev/null || exit 13
 
 stage gpu-sim-check
 SIM_DEVICE=cpu; EVAL_ENVS=8

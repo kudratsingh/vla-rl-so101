@@ -41,7 +41,8 @@ $300 arm — with SFT-only vs SFT+RL tables on seen positions, shifted positions
    start/end, dollars).
 2. **Pin everything.** Versions in `docs/ENVIRONMENT.md` and `pyproject.toml` are frozen. Upgrading
    any pinned dependency is its own work order with a stated reason.
-3. **Few-shot regime.** SFT uses ≤10 demos per task. RL only starts from a checkpoint with
+3. **Few-shot regime.** SFT uses ≤25 demos per task (amended from ≤10 by the owner on 2026-10-27
+   after three ≤10-demo OpenVLA-OFT SFT attempts stayed below 20% — still few-shot; ADR-0001). RL only starts from a checkpoint with
    nonzero success (target 20–60% on seen positions). RL cannot rescue a 0%-success base; if SFT
    is at 0%, fix SFT, do not launch RL.
 4. **Eval protocol is fixed before training.** `src/eval/protocol.py` defines: tasks, 100 episodes
