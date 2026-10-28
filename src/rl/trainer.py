@@ -91,6 +91,9 @@ class GRPOConfig:
     early_stop_on_flat: bool = True
     early_stop_eval_episodes: int = 64  # per task, step-0 baseline + check-step eval (owner, WO-04)
     early_stop_min_improvement: float = 0.03  # stop if check - baseline < this (owner, WO-04)
+    # "any_task": pass if ANY trained task gained >= min_improvement (owner, 2026-10-28);
+    # "mean": the trained-task mean must gain it (ADR-0002 amendment 1)
+    early_stop_rule: Literal["any_task", "mean"] = "any_task"
     require_nonzero_baseline: bool = True  # CLAUDE.md rule 3: never train from a 0%-success base
     group_reset_check: Literal["error", "warn", "off"] = "error"
     train_tasks: tuple[str, ...] = ()  # RL rollouts on these only; () = every env task. Evals cover
@@ -144,6 +147,8 @@ class GRPOConfig:
             raise ValueError("rollout temperature must be > 0")
         if not 0 < self.early_stop_check_at_frac <= 1:
             raise ValueError("early_stop_check_at_frac must be in (0, 1]")
+        if self.early_stop_rule not in ("any_task", "mean"):
+            raise ValueError("early_stop_rule must be any_task|mean")
         if self.group_reset_check not in ("error", "warn", "off"):
             raise ValueError("group_reset_check must be error|warn|off")
         if self.max_episode_steps < 0:
@@ -315,6 +320,9 @@ class GRPOTrainer:
         t0 = time.perf_counter()
         kept: list[RolloutBatch] = []
         n_kept = 0
+        per_task: dict[str, list[int]] = {
+            t: [0, 0, 0] for t in self.train_tasks
+        }  # gen/kept/trained
         gen_rewards: list[Tensor] = []
         gen_len: list[Tensor] = []
         reset_diff = 0.0
@@ -341,6 +349,9 @@ class GRPOTrainer:
             gen_len.append(batch.episode_len)
             if rl.dynamic_sampling:
                 batch = batch.select_groups(dynamic_sampling_keep(batch.group_rewards))
+            per_task[task][0] += groups_per_batch
+            per_task[task][1] += batch.num_groups
+            per_task[task][2] += min(batch.num_groups, max(0, rl.rollout_batch - n_kept))
             if batch.num_groups:
                 kept.append(batch)
                 n_kept += batch.num_groups
@@ -363,6 +374,10 @@ class GRPOTrainer:
             "rollout/group_reset_diff_frac": reset_diff,
             "rollout/time_s": elapsed,
         }
+        for t, (gen_t, kept_t, trained_t) in per_task.items():
+            if gen_t:
+                stats[f"rollout/frac_groups_dropped/{t}"] = 1.0 - kept_t / gen_t
+            stats[f"rollout/groups_trained/{t}"] = float(trained_t)
         if not kept:
             return None, stats
         merged = RolloutBatch.cat(kept)
@@ -569,14 +584,13 @@ class GRPOTrainer:
                 if step in schedule:
                     row.update(self.evaluate(schedule[step]))
                     history.append((step, row["eval/success"]))
-                # kill switch on the trained tasks' mean (eval-only tasks cannot move it by RL)
-                key = "eval/success_train"
-                if step == check_step and is_flat_run(
-                    baseline[key], row[key], rl.early_stop_min_improvement
-                ):
-                    stopped_flat = rl.early_stop_on_flat
-                    self._flat_run_warning(step, baseline[key], row[key])
-                    row["event/flat_run"] = 1.0
+                # kill switch on the trained tasks only (eval-only tasks cannot move by RL)
+                if step == check_step:
+                    base, cur = self._kill_switch_values(baseline, row)
+                    if is_flat_run(base, cur, rl.early_stop_min_improvement):
+                        stopped_flat = rl.early_stop_on_flat
+                        self._flat_run_warning(step, base, cur)
+                        row["event/flat_run"] = 1.0
                 if step % rl.checkpoint_every == 0 or step == rl.steps or stopped_flat:
                     self.save_checkpoint(step, history)
                 row["time/step_s"] = time.perf_counter() - t0
@@ -604,6 +618,17 @@ class GRPOTrainer:
             "trainable_params": self.num_trainable,
             "wall_time_s": time.perf_counter() - t_start,
         }
+
+    def _kill_switch_values(
+        self, baseline: dict[str, float], row: dict[str, Any]
+    ) -> tuple[float, float]:
+        """(step-0, check-step) success the kill switch compares: the trained-task mean, or
+        (rule any_task) the trained task with the largest gain."""
+        if self.rl.early_stop_rule == "mean":
+            return baseline["eval/success_train"], row["eval/success_train"]
+        keys = [f"eval/success/{t}" for t in self.train_tasks]
+        best = max(keys, key=lambda k: row[k] - baseline[k])
+        return baseline[best], row[best]
 
     def _flat_run_warning(self, step: int, baseline: float, current: float) -> None:
         bar = "!" * 78

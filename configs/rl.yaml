@@ -108,12 +108,13 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   eval_episodes: 32         # per task, greedy, fixed seeds: the periodic evals
   checkpoint_every: 50
   # Kill switch (owner, WO-04; amended): step 0 and step ceil(0.25 x 150) = 38 both evaluate 64
-  # greedy episodes per task on the same seeds; stop at 38 if the trained tasks' mean success
-  # rose by < 0.03 (3 points).
+  # greedy episodes per task on the same seeds; stop at 38 unless at least one trained task rose
+  # by >= 0.03 (3 points) (owner 2026-10-28; was: the trained-task mean).
   early_stop_check_at_frac: 0.25
   early_stop_on_flat: true
   early_stop_eval_episodes: 64
   early_stop_min_improvement: 0.03
+  early_stop_rule: any_task  # owner 2026-10-28: pass if ANY trained task is +3 at step 38
   require_nonzero_baseline: true  # CLAUDE.md rule 3: abort if the step-0 eval is 0 on every task
   group_reset_check: error  # identical reset seeds must give identical scenes
   # Owner amendment (ADR-0002): RL rollouts on PickPlace + Push only; Stack (0/64 at step 0, every
