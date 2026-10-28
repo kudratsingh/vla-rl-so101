@@ -366,6 +366,49 @@ class _TaskTaggedEnv(_RecordingEnv):
         return super().reset(seed=seed, options=options)
 
 
+def test_kill_switch_any_task_rule(tmp_path: Path) -> None:
+    """Owner 2026-10-28: pass at the check step if ANY trained task gained >= 3 points (PickPlace
+    +3.1 with Push -5 continues under any_task but stops under the old mean rule)."""
+    cases = (
+        ("any_task", (0.531, 0.45), False),  # PickPlace +3.1 -> continue
+        ("any_task", (0.529, 0.529), True),  # both +2.9 -> stop
+        ("mean", (0.531, 0.45), True),  # mean -0.95 -> stop
+    )
+    for rule, (pick, push), stops in cases:
+        cfg = _cfg(steps=8, eval_every=100, train_tasks=["PickPlace", "Push"], early_stop_rule=rule)
+        cfg["env"]["tasks"] = ["PickPlace", "Push"]
+        tr = _trainer(cfg, tmp_path / f"{rule}-{pick}-{push}")
+        evals = iter([(0.5, 0.5), (pick, push)])
+
+        def fake_eval(episodes: int | None = None, it: Any = evals) -> dict[str, float]:
+            p, u = next(it, (0.9, 0.9))
+            return {
+                "eval/success": (p + u) / 2,
+                "eval/success_train": (p + u) / 2,
+                "eval/success/PickPlace": p,
+                "eval/success/Push": u,
+            }
+
+        tr.evaluate = fake_eval  # type: ignore[method-assign]
+        summary = tr.run()
+        assert summary["stopped_flat"] is stops, (rule, pick, push)
+        assert summary["steps_completed"] == (2 if stops else 8)
+    assert GRPOConfig.from_config(load_config("rl")).early_stop_rule == "any_task"
+    with pytest.raises(ValueError, match="early_stop_rule"):
+        GRPOConfig.from_config(_cfg(early_stop_rule="median"))
+
+
+def test_collect_logs_exact_per_task_rollout_stats(tmp_path: Path) -> None:
+    cfg = _cfg(train_tasks=["PickPlace", "Push"])
+    cfg["env"]["tasks"] = ["PickPlace", "Push"]
+    tr = _trainer(cfg, tmp_path)
+    _, stats = tr.collect()
+    trained = stats["rollout/groups_trained/PickPlace"] + stats["rollout/groups_trained/Push"]
+    assert trained == stats["rollout/groups_trained"]
+    for t in ("PickPlace", "Push"):
+        assert 0.0 <= stats.get(f"rollout/frac_groups_dropped/{t}", 0.0) <= 1.0
+
+
 def test_zero_success_baseline_aborts_before_training(tmp_path: Path) -> None:
     """CLAUDE.md rule 3: RL never starts from a 0%-success base."""
     tr = _trainer(_cfg(steps=4), tmp_path)
