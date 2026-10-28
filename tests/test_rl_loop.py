@@ -409,6 +409,36 @@ def test_collect_logs_exact_per_task_rollout_stats(tmp_path: Path) -> None:
         assert 0.0 <= stats.get(f"rollout/frac_groups_dropped/{t}", 0.0) <= 1.0
 
 
+def test_peak_stop_ends_training_past_the_peak(tmp_path: Path) -> None:
+    """Owner 2026-10-28: stop at peak_stop_step if its trained-task eval is below peak_ref_step's."""
+    for at_8, stops in ((0.5, True), (0.7, False)):
+        cfg = _cfg(
+            steps=12, eval_every=4, peak_stop_step=8, peak_ref_step=4, early_stop_on_flat=False
+        )
+        tr = _trainer(cfg, tmp_path / str(at_8))
+        vals = iter([0.3, 0.6, 0.6, at_8])  # steps 0, 3 (kill-switch check), 4, 8
+
+        def fake_eval(episodes: int | None = None, it: Any = vals) -> dict[str, float]:
+            v = next(it, 0.9)
+            return {"eval/success": v, "eval/success_train": v, "eval/success/PickPlace": v}
+
+        tr.evaluate = fake_eval  # type: ignore[method-assign]
+        summary = tr.run()
+        assert summary["stopped_peak"] is stops
+        assert summary["steps_completed"] == (8 if stops else 12)
+    for bad in ((4, 4), (8, 0), (20, 4)):  # ref == stop, ref unset, stop past the last step
+        with pytest.raises(ValueError, match="peak_ref_step"):
+            GRPOConfig.from_config(_cfg(steps=12, peak_stop_step=bad[0], peak_ref_step=bad[1]))
+    # off-grid peak steps are added to the eval schedule with equal episode counts
+    rl = GRPOConfig.from_config(
+        _cfg(steps=12, eval_every=5, eval_episodes=32, peak_stop_step=7, peak_ref_step=3)
+    )
+    plan = eval_schedule(rl)
+    assert plan[3] == plan[7] == rl.early_stop_eval_episodes  # step 3 = kill-switch check
+    rl = GRPOConfig.from_config(load_config("rl", REPO / "configs" / "rl_pickplace.yaml"))
+    assert eval_schedule(rl)[50] == eval_schedule(rl)[100] == 32  # running preset unchanged
+
+
 def test_zero_success_baseline_aborts_before_training(tmp_path: Path) -> None:
     """CLAUDE.md rule 3: RL never starts from a 0%-success base."""
     tr = _trainer(_cfg(steps=4), tmp_path)

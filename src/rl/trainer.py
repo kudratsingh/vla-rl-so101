@@ -94,6 +94,10 @@ class GRPOConfig:
     # "any_task": pass if ANY trained task gained >= min_improvement (owner, 2026-10-28);
     # "mean": the trained-task mean must gain it (ADR-0002 amendment 1)
     early_stop_rule: Literal["any_task", "mean"] = "any_task"
+    # Peak stop (owner 2026-10-28): after the eval at peak_stop_step, stop if the trained-task
+    # mean is below its value at peak_ref_step (training past the peak). 0 = off.
+    peak_stop_step: int = 0
+    peak_ref_step: int = 0
     require_nonzero_baseline: bool = True  # CLAUDE.md rule 3: never train from a 0%-success base
     group_reset_check: Literal["error", "warn", "off"] = "error"
     train_tasks: tuple[str, ...] = ()  # RL rollouts on these only; () = every env task. Evals cover
@@ -147,6 +151,8 @@ class GRPOConfig:
             raise ValueError("rollout temperature must be > 0")
         if not 0 < self.early_stop_check_at_frac <= 1:
             raise ValueError("early_stop_check_at_frac must be in (0, 1]")
+        if self.peak_stop_step and not 0 < self.peak_ref_step < self.peak_stop_step <= self.steps:
+            raise ValueError("need 0 < peak_ref_step < peak_stop_step <= steps")
         if self.early_stop_rule not in ("any_task", "mean"):
             raise ValueError("early_stop_rule must be any_task|mean")
         if self.group_reset_check not in ("error", "warn", "off"):
@@ -167,6 +173,9 @@ def eval_schedule(rl: GRPOConfig) -> dict[int, int]:
     plan[rl.steps] = rl.eval_episodes
     plan[0] = rl.early_stop_eval_episodes
     plan[kill_switch_step(rl)] = rl.early_stop_eval_episodes
+    if rl.peak_stop_step:  # both peak-stop steps are evaluated, on the same episode count
+        n = max(plan.get(rl.peak_ref_step, 0), plan.get(rl.peak_stop_step, 0), rl.eval_episodes)
+        plan[rl.peak_ref_step] = plan[rl.peak_stop_step] = n
     return dict(sorted(plan.items()))
 
 
@@ -569,7 +578,8 @@ class GRPOTrainer:
         log.info("GRPO: %d trainable params, rl=%s", self.num_trainable, asdict(rl))
         schedule = eval_schedule(rl)
         check_step = kill_switch_step(rl)
-        stopped_flat = False
+        stopped_flat = stopped_peak = False
+        train_evals: dict[int, float] = {}
         step = 0
         history: list[tuple[int, float]] = []
         try:
@@ -584,6 +594,20 @@ class GRPOTrainer:
                 if step in schedule:
                     row.update(self.evaluate(schedule[step]))
                     history.append((step, row["eval/success"]))
+                    train_evals[step] = row["eval/success_train"]
+                if step == rl.peak_stop_step:  # eval_schedule guarantees both evals exist
+                    ref, cur = train_evals[rl.peak_ref_step], train_evals[step]
+                    if cur < ref:
+                        stopped_peak = True
+                        row["event/past_peak"] = 1.0
+                        log.warning(
+                            "PAST PEAK: trained-task eval %.3f at step %d < %.3f at step %d; "
+                            "stopping",
+                            cur,
+                            step,
+                            ref,
+                            rl.peak_ref_step,
+                        )
                 # kill switch on the trained tasks only (eval-only tasks cannot move by RL)
                 if step == check_step:
                     base, cur = self._kill_switch_values(baseline, row)
@@ -591,13 +615,14 @@ class GRPOTrainer:
                         stopped_flat = rl.early_stop_on_flat
                         self._flat_run_warning(step, base, cur)
                         row["event/flat_run"] = 1.0
-                if step % rl.checkpoint_every == 0 or step == rl.steps or stopped_flat:
+                stop = stopped_flat or stopped_peak
+                if step % rl.checkpoint_every == 0 or step == rl.steps or stop:
                     self.save_checkpoint(step, history)
                 row["time/step_s"] = time.perf_counter() - t0
                 row["time/elapsed_s"] = time.perf_counter() - t_start
                 self._log({"kind": "train", "step": step, **row})
                 self._console(step, row)
-                if stopped_flat:
+                if stop:
                     break
         except (KeyboardInterrupt, SystemExit):
             # SIGTERM from the pod job's soft deadline (scripts/wo03_rl.py maps it to SystemExit):
@@ -611,6 +636,7 @@ class GRPOTrainer:
         return {
             "steps_completed": step,
             "stopped_flat": stopped_flat,
+            "stopped_peak": stopped_peak,
             "initial_eval_success": history[0][1],
             "final_eval_success": history[-1][1],
             "best_eval_success": max(s for _, s in history),

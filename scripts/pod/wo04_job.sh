@@ -226,7 +226,8 @@ if [ "$STATUS" = stopped_flat ]; then
   echo "[job] KILL SWITCH: eval gain at the check step < rl.early_stop_min_improvement; no protocol eval"
   exit 0
 fi
-[ "$STATUS" = finished ] || { echo "[job] unexpected RL status $STATUS"; exit 32; }
+# stopped_peak (rl.peak_stop_step): stopped past the peak; evaluated like a finished run
+[ "$STATUS" = finished ] || [ "$STATUS" = stopped_peak ] || { echo "[job] unexpected RL status $STATUS"; exit 32; }
 upload "RL run"
 
 stage full-eval
@@ -235,6 +236,27 @@ echo "[job] final RL checkpoint: $CK"
 run_until_deadline uv run scripts/wo02_eval.py --preset sim --config "$CFG" --adapter "$CK/adapter" \
   --num-envs 50 --sim-device cuda || exit 40
 echo "$CK $(ls -d runs/*-wo02eval-sim-* | sort | tail -1)" > "$RUN/protocol_eval.txt"
+# owner 2026-10-28: also score the best mid-run checkpoint (highest in-training trained-task eval;
+# earliest on a tie) when it is not the final one
+BEST=$(uv run python - "$RUN" <<'EOF'
+import json, os, sys
+run = sys.argv[1]
+evals = [json.loads(l) for l in open(f"{run}/metrics.jsonl")]
+evals = [(r["step"], r["eval/success_train"]) for r in evals
+         if "eval/success_train" in r and r["step"] > 0
+         and os.path.isdir(f"{run}/checkpoints/step_{r['step']:06d}")]
+if evals:
+    step, val = max(evals, key=lambda e: (e[1], -e[0]))
+    print(f"{run}/checkpoints/step_{step:06d}")
+EOF
+)
+if [ -n "$BEST" ] && [ "$BEST" != "$CK" ]; then
+  stage best-eval
+  echo "[job] best mid-run checkpoint: $BEST"
+  run_until_deadline uv run scripts/wo02_eval.py --preset sim --config "$CFG" --adapter "$BEST/adapter" \
+    --num-envs 50 --sim-device cuda || exit 42
+  echo "$BEST $(ls -d runs/*-wo02eval-sim-* | sort | tail -1)" >> "$RUN/protocol_eval.txt"
+fi
 if [ "${EVAL_SFT:-0}" = 1 ]; then
   stage sft-eval
   run_until_deadline uv run scripts/wo02_eval.py --preset sim --config "$CFG" --adapter "$SFT_ADAPTER" \

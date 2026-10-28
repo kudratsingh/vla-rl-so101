@@ -7,3 +7,6 @@ inherit: configs/rl.yaml
 
 rl:
   train_tasks: [PickPlace]
+  checkpoint_every: 25      # owner 2026-10-28: every eval step has a checkpoint
+  peak_stop_step: 100       # owner 2026-10-28: if step 100 < step 50 (trained-task eval), stop:
+  peak_ref_step: 50         #   "don't train past the peak"; the best checkpoint is evaluated
