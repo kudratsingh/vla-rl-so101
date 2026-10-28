@@ -151,8 +151,8 @@ class GRPOConfig:
             raise ValueError("rollout temperature must be > 0")
         if not 0 < self.early_stop_check_at_frac <= 1:
             raise ValueError("early_stop_check_at_frac must be in (0, 1]")
-        if self.peak_stop_step and not 0 < self.peak_ref_step < self.peak_stop_step:
-            raise ValueError("peak_ref_step must be in (0, peak_stop_step)")
+        if self.peak_stop_step and not 0 < self.peak_ref_step < self.peak_stop_step <= self.steps:
+            raise ValueError("need 0 < peak_ref_step < peak_stop_step <= steps")
         if self.early_stop_rule not in ("any_task", "mean"):
             raise ValueError("early_stop_rule must be any_task|mean")
         if self.group_reset_check not in ("error", "warn", "off"):
@@ -173,6 +173,9 @@ def eval_schedule(rl: GRPOConfig) -> dict[int, int]:
     plan[rl.steps] = rl.eval_episodes
     plan[0] = rl.early_stop_eval_episodes
     plan[kill_switch_step(rl)] = rl.early_stop_eval_episodes
+    if rl.peak_stop_step:  # both peak-stop steps are evaluated, on the same episode count
+        n = max(plan.get(rl.peak_ref_step, 0), plan.get(rl.peak_stop_step, 0), rl.eval_episodes)
+        plan[rl.peak_ref_step] = plan[rl.peak_stop_step] = n
     return dict(sorted(plan.items()))
 
 
@@ -592,8 +595,8 @@ class GRPOTrainer:
                     row.update(self.evaluate(schedule[step]))
                     history.append((step, row["eval/success"]))
                     train_evals[step] = row["eval/success_train"]
-                if step == rl.peak_stop_step and rl.peak_ref_step in train_evals:
-                    ref, cur = train_evals[rl.peak_ref_step], train_evals.get(step, float("nan"))
+                if step == rl.peak_stop_step:  # eval_schedule guarantees both evals exist
+                    ref, cur = train_evals[rl.peak_ref_step], train_evals[step]
                     if cur < ref:
                         stopped_peak = True
                         row["event/past_peak"] = 1.0

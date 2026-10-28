@@ -426,8 +426,17 @@ def test_peak_stop_ends_training_past_the_peak(tmp_path: Path) -> None:
         summary = tr.run()
         assert summary["stopped_peak"] is stops
         assert summary["steps_completed"] == (8 if stops else 12)
-    with pytest.raises(ValueError, match="peak_ref_step"):
-        GRPOConfig.from_config(_cfg(peak_stop_step=4, peak_ref_step=4))
+    for bad in ((4, 4), (8, 0), (20, 4)):  # ref == stop, ref unset, stop past the last step
+        with pytest.raises(ValueError, match="peak_ref_step"):
+            GRPOConfig.from_config(_cfg(steps=12, peak_stop_step=bad[0], peak_ref_step=bad[1]))
+    # off-grid peak steps are added to the eval schedule with equal episode counts
+    rl = GRPOConfig.from_config(
+        _cfg(steps=12, eval_every=5, eval_episodes=32, peak_stop_step=7, peak_ref_step=3)
+    )
+    plan = eval_schedule(rl)
+    assert plan[3] == plan[7] == rl.early_stop_eval_episodes  # step 3 = kill-switch check
+    rl = GRPOConfig.from_config(load_config("rl", REPO / "configs" / "rl_pickplace.yaml"))
+    assert eval_schedule(rl)[50] == eval_schedule(rl)[100] == 32  # running preset unchanged
 
 
 def test_zero_success_baseline_aborts_before_training(tmp_path: Path) -> None:
