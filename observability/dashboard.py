@@ -13,11 +13,13 @@ import re
 from collections import defaultdict
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, TypeGuard
 
 RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 METRIC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,95}\Z")
-SENSITIVE = re.compile(r"password|secret|api.?key|access.?token|authorization|credential", re.I)
+SENSITIVE = re.compile(
+    r"password|secret|api.?key|access.?token|authorization|credential", re.IGNORECASE
+)
 BENCHMARK_TASKS = ("PickPlace", "Push", "Stack")
 BENCHMARK_CELLS = ("seen", "shifted", "unseen_objects")
 METRIC_PREFIXES = ("train/", "rollout/", "eval/", "time/")
@@ -42,8 +44,8 @@ MAX_SAMPLES = 2400
 MAX_LOG_BYTES = 32 * 1024 * 1024
 
 
-def _numeric(value: object) -> bool:
-    return type(value) in (int, float) and math.isfinite(value)
+def _numeric(value: object) -> TypeGuard[int | float]:
+    return (type(value) is int or type(value) is float) and math.isfinite(value)
 
 
 def _valid_metric(key: object) -> bool:
@@ -165,6 +167,14 @@ def load_runs(root: Path) -> list[dict[str, Any]]:
         # Never mix future real-hardware data into this simulation comparison.
         is_sim_eval = metadata.get("script") == "scripts/wo02_eval.py"
         evals = _read_events(logs, metric_series)
+        results = metadata.get("results")
+        protocol_hash = results.get("protocol_hash") if isinstance(results, dict) else None
+        if not (
+            is_sim_eval
+            and isinstance(protocol_hash, str)
+            and re.fullmatch(r"[0-9a-f]{64}", protocol_hash)
+        ):
+            protocol_hash = None
         status = metadata.get("status")
         cost = metadata.get("actual_usd")
         git = metadata.get("git")
@@ -180,6 +190,7 @@ def load_runs(root: Path) -> list[dict[str, Any]]:
                 ),
                 "cost_usd": float(cost) if _numeric(cost) and cost >= 0 else None,
                 "series": metric_series,
+                "protocol_hash": protocol_hash,
                 "benchmarks": _benchmarks(evals) if is_sim_eval else [],
             }
         )
@@ -214,7 +225,7 @@ footer{color:#8495ae;font-size:12px;margin-top:22px}
 </style></head><body>
 <header><div><div class="eyebrow">Local-first · Simulation research</div><h1>SO-101 Observatory</h1><p>Training signal, seed-aware outcomes and run provenance.</p></div><div class="tag">Offline · Read-only inputs</div></header>
 <section class="panel"><div class="row"><div><h2>SFT / GRPO metric explorer</h2><p>Compare runs on like-for-like metrics, including rollout group drops and held-out success.</p></div><label for="metric">Metric <select id="metric"></select></label></div><svg id="chart" role="img" aria-label="Selected metric over training steps" viewBox="0 0 960 345"></svg><div id="legend"></div></section>
-<section class="panel"><h2>Simulation evaluation · two-run comparison</h2><p>Explicitly choose a baseline and candidate. Selection does not imply model type; verify checkpoint provenance. Real trials are excluded.</p><div class="row" style="margin:16px 0"><label for="baseline">Baseline <select id="baseline"></select></label><label for="candidate">Candidate <select id="candidate"></select></label></div><div class="tablewrap"><table><thead><tr><th>Task</th><th>Distribution</th><th>Baseline (95% CI)</th><th>Candidate (95% CI)</th><th>Δ pp</th><th>Trials</th></tr></thead><tbody id="benchmarkBody"></tbody></table></div><small>Each cell aggregates distinct recorded evaluation seeds; CIs use the 95% Wilson interval. Differences are descriptive, not significance tests. Missing evaluation data is not zero success.</small></section>
+<section class="panel"><h2>Simulation evaluation · two-run comparison</h2><p>Explicitly choose a baseline and candidate. Selection does not imply model type; verify checkpoint provenance. Real trials are excluded.</p><div class="row" style="margin:16px 0"><label for="baseline">Baseline <select id="baseline"></select></label><label for="candidate">Candidate <select id="candidate"></select></label></div><p id="protocolStatus" role="status" style="overflow-wrap:anywhere"></p><div class="tablewrap"><table><thead><tr><th>Task</th><th>Distribution</th><th>Baseline (95% CI)</th><th>Candidate (95% CI)</th><th>Δ pp</th><th>Trials</th></tr></thead><tbody id="benchmarkBody"></tbody></table></div><small>Each cell aggregates distinct recorded evaluation seeds; CIs use the 95% Wilson interval. Differences are descriptive, not significance tests. Missing evaluation data is not zero success.</small></section>
 <section class="panel"><h2>Run inventory</h2><p>Recorded local run status and estimated cost, not live RunPod billing.</p><div class="tablewrap"><table><thead><tr><th>Run</th><th>Status</th><th>Steps seen</th><th>Latest success (train tasks)</th><th>Recorded cost</th><th>Commit</th></tr></thead><tbody id="runBody"></tbody></table></div></section>
 <footer>Uses only numerical metrics and (for sim eval only) task/cell/seed aggregate counts from record.json and metrics.jsonl. No frames, prompts, trajectories, checkpoints, robot commands, secrets, full configuration or live hardware endpoints are included.</footer>
 <script id="data" type="application/json">__PAYLOAD__</script>
@@ -253,9 +264,15 @@ for(const sel of [baseBox,candBox]){const empty=document.createElement("option")
 if(evalRuns.length){baseBox.value=evalRuns[evalRuns.length-1].id;if(evalRuns.length>1)candBox.value=evalRuns[0].id;}
 const tasks=["PickPlace","Push","Stack"],cells=["seen","shifted","unseen_objects"];
 function bcell(r,t,c){return r?.benchmarks.find(x=>x.task===t&&x.cell===c)||null;}
-function score(b){if(!b)return "—";return (b.rate*100).toFixed(1)+"% ["+(b.ci[0]*100).toFixed(1)+", "+(b.ci[1]*100).toFixed(1)+"]";}
-function renderBench(){const tbody=document.getElementById("benchmarkBody");tbody.replaceChildren();const a=evalRuns.find(r=>r.id===baseBox.value),b=evalRuns.find(r=>r.id===candBox.value);if(!a&&!b){const tr=document.createElement("tr"),td=document.createElement("td");td.colSpan=6;td.className="empty";td.textContent="No local simulation evaluation rows. Copy metrics.jsonl from a WO-02 evaluation run.";tr.appendChild(td);tbody.appendChild(tr);return;}
-for(const t of tasks)for(const c of cells){const x=bcell(a,t,c),y=bcell(b,t,c),tr=document.createElement("tr");cell(tr,t);cell(tr,c.replaceAll("_"," "));cell(tr,score(x));cell(tr,score(y));const diff=x&&y?(y.rate-x.rate)*100:null;cell(tr,diff===null?"—":(diff>=0?"+":"")+diff.toFixed(1),diff===null?"":diff>0?"pos":diff<0?"neg":"");cell(tr,[x?`${x.episodes} / ${x.seeds} seeds`:null,y?`${y.episodes} / ${y.seeds} seeds`:null].filter(Boolean).join(" | ")||"—");tbody.appendChild(tr);}}
+function score(b,r){if(!b)return "—";if(!r.protocol_hash)return "Unverified protocol";return (b.rate*100).toFixed(1)+"% ["+(b.ci[0]*100).toFixed(1)+", "+(b.ci[1]*100).toFixed(1)+"]";}
+function renderBench(){const tbody=document.getElementById("benchmarkBody");tbody.replaceChildren();const a=evalRuns.find(r=>r.id===baseBox.value),b=evalRuns.find(r=>r.id===candBox.value);
+const comparable=Boolean(a?.protocol_hash&&b?.protocol_hash&&a.protocol_hash===b.protocol_hash);
+const provenance=[];
+for(const [label,r] of [["Baseline",a],["Candidate",b]])if(r)provenance.push(label+" "+r.id+" protocol: "+(r.protocol_hash||"missing or invalid; success rates hidden"));
+if(a&&b&&!comparable)provenance.push(a.protocol_hash&&b.protocol_hash?"Protocol mismatch; delta withheld.":"Matching recorded protocol hashes required; delta withheld.");
+document.getElementById("protocolStatus").textContent=provenance.join(" · ");
+if(!a&&!b){const tr=document.createElement("tr"),td=document.createElement("td");td.colSpan=6;td.className="empty";td.textContent="No local simulation evaluation rows. Copy metrics.jsonl from a WO-02 evaluation run.";tr.appendChild(td);tbody.appendChild(tr);return;}
+for(const t of tasks)for(const c of cells){const x=bcell(a,t,c),y=bcell(b,t,c),tr=document.createElement("tr");cell(tr,t);cell(tr,c.replaceAll("_"," "));cell(tr,score(x,a));cell(tr,score(y,b));const diff=comparable&&x&&y?(y.rate-x.rate)*100:null;cell(tr,diff===null?"—":(diff>=0?"+":"")+diff.toFixed(1),diff===null?"":diff>0?"pos":diff<0?"neg":"");cell(tr,[x?`${x.episodes} / ${x.seeds} seeds`:null,y?`${y.episodes} / ${y.seeds} seeds`:null].filter(Boolean).join(" | ")||"—");tbody.appendChild(tr);}}
 baseBox.addEventListener("change",renderBench);candBox.addEventListener("change",renderBench);renderBench();
 </script></body></html>"""
 
