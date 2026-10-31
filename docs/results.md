@@ -25,6 +25,38 @@ One SFT training run (single-run); GPU sim (physx_cuda), RTX 4090, 2026-10-27, e
 | Stack | shifted | 0.0 [0.0, 1.3] (0, 0, 0) | | | `20261027T190836Z-wo02eval-sim-cdd3` | 0.1-draft `e9ce5bb47a88` |
 | Stack | unseen objects | 2.0 [0.9, 4.3] (1, 3, 2) | | | `20261027T190836Z-wo02eval-sim-cdd3` | 0.1-draft `e9ce5bb47a88` |
 
+The SFT+RL column stays empty: it needs 3 training seeds, and only one two-task seed finished.
+The two RL runs that completed are in the next table.
+
+## Sim — WO-04 RL runs, each a single training seed (single-run)
+
+Success %, pooled over 3 sim seeds x 100 episodes, [95% Wilson]. Protocol 0.1-draft
+`e9ce5bb47a88`, horizon 150, GPU sim, A100-80GB, final checkpoint (step 150). Both start from the
+SFT-only checkpoint above. The two-task run trained on PickPlace + Push, the PickPlace-only run on
+PickPlace. **WO-04's benchmark (>= +20 points on 2 of 3 tasks, 3 seeds) is not met.**
+
+| Task | Cell | SFT-only | Two-task RL | Δ | PickPlace-only RL | Δ |
+|---|---|---|---|---|---|---|
+| PickPlace | seen | 17.0 [13.2, 21.7] | 22.0 [17.7, 27.0] | +5.0 | 20.7 [16.5, 25.6] | +3.7 |
+| PickPlace | shifted | 1.7 [0.7, 3.8] | 2.3 [1.1, 4.7] | +0.7 | 2.3 [1.1, 4.7] | +0.7 |
+| PickPlace | unseen objects | 14.7 [11.1, 19.1] | 14.7 [11.1, 19.1] | 0.0 | 19.7 [15.6, 24.5] | +5.0 |
+| Push | seen | 10.0 [7.1, 13.9] | 7.7 [5.2, 11.2] | -2.3 | 9.7 [6.8, 13.5] | -0.3 |
+| Push | shifted | 3.7 [2.1, 6.4] | 2.0 [0.9, 4.3] | -1.7 | 4.0 [2.3, 6.9] | +0.3 |
+| Push | unseen objects | 6.3 [4.1, 9.7] | 6.7 [4.4, 10.1] | +0.3 | 8.3 [5.7, 12.0] | +2.0 |
+| Stack | seen | 2.7 [1.4, 5.2] | 2.3 [1.1, 4.7] | -0.3 | 2.0 [0.9, 4.3] | -0.7 |
+| Stack | shifted | 0.0 [0.0, 1.3] | 0.3 [0.1, 1.9] | +0.3 | 0.0 [0.0, 1.3] | 0.0 |
+| Stack | unseen objects | 2.0 [0.9, 4.3] | 2.0 [0.9, 4.3] | 0.0 | 2.0 [0.9, 4.3] | 0.0 |
+
+| Run | RL run id | Protocol eval run id | Commit | Eval config | Pod | $ |
+|---|---|---|---|---|---|---|
+| Two-task, seed 0 | `20261027T205508Z-wo04-rl-s0-2992e5` | `20261028T234248Z-wo02eval-sim-8de3` | `7c896d0` | `56483b601882` | `9d8p7vyfyv6ca4` | 51.27 |
+| PickPlace-only, seed 0 | `20261028T185032Z-wo04-rl-s0-84bf82` | `20261029T233518Z-wo02eval-sim-d102` | `4a76953` | `d090ed40bb1b` | `s2ljj3drwg0ov0` | 55.00 |
+
+**The PickPlace-only run missed its bar** (owner, 2026-10-28: seen, PickPlace, 300 episodes,
+>= 27.0%): 20.7%, 62/300. Neither RL gain on PickPlace seen is distinguishable from SFT-only by
+an unpaired two-proportion test (two-task p = 0.12, PickPlace-only p = 0.25); the two runs do not
+differ from each other (p = 0.69).
+
 ## Ablations (WO-05)
 
 | Factor | Levels | Result | Run ids |
@@ -51,3 +83,17 @@ One SFT training run (single-run); GPU sim (physx_cuda), RTX 4090, 2026-10-27, e
   all-equal (dropped), and reusing sampler log-probs as old log-probs gave |log ratio| max
   0.15-0.20 (mean 0.013). Temperature 1.0 cut drops to 72%; recompute cut the mean to 0.00012.
   ADR-0002 amendment 1.
+- WO-04 (2026-10-29/30): GRPO gave +5.0 / +3.7 points on PickPlace seen after 150 steps, well short
+  of the published +40-50 and of the owner's +10 bar. Two of three two-task seeds stopped flat at
+  step 38 (mean rule: seed 1 13.3 -> 13.3%, seed 2 13.3 -> 11.7%).
+- WO-04 giving RL all the updates did not help: PickPlace-only (20.7%) did not beat two-task (22.0%)
+  on PickPlace, and Push did not fall when untrained (9.7% vs 10.0%). Interference between tasks is
+  not supported; the PickPlace-only result rules out the stratified multi-task follow-up.
+- WO-04 in-training evals (32 episodes, step 150: 31.2% PickPlace-only, 25.0% two-task) read higher
+  than the protocol (20.7%, 22.0%). Two-task PickPlace read 37.5% at step 50 and 34.4% at step 75,
+  then 21.9% at step 100; with about +/-15 points at 32 episodes that is not evidence of a peak.
+  Those mid-run checkpoints have no protocol eval: the job's best-checkpoint rule picked step 150
+  in the PickPlace-only run, and the two-task job predates the rule.
+- WO-04 the updates are very small: approx_kl ~3e-5, clip fraction 0.000 in every 25-step window of
+  both runs. PickPlace-only sampled success still rose (7.9% -> 12.6%, entropy 1.31 -> 1.08,
+  groups dropped 61% -> 51%); two-task stayed flat (6.8% -> 7.7%, entropy ~1.5).

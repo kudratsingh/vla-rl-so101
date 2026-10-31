@@ -100,3 +100,28 @@ model updated to the measured rollout rate (86 env actions/s) and the refill cap
 trained one): worst case 13.1 min/step, 150 steps = 33.0 h = **$59 per seed** (`--estimate`);
 if 50–60% of K=16 groups survive, ~10–11.5 min/step = ~$46–52. The seed-0 pod's own probe (job
 stage `probe`, before its approval gate) measures the K=16 drop rate before any spend beyond ~$1.5.
+
+## Amendment 2 (2026-10-28, owner; outcomes 2026-10-30)
+
+Seeds 1 and 2 of the two-task run stopped at the step-38 mean check (0.0 and -1.6 points); seed 0
+passed by one episode (+3.1). In all three PickPlace rose 5-9 points and Push fell 2-9. An estimate
+from the aggregate logs put PickPlace's share of trained groups at ~48% (at most ~63%), so it did
+not dominate the updates.
+
+Owner decisions: no per-task advantage normalization (groups already share a prompt); the kill
+switch passes if ANY trained task is +3 at step 38 (`rl.early_stop_rule: any_task`); run
+PickPlace-only, one seed, then multi-task with stratified batches only if it clears +10 points on
+the final protocol eval (seen, 300 episodes, >= 27.0%). Added for that run: checkpoints every 25
+steps, a stop at step 100 if below step 50, protocol eval of the best mid-run checkpoint.
+
+Outcome: PickPlace seen 20.7% [16.5, 25.6], **+3.7 points, bar missed**, so stratified batches are
+not run. Two-task seed 0: 22.0% [17.7, 27.0], +5.0. `docs/results.md` has both tables. The peak
+stop did not fire (step 100 28.1% vs step 50 25.0%). The best checkpoint was step 150, so no
+separate mid-run protocol eval ran.
+
+Per-update policy change is very small in both runs (approx_kl ~3e-5, clip fraction 0.000): 150
+updates x 2 optimizer steps at lr 5e-5 = 300 steps, against 8000 SFT steps at lr 5e-4. This is the
+leading hypothesis for the slow gain, not a verified cause.
+
+This meets half of the "what would reopen this" condition above: GRPO has shown no clear
+improvement on a base below the 20-60% band. The decision is with the owner.
