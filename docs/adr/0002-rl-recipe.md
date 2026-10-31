@@ -116,8 +116,9 @@ steps, a stop at step 100 if below step 50, protocol eval of the best mid-run ch
 
 Outcome: PickPlace seen 20.7% [16.5, 25.6], **+3.7 points, bar missed**, so stratified batches are
 not run. Two-task seed 0: 22.0% [17.7, 27.0], +5.0. `docs/results.md` has both tables. The peak
-stop did not fire (step 100 28.1% vs step 50 25.0%). The best checkpoint was step 150, so no
-separate mid-run protocol eval ran.
+stop did not fire (step 100 28.1% vs step 50 25.0%). The best checkpoint was step 150, so the job
+ran no separate mid-run eval; a later protocol eval of two-task step 50 (21.3%) and PickPlace-only
+step 100 (22.7%) found no peak.
 
 Per-update policy change is very small in both runs (approx_kl ~3e-5, clip fraction 0.000): 150
 updates x 2 optimizer steps at lr 5e-5 = 300 steps, against 8000 SFT steps at lr 5e-4. This is the

@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-10-30
+Updated: 2026-10-31
 
 ## Current work order
 
@@ -53,12 +53,13 @@ settling, so their rows use wall-clock x rate).
 | pod `d74m2ppdjvvof6` (WO-04 two-task seed 2, kill switch at step 38) | 04 | A100-80GB, $1.79/h | 7.6 | 13.69 | yes, 2026-10-27 (after seed 0 passed step 38) |
 | pod `s2ljj3drwg0ov0` (WO-04 PickPlace-only seed 0: probe, 150 steps, protocol eval) | 04 | A100-80GB, $1.79/h | 30.5 | 55.00 | yes, 2026-10-28 (auto-gate: <= 60% dropped, <= $60 projected) |
 | pod `82a5je0ve40rlp` (rollout videos, 5 checkpoints) | 04 | RTX 4090, $0.89/h | 0.18 | 0.17 | yes, 2026-10-28 |
+| pod `7gbl8q46qlxf1z` (protocol eval of two-task step 50, PickPlace-only step 100) | 04 | RTX 4090, $0.89/h | 2.17 | ~1.93 | yes, 2026-10-31 (~$2) |
 
-Running total (all finished): WO-02 ~$13.56 of its $15 cap; WO-04 ~$140.60; total ~$154.16 of the ~$200 budget.
+Running total (all finished): WO-02 ~$13.56 of its $15 cap; WO-04 ~$142.53; total ~$156.09 of the ~$200 budget.
 
 ## Blockers and decisions pending the owner
 
-- WO-04: GRPO has not produced a clear gain (PickPlace seen +5.0 and +3.7 points, single seeds, ~$46 of budget left). What to try next is the owner's call; WO-05 is blocked on it. Best guess: updates are too small (approx_kl ~3e-5, clip fraction 0), so test a higher LoRA lr or more optimizer steps per update on a short PickPlace-only run. Optional first: ~$2 protocol eval of two-task step 50 and PickPlace-only step 100.
+- WO-04: GRPO has not produced a clear gain (PickPlace seen +3.7 to +5.7 points across four checkpoints, no peak, ~$44 of budget left). WO-05 is blocked on the owner's next step. On hold by the owner (2026-10-31): a 75-step PickPlace-only run at lr 5e-4; priced ~$50 at 4 epochs x 8 prompts, ~$38 at 4 epochs x 6 prompts, ~$36 at 2 epochs x 8 prompts, because updates look too small (approx_kl ~3e-5, clip fraction 0).
 
 ## Owner decisions in effect
 
