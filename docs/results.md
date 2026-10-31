@@ -57,6 +57,19 @@ PickPlace. **WO-04's benchmark (>= +20 points on 2 of 3 tasks, 3 seeds) is not m
 an unpaired two-proportion test (two-task p = 0.12, PickPlace-only p = 0.25); the two runs do not
 differ from each other (p = 0.69).
 
+Mid-run checkpoints, same protocol (owner, 2026-10-31: is there a peak?). Two-task step 50 had the
+highest in-training reading of any checkpoint (37.5% at 32 episodes). RTX 4090, $0.93 each, commit
+`7dc6822`, pod `7gbl8q46qlxf1z`.
+
+| Checkpoint | PickPlace seen | Vs same run's step 150 | Push seen | Stack seen | Eval run id |
+|---|---|---|---|---|---|
+| Two-task, step 50 | 21.3 [17.1, 26.3] | 22.0 | 8.7 [6.0, 12.4] | 2.7 [1.4, 5.2] | `20261031T041440Z-wo02eval-sim-4be2` |
+| PickPlace-only, step 100 | 22.7 [18.3, 27.7] | 20.7 | 10.0 [7.1, 13.9] | 3.0 [1.6, 5.6] | `20261031T051736Z-wo02eval-sim-a72a` |
+
+No peak: each mid-run checkpoint is within 2 points of its run's final checkpoint, and none reaches
+27.0%. Against SFT-only (unpaired): two-task step 50 p = 0.18, PickPlace-only step 100 p = 0.08,
+before allowing for having looked at four checkpoints.
+
 ## Ablations (WO-05)
 
 | Factor | Levels | Result | Run ids |
@@ -91,9 +104,8 @@ differ from each other (p = 0.69).
   not supported; the PickPlace-only result rules out the stratified multi-task follow-up.
 - WO-04 in-training evals (32 episodes, step 150: 31.2% PickPlace-only, 25.0% two-task) read higher
   than the protocol (20.7%, 22.0%). Two-task PickPlace read 37.5% at step 50 and 34.4% at step 75,
-  then 21.9% at step 100; with about +/-15 points at 32 episodes that is not evidence of a peak.
-  Those mid-run checkpoints have no protocol eval: the job's best-checkpoint rule picked step 150
-  in the PickPlace-only run, and the two-task job predates the rule.
+  then 21.9% at step 100. The protocol eval of step 50 reads 21.3%: that peak was eval noise (about
+  +/-15 points at 32 episodes). In-training evals are not a safe way to pick a checkpoint here.
 - WO-04 the updates are very small: approx_kl ~3e-5, clip fraction 0.000 in every 25-step window of
   both runs. PickPlace-only sampled success still rose (7.9% -> 12.6%, entropy 1.31 -> 1.08,
   groups dropped 61% -> 51%); two-task stayed flat (6.8% -> 7.7%, entropy ~1.5).
