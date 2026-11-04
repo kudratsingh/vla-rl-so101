@@ -1,8 +1,8 @@
-# SO-101 VLA + RL
+# SO-101 — VLA Reinforcement Learning & Sim-to-Real
 
-Can reinforcement learning improve a vision-language-action model after only a few demonstrations? This project tests **OpenVLA-OFT LoRA SFT → GRPO post-training** in ManiSkill3, one training GPU at a time, with a planned transfer to an SO-101 arm.
+A **vision-language-action (VLA) reinforcement-learning and sim-to-real manipulation stack** for the **SO-101 robot arm**. It connects few-shot **OpenVLA-OFT LoRA supervised fine-tuning** to single-GPU **GRPO post-training**, using camera-conditioned policies and task-success rewards in **ManiSkill3**.
 
-It includes the simulator, demonstration pipeline, training loop, evaluation protocol and robot-side safety code. **Simulation experiments have run; the RL improvement benchmark has not been met, and real-arm deployment has not been demonstrated.**
+The pipeline spans scripted IK demonstrations, LeRobotDataset recording, grouped rollouts, action-token log-probability updates, checkpoint evaluation and robot-side command filtering. Protocol-hashed evaluations separate seen positions, shifted positions and unseen objects, while joint, workspace, velocity and deadman checks define the hardware control boundary.
 
 ## Latest results
 
