@@ -14,25 +14,39 @@ longer than ``deadman_frame_timeout_ms`` (300), so the deadman cannot check the 
 the chunk was predicted from. Three separate bounds instead:
 
 1. Camera liveness (the deadman). A fresh frame is read on EVERY control tick, including the
-   tick that writes a chunk's first action and the decision tick before a query, and that
-   frame's capture time is what the driver checks. A camera that faults, or stalls (returns the
-   same stamp), trips the deadman (HOLD) within ``deadman_frame_timeout_ms`` plus one tick.
+   tick that writes a chunk's first action, the decision tick before a query and a tick whose
+   action is dropped as stale, and the driver checks that frame's capture time before anything
+   else happens on the tick. A camera that faults (a lost frame) trips the deadman (HOLD) on that
+   tick. One that stalls (returns the same stamp) trips at the first check after the frame is
+   older than ``deadman_frame_timeout_ms``: within one tick while a chunk executes, but only
+   after the reply while a query is in flight, so the worst case is the timeout + preprocessing
+   + RTT (<= ``request_timeout_ms``), ~700 ms with real.yaml. No write ever uses a frame older
+   than ``deadman_frame_timeout_ms``.
 2. Chunk staleness. ``max_chunk_age_ms`` bounds the time from the chunk's SOURCE frame capture to
    each write. A later action that is too old is dropped with the rest of the chunk and the
    policy is re-queried (counted in ``stale_chunk_drops``); a chunk whose FIRST action is already
    too old trips the deadman (HOLD), since the loop can no longer act on current observations.
 3. Server timeout. ``request_timeout_ms`` is the gRPC deadline, and also checked on the loop's
-   own clock. A timeout, an unreachable server, a server error or a malformed reply trips the
-   deadman (HOLD). Nothing is written after a trip except the driver's single hold write.
+   own clock. A timeout, an unreachable server, a server error or a malformed reply (wrong shape,
+   non-finite actions) trips the deadman (HOLD). Nothing is written after a trip except the
+   driver's single hold write.
 
-A serial error ends everything: the driver has already cut torque. A HOLD trip ends the trial;
-resuming needs an operator acknowledgement (``Deadman.reset``). Ctrl-C holds (a deadman trip),
-then ``safe_shutdown`` waits for the operator to support the arm before disabling torque.
+Pacing. Writes are at least one period apart. The policy is queried synchronously between chunks,
+right after the previous chunk's last write, and that query counts against the next write's
+period: the gap at a chunk boundary is max(period, decision tick + query), not their sum. A query
+slower than the period therefore stretches the boundary gap (``boundary_gap_ms`` per decision,
+``write_hz`` per trial); overlapping the query with the last action is left for WO-08.
+
+A serial error ends everything: the driver has already cut torque, and nothing is written after
+it. A HOLD trip ends the trial; resuming needs an operator acknowledgement (``Deadman.reset``).
+Ctrl-C holds (a deadman trip), then ``safe_shutdown`` waits for the operator to support the arm
+before disabling torque.
 
 Latency, all from the injected ``clock`` (``time.perf_counter`` on the arm; the camera stamps with
 the same clock): capture -> preprocessed (state read + image pipeline) -> send -> recv -> first
 write, plus the server's ``infer_ms`` / ``server_ms``. The WO-07 metric is
-``capture_to_first_write_ms``. LeRobot stamps a frame after its driver read, so this is
+``capture_to_first_write_ms``; when the query beats the period it includes ``pace_wait_ms``, the
+wait for the write tick. LeRobot stamps a frame after its driver read, so this is
 host-stamped capture to bus write: sensor exposure and USB / driver buffering are NOT included.
 """
 
@@ -83,6 +97,7 @@ class DeployConfig:
     home_timeout_s: float
     latency_target_ms: float
     stop_on_reject: bool
+    policy_checkpoint: str | None = None  # server.policy_checkpoint: Info's policy_id must match
 
     def __post_init__(self) -> None:
         if not 1 <= self.exec_steps <= self.chunk_len:
@@ -99,6 +114,7 @@ class DeployConfig:
         d = cfg["deploy"]
         chunk_len = int(d["chunk_len"])
         exec_steps = d.get("exec_steps")
+        checkpoint = (cfg.get("server") or {}).get("policy_checkpoint")
         return cls(
             control_hz=float(cfg["robot"]["control_hz"]),
             chunk_len=chunk_len,
@@ -113,6 +129,7 @@ class DeployConfig:
             home_timeout_s=float(d["home_timeout_s"]),
             latency_target_ms=float(d["latency_target_ms"]),
             stop_on_reject=bool(d.get("stop_on_reject", True)),
+            policy_checkpoint=None if checkpoint is None else str(checkpoint),
         )
 
 
@@ -209,6 +226,8 @@ class PolicyClient:
                 "bad_reply",
                 f"actions {actions.shape}, expected ({self.chunk_len}, {self.action_dim})",
             )
+        if not np.all(np.isfinite(actions)):  # a server fault, not a policy safety rejection
+            raise ServerFault("bad_reply", "actions contain non-finite values")
         return ActReply(actions, infer_ms, server_ms, t_send, t_recv)
 
     @staticmethod
@@ -246,8 +265,14 @@ def server_mismatches(info: Mapping[str, Any], dcfg: DeployConfig) -> list[str]:
         for k, v in expected.items()
         if info.get(k) != v
     ]
-    if not info.get("policy_id"):
-        out.append("policy_id: server sent none")
+    policy_id = info.get("policy_id")
+    if not policy_id or str(policy_id).strip().lower() in ("none", "null"):
+        out.append(f"policy_id: server sent none ({policy_id!r})")
+    elif dcfg.policy_checkpoint is not None and policy_id != dcfg.policy_checkpoint:
+        out.append(
+            f"policy_id: server {policy_id!r} != server.policy_checkpoint "
+            f"{dcfg.policy_checkpoint!r}"
+        )
     return out
 
 
@@ -281,9 +306,19 @@ class TrialResult:
     max_frame_age_ms: float = 0.0
     t_start: float = 0.0
     t_end: float = 0.0
+    t_first_write: float | None = None
+    t_last_write: float | None = None
 
     def latency_ms(self, key: str = "capture_to_first_write_ms") -> list[float]:
         return [t[key] for t in self.timings if key in t]
+
+    @property
+    def write_hz(self) -> float | None:
+        """Realised policy-write rate over the trial (sim: exactly control_hz)."""
+        if self.t_first_write is None or self.t_last_write is None or self.steps < 2:
+            return None
+        span = self.t_last_write - self.t_first_write
+        return (self.steps - 1) / span if span > 0 else None
 
 
 def _ms(a: float, b: float) -> float:
@@ -380,8 +415,10 @@ class DeployLoop:
 
     def _loop(self, res: TrialResult, instruction: str, n_max: int) -> None:
         dcfg = self.dcfg
+        t_tick: float | None = None  # start of the last write tick; the next starts a period later
         while res.steps < n_max:
-            # -- decision tick: fresh frame, liveness check, query --------------------------------
+            # -- decision tick: right after the last write, so the query counts against the next
+            # write's period. Fresh frame, liveness check, query --------------------------------
             frame = self._read_frame()
             self.arm.check_frame(None if frame is None else frame.capture_time)
             assert frame is not None  # check_frame raised otherwise
@@ -408,8 +445,12 @@ class DeployLoop:
             for i, action in enumerate(reply.actions[: dcfg.exec_steps]):
                 if res.steps >= n_max:
                     break
-                t0 = self.clock()  # each write tick is paced from its own start, so action 2
-                frame = self._read_frame()  # lands one period after action 1, not after the query
+                wait = 0.0 if t_tick is None else max(0.0, t_tick + self.period - self.clock())
+                self.sleep(wait)  # writes at least one period apart, the first of a chunk too
+                t0 = self.clock()
+                frame = self._read_frame()
+                # liveness first, on every tick: a lost frame on a stale-drop tick still trips
+                self.arm.check_frame(None if frame is None else frame.capture_time)
                 now = self.clock()
                 if now - t_capture > dcfg.max_chunk_age_s:
                     if i == 0:
@@ -425,19 +466,25 @@ class DeployLoop:
                     res.max_frame_age_ms = max(res.max_frame_age_ms, _ms(frame_time, now))
                 out = self.arm.step(action, frame_time=frame_time)
                 t_write = self.clock()
+                t_tick = t0
                 res.steps += 1
                 self._record_safety(res, out.safety)
                 if i == 0:
+                    timing["pace_wait_ms"] = wait * 1e3
                     timing["recv_to_first_write_ms"] = _ms(reply.t_recv, t_write)
                     timing["capture_to_first_write_ms"] = _ms(t_capture, t_write)
+                    if res.t_last_write is not None:  # last write of the previous chunk -> this
+                        timing["boundary_gap_ms"] = _ms(res.t_last_write, t_write)
                     res.timings.append(timing)
                     if self.on_decision is not None:
                         self.on_decision(timing)
+                if res.t_first_write is None:
+                    res.t_first_write = t_write
+                res.t_last_write = t_write
                 if out.safety.status == "rejected" and dcfg.stop_on_reject:
                     res.stop_reason = "safety_reject"
                     res.stop_detail = "; ".join(iv.reason for iv in out.safety.interventions)
                     return
-                self._sleep_to(t0)
 
     @staticmethod
     def _record_safety(res: TrialResult, safety: Any) -> None:
@@ -532,6 +579,8 @@ def trial_record(
             "capture_to_first_write_ms": stats(result.latency_ms()),
             "rtt_ms": stats(result.latency_ms("rtt_ms")),
             "infer_ms": stats(result.latency_ms("infer_ms")),
+            "boundary_gap_ms": stats(result.latency_ms("boundary_gap_ms")),
+            "write_hz": None if result.write_hz is None else round(result.write_hz, 3),
             "max_frame_age_ms": round(result.max_frame_age_ms, 3),
             "per_decision_capture_to_first_write_ms": [round(v, 3) for v in result.latency_ms()],
             "note": LATENCY_NOTE,
@@ -566,6 +615,7 @@ def summarize(trials: Sequence[Mapping[str, Any]], latency_target_ms: float) -> 
         "protocol_hash": protocol.protocol_hash(),
         "cells": cells,
         "capture_to_first_write_ms": lat_stats,
+        "write_hz": stats([h for t in trials if (h := t["latency"].get("write_hz")) is not None]),
         "latency_target_ms": latency_target_ms,
         "latency_p95_under_target": None if p95 is None else bool(p95 < latency_target_ms),
         "latency_note": LATENCY_NOTE,
@@ -646,10 +696,12 @@ def run_trials(
     log_row: Callable[..., None] | None = None,
     max_steps: int | None = None,
     trials: list[dict[str, Any]] | None = None,
+    on_trial_start: Callable[[int], None] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Home -> trial -> outcome, ``n_trials`` times. Returns (trial records, why the session
     ended). A serial fault / torque-off, an operator abort or a declined resume ends the session.
-    Records are appended to ``trials`` as they finish, so a Ctrl-C at a prompt keeps them."""
+    Records are appended to ``trials`` as they finish, so a Ctrl-C at a prompt keeps them.
+    ``on_trial_start(k)`` runs right before each policy trial (the mock pilot resets its path)."""
     if task not in protocol.TASKS or cell not in protocol.CELLS:
         raise ValueError(f"unknown task/cell {task}/{cell}")
     arm = loop.arm
@@ -670,6 +722,8 @@ def run_trials(
                 return trials, "operator_quit"
             if log_row is not None:
                 loop.on_decision = lambda t, k=k: log_row(kind="decision", trial_idx=k, **t)
+            if on_trial_start is not None:
+                on_trial_start(k)
             result = loop.run_trial(instruction, max_steps)
         else:
             result = TrialResult(stop_reason="home_failed", stop_detail=str(home))
@@ -708,15 +762,29 @@ def run_trials(
     return trials, "completed"
 
 
+def _torque_already_off(arm: So101Driver, reason: str) -> None:
+    msg = f"torque is already OFF ({reason}): the arm is limp; check it is resting safely"
+    if not arm.torque_off():  # retry, harmless if it is already off
+        msg += ". TORQUE OFF FAILED: CUT THE ARM'S POWER NOW"
+    log.critical(msg)
+    print(msg, flush=True)
+
+
 def safe_shutdown(arm: So101Driver, operator: Operator) -> None:
     """End of a real-arm session (also after Ctrl-C): hold the measured pose so the arm stays up,
     let the operator support it, then disable torque (the arm goes limp). A second Ctrl-C at the
     prompt goes straight to torque off. Leaving the driver's ``with`` block disables torque again.
+    After a serial fault (deadman latched TORQUE_OFF) nothing is written and there is no HOLDING
+    prompt: torque is already off.
     """
+    if arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF:
+        _torque_already_off(arm, arm.deadman.reason)
+        return
     try:
         arm.hold()
-    except SerialFault:
-        pass  # the driver already cut torque
+    except SerialFault as e:  # the driver already cut torque
+        _torque_already_off(arm, str(e))
+        return
     try:
         operator.wait("arm HOLDING; support it, then press ENTER to disable torque: ")
     except (KeyboardInterrupt, EOFError):
