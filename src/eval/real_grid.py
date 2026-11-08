@@ -27,7 +27,10 @@ the cell's valid object slots, so every slot is used about equally often) and th
 constraints for that object slot: the same cell's slots, centre distances (MIN_SEP; Push 6-10 cm
 along any direction, the pusher start within PUSH_REACH), and keep-outs from the robot base. Also
 a cube yaw in 15 deg steps within the sim's +/-45 deg. The same seed gives the same plan, so an SFT
-and an SFT+RL session with one seed are paired trial by trial.
+and an SFT+RL session with one seed are paired trial by trial (owner 2026-11-08: both checkpoints
+use the same slot sequence). The plan is prefix-stable: it is always drawn for at least
+``REAL_TRIALS_PER_CELL`` (50) trials and cut to ``n``, so trial k's placement does not depend on
+the session's trial count.
 """
 
 from __future__ import annotations
@@ -152,12 +155,13 @@ def sample_plan(task: str, cell: str, n: int, seed: int) -> list[dict[str, Any]]
         raise RuntimeError(f"no valid placements for {task}/{cell}")
     objs = sorted(pairs)
     rng = np.random.default_rng([int(seed), P.TASKS.index(task), P.CELLS.index(cell)])
+    n_draw = max(int(n), P.REAL_TRIALS_PER_CELL)  # prefix-stable in n (module doc)
     order: list[str] = []
-    while len(order) < n:
+    while len(order) < n_draw:
         order += [objs[i] for i in rng.permutation(len(objs))]
     yaws = list(range(-YAW_MAX_DEG, YAW_MAX_DEG + 1, YAW_STEP_DEG))
     plan = []
-    for k in range(n):
+    for k in range(n_draw):
         o = by_id[order[k]]
         goals = pairs[o.id]
         g = by_id[goals[int(rng.integers(len(goals)))]]
@@ -173,7 +177,7 @@ def sample_plan(task: str, cell: str, n: int, seed: int) -> list[dict[str, Any]]
                 "goal_xy_m": [g.x, g.y],
             }
         )
-    return plan
+    return plan[: int(n)]
 
 
 def placement_prompt(obj_label: str, placement: dict[str, Any]) -> str:

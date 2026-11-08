@@ -6,29 +6,53 @@ One task per session, cells in protocol order (seen, shifted, unseen_objects), `
 safety filter, the operator places the objects on the slots this script prints (placement grid
 ``docs/assets/placement-grid-a3.pdf``, slots sampled by ``src/eval/real_grid.py`` from
 ``--slot-seed``: the same seed gives SFT and SFT+RL sessions the same placements, trial by trial),
-the policy runs (``src/robot/client.py``), then the operator scores it y/n under the judging rule
-below. Every trial record carries protocol 0.2's composite hash (``src/eval/protocol_v02.py``) with
-the 0.1-draft version and hash as a reference, the placement, the judging-rule version and the
-real-eval file hashes. ``record.json`` holds the Wilson table.
+the policy runs (``src/robot/client.py``), the arm holds still for the settling interval, then
+the operator scores it y/n under the judging rule below. Every trial record carries protocol 0.2's
+composite hash (``src/eval/protocol_v02.py``) with the 0.1-draft version and hash as a reference,
+the placement and the placement plan's hash, the judging-rule version, the settling interval, the
+real-eval file hashes and the session fingerprint. ``record.json`` holds the Wilson table.
 
-Judging rule (``JUDGING_RULE``; project review 2026-11-07 section 3.2: a real judge must be
-defined before WO-07): judged ONCE, after the trial has ended and the arm holds still (the
-prompt only appears then), by eye, without touching anything. Real trials have no success latch:
-the sim stops at its first success step, the arm keeps acting until ``trial_max_steps`` or a stop,
-so a success undone before the end is a failure (stricter than sim).
+Judging rule ``real-judge-1`` (``judging_rule()``; project review 2026-11-07 section 3.2: a real
+judge must be defined before WO-07; approved by the owner 2026-11-08): after the trial has ended,
+the arm holds still for ``eval.settle_s`` seconds (the settling interval: objects stop rolling or
+tipping), then it is judged ONCE (the prompt only appears then), by eye, without touching
+anything. Real trials have no success latch: the sim stops at its first success step, the arm
+keeps acting until ``trial_max_steps`` or a stop, so a success undone before the end is a failure
+(stricter than sim). Doubt counts as a failure.
+
+Paired placements (owner 2026-11-08): the SFT and the SFT+RL sessions use the SAME slot sequence.
+``--hardware`` refuses a ``--slot-seed`` other than ``eval.slot_seed``, and the plan is
+prefix-stable in the trial count (``src/eval/real_grid.py``), so trial k of a cell gets the same
+placement in every session; every trial record carries ``placement_plan_sha256`` (the cell's
+50-trial plan) to check the pairing afterwards.
+
+Session fingerprint (owner 2026-11-08). A session is bound to the effective settings it ran with,
+in six components hashed separately (``fingerprint_values``): ``protocol`` (protocol 0.2 hash, the
+0.1-draft reference, judging rule and grid hashes), ``policy`` (the server's policy_id,
+``server.policy_checkpoint``), ``camera`` (the ``cameras`` block: index, resolution, fps,
+intrinsics, crop, fov, pose), ``calibration`` (the calibration the driver loaded: per motor id,
+drive mode, homing offset, range; the file's sha256; ``robot.units``), ``safety`` (the effective
+``SafetyConfig``, ``robot.safety``, ``robot.servo_monitor``) and ``motion`` (control rate, the
+effective deploy settings: chunk length and execution, timeouts, chunk age, trial steps, home and
+park settings incl. ``robot.park.enabled``, the gripper floor, the settling interval). Every trial
+record stores it. ``--resume`` refuses when any component changed, naming the component and the
+changed keys, and the table refuses to pool trials whose fingerprints differ.
 
 Resumable: ``--resume <run id>`` continues a session (any earlier run of it). The task, cells,
-trials per cell, slot seed, label, policy id and protocol hashes come from that run and must still
-match; trials without a y/n score (aborted: Ctrl-C, home failed, a fault) are redone with the same
-placement. Each invocation is its own run record, holding every trial of the session so far.
+trials per cell, slot seed, label, policy id and fingerprint come from that run and must still
+match; trials without a y/n score (aborted: Ctrl-C, home failed, a fault, torque off unconfirmed)
+are redone with the same placement. Each invocation is its own run record, holding every trial
+of the session so far.
 
 --mock      CPU, in-process, safe anywhere: MockPolicy behind gRPC on 127.0.0.1, the fake arm and
             camera from tests/robot_fakes.py, the real safety filter and sim FK. Scripted scores.
             NOT a result.
 --hardware  OWNER ONLY, never run by tests or agents: gated exactly like scripts/wo07_pilot.py
-            (refuses without --i-am-present, then needs 'go' typed). A normal end parks the arm
-            (robot.park), then torque off; Ctrl-C during motion holds, then torque off after ENTER;
-            a servo over-temperature / over-current fault cuts torque at once.
+            (refuses without --i-am-present, then needs 'go' typed). A normal end holds the arm,
+            asks for support, then torque off (robot.park.enabled, default false: parks first);
+            Ctrl-C during motion holds, then torque off after ENTER; a servo over-temperature /
+            over-current fault cuts torque at once; a failed torque-off blocks all motion and
+            says to switch off the inline power switch.
 
     uv run scripts/wo07_real_eval.py --preset real --mock --fake-clock --trials 2 --max-steps 16
     uv run scripts/wo07_real_eval.py --preset real --hardware --i-am-present --task PickPlace \\
@@ -39,9 +63,11 @@ placement. Each invocation is its own run record, holding every trial of the ses
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import importlib.util
 import json
+import math
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -67,6 +93,7 @@ from src.robot.client import (
     ScriptedOperator,
     TrialResult,
     check_server,
+    final_session_end,
     latency_lines,
     run_trials,
     shutdown_session,
@@ -81,10 +108,12 @@ from src.robot.units import UnitMap
 from src.runs import RUNS_DIR, Run, new_run_id
 
 JUDGING_RULE_VERSION = "real-judge-1"
+DEFAULT_SETTLE_S = 3.0  # eval.settle_s
 JUDGING_GENERAL = (
-    "Judge ONCE, after the trial has ended and the arm holds still (this prompt only appears "
-    "then), by eye, touching nothing. y only if ALL of the task's conditions hold NOW; a success "
-    "that was undone before the end is n. Doubt = n."
+    "Judge ONCE, after the trial has ended and the arm has then held still for the settling "
+    "interval of {settle_s:g} s (eval.settle_s; this prompt only appears then), by eye, touching "
+    "nothing. y only if ALL of the task's conditions hold NOW; a success that was undone before "
+    "the end is n. Doubt = n."
 )
 JUDGING_RULE: dict[str, str] = {  # mirrors src/env/success.py, read only
     "PickPlace": "the object rests inside the bowl (over the bowl floor, below the rim), the bowl "
@@ -109,10 +138,12 @@ HARDWARE_BANNER = """
  THIS WILL MOVE THE REAL ARM, up to 50 trials per cell.
  Before every trial it drives to the home pose (deploy.home_qpos) through the safety filter,
  then the policy moves it. Keep the workspace clear and a hand on the power switch.
- A normal end (all trials, or q / Ctrl-C at a prompt) PARKS the arm at robot.park.qpos
- (it moves), then torque goes off. Ctrl-C while the arm moves holds it; after ENTER
- torque goes off and the arm drops: support it. A servo over-temperature / over-current
- fault cuts torque AT ONCE: the arm drops, support it.
+ After each trial the arm holds still for eval.settle_s, then you score it (doubt = n).
+ A normal end (all trials, or q / Ctrl-C at a prompt) holds the arm: support it, press
+ ENTER, torque goes off (robot.park.enabled true: it PARKS first, it moves). Ctrl-C while
+ the arm moves holds it; after ENTER torque goes off and the arm drops: support it. A servo
+ over-temperature / over-current fault cuts torque AT ONCE: the arm drops, support it.
+ TORQUE OFF UNCONFIRMED: switch off the servo supply at the inline power switch.
 ==========================================================================================
 """
 
@@ -121,12 +152,26 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def protocol_fields() -> dict[str, Any]:
+def settle_s_from_config(cfg: Config) -> float:
+    v = float((cfg.get("eval") or {}).get("settle_s", DEFAULT_SETTLE_S))
+    if not (math.isfinite(v) and 0.0 <= v <= 30.0):
+        raise ValueError(f"eval.settle_s must be in [0, 30] s, got {v}")
+    return v
+
+
+def judging_rule(settle_s: float) -> dict[str, Any]:
+    """The judging rule real-judge-1, with its settling interval."""
+    return {
+        "version": JUDGING_RULE_VERSION,
+        "general": JUDGING_GENERAL.format(settle_s=settle_s),
+        "tasks": JUDGING_RULE,
+        "settle_s": float(settle_s),
+    }
+
+
+def protocol_fields(settle_s: float = DEFAULT_SETTLE_S) -> dict[str, Any]:
     """Per-trial protocol citation: 0.2 composite hash, 0.1-draft as a reference, real-eval files."""
-    rule_text = json.dumps(
-        {"version": JUDGING_RULE_VERSION, "general": JUDGING_GENERAL, "tasks": JUDGING_RULE},
-        sort_keys=True,
-    )
+    rule_text = json.dumps(judging_rule(settle_s), sort_keys=True)
     return {
         "protocol_version": P2.PROTOCOL_VERSION,
         "protocol_hash": P2.protocol_hash(),
@@ -134,6 +179,7 @@ def protocol_fields() -> dict[str, Any]:
         "real_eval": {
             "judging_rule": JUDGING_RULE_VERSION,
             "judging_rule_sha256": hashlib.sha256(rule_text.encode()).hexdigest(),
+            "settle_s": float(settle_s),
             "grid_sha256": _sha256(REPO_ROOT / "src" / "eval" / "real_grid.py"),
             "grid_pdf_sha256": _sha256(REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf"),
         },
@@ -141,16 +187,161 @@ def protocol_fields() -> dict[str, Any]:
 
 
 class JudgeOperator(ConsoleOperator):
-    """The person at the arm, scoring under ``JUDGING_RULE``."""
+    """The person at the arm, scoring under ``judging_rule(settle_s)``."""
 
-    def __init__(self, task: str, input_fn: Callable[[str], str] = input):
+    def __init__(
+        self, task: str, settle_s: float = DEFAULT_SETTLE_S, input_fn: Callable[[str], str] = input
+    ):
         super().__init__(input_fn)
         self.task = task
+        self.settle_s = settle_s
 
     def outcome(self, result: TrialResult) -> str:
-        print(f"\ntrial ended ({result.stop_reason}, {result.steps} steps). {JUDGING_GENERAL}")
+        rule = judging_rule(self.settle_s)
+        print(f"\ntrial ended ({result.stop_reason}, {result.steps} steps). {rule['general']}")
         print(f"  {self.task} success = {JUDGING_RULE[self.task]}.")
         return super().outcome(result)
+
+
+# ------------------------------------------------------------------------------------------------
+# Session fingerprint and paired placements
+# ------------------------------------------------------------------------------------------------
+FINGERPRINT_COMPONENTS = ("protocol", "policy", "camera", "calibration", "safety", "motion")
+# deploy fields that only label the latency report; they never change what the arm does
+_REPORT_ONLY = ("latency_target_ms", "capture_offset_ms", "policy_checkpoint")
+
+
+def _canon(v: Any) -> Any:
+    """JSON-normal form: tuples -> lists, keys sorted, non-JSON values as strings."""
+    return json.loads(json.dumps(v, sort_keys=True, default=str))
+
+
+def _digest(v: Any) -> str:
+    return hashlib.sha256(json.dumps(v, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def calibration_values(arm: So101Driver, cfg: Config) -> dict[str, Any]:
+    """The calibration the driver loaded (lerobot reads ``<calibration_dir>/<id>.json`` when the
+    follower is built, before any port is opened), the file's sha256, and ``robot.units``."""
+    fol = arm.follower
+    cal = getattr(fol, "calibration", None) or {}
+    keys = ("id", "drive_mode", "homing_offset", "range_min", "range_max")
+    path = getattr(fol, "calibration_fpath", None)
+    file_sha = _sha256(Path(path)) if path is not None and Path(path).is_file() else None
+    return {
+        "motors": {m: {k: int(getattr(c, k)) for k in keys} for m, c in sorted(cal.items())},
+        "file_sha256": file_sha,
+        "units": cfg["robot"].get("units"),
+    }
+
+
+def fingerprint_values(
+    cfg: Config,
+    arm: So101Driver,
+    info: dict[str, Any],
+    dcfg: DeployConfig,
+    *,
+    max_steps: int | None,
+    settle_s: float,
+) -> dict[str, Any]:
+    """The effective settings a session is bound to, per component (module doc)."""
+    r = cfg["robot"]
+    sc = arm.safety.config
+    deploy = {
+        k: v for k, v in dataclasses.asdict(dcfg).items() if k not in _REPORT_ONLY
+    }  # control_hz, chunk_len, exec_steps, timeouts, chunk age, trial steps, home, park
+    return _canon(
+        {
+            "protocol": protocol_fields(settle_s),
+            "policy": {
+                "policy_id": info.get("policy_id"),
+                "policy_checkpoint": dcfg.policy_checkpoint,
+            },
+            "camera": {"cameras": cfg["cameras"]},
+            "calibration": calibration_values(arm, cfg),
+            "safety": {
+                "effective": dataclasses.asdict(sc),
+                "robot.safety": r.get("safety"),
+                "robot.servo_monitor": r.get("servo_monitor"),
+            },
+            "motion": {
+                "robot.control_hz": r.get("control_hz"),
+                "deploy": deploy,
+                "trial_max_steps_effective": (
+                    dcfg.trial_max_steps if max_steps is None else int(max_steps)
+                ),
+                "robot.park": r.get("park"),
+                "park_enabled": dcfg.park is not None,
+                "gripper_floor_deg": round(math.degrees(sc.lower_rad[-1]), 4),
+                "settle_s": float(settle_s),
+            },
+        }
+    )
+
+
+def make_fingerprint(values: dict[str, Any]) -> dict[str, Any]:
+    comps = {c: _digest(values[c]) for c in FINGERPRINT_COMPONENTS}
+    return {"sha256": _digest(comps), "components": comps}
+
+
+def _flat(v: Any, prefix: str = "") -> dict[str, Any]:
+    if isinstance(v, dict):
+        out: dict[str, Any] = {}
+        for k, x in v.items():
+            out.update(_flat(x, f"{prefix}.{k}" if prefix else str(k)))
+        return out
+    return {prefix: v}
+
+
+def fingerprint_diff(
+    old: dict[str, Any], new_values: dict[str, Any], max_keys: int = 6
+) -> list[str]:
+    """One line per changed component, naming up to ``max_keys`` changed settings."""
+    new = make_fingerprint(new_values)
+    old_vals = old.get("values") or {}
+    lines = []
+    for c in FINGERPRINT_COMPONENTS:
+        if old.get("components", {}).get(c) == new["components"][c]:
+            continue
+        a, b = _flat(old_vals.get(c, {})), _flat(new_values[c])
+        changed = sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
+        detail = ", ".join(f"{k}: {a.get(k)!r} -> {b.get(k)!r}" for k in changed[:max_keys])
+        more = f" (+{len(changed) - max_keys} more)" if len(changed) > max_keys else ""
+        lines.append(f"{c} changed: {detail or 'no recorded values to compare'}{more}")
+    return lines
+
+
+def check_poolable(trials: Sequence[dict[str, Any]], fingerprint: dict[str, Any]) -> None:
+    """Refuse to pool trials recorded under a different session fingerprint (or none)."""
+    want = fingerprint["sha256"]
+    bad = [t for t in trials if (t.get("session_fingerprint") or {}).get("sha256") != want]
+    if not bad:
+        return
+    lines = []
+    for t in bad[:5]:
+        got = t.get("session_fingerprint") or {}
+        comps = [
+            c
+            for c in FINGERPRINT_COMPONENTS
+            if (got.get("components") or {}).get(c) != fingerprint["components"][c]
+        ]
+        lines.append(
+            f"{t.get('cell')} trial {t.get('trial_idx')} ({t.get('start_utc')}): "
+            f"{'no fingerprint' if not got else 'differs in ' + ', '.join(comps)}"
+        )
+    raise PoolingRefused(
+        f"refusing to pool {len(bad)} trial(s) recorded under different session settings:\n  "
+        + "\n  ".join(lines)
+    )
+
+
+class PoolingRefused(RuntimeError):
+    """Trials from different effective settings would be pooled into one table."""
+
+
+def plan_sha256(task: str, cell: str, slot_seed: int) -> str:
+    """Hash of the cell's REAL_TRIALS_PER_CELL-trial placement plan (the paired slot sequence)."""
+    return _digest(_canon(G.sample_plan(task, cell, P1.REAL_TRIALS_PER_CELL, slot_seed)))
 
 
 # ------------------------------------------------------------------------------------------------
@@ -191,7 +382,10 @@ def scored_indices(trials: Sequence[dict[str, Any]], cell: str) -> set[int]:
 def table(
     trials: Sequence[dict[str, Any]], settings: dict[str, Any], cfg_deploy: DeployConfig
 ) -> dict[str, Any]:
-    """client.summarize over the first scored record per (cell, trial_idx), plus completeness."""
+    """client.summarize over the first scored record per (cell, trial_idx), plus completeness.
+    Raises PoolingRefused when a trial's session fingerprint differs from the session's."""
+    if settings.get("fingerprint"):
+        check_poolable(trials, settings["fingerprint"])
     first: dict[tuple[str, int], dict[str, Any]] = {}
     aborted = []
     for t in trials:
@@ -219,6 +413,7 @@ def table(
         protocol_ref=settings["protocol"]["protocol_ref"],
         label=settings["label"],
         judging_rule=JUDGING_RULE_VERSION,
+        session_fingerprint=(settings.get("fingerprint") or {}).get("sha256"),
     )
     return s
 
@@ -245,6 +440,8 @@ def print_table(run_id: str, s: dict[str, Any], end: str) -> None:
             f"  NOT a protocol table: needs {P1.REAL_TRIALS_PER_CELL} scored trials in each of "
             f"{', '.join(P1.CELLS)}"
         )
+    if s.get("torque_off_unconfirmed") or end.startswith("torque_off_unconfirmed"):
+        print("  TORQUE OFF UNCONFIRMED: keep the servo supply OFF at the inline power switch")
 
 
 # ------------------------------------------------------------------------------------------------
@@ -266,13 +463,16 @@ def session(
     on_trial_start: Callable[[int], None] | None = None,
 ) -> Path:
     task, n = str(settings["task"]), int(settings["trials_per_cell"])
+    settle_s = float(settings["settle_s"])
     trials: list[dict[str, Any]] = list(prior_trials)
     end = "error"
+    fingerprint = settings["fingerprint"]
     extra = {
         **settings["protocol"],
         "session_id": settings["session_id"],
         "label": settings["label"],
         "mode": mode,
+        "session_fingerprint": {k: fingerprint[k] for k in ("sha256", "components")},
     }
     with Run(
         work_order="WO-07",
@@ -290,13 +490,9 @@ def session(
             session=settings,
             resumed_from=resumed_from,
             server_info=info,
-            judging_rule={
-                "version": JUDGING_RULE_VERSION,
-                "general": JUDGING_GENERAL,
-                "tasks": JUDGING_RULE,
-            },
+            judging_rule=judging_rule(settle_s),
         )
-        print(f"{JUDGING_GENERAL}\n  {task} success = {JUDGING_RULE[task]}.")
+        print(f"{judging_rule(settle_s)['general']}\n  {task} success = {JUDGING_RULE[task]}.")
         try:
             end = "completed"
             for cell in settings["cells"]:
@@ -326,7 +522,13 @@ def session(
                     on_trial_start=on_trial_start,
                     indices=todo,
                     placement_fn=place,
-                    record_extra=extra,
+                    record_extra={
+                        **extra,
+                        "placement_plan_sha256": plan_sha256(
+                            task, cell, int(settings["slot_seed"])
+                        ),
+                    },
+                    settle_s=settle_s,
                 )
                 if end != "completed":
                     break
@@ -334,8 +536,15 @@ def session(
             end = "operator_ctrl_c"
         finally:
             shutdown = shutdown_session(loop, operator, end)
+            end = final_session_end(loop.arm, end)  # a failed torque-off wins over any end
+            run.results.update(
+                session_end=end,
+                shutdown=shutdown,
+                torque_off_unconfirmed=loop.arm.torque_off_unconfirmed,
+                trials=trials,
+            )
             summary = table(trials, settings, loop.dcfg)
-            run.results.update(session_end=end, shutdown=shutdown, trials=trials, summary=summary)
+            run.results.update(summary=summary)
         print_table(run.id, summary, end)
         if not summary["complete"]:
             print(f"  session incomplete: resume with --resume {run.id}")
@@ -360,12 +569,18 @@ def new_settings(args: argparse.Namespace, cfg: Config) -> dict[str, Any]:
         ),
         "label": args.label,
         "policy_id": None,  # from the server's Info
-        "protocol": protocol_fields(),
+        "settle_s": settle_s_from_config(cfg),
+        "protocol": protocol_fields(settle_s_from_config(cfg)),
+        "fingerprint": None,  # bind_session, once the rig and the server are known
     }
 
 
-def check_resume(settings: dict[str, Any], info: dict[str, Any]) -> None:
-    now = protocol_fields()
+def check_resume(
+    settings: dict[str, Any], info: dict[str, Any], values: dict[str, Any] | None = None
+) -> None:
+    """Refuse to resume when the protocol, the policy or (with ``values``) any fingerprint
+    component differs from the session's."""
+    now = protocol_fields(float(settings.get("settle_s", DEFAULT_SETTLE_S)))
     bad = [
         f"{k}: session {settings['protocol'][k]!r} != now {now[k]!r}"
         for k in ("protocol_hash", "protocol_ref", "real_eval")
@@ -375,8 +590,45 @@ def check_resume(settings: dict[str, Any], info: dict[str, Any]) -> None:
         bad.append(
             f"policy_id: session {settings['policy_id']!r} != server {info.get('policy_id')!r}"
         )
+    if values is not None:
+        old = settings.get("fingerprint")
+        if not old:
+            bad.append("fingerprint: the session has none (recorded before fingerprints)")
+        elif old.get("sha256") != make_fingerprint(values)["sha256"]:
+            bad += fingerprint_diff(old, values)
     if bad:
         sys.exit("--resume refused, the session's evaluation changed:\n  " + "\n  ".join(bad))
+
+
+def bind_session(
+    cfg: Config,
+    settings: dict[str, Any],
+    prior: Sequence[dict[str, Any]],
+    resumed_from: str | None,
+    arm: So101Driver,
+    info: dict[str, Any],
+    dcfg: DeployConfig,
+    max_steps: int | None,
+) -> None:
+    """Fingerprint the effective settings; on a resume refuse any change, and refuse to pool
+    earlier trials with a different fingerprint. Runs before the arm is connected on hardware."""
+    values = fingerprint_values(
+        cfg, arm, info, dcfg, max_steps=max_steps, settle_s=settle_s_from_config(cfg)
+    )
+    if resumed_from:
+        check_resume(settings, info, values)
+        try:
+            check_poolable(prior, settings["fingerprint"])
+        except PoolingRefused as e:
+            sys.exit(f"--resume refused: {e}")
+        if any(t.get("torque_off_unconfirmed") for t in prior):
+            print(
+                "WARNING: an earlier run of this session ended with TORQUE OFF UNCONFIRMED. "
+                "Check the bus, the USB cable and every servo before powering the arm."
+            )
+    else:
+        settings["fingerprint"] = {**make_fingerprint(values), "values": values}
+    settings["policy_id"] = info.get("policy_id")
 
 
 @contextmanager
@@ -452,9 +704,7 @@ def run(
     if args.hardware:
         return run_hardware(cfg, args, settings, prior, resumed_from)
     with mock_rig(cfg, args, fk) as (loop, info, on_start, calibrated):
-        if resumed_from:
-            check_resume(settings, info)
-        settings["policy_id"] = info.get("policy_id")
+        bind_session(cfg, settings, prior, resumed_from, loop.arm, info, loop.dcfg, args.max_steps)
         return session(
             cfg,
             loop,
@@ -487,6 +737,12 @@ def run_hardware(
     cam_cfg = cfg["cameras"]["front"]
     if not cam_cfg.get("intrinsics"):
         sys.exit("cameras.front.intrinsics is null: run scripts/wo06_camera_intrinsics.py first")
+    cfg_seed = int((cfg.get("eval") or {}).get("slot_seed", 0))
+    if int(settings["slot_seed"]) != cfg_seed:
+        sys.exit(
+            f"slot seed {settings['slot_seed']} != eval.slot_seed {cfg_seed}: the SFT and SFT+RL "
+            "sessions must use the same placements (owner 2026-11-08); drop --slot-seed"
+        )
     from src.robot.camera import OpenCVFrameSource
 
     dcfg = DeployConfig.from_config(cfg)
@@ -501,14 +757,15 @@ def run_hardware(
     ) as client:
         info = client.info()  # before the arm is connected: a wrong server never moves it
         check_server(info, dcfg)
-        if resumed_from:
-            check_resume(settings, info)
-        settings["policy_id"] = info.get("policy_id")
+        # builds the follower (lerobot reads the calibration file; no port is opened) so the
+        # fingerprint and the resume check run before anything can move
+        arm = So101Driver.from_config(cfg, fk)
+        bind_session(cfg, settings, prior, resumed_from, arm, info, dcfg, None)
         print(f"policy server OK: {info['policy_id']} (server run {info.get('server_run')})")
         if dcfg.policy_checkpoint is None:
             print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
-        operator = JudgeOperator(str(settings["task"]))
-        with OpenCVFrameSource(cam_cfg) as cam, So101Driver.from_config(cfg, fk) as arm:
+        operator = JudgeOperator(str(settings["task"]), settle_s_from_config(cfg))
+        with OpenCVFrameSource(cam_cfg) as cam, arm:
             loop = DeployLoop(arm, cam, pipe, client, dcfg)
             return session(
                 cfg,

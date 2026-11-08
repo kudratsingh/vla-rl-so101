@@ -107,7 +107,8 @@ def test_mock_session_records_protocol_02_and_resumes(
     monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(4))
     rec1 = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--label", "sft"))
     r1 = json.loads(rec1.read_text())["results"]
-    assert r1["session_end"] == "operator_quit" and r1["shutdown"] == "parked"
+    assert r1["session_end"] == "operator_quit"
+    assert r1["shutdown"] == "supported"  # robot.park.enabled false: hold + support, no park
     assert [t["cell"] for t in r1["trials"]] == ["seen", "seen"]
     assert not r1["summary"]["complete"] and not r1["summary"]["protocol_complete"]
     t0 = r1["trials"][0]
@@ -152,3 +153,110 @@ def test_hardware_mode_is_gated_like_the_pilot(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr("builtins.input", lambda _msg="": "no")
     with pytest.raises(SystemExit, match="nothing was opened"):
         ev.main(["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"])
+
+
+def test_trial_records_carry_settle_fingerprint_and_paired_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    rec = ev.main(_args(tmp_path, "--task", "Push", "--trials", "2", "--cells", "seen"))
+    r = json.loads(rec.read_text())["results"]
+    fp = r["session"]["fingerprint"]
+    assert set(fp["components"]) == set(ev.FINGERPRINT_COMPONENTS)
+    motion = fp["values"]["motion"]
+    assert motion["gripper_floor_deg"] == pytest.approx(-5.0) and motion["settle_s"] == 3.0
+    assert motion["park_enabled"] is False and motion["deploy"]["exec_steps"] == 8
+    assert fp["values"]["calibration"]["motors"]["wrist_flex"]["homing_offset"] == 0
+    assert r["judging_rule"]["settle_s"] == 3.0 and "3 s" in r["judging_rule"]["general"]
+    for t in r["trials"]:
+        assert t["session_fingerprint"] == {k: fp[k] for k in ("sha256", "components")}
+        # the arm held still for the settling interval before the (scripted) score
+        assert t["settle"] == {"settle_s": 3.0, "measured_s": 3.0}
+        assert t["placement_plan_sha256"] == ev.plan_sha256("Push", "seen", 0)
+        assert t["torque_off_unconfirmed"] is False
+    # the slot sequence does not depend on the session's trial count: SFT and SFT+RL pair up
+    for task in P1.TASKS:
+        assert G.sample_plan(task, "shifted", 3, 0) == G.sample_plan(task, "shifted", 50, 0)[:3]
+
+
+def _with_cfg(monkeypatch: pytest.MonkeyPatch, edit: Any) -> None:
+    real_load = ev.load_config
+
+    def load(preset: str, path: Any = None) -> Any:
+        cfg = real_load(preset, path)
+        edit(cfg)
+        return cfg
+
+    monkeypatch.setattr(ev, "load_config", load)
+
+
+@pytest.mark.parametrize(
+    ("component", "edit"),
+    [
+        ("camera", lambda c: c["cameras"]["front"].update(crop_to=200)),
+        ("safety", lambda c: c["robot"]["safety"].update(max_velocity_deg_s=45.0)),
+        ("motion", lambda c: c["deploy"].update(request_timeout_ms=300)),
+        ("motion", lambda c: c["eval"].update(settle_s=1.0)),
+        ("calibration", lambda c: c["robot"]["units"].update(arm_offset_deg=[1, 0, 0, 0, 0])),
+    ],
+)
+def test_resume_refuses_changed_effective_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str, edit: Any
+) -> None:
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(2))  # 1 trial, then quit
+    rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen"))
+    _with_cfg(monkeypatch, edit)
+    with pytest.raises(SystemExit, match=f"resume refused(.|\n)*{component} changed: "):
+        ev.main(_args(tmp_path, "--resume", rec.parent.name))
+
+
+def test_resume_refuses_a_changed_calibration_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import robot_fakes
+
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(2))
+    rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen"))
+    real = robot_fakes.full_sweep_calibration
+
+    def recalibrated() -> dict[str, Any]:
+        cal = real()
+        c = cal["elbow_flex"]
+        cal["elbow_flex"] = type(c)(c.id, c.drive_mode, 12, c.range_min, c.range_max)
+        return cal
+
+    monkeypatch.setattr(robot_fakes, "full_sweep_calibration", recalibrated)
+    with pytest.raises(SystemExit, match="calibration changed: motors.elbow_flex.homing_offset"):
+        ev.main(_args(tmp_path, "--resume", rec.parent.name))
+
+
+def test_trials_from_different_settings_are_never_pooled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(2))
+    rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen"))
+    data = json.loads(rec.read_text())
+    fp = data["results"]["session"]["fingerprint"]
+    trial = data["results"]["trials"][0]
+    trial["session_fingerprint"] = {
+        "sha256": "f" * 64,
+        "components": {**fp["components"], "camera": "0" * 64},
+    }
+    rec.write_text(json.dumps(data))
+    (rec.parent / "metrics.jsonl").write_text("")  # only record.json's (tampered) trial
+    with pytest.raises(SystemExit, match="refusing to pool 1 trial(.|\n)*differs in camera"):
+        ev.main(_args(tmp_path, "--resume", rec.parent.name))
+    settings = data["results"]["session"]
+    with pytest.raises(ev.PoolingRefused, match="no fingerprint"):
+        ev.check_poolable([{**trial, "session_fingerprint": None}], settings["fingerprint"])
+
+
+def test_hardware_refuses_a_slot_seed_other_than_the_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    intr = {"fx": 500.0, "fy": 500.0, "cx": 320.0, "cy": 240.0, "dist": [0.0] * 5}
+    _with_cfg(monkeypatch, lambda c: c["cameras"]["front"].update(intrinsics=intr))
+    monkeypatch.setattr("builtins.input", lambda _msg="": "go")
+    argv = ["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"]
+    with pytest.raises(SystemExit, match="must use the same placements"):
+        ev.main([*argv, "--slot-seed", "7"])  # exits before any client, camera or port
