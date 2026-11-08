@@ -58,9 +58,30 @@ cameras:
     enabled: false
 
 server:
-  host: <runpod-ip>
+  # The server binds 127.0.0.1 on the GPU box (src/robot/serve.py); the Mac reaches it through
+  # an SSH tunnel: ssh -N -L 50051:127.0.0.1:50051 root@<pod-ip> -p <pod-ssh-port>
+  host: 127.0.0.1
   port: 50051
   policy_checkpoint: null             # HF id of SFT or SFT+RL LoRA
+
+# WO-07 client (src/robot/client.py). Stop semantics are documented at the top of that file.
+deploy:
+  chunk_len: 8                       # actions per policy query; must equal the server's Info
+  action_dim: 6
+  exec_steps: null                   # actions executed per chunk; null = whole chunk (as sim eval)
+  request_timeout_ms: 400            # ms, policy server deadline -> deadman (hold)
+  max_chunk_age_ms: 800              # ms, source-frame capture -> write; older actions are dropped
+                                     # and the policy re-queried (first action too old -> hold)
+  trial_max_steps: 150               # writes per trial = sim max_episode_steps (10 s at 15 Hz)
+  home_qpos: [0.0, -1.30, 0.60, 1.30, 0.0, 0.0]  # rad, sim REST_QPOS (src/env/robot.py)
+  home_tol_deg: 3.0                  # deg, every joint; residual logged per trial
+  home_timeout_s: 20
+  latency_target_ms: 150             # WO-07 benchmark: capture -> first bus write
+  stop_on_reject: true               # a workspace / invalid-action rejection ends the trial
+  pilot:                             # scripts/wo07_pilot.py
+    task: PickPlace
+    cell: seen
+    trials: 5
 
 eval:
   trials_per_cell: 50
