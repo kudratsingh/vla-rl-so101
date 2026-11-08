@@ -21,7 +21,7 @@ import torch
 
 from src.config import load_config
 from src.policy.openvla_oft import OpenVLAOFTPolicy, build_policy
-from src.rl.rollout import RolloutBatch
+from src.rl.rollout import TIMING_KEYS, RolloutBatch
 from src.rl.trainer import GRPOTrainer
 
 REPO = Path(__file__).resolve().parent.parent
@@ -63,7 +63,7 @@ class _Spy(GRPOTrainer):
         self.oft = self.policy
         assert isinstance(self.oft, OpenVLAOFTPolicy)
         self.init_params = {n: p.detach().clone() for n, p in self.oft.named_parameters()}
-        self.updates: list[tuple[RolloutBatch, dict[str, float], float]] = []
+        self.updates: list[tuple[RolloutBatch, dict[str, Any], float]] = []
 
     @torch.no_grad()
     def _parity(self, batch: RolloutBatch) -> float:
@@ -82,7 +82,7 @@ class _Spy(GRPOTrainer):
                     worst = max(worst, float(diff.max()))
         return worst
 
-    def update(self, batch: RolloutBatch) -> dict[str, float]:
+    def update(self, batch: RolloutBatch) -> dict[str, Any]:
         parity = self._parity(batch)
         stats = super().update(batch)
         self.updates.append((batch, stats, parity))
@@ -130,9 +130,9 @@ rl:
   recompute_old_log_probs: false   # as configs/rl.yaml: sampler log-probs are the old ones
   eval_every: 2
   eval_episodes: 2
-  early_stop_eval_episodes: 4
-  early_stop_check_at_frac: 0.5
-  early_stop_on_flat: false   # scripted eval success is constant
+  gate_check_frac: 0          # 2 steps: no room for two gate windows
+  diag_trajectories: 2        # the fixed-batch diagnostic on the first group
+  diag_argmax: true
   checkpoint_every: 2
 """)
     script = _load_script()
@@ -176,6 +176,10 @@ rl:
         assert stats["train/first_minibatch_max_abs_log_ratio"] < 1e-5
         assert stats["train/optimizer_steps"] == 1.0 and stats["train/grad_norm"] > 0
         assert stats["train/adv_abs_mean"] > 0
+        # fixed-batch diagnostic on the real policy: the pre-update scores match the sampler's
+        # log-probs (reused as old ones here), the post-update ones moved
+        assert stats["diag/pre/max_abs_dlogp"] < 1e-5 and stats["diag/post/mean_abs_dlogp"] > 0
+        assert 0 <= stats["diag/post/argmax_flip_frac"] <= 1
 
     # the update moved LoRA weights only (base, proprio projector frozen)
     changed = {
@@ -190,9 +194,15 @@ rl:
     assert summary["steps_completed"] == 2
     rows = [json.loads(x) for x in (run_dir / "metrics.jsonl").read_text().splitlines()]
     evals = {r["step"]: r["eval/episodes_per_task"] for r in rows if "eval/success" in r}
-    assert evals == {0: 4.0, 1: 4.0, 2: 2.0}  # baseline + kill-switch check 4, periodic 2
+    assert evals == {0: 2.0, 2: 2.0}  # step-0 baseline + periodic, eval_episodes each
     train = [r for r in rows if r["kind"] == "train"]
     assert [r["rollout/group_reset_diff_frac"] for r in train] == [0.0, 0.0]  # groups share scenes
+    # rollout timing split: the render hook reaches the serial CPU envs' renderers
+    for r in train:
+        assert r["rollout/time/render_s"] > 0 and r["rollout/time/sim_step_s"] > 0
+        assert r["rollout/time/policy_s"] > 0
+        parts = sum(r[f"rollout/time/{k}_s"] for k in TIMING_KEYS)
+        assert parts == pytest.approx(r["rollout/time_s"], rel=0.05)
 
     # the final RL checkpoint loads the way scripts/wo02_eval.py loads it, with identical outputs
     ckpt = run_dir / "checkpoints" / "step_000002" / "adapter"

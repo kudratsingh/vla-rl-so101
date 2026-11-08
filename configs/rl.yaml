@@ -22,7 +22,9 @@
 #                                                        action-slot logits; NOT concurrent with the update
 #   ManiSkill GPU envs, 3 tasks x 32 @ 224^2     6       ~2 GiB per env instance (PhysX GPU buffers
 #                                                        + Vulkan renderer + targets); one per task
-#                                                        (WO-03 sized this at 128^2; sim.yaml renders 224)
+#                                                        (WO-03 sized this at 128^2; sim.yaml renders 224;
+#                                                        since 2026-11-08 only the trained tasks' envs
+#                                                        are built: 2 x 2 = 4 GiB)
 #   rollout buffer (obs, tokens, log-probs)      0       kept in host RAM: <= 12 env batches x 32
 #                                                        x 19 decisions x 150 KB image = ~1.1 GB CPU
 #   CUDA context + allocator slack               2.5
@@ -34,21 +36,26 @@
 #                                                        ~0.6 GiB per decision (5*a*s^2*layers).
 # rollout_envs=32 fits by this estimate (64 would too: +~3 GiB rollout-phase, +~1 GiB/env).
 #
-# SUPERSEDED by the WO-04 probes + owner amendment (docs/adr/0002, 2026-10-27): the measured
-# throughput is in cost.throughput below and the amended run is 150 steps at horizon 120.
-# Wall-clock / $ (estimates; `uv run scripts/wo03_rl.py --preset rl --estimate` recomputes from
-# cost.throughput below). Per step, worst case (every episode runs the full 150 steps):
-#   trained trajectories   16 prompts x K=8                      =    128
-#   episodes generated     128 x 1.25 refill                     =    160
-#   env actions            160 x 150                             = 24,000 -> / 250 per s =  96 s
-#   decisions trained      128 x ceil(150 / 8) = 128 x 19        =  2,432 -> / 12 per s  = 203 s
-#   old log-prob recompute off (sampler log-probs reused)                                =   0 s
-#   step                                                                          = 299 s = 5.0 min
-#   evals: steps {0, 25, ..., 300}: 11 x 32 + 2 x 64 (step 0 + kill-switch step 75) = 480 ep/task
-#          x 3 tasks x 150 actions / 250 per s                                     =     0.24 h
-#   run: 300 x 299 s + 0.24 h = 25.1 h x $1.79 = ~$45 per seed (~$135 for 3 seeds)
-# The upstream-sized batch (64 prompts, recompute on) is 384 + 324 + 811 s = 25 min/step, ~127 h,
-# ~$227 per seed -- over the whole ~$200 project budget -- hence rollout_batch 16 here.
+# CURRENT SHAPE (2026-11-08, review 3.1 / 9: 16 prompts x K=8, lr 1e-4, ppo_epochs 2, periodic
+# evals on the trained tasks only). `uv run scripts/wo03_rl.py --preset rl --estimate` recomputes
+# this from cost.throughput (A100 numbers MEASURED on the WO-04 pods); worst case = the
+# dynamic-sampling refill cap binds every step (K=8 probes dropped 72% of groups):
+#   trained trajectories   16 prompts x K=8                                =    128
+#   episodes generated     128 x 3.0 (refill cap: 3 rounds x 4 env batches) =    384
+#   env actions            384 x 120 (RL horizon)        = 46,080 -> / 86 per s  = 535.8 s
+#   old log-prob recompute 128 x ceil(120 / 8) = 1,920 decisions / 31 per s     =  61.9 s
+#   update                 2 epochs x 1,920 decisions / 10.3 per s              = 372.8 s
+#                          (2 mini-batches of 64 x 2 epochs = 4 Adam steps; upstream ~4)
+#   fixed-batch diagnostic 32 trajectories x 15 decisions = 480 / 31 per s      =  15.5 s
+#   step                                                               = 986.0 s = 16.4 min
+#   evals (sanity only)    steps {0, 25, ..., 150}: 7 x 32 episodes x 2 trained tasks
+#                          x 120 actions / 86 per s                             =   0.17 h
+#   run: 150 x 986 s + 0.17 h = 41.3 h x $1.79 = ~$74 per seed, worst case. The K=16 runs hit the
+#   refill cap on only 16-26% of steps (~11.5 min/step measured), so expect less if the new base
+#   drops fewer groups. Flat-gate stop at step 38: ~10.5 h = ~$19.
+#   estimated: A100-80GB x 41.3 h = $74 per seed (worst case); flat-gate stop 10.5 h = $19
+# vs the previous 8 x K=16, 1 epoch shape: same 128 trajectories and the same rollout cap (4 env
+# batches per round), +186 s/step for the second epoch, +15 s for the diagnostic.
 #
 # RTX 4090 ($0.89/h) vs A100-80GB ($1.79/h, the rl tier in docs/ENVIRONMENT.md). Derived from the
 # one measurement we have (WO-02 4090 probe: 1.55-1.58 s per SFT step, batch 8, grad checkpointing,
@@ -82,44 +89,65 @@ policy:
 
 rl:                         # GRPO, ADR-0002; every key is documented in src/rl/trainer.py
   algorithm: grpo
-  samples_per_prompt: 16    # K. Owner rule (ADR-0002 amendment 1): the confirming probe (pod
-                            # gzxhwhjhdtc1kc) still dropped 72% of K=8 groups (> 60%) -> 16
-  rollout_envs: 32          # parallel envs per env batch (2 groups at K=16); one env per task
-  rollout_batch: 8          # prompts (groups) per update -> 128 trajectories, as at K=8 x 16
-                            # (agent proposal, owner to confirm in PR #11; upstream: 64 x 8)
+  samples_per_prompt: 8     # K. 2026-11-08 (review 3.1 item 5): 16 prompts x K=8 doubles the
+                            # prompts per update at the same 128 trajectories as 8 x K=16; the
+                            # extra all-equal groups on hard states are dropped by dynamic sampling
+  rollout_envs: 32          # parallel envs per env batch (4 groups at K=8); one env per task
+  rollout_batch: 16         # prompts (groups) per update -> 128 trajectories (upstream: 64 x 8)
   max_rollout_rounds: 3     # dynamic-sampling refill cap, in multiples of one full round
   steps: 150                # owner amendment (ADR-0002): was 300
-  lr: 5e-5                  # LoRA (owner, WO-04; was 1e-5)
+  # lr 1e-4 rests on the published LoRA recipes (RIPT-VLA, RLinf-VLA; RL4VLA also uses 1e-4 for
+  # LoRA), NOT on the logged approx_kl / clip_frac: those were averaged over mini-batches measured
+  # before their own optimizer step and are uninformative (review 3.1). `--lr-sweep` measures the
+  # on-batch movement per lr before any longer run.
+  lr: 1e-4                  # was 5e-5 (owner, WO-04), 1e-5 before that
   weight_decay: 0.01
-  grad_clip: 1.0
-  ppo_epochs: 1
-  ppo_mini_batch: 64        # trajectories per optimizer step -> 2 steps per update (upstream 4)
+  grad_clip: 1.0            # not a step-size lever under Adam (rescaling g cancels); lr/epochs are
+  ppo_epochs: 2             # 2026-11-08: was 1
+  ppo_mini_batch: 64        # trajectories per optimizer step -> 2 per epoch, 4 per update
   micro_batch: 8            # decisions per forward/backward; memory only, gradient unchanged
   clip_low: 0.2
   clip_high: 0.28
-  temperature: 1.0          # owner amendment (ADR-0002): 1.6 dropped 92-93% of groups
+  temperature: 1.0          # owner amendment (ADR-0002): 1.6 dropped 92-93% of groups;
+                            # `--probe-temperatures 0.7,1.0,1.3` measures drop rate / success
   kl_coef: 0.0              # must stay 0 (no reference model)
   dynamic_sampling: true
   # Upstream recomputes old log-probs with an extra no-grad forward. The WO-04 probes measured
   # first-minibatch |log ratio| max 0.196 (A100) / 0.149 (H100) with sampler log-probs reused,
   # well over the 0.05 bar, so it is on (owner amendment, ADR-0002).
   recompute_old_log_probs: true
+  # Periodic greedy evals: SANITY LOGS ONLY, on the trained tasks only (Stack's eval-only evals
+  # cost ~$0.5/run for nothing). The fixed held-out protocol eval (scripts/wo02_eval.py) is the
+  # only measurement of improvement; step 0 also enforces CLAUDE.md rule 3.
   eval_every: 25
-  eval_episodes: 32         # per task, greedy, fixed seeds: the periodic evals
-  checkpoint_every: 50
-  # Kill switch (owner, WO-04; amended): step 0 and step ceil(0.25 x 150) = 38 both evaluate 64
-  # greedy episodes per task on the same seeds; stop at 38 unless at least one trained task rose
-  # by >= 0.03 (3 points) (owner 2026-10-28; was: the trained-task mean).
-  early_stop_check_at_frac: 0.25
-  early_stop_on_flat: true
-  early_stop_eval_episodes: 64
-  early_stop_min_improvement: 0.03
-  early_stop_rule: any_task  # owner 2026-10-28: pass if ANY trained task is +3 at step 38
+  eval_episodes: 32         # per trained task, greedy, fixed seeds
+  checkpoint_every: 25      # resume (--resume) loses at most 25 steps (~6.8 h worst case)
+  # Spend gates (src/rl/gates.py), replacing the 64-episode kill switch and the 32-episode peak
+  # stop (neither could tell +3 points from 0). They decide whether to KEEP SPENDING on this run;
+  # they do not decide whether RL improved the policy. Inputs: windowed rollout/success_rate over
+  # every generated episode (~130-380 per step; a 10-step window has an SE of ~0.5-1 point; its
+  # episodes share scenes within a group and come from a changing policy, hence not a measure of
+  # improvement) and the rollout's sampled-token entropy.
+  gate_window: 10           # steps per window
+  gate_check_frac: 0.25     # flat gate at step ceil(0.25 x 150) = 38: window 29-38 vs 1-10
+  gate_min_gain: 0.03       # owner's +3 points (WO-04), now on windowed SAMPLED success (owner to
+                            # confirm: sampled success moved 7.9% -> 12.6% over 150 K=16 steps)
+  gate_rule: any_task       # owner 2026-10-28: pass if ANY trained task gained it
+  gate_max_drop: 0.04       # decline: stop if the window is > 4 points below its best
+                            # non-overlapping window (replaces the step-50/100 peak stop)
+  gate_entropy_min: 0.5     # nats/token at T: below this sampling has collapsed onto the argmax
+                            # (WO-04 K=16 run: 1.32 -> 1.07 over 150 steps); judgment, not measured
+  gate_stop: true
+  # Fixed-batch policy-movement diagnostic (src/rl/diagnostics.py): diag/pre/* and diag/post/*
+  # = per-token |dlogp| by advantage sign, k3 KL and clip fraction of the first 32 trajectories of
+  # each update, before and after ALL its optimizer steps; + train/grad_norm. ~15 s per step.
+  diag_every: 1
+  diag_trajectories: 32
+  diag_argmax: false        # greedy argmax flip rate: +2 forwards (~31 s/step); on in --lr-sweep
   require_nonzero_baseline: true  # CLAUDE.md rule 3: abort if the step-0 eval is 0 on every task
   group_reset_check: error  # identical reset seeds must give identical scenes
   # Owner amendment (ADR-0002): RL rollouts on PickPlace + Push only; Stack (0/64 at step 0, every
-  # group all-zero) is eval-only. Evals still cover all three tasks; the kill switch compares the
-  # trained tasks' mean (eval/success_train).
+  # group all-zero) is not trained and, since 2026-11-08, not in the periodic evals either.
   train_tasks: [PickPlace, Push]
   # RL rollout + in-training eval horizon (owner amendment, ADR-0002); the protocol eval
   # (scripts/wo02_eval.py) keeps env.max_episode_steps = 150.

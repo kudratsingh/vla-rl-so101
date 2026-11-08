@@ -42,8 +42,8 @@ rl:                          # GRPO on the WO-03 toy task; keys documented in sr
   eval_every: 10
   eval_episodes: 256
   checkpoint_every: 50
-  early_stop_check_at_frac: 0.25
-  early_stop_eval_episodes: 256   # baseline + kill-switch evals; same as the periodic ones here
+  gate_window: 5                  # spend gates on windowed rollout success (src/rl/gates.py)
+  gate_check_frac: 0.25           # flat gate at step 25: windows 1-5 vs 21-25
 
 toy:                         # synthetic verification task + 2-layer policy (src/rl/toy_*.py)
   grid_size: 5

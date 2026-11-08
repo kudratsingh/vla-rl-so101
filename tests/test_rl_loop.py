@@ -4,8 +4,10 @@ import copy
 import importlib.util
 import json
 import random
+import statistics
 from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -23,8 +25,7 @@ from src.rl.trainer import (
     GRPOConfig,
     GRPOTrainer,
     eval_schedule,
-    is_flat_run,
-    kill_switch_step,
+    gate_check_step,
 )
 
 REPO = Path(__file__).resolve().parent.parent
@@ -187,6 +188,7 @@ def test_update_matches_upstream_per_trajectory_loss_and_ignores_micro_batching(
         tr.policy = copy.deepcopy(base.policy)
         tr.params = tr.policy.trainable_parameters()
         tr.optimizer = torch.optim.SGD(tr.params, lr=0.0)
+        tr.scheduler = SimpleNamespace(step=lambda: None)  # type: ignore[assignment]
         grads[micro] = _capture_grads_instead_of_stepping(tr)
         tr.update(batch)
 
@@ -214,11 +216,11 @@ def test_update_matches_upstream_per_trajectory_loss_and_ignores_micro_batching(
 
 
 def test_tiny_loop_improves_success_deterministically(tmp_path: Path) -> None:
-    cfg = _cfg(steps=40, eval_every=10)  # kill-switch check at step 10
+    cfg = _cfg(steps=40, eval_every=10)  # flat gate at step 10 (windows 1-5 vs 6-10)
     first = _trainer(cfg, tmp_path / "a").run()
     again = _trainer(cfg, tmp_path / "b").run()
     assert first["eval_history"] == again["eval_history"]  # same seed -> same numbers
-    assert not first["stopped_flat"]
+    assert first["stop_reason"] is None
     assert first["final_eval_success"] >= first["initial_eval_success"] + 0.4
     assert first["final_eval_success"] >= 0.9
     rows = [
@@ -226,13 +228,38 @@ def test_tiny_loop_improves_success_deterministically(tmp_path: Path) -> None:
     ]
     train = [r for r in rows if r["kind"] == "train"]
     assert len(train) == 40
-    for key in ("rollout/success_rate", "rollout/frac_groups_dropped", "train/clip_frac",
-                "train/approx_kl", "train/entropy", "rollout/episodes_per_hour"):  # fmt: skip
-        assert key in train[0], key
+    for key in ("rollout/success_rate", "rollout/frac_groups_dropped", "rollout/entropy",
+                "train/entropy", "train/grad_norm", "train/offpolicy_k3_kl", "diag/post/k3_kl",
+                "diag/post/clip_frac", "diag/pre/k3_kl", "rollout/episodes_per_hour",
+                "rollout/time/policy_s", "rollout/time/sim_step_s", "gate/success_window"):  # fmt: skip
+        assert any(key in r for r in train), key
+    for removed in ("train/clip_frac", "train/approx_kl"):  # uninformative aggregates (3.1)
+        assert not any(removed in r for r in train)
+    # 128 trajectories / 32 per mini-batch = 4 optimizer steps, each with its own pre-step stats
+    assert len(train[0]["train/opt_step_k3_kl"]) == 4 and train[0]["train/opt_step_k3_kl"][0] < 1e-9
     # silent-bug detectors: the sampler and the scorer agree, and before the first optimizer
     # step the PPO ratio is exactly 1
     assert max(r["train/logprob_mismatch"] for r in train) < 1e-5
     assert max(r["train/first_minibatch_max_abs_log_ratio"] for r in train) < 1e-5
+    # fixed-batch diagnostic: zero movement before the update (recompute on), real movement after
+    # it, in the advantage's direction: the surrogate gain mean(A x dlogp) on the held 32
+    # trajectories is positive on (nearly) every update -- the later mini-batches train on other
+    # prompts and at tiny's lr 1e-2 can undo a little -- and on average A > 0 tokens rise while
+    # A < 0 tokens fall
+    assert max(r["diag/pre/mean_abs_dlogp"] for r in train) == 0.0
+    diag = [r for r in train if "diag/post/k3_kl" in r]
+    assert len(diag) >= 35  # every step that trained (diag_every 1)
+    assert all(r["diag/post/mean_abs_dlogp"] > 0 and r["diag/post/k3_kl"] > 0 for r in diag)
+    assert sum(r["diag/post/mean_adv_dlogp"] > 0 for r in diag) >= 0.9 * len(diag)
+    assert statistics.mean(r["diag/post/mean_adv_dlogp"] for r in diag) > 0.01
+    early = train[:10]
+    assert statistics.mean(r["diag/post/mean_dlogp_pos_adv"] for r in early) > 0
+    assert statistics.mean(r["diag/post/mean_dlogp_neg_adv"] for r in early) < 0
+    # timing split: sections add up to the rollout time; the toy env has no renderer
+    split = sum(train[0][f"rollout/time/{k}_s"] for k in ("policy", "sim_step", "render", "obs_fn",
+                                                         "host_copy", "reset", "other"))  # fmt: skip
+    assert split == pytest.approx(train[0]["rollout/time_s"], rel=0.05)
+    assert train[0]["rollout/time/render_s"] == 0.0
 
 
 class _RecordingEnv:
@@ -253,20 +280,13 @@ class _RecordingEnv:
         return self.env.unwrapped
 
 
-def test_kill_switch_evals_64_episodes_on_identical_seeds_periodic_32(tmp_path: Path) -> None:
-    """Owner, WO-04: step 0 and the 25% check evaluate early_stop_eval_episodes (64) per task on
-    the same seeds; the periodic evals keep eval_episodes (32)."""
-    cfg = _cfg(
-        steps=8,
-        eval_every=4,
-        rollout_envs=32,
-        rollout_batch=8,
-        eval_episodes=32,
-        early_stop_eval_episodes=64,
-        early_stop_on_flat=False,  # keep evaluating after the check step
-    )
+def test_periodic_evals_use_identical_seeds_and_eval_episodes(tmp_path: Path) -> None:
+    """Periodic greedy evals (sanity logs only): step 0, every eval_every and the last step, all
+    eval_episodes per trained task on the same seeds, disjoint from the training prompts."""
+    cfg = _cfg(steps=8, eval_every=4, rollout_envs=32, rollout_batch=8, eval_episodes=32)
+    cfg["rl"]["gate_check_frac"] = 0  # 8 steps: no room for two gate windows
     rl = GRPOConfig.from_config(cfg)
-    assert eval_schedule(rl) == {0: 64, 2: 64, 4: 32, 8: 32}  # check step = ceil(0.25 * 8) = 2
+    assert eval_schedule(rl) == {0: 32, 4: 32, 8: 32}
     tr = _trainer(cfg, tmp_path)
     resets: list[list[int]] = []
     factory = tr.env_factory
@@ -284,36 +304,19 @@ def test_kill_switch_evals_64_episodes_on_identical_seeds_periodic_32(tmp_path: 
     tr.run()
     rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
     per_task = {r["step"]: r["eval/episodes_per_task"] for r in rows if "eval/success" in r}
-    assert per_task == {0: 64.0, 2: 64.0, 4: 32.0, 8: 32.0}
-    seeds64 = [EVAL_SEED_BASE + i for i in range(64)]
-    assert seeds_by_eval[0] == seeds_by_eval[1] == seeds64  # baseline == check-step seeds
-    assert seeds_by_eval[2] == seeds_by_eval[3] == seeds64[:32]
+    assert per_task == {0: 32.0, 4: 32.0, 8: 32.0}
+    seeds32 = [EVAL_SEED_BASE + i for i in range(32)]
+    assert seeds_by_eval == [seeds32] * 3
     train_seeds = [s for r in resets for s in r if s < EVAL_SEED_BASE]
     assert train_seeds and max(train_seeds) < EVAL_SEED_BASE  # disjoint from the eval seeds
 
 
-def test_kill_switch_threshold_is_three_points(tmp_path: Path) -> None:
-    """Improvement 0.029 over step 0 stops the run at the check step; 0.031 continues."""
-    assert is_flat_run(0.5, 0.529, 0.03) and not is_flat_run(0.5, 0.531, 0.03)
-    assert GRPOConfig().early_stop_min_improvement == 0.03
-    for check_value, stops in ((0.529, True), (0.531, False)):
-        tr = _trainer(_cfg(steps=8, eval_every=100), tmp_path / str(check_value))
-        values = iter([0.5, check_value])  # step-0 baseline, step-2 check; later evals: last step
-
-        def fake_eval(episodes: int | None = None, it: Any = values) -> dict[str, float]:
-            v = next(it, 0.9)  # the all-task mean stays flat: only the trained-task mean counts
-            return {"eval/success": 0.5, "eval/success_train": v, "eval/success/PickPlace": v}
-
-        tr.evaluate = fake_eval  # type: ignore[method-assign]
-        summary = tr.run()
-        assert summary["stopped_flat"] is stops
-        assert summary["steps_completed"] == (2 if stops else 8)
-
-
-def test_train_tasks_roll_out_only_trained_tasks_and_evaluate_all(tmp_path: Path) -> None:
-    """Owner amendment (ADR-0002): RL rollouts on rl.train_tasks only (Stack eval-only); evals
-    cover every env task and report the trained-task mean; rl.max_episode_steps sets the horizon."""
+def test_train_tasks_roll_out_and_evaluate_only_trained_tasks(tmp_path: Path) -> None:
+    """Owner amendment (ADR-0002): RL rollouts on rl.train_tasks only; since 2026-11-08 the
+    periodic evals cover the trained tasks only too (review 9: no eval-only tasks in periodic
+    evals; Stack is measured by the protocol eval); rl.max_episode_steps sets the horizon."""
     cfg = _cfg(steps=2, eval_every=100, train_tasks=["PickPlace", "Push"], max_episode_steps=4)
+    cfg["rl"]["gate_check_frac"] = 0
     cfg["env"]["tasks"] = ["PickPlace", "Push", "Stack"]
     tr = _trainer(cfg, tmp_path)
     assert tr.max_episode_steps == 4  # overrides toy.max_episode_steps = 6
@@ -337,9 +340,12 @@ def test_train_tasks_roll_out_only_trained_tasks_and_evaluate_all(tmp_path: Path
 
     tr.collect = spy_collect  # type: ignore[method-assign]
     out = evaluate(32)
-    assert set(evaluated) == {"PickPlace", "Push", "Stack"}
-    assert out["eval/success_train"] == pytest.approx(
-        (out["eval/success/PickPlace"] + out["eval/success/Push"]) / 2
+    assert set(evaluated) == {"PickPlace", "Push"}
+    assert "eval/success/Stack" not in out
+    assert (
+        out["eval/success_train"]
+        == out["eval/success"]
+        == pytest.approx((out["eval/success/PickPlace"] + out["eval/success/Push"]) / 2)
     )
     tr.run()
     assert collected and set(collected) == {"PickPlace", "Push"}
@@ -366,38 +372,6 @@ class _TaskTaggedEnv(_RecordingEnv):
         return super().reset(seed=seed, options=options)
 
 
-def test_kill_switch_any_task_rule(tmp_path: Path) -> None:
-    """Owner 2026-10-28: pass at the check step if ANY trained task gained >= 3 points (PickPlace
-    +3.1 with Push -5 continues under any_task but stops under the old mean rule)."""
-    cases = (
-        ("any_task", (0.531, 0.45), False),  # PickPlace +3.1 -> continue
-        ("any_task", (0.529, 0.529), True),  # both +2.9 -> stop
-        ("mean", (0.531, 0.45), True),  # mean -0.95 -> stop
-    )
-    for rule, (pick, push), stops in cases:
-        cfg = _cfg(steps=8, eval_every=100, train_tasks=["PickPlace", "Push"], early_stop_rule=rule)
-        cfg["env"]["tasks"] = ["PickPlace", "Push"]
-        tr = _trainer(cfg, tmp_path / f"{rule}-{pick}-{push}")
-        evals = iter([(0.5, 0.5), (pick, push)])
-
-        def fake_eval(episodes: int | None = None, it: Any = evals) -> dict[str, float]:
-            p, u = next(it, (0.9, 0.9))
-            return {
-                "eval/success": (p + u) / 2,
-                "eval/success_train": (p + u) / 2,
-                "eval/success/PickPlace": p,
-                "eval/success/Push": u,
-            }
-
-        tr.evaluate = fake_eval  # type: ignore[method-assign]
-        summary = tr.run()
-        assert summary["stopped_flat"] is stops, (rule, pick, push)
-        assert summary["steps_completed"] == (2 if stops else 8)
-    assert GRPOConfig.from_config(load_config("rl")).early_stop_rule == "any_task"
-    with pytest.raises(ValueError, match="early_stop_rule"):
-        GRPOConfig.from_config(_cfg(early_stop_rule="median"))
-
-
 def test_collect_logs_exact_per_task_rollout_stats(tmp_path: Path) -> None:
     cfg = _cfg(train_tasks=["PickPlace", "Push"])
     cfg["env"]["tasks"] = ["PickPlace", "Push"]
@@ -407,41 +381,16 @@ def test_collect_logs_exact_per_task_rollout_stats(tmp_path: Path) -> None:
     assert trained == stats["rollout/groups_trained"]
     for t in ("PickPlace", "Push"):
         assert 0.0 <= stats.get(f"rollout/frac_groups_dropped/{t}", 0.0) <= 1.0
-
-
-def test_peak_stop_ends_training_past_the_peak(tmp_path: Path) -> None:
-    """Owner 2026-10-28: stop at peak_stop_step if its trained-task eval is below peak_ref_step's."""
-    for at_8, stops in ((0.5, True), (0.7, False)):
-        cfg = _cfg(
-            steps=12, eval_every=4, peak_stop_step=8, peak_ref_step=4, early_stop_on_flat=False
-        )
-        tr = _trainer(cfg, tmp_path / str(at_8))
-        vals = iter([0.3, 0.6, 0.6, at_8])  # steps 0, 3 (kill-switch check), 4, 8
-
-        def fake_eval(episodes: int | None = None, it: Any = vals) -> dict[str, float]:
-            v = next(it, 0.9)
-            return {"eval/success": v, "eval/success_train": v, "eval/success/PickPlace": v}
-
-        tr.evaluate = fake_eval  # type: ignore[method-assign]
-        summary = tr.run()
-        assert summary["stopped_peak"] is stops
-        assert summary["steps_completed"] == (8 if stops else 12)
-    for bad in ((4, 4), (8, 0), (20, 4)):  # ref == stop, ref unset, stop past the last step
-        with pytest.raises(ValueError, match="peak_ref_step"):
-            GRPOConfig.from_config(_cfg(steps=12, peak_stop_step=bad[0], peak_ref_step=bad[1]))
-    # off-grid peak steps are added to the eval schedule with equal episode counts
-    rl = GRPOConfig.from_config(
-        _cfg(steps=12, eval_every=5, eval_episodes=32, peak_stop_step=7, peak_ref_step=3)
-    )
-    plan = eval_schedule(rl)
-    assert plan[3] == plan[7] == rl.early_stop_eval_episodes  # step 3 = kill-switch check
-    rl = GRPOConfig.from_config(load_config("rl", REPO / "configs" / "rl_pickplace.yaml"))
-    assert eval_schedule(rl)[50] == eval_schedule(rl)[100] == 32  # running preset unchanged
+    # the gate tallies cover every generated group (dropped ones too)
+    groups = sum(t.groups for t in tr._last_tallies.values())
+    assert groups == stats["rollout/groups_generated"]
+    rate = sum(t.sum_rate for t in tr._last_tallies.values()) / groups
+    assert rate == pytest.approx(stats["rollout/success_rate"])
 
 
 def test_zero_success_baseline_aborts_before_training(tmp_path: Path) -> None:
     """CLAUDE.md rule 3: RL never starts from a 0%-success base."""
-    tr = _trainer(_cfg(steps=4), tmp_path)
+    tr = _trainer(_cfg(steps=4, gate_check_frac=0), tmp_path)
     tr.evaluate = lambda episodes=None: {  # type: ignore[method-assign]
         "eval/success": 0.0,
         "eval/success/PickPlace": 0.0,
@@ -459,33 +408,44 @@ def test_probe_measures_without_saving(tmp_path: Path) -> None:
     assert len(probe["rows"]) == 3 and probe["s_per_step_median"] > 0
     assert probe["rollout_episodes_per_hour"] > 0 and probe["eval_s_per_env_batch"] > 0
     assert probe["first_minibatch_max_abs_log_ratio"] < 1e-5
+    split = probe["rollout_split_s_per_env_batch"]
+    assert sum(split.values()) == pytest.approx(probe["rollout_s_per_env_batch"], rel=0.05)
+    assert probe["diag_post"]["k3_kl"] > 0 and 0 <= probe["refill_cap_hit_frac"] <= 1
     assert not (tmp_path / "checkpoints").exists()
 
 
-def test_flat_run_kill_switch_stops_the_run(tmp_path: Path) -> None:
-    cfg = _cfg(steps=20, lr=0.0, eval_every=100)  # lr 0: policy cannot change -> flat
+def test_flat_gate_stops_a_run_that_cannot_learn(tmp_path: Path) -> None:
+    """lr 0: the policy cannot change, so windowed rollout success stays flat -> the flat gate
+    stops at ceil(0.25 x 40) = 10 and checkpoints there (spend decision only)."""
+    cfg = _cfg(steps=40, lr=0.0, eval_every=100)
     summary = _trainer(cfg, tmp_path).run()
-    assert summary["stopped_flat"]
-    assert summary["steps_completed"] == 5  # ceil(0.25 * 20)
+    assert summary["stop_reason"] == "flat" and summary["stopped_flat"]
+    assert summary["steps_completed"] == 10
     rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
-    assert rows[-1]["event/flat_run"] == 1.0
-    assert (tmp_path / "checkpoints" / "step_000005" / "adapter").is_dir()
+    assert rows[-1]["event/flat_run"] == 1.0 and rows[-1]["gate/flat_gain"] < 0.03
+    assert (tmp_path / "checkpoints" / "step_000010" / "adapter").is_dir()
+    cfg["rl"]["gate_stop"] = False  # gates only log
+    summary = _trainer(cfg, tmp_path / "log_only").run()
+    assert summary["stop_reason"] is None and summary["steps_completed"] == 40
 
 
 def test_config_validation() -> None:
-    rl = GRPOConfig.from_config(load_config("rl"))  # the WO-04 preset must parse
+    rl = GRPOConfig.from_config(load_config("rl"))  # the next-run preset must parse
     assert (rl.clip_low, rl.clip_high) == (0.2, 0.28)
-    # owner's K=16 rule fired (confirming probe: 72% of K=8 groups dropped); 128 trajectories
-    assert (rl.samples_per_prompt, rl.rollout_batch, rl.rollout_envs) == (16, 8, 32)
+    # review 3.1 / 9 (2026-11-08): 16 prompts x K=8 = 128 trajectories, lr 1e-4, 2 PPO epochs
+    assert (rl.samples_per_prompt, rl.rollout_batch, rl.rollout_envs) == (8, 16, 32)
+    assert (rl.lr, rl.ppo_epochs, rl.ppo_mini_batch) == (1e-4, 2, 64)
     # owner amendment after the WO-04 probes (2026-10-27, ADR-0002)
     assert (rl.temperature, rl.recompute_old_log_probs, rl.steps) == (1.0, True, 150)
     assert (rl.train_tasks, rl.max_episode_steps) == (("PickPlace", "Push"), 120)
-    assert kill_switch_step(rl) == 38
-    # owner's WO-04 settings (2026-10-26)
-    assert (rl.lr, rl.ppo_mini_batch) == (5e-5, 64)
-    assert (rl.eval_episodes, rl.early_stop_eval_episodes) == (32, 64)
-    assert (rl.early_stop_min_improvement, rl.early_stop_check_at_frac) == (0.03, 0.25)
-    assert rl.early_stop_on_flat and rl.require_nonzero_baseline
+    # spend gates on rollout windows; flat gate at step 38 compares windows 1-10 and 29-38
+    assert gate_check_step(rl) == 38 and rl.gate_window == 10
+    assert (rl.gate_min_gain, rl.gate_rule, rl.gate_stop) == (0.03, "any_task", True)
+    assert rl.eval_episodes == 32 and rl.require_nonzero_baseline
+    assert (rl.diag_every, rl.diag_trajectories) == (1, 32)
+    pick = GRPOConfig.from_config(load_config("rl", REPO / "configs" / "rl_pickplace.yaml"))
+    assert pick.train_tasks == ("PickPlace",) and pick.checkpoint_every == 25
+    assert (pick.lr, pick.samples_per_prompt, pick.ppo_epochs) == (1e-4, 8, 2)
     with pytest.raises(ValueError, match="kl_coef"):
         GRPOConfig.from_config(_cfg(kl_coef=0.01))
     with pytest.raises(ValueError, match="multiple of K"):
@@ -494,6 +454,16 @@ def test_config_validation() -> None:
         GRPOConfig.from_config(_cfg(clip_ratio=0.2))
     with pytest.raises(ValueError, match="max_episode_steps"):
         GRPOConfig.from_config(_cfg(max_episode_steps=-1))
+    # the removed kill-switch / peak-stop keys fail loudly and name their replacement
+    for key in ("early_stop_eval_episodes", "peak_stop_step", "early_stop_min_improvement"):
+        with pytest.raises(ValueError, match="removed.*gate|gate.*removed|replaced"):
+            GRPOConfig.from_config(_cfg(**{key: 1}))
+    with pytest.raises(ValueError, match="2 x gate_window"):
+        GRPOConfig.from_config(_cfg(steps=8))  # check step 2 < 2 x 5
+    with pytest.raises(ValueError, match="gate_rule"):
+        GRPOConfig.from_config(_cfg(gate_rule="median"))
+    with pytest.raises(ValueError, match="diag_trajectories"):
+        GRPOConfig.from_config(_cfg(diag_trajectories=6))  # not a multiple of K=4
     # WO-02 provides the OpenVLA-OFT builder; it refuses a config without the base checkpoint
     with pytest.raises(ValueError, match="policy.checkpoint"):
         build_policy({"policy": {"base": "openvla_oft"}}, "cpu")
@@ -508,20 +478,34 @@ def _load_script() -> Any:
 
 
 def test_cost_estimate_matches_rl_yaml_arithmetic() -> None:
-    est = _load_script().estimate_cost(load_config("rl"))
-    # configs/rl.yaml (A100 throughput measured 2026-10-27; amended preset): 8 x 16 = 128 trained,
-    # x 3.0 (refill cap) = 384 episodes x 120 (RL horizon) = 46,080 actions / 86 = 535.8 s;
-    # 128 x 15 = 1,920 decisions / 10.3 = 186.4 s update + / 31 = 61.9 s old-log-prob recompute;
-    # 8 evals = 6 x 32 + 2 x 64 (step 0 and the kill-switch step 38) = 320 episodes/task x 3 tasks
-    # x 120 / 86
+    script = _load_script()
+    est = script.estimate_cost(load_config("rl"))
+    # configs/rl.yaml (A100 throughput measured 2026-10-27; 2026-11-08 shape): 16 x 8 = 128
+    # trained, x 3.0 (refill cap) = 384 episodes x 120 (RL horizon) = 46,080 actions / 86 =
+    # 535.8 s; 128 x 15 = 1,920 decisions: / 31 = 61.9 s recompute, 2 epochs / 10.3 = 372.8 s
+    # update; diagnostic 32 x 15 = 480 decisions / 31 = 15.5 s; 7 evals (steps 0, 25, .., 150)
+    # x 32 episodes x 2 trained tasks x 120 / 86
     assert est["actions_per_step"] == 46_080
     assert est["decisions_trained_per_step"] == 1_920
     assert est["recompute_s_per_step"] == pytest.approx(1920 / 31)
-    assert est["evals"] == 8 and est["eval_episodes_per_task"] == 320
-    assert est["hours"] == pytest.approx(
-        (150 * (46_080 / 86 + 1920 / 10.3 + 1920 / 31) + 320 * 3 * 120 / 86) / 3600
-    )
+    assert est["update_s_per_step"] == pytest.approx(2 * 1920 / 10.3)
+    assert est["diag_s_per_step"] == pytest.approx(480 / 31)
+    assert est["evals"] == 7 and est["eval_episodes_per_task"] == 224 and est["eval_tasks"] == 2
+    step_s = 46_080 / 86 + 2 * 1920 / 10.3 + 1920 / 31 + 480 / 31
+    assert est["hours"] == pytest.approx((150 * step_s + 224 * 2 * 120 / 86) / 3600)
     assert est["dollars"] == pytest.approx(est["hours"] * 1.79)
+    assert est["gate_check_step"] == 38
+    assert est["gate_check_stop_h"] == pytest.approx((38 * step_s + 64 * 2 * 120 / 86) / 3600)
+    # Track B probes: lr sweep = one capped collection + per lr (8 Adam steps x 64 x 15 / 10.3 +
+    # 3 forwards of 1,920 decisions / 31) + one greedy forward; temperature probe = 16 env
+    # batches of 32 x 120 actions / 86 per temperature
+    probes = script.estimate_probes(
+        load_config("rl"), lrs=[5e-5, 2e-4, 5e-4, 1e-3], adam_steps=8, stored_batch=False,
+        temperatures=[0.7, 1.0, 1.3], groups=64,
+    )  # fmt: skip
+    per_lr = 8 * 64 * 15 / 10.3 + 3 * 1920 / 31
+    assert probes["lr_sweep_h"] == pytest.approx((46_080 / 86 + 1920 / 31 + 4 * per_lr) / 3600)
+    assert probes["temp_probe_h"] == pytest.approx(3 * 16 * 32 * 120 / 86 / 3600)
 
 
 def test_entry_script_tiny_writes_run_record(
@@ -530,10 +514,9 @@ def test_entry_script_tiny_writes_run_record(
     script = _load_script()
     monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
     cfg_path = tmp_path / "tiny_short.yaml"
-    # 3 steps puts the flat-run check at step 1, where eval noise alone can trip it (seen on the
-    # Linux CI runner); this test is about the run record, so the kill switch is off
+    # 3 steps leaves no room for two gate windows; this test is about the run record
     cfg_path.write_text(
-        f"inherit: {REPO / 'configs' / 'tiny.yaml'}\nrl:\n  steps: 3\n  early_stop_on_flat: false\n"
+        f"inherit: {REPO / 'configs' / 'tiny.yaml'}\nrl:\n  steps: 3\n  gate_check_frac: 0\n"
     )
     summary = script.main(["--preset", "tiny", "--config", str(cfg_path), "--seed", "1"])
     (run_dir,) = (tmp_path / "runs").iterdir()
@@ -560,11 +543,23 @@ def test_entry_script_probe_prints_projection(
     eval_batches = sum(-(-ep // rl.rollout_envs) for ep in eval_schedule(rl).values())
     want = rl.steps * out["s_per_step_median"] + eval_batches * out["eval_s_per_env_batch"]
     assert proj["run_h"] == pytest.approx(want / 3600)
-    assert proj["kill_switch_stop_h"] < proj["run_h"] <= proj["worst_case_h"]
+    assert proj["gate_check_stop_h"] < proj["run_h"] <= proj["worst_case_h"]
     printed = [
         ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("[wo03_rl] PROBE")
     ]
     assert any("projected" in ln and "per seed" in ln for ln in printed)
+    assert any("sim_step" in ln and "render" in ln for ln in printed)  # rollout timing split
+    assert any("post-update" in ln and "k3 KL" in ln for ln in printed)
+    assert len(printed) <= 6  # scripts/pod/wo04_job.sh posts the last 6 PROBE lines
+
+
+def test_entry_script_rejects_rl_seeds_on_the_protocol_range(tmp_path: Path) -> None:
+    """Review 9 / PR #25: ManiSkill RL seed 10 would draw training prompts from 100M.., the
+    protocol's held-out episode seeds; it is rejected before anything is built."""
+    cfg_path = tmp_path / "maniskill.yaml"
+    cfg_path.write_text(f"inherit: {REPO / 'configs' / 'rl.yaml'}\nseed: 10\n")
+    with pytest.raises(ValueError, match="overlapping"):
+        _load_script().main(["--preset", "rl", "--config", str(cfg_path), "--estimate"])
 
 
 def test_sigterm_saves_interrupted_checkpoint_and_record(
@@ -597,4 +592,7 @@ def test_sigterm_saves_interrupted_checkpoint_and_record(
     (run_dir,) = (tmp_path / "runs").iterdir()
     record = json.loads((run_dir / "record.json").read_text())
     assert record["status"] == "interrupted" and record["end_utc"] and record["dollars"] == 0.0
-    assert (run_dir / "checkpoints" / "step_000003_interrupted" / "adapter").is_dir()
+    ckpt = run_dir / "checkpoints" / "step_000003_interrupted"
+    assert (ckpt / "adapter").is_dir() and (ckpt / "optimizer.pt").is_file()
+    state = json.loads((ckpt / "trainer_state.json").read_text())
+    assert (state["step"], state["completed_step"]) == (3, 2)  # resume would redo step 3
