@@ -80,7 +80,9 @@ def test_calibration_is_fresh_torque_off_and_backs_up(tmp_path: Path) -> None:
     assert dev.bus.calls == ["connect", "disable_torque", "disconnect(disable_torque=True)"]
     assert "support the arm" in prompts[0]
     backups = list(tmp_path.glob("so101_follower.*.bak.json"))
-    assert len(backups) == 1 and json.loads(backups[0].read_text())["shoulder_pan"]["range_max"] == 1
+    assert (
+        len(backups) == 1 and json.loads(backups[0].read_text())["shoulder_pan"]["range_max"] == 1
+    )
     assert json.loads(path.read_text())["shoulder_pan"]["range_max"] == 3000
 
     reuse = CalDevice(path)
