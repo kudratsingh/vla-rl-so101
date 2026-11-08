@@ -179,12 +179,15 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   # RL rollout + in-training eval horizon (owner amendment, ADR-0002); the protocol eval
   # (scripts/wo02_eval.py) keeps env.max_episode_steps = 150.
   max_episode_steps: 120
-  # Protocol 0.2's per-joint step clip (4 deg/step, configs/real.yaml robot.safety) inside RL
-  # rollouts and the in-training evals. null = OFF, as in every RL run so far (WO-04): RL trains
-  # WITHOUT the clip that protocol 0.2 sim eval (and the real arm) applies. The next run keeps it
-  # off (comparable with WO-04 and the 0.1 protocol numbers) unless the owner chooses 4.0 to match
-  # 0.2 (docs/STATUS.md "RL rollout action clip").
-  rollout_action_clip_deg: null
+  # Protocol 0.2's per-joint step clip inside RL rollouts, the in-training evals and every probe
+  # of this preset (--probe-temperatures, --lr-sweep's batch, --probe-steps). OWNER DECISION
+  # 2026-11-08: ON at 4.0 deg/step, the bound protocol 0.2 eval and the real arm apply
+  # (configs/real.yaml robot.safety: min(max_joint_step_deg 4, max_velocity_deg_s 60 / 15 Hz);
+  # tests/test_rl_action_clip.py checks the two agree). It clips the action SENT TO THE ENV only:
+  # PPO keeps the sampled tokens and their log-probs (src/rl/rollout.py). WO-04 ran with no clip
+  # (null), so this run is NOT like-for-like with WO-04 on this axis; `--probe-clip` measures the
+  # difference on paired rollouts before the run. null = off (the code default, tiny preset).
+  rollout_action_clip_deg: 4.0
 
 cost:
   gpu: A100-80GB

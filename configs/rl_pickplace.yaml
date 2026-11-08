@@ -18,3 +18,5 @@ rl:
   gate_stop: false          # owner 2026-11-08: the first RL run observes the gates (gate/would_stop,
                             # record gate_decisions) before they may stop a run; as configs/rl.yaml
   checkpoint_every: 25      # owner 2026-10-28: every eval step has a checkpoint
+  rollout_action_clip_deg: 4.0  # owner 2026-11-08: protocol 0.2's clip on the env action, as
+                            # configs/rl.yaml (inherited; repeated so the setting is explicit)

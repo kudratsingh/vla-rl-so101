@@ -54,6 +54,11 @@ Intentional differences (none changes the gradient of a step except the refill c
     groups at 8 groups per mini-batch was 64 + a 24-trajectory tail with its own full Adam step;
     now 6 + 5 groups). A full batch (groups a multiple of ppo_mini_batch / K) splits exactly as
     before, so its gradients are unchanged.
+  * `rollout_action_clip_deg` (owner 2026-11-08: 4.0 in configs/rl.yaml, null in tiny and the
+    code default): protocol 0.2's per-joint step clip on the action SENT TO THE ENV in rollouts
+    and in-training evals (src/rl/rollout.py). It is part of the environment, not of the policy:
+    the batch keeps the sampled tokens and their sampler log-probs, so old log-probs (sampler or
+    recomputed), ratios and advantages are all on the sampled tokens. Upstream has no clip.
 """
 
 from __future__ import annotations
@@ -84,10 +89,12 @@ from src.rl.grpo import (
     group_advantages,
     seq_mean_token_mean_weights,
 )
+from src.rl.paired import paired_group_rewards
 from src.rl.policy_api import RLPolicy
 from src.rl.rollout import (
     STORAGE,
     TIMING_KEYS,
+    ClipStats,
     ObsFn,
     RolloutBatch,
     RolloutTimer,
@@ -100,6 +107,9 @@ log = logging.getLogger(__name__)
 EnvFactory = Callable[[str, int], VecEnv]  # (task, num_envs) -> batched env
 TRAIN_SEED_STRIDE = 10_000_000  # train prompt seeds: seed * stride + counter
 EVAL_SEED_BASE = 4_000_000_000  # eval seeds: fixed, shared by all run seeds, disjoint from train
+# probe_clip: torch RNG seed of env batch b = this + seed * TRAIN_SEED_STRIDE + b, the same in both
+# arms (a sampling seed, not an env reset seed)
+CLIP_PROBE_SAMPLING_SEED = 9_000_000_000
 
 # rl keys removed 2026-11-08 (review 3.1): the greedy-eval kill switch and peak stop -> gate_*
 REMOVED_KEYS = {
@@ -158,8 +168,9 @@ class GRPOConfig:
     train_tasks: tuple[str, ...] = ()  # RL rollouts and periodic evals on these; () = every task
     max_episode_steps: int = 0  # RL rollout + in-training eval horizon; 0 = env.max_episode_steps
     # Per-joint step clip (deg) on every executed RL-rollout and in-training-eval action, as
-    # protocol 0.2's sim eval applies it (4 deg/step from configs/real.yaml). None = off: the
-    # default and every RL run so far (WO-04), so RL trains WITHOUT the clip 0.2 evaluates with.
+    # protocol 0.2's sim eval applies it (4 deg/step from configs/real.yaml). None = off: the code
+    # default, the tiny preset and every RL run so far (WO-04). configs/rl.yaml sets 4.0 (owner
+    # 2026-11-08). Env action only: PPO trains on the sampled tokens (module docstring).
     rollout_action_clip_deg: float | None = None
 
     @classmethod
@@ -552,7 +563,7 @@ class GRPOTrainer:
         ent_sum, ent_tokens = 0.0, 0
         reset_diff = 0.0
         n_batches = 0
-        clip_stats: dict[str, int] = {}
+        clip_stats = ClipStats()
         for _ in range(max_batches):
             task = self.train_tasks[self._next_task % len(self.train_tasks)]
             self._next_task += 1
@@ -612,10 +623,8 @@ class GRPOTrainer:
         }
         for key, value in timer.totals(elapsed).items():  # sums to rollout/time_s
             stats[f"rollout/time/{key}_s"] = value
-        if rl.rollout_action_clip_deg is not None:  # fraction of env steps the clip changed
-            stats["rollout/action_clip_frac"] = clip_stats.get("clipped_steps", 0) / max(
-                clip_stats.get("active_steps", 0), 1
-            )
+        if rl.rollout_action_clip_deg is not None:  # clip intervention over this step's rollouts
+            stats.update(clip_stats.summary("rollout/action_clip"))
         for t, (gen_t, kept_t, trained_t) in per_task.items():
             if gen_t:
                 stats[f"rollout/frac_groups_dropped/{t}"] = 1.0 - kept_t / gen_t
@@ -1279,6 +1288,12 @@ class GRPOTrainer:
                 "eval_s_first_env_batch": eval_batch_s[0],
                 "frac_groups_dropped": total("rollout/frac_groups_dropped") / len(timed),
                 "refill_cap_hit_frac": total("rollout/refill_cap_hit") / len(timed),
+                # mean over steps of the env-step fraction the clip changed; None = clip off
+                "action_clip_frac": (
+                    total("rollout/action_clip_frac") / len(timed)
+                    if self.rl.rollout_action_clip_deg is not None
+                    else None
+                ),
                 "first_minibatch_max_abs_log_ratio": max(
                     r.get("train/first_minibatch_max_abs_log_ratio", 0.0) for r in rows
                 ),
@@ -1312,7 +1327,11 @@ class GRPOTrainer:
         if not lrs or adam_steps < 1:
             raise ValueError("need >= 1 lr and adam_steps >= 1")
         rows: list[dict[str, Any]] = []
-        out: dict[str, Any] = {"adam_steps": adam_steps, "lrs": list(lrs)}
+        out: dict[str, Any] = {
+            "adam_steps": adam_steps,
+            "lrs": list(lrs),
+            "rollout_action_clip_deg": self.rl.rollout_action_clip_deg,  # of the batch's rollouts
+        }
         try:
             stats: dict[str, float] = {}
             if batch is None:
@@ -1397,6 +1416,7 @@ class GRPOTrainer:
                     raise ValueError("probe temperatures must be > 0")
                 self._next_prompt, self._next_task = start_prompt, start_task  # paired prompts
                 timer = RolloutTimer()
+                clip_stats = ClipStats()
                 t0 = time.perf_counter()
                 by_task: dict[str, list[Tensor]] = {t: [] for t in self.train_tasks}
                 ent_sum, ent_tokens = 0.0, 0
@@ -1417,12 +1437,20 @@ class GRPOTrainer:
                         group_reset_check=rl.group_reset_check,
                         timer=timer,
                         action_clip=rl.action_clip_rad,
+                        clip_stats=clip_stats,
                     )
                     by_task[task].append(batch.group_rewards)
                     es, et = entropy_from_sampled_log_probs(batch.log_probs, _token_mask(batch))
                     ent_sum, ent_tokens = ent_sum + es, ent_tokens + et
                 elapsed = time.perf_counter() - t0
-                row: dict[str, Any] = {"kind": "temp_probe", "step": 0, "temperature": temp}
+                row: dict[str, Any] = {
+                    "kind": "temp_probe",
+                    "step": 0,
+                    "temperature": temp,
+                    "rollout_action_clip_deg": rl.rollout_action_clip_deg,  # the preset's
+                }
+                if rl.rollout_action_clip_deg is not None:
+                    row.update(clip_stats.summary("probe/action_clip"))
                 everything = torch.cat([r for rs in by_task.values() for r in rs])
                 row.update(_group_summary(everything, "probe"))
                 for t, rs in by_task.items():
@@ -1449,7 +1477,141 @@ class GRPOTrainer:
                 )
         finally:
             self.close()
-        return {"groups": n_batches * gpb, "env_batches_per_temperature": n_batches, "rows": rows}
+        return {
+            "groups": n_batches * gpb,
+            "env_batches_per_temperature": n_batches,
+            "rollout_action_clip_deg": rl.rollout_action_clip_deg,
+            "rows": rows,
+        }
+
+    def probe_clip(self, groups: int) -> dict[str, Any]:
+        """Paired clip on/off probe (owner 2026-11-08), rollouts only (no update, no dynamic
+        sampling, no refill). Both arms play the SAME `groups` prompts (reset seeds and tasks
+        round-robin from the trainer's counters, as in training; rounded up to whole env batches)
+        with the SAME sampling seeds: the global torch RNG is reseeded to the same value before
+        each env batch of each arm, so a slot's first decision draws identical tokens and later
+        decisions use common random numbers. K = rl.samples_per_prompt, T = rl.temperature (the
+        preset's). Arm "on" applies rl.rollout_action_clip_deg to the env action; arm "off" sends
+        the sampled action unchanged and only measures how often the clip WOULD have changed it
+        (against its own previous executed action). Per arm: sampled success, group-drop rate
+        (all-equal groups, which dynamic sampling drops), entropy, episode length and clip
+        intervention; paired: per-group success difference and the episode / group count tables
+        (src/rl/paired.py)."""
+        rl = self.rl
+        bound = rl.action_clip_rad
+        if bound is None:
+            raise ValueError(
+                "probe_clip compares the preset's rl.rollout_action_clip_deg against no clip; "
+                "it is null"
+            )
+        if groups < 1:
+            raise ValueError("groups must be >= 1")
+        k = rl.samples_per_prompt
+        gpb = rl.rollout_envs // k
+        n_batches = math.ceil(groups / gpb)
+        arms = {"off": False, "on": True}  # arm -> clip applied to the env action
+        rewards: dict[str, list[Tensor]] = {a: [] for a in arms}
+        by_task: dict[str, dict[str, list[Tensor]]] = {
+            a: {t: [] for t in self.train_tasks} for a in arms
+        }
+        first_tokens: dict[str, list[Tensor]] = {a: [] for a in arms}
+        ep_len: dict[str, list[Tensor]] = {a: [] for a in arms}
+        ent = {a: [0.0, 0] for a in arms}
+        clip_stats = {a: ClipStats() for a in arms}
+        timers = {a: RolloutTimer() for a in arms}
+        elapsed = {a: 0.0 for a in arms}
+        sampling_seeds: list[int] = []
+        try:
+            for b in range(n_batches):
+                task = self.train_tasks[self._next_task % len(self.train_tasks)]
+                self._next_task += 1
+                seeds = list(range(self._next_prompt, self._next_prompt + gpb))
+                self._next_prompt += gpb
+                sampling_seed = CLIP_PROBE_SAMPLING_SEED + self.seed * TRAIN_SEED_STRIDE + b
+                sampling_seeds.append(sampling_seed)
+                for arm, apply in arms.items():
+                    torch.manual_seed(sampling_seed)  # CPU and every CUDA device: same draws
+                    t0 = time.perf_counter()
+                    batch, _ = collect_rollouts(
+                        self.policy,
+                        self._env(task),
+                        self.obs_fn,
+                        prompt_seeds=seeds,
+                        group_size=k,
+                        temperature=rl.temperature,
+                        max_episode_steps=self.max_episode_steps,
+                        task=task,
+                        group_reset_check=rl.group_reset_check,
+                        timer=timers[arm],
+                        action_clip=bound,
+                        clip_stats=clip_stats[arm],
+                        clip_apply=apply,
+                    )
+                    elapsed[arm] += time.perf_counter() - t0
+                    rewards[arm].append(batch.group_rewards)
+                    by_task[arm][task].append(batch.group_rewards)
+                    first_tokens[arm].append(batch.tokens[:, 0])
+                    ep_len[arm].append(batch.episode_len)
+                    es, et = entropy_from_sampled_log_probs(batch.log_probs, _token_mask(batch))
+                    ent[arm][0] += es
+                    ent[arm][1] += int(et)
+        finally:
+            self.close()
+        rows: list[dict[str, Any]] = []
+        for arm, apply in arms.items():
+            row: dict[str, Any] = {
+                "kind": "clip_probe",
+                "step": 0,
+                "arm": arm,
+                "clip_applied": apply,
+                "rollout_action_clip_deg": rl.rollout_action_clip_deg,
+                "temperature": rl.temperature,
+                "samples_per_prompt": k,
+            }
+            row.update(_group_summary(torch.cat(rewards[arm]), "probe"))
+            for t, rs in by_task[arm].items():
+                if rs:
+                    row.update(_group_summary(torch.cat(rs), f"probe/{t}"))
+            row["probe/entropy"] = ent[arm][0] / max(int(ent[arm][1]), 1)
+            row["probe/mean_episode_len"] = float(torch.cat(ep_len[arm]).float().mean())
+            # arm on: how often the clip changed the env action; arm off: how often it WOULD have
+            row.update(clip_stats[arm].summary("probe/action_clip"))
+            row["probe/time_s"] = elapsed[arm]
+            row["probe/s_per_env_batch"] = elapsed[arm] / n_batches
+            for key, value in timers[arm].totals(elapsed[arm]).items():
+                row[f"probe/time/{key}_s"] = value
+            self._log(row)
+            rows.append(row)
+        paired = paired_group_rewards(torch.cat(rewards["off"]), torch.cat(rewards["on"]))
+        tok_off, tok_on = torch.cat(first_tokens["off"]), torch.cat(first_tokens["on"])
+        # pairing check: same scene + same RNG -> the first decision's tokens agree (1.0 on CPU;
+        # GPU kernel nondeterminism can flip a few)
+        paired["first_decision_token_match"] = float(
+            (tok_off == tok_on).flatten(1).all(-1).float().mean()
+        )
+        self._log({"kind": "clip_probe_paired", "step": 0, **paired})
+        log.info(
+            "clip probe: success off %.3f / on %.3f (paired diff %+.3f, SE %.3f), dropped "
+            "off %.3f / on %.3f, clip changed %.3f of steps (on), would change %.3f (off)",
+            rows[0]["probe/success_rate"],
+            rows[1]["probe/success_rate"],
+            paired["success_diff_on_minus_off"],
+            paired["success_diff_se"],
+            rows[0]["probe/frac_groups_dropped"],
+            rows[1]["probe/frac_groups_dropped"],
+            rows[1]["probe/action_clip_frac"],
+            rows[0]["probe/action_clip_frac"],
+        )
+        return {
+            "groups": n_batches * gpb,
+            "env_batches_per_arm": n_batches,
+            "samples_per_prompt": k,
+            "temperature": rl.temperature,
+            "rollout_action_clip_deg": rl.rollout_action_clip_deg,
+            "sampling_seeds": sampling_seeds,
+            "rows": rows,
+            "paired": paired,
+        }
 
     @staticmethod
     def _console(step: int, row: dict[str, Any]) -> None:
