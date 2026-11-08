@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import pytest
 import yaml
+from real_fixture import placeholder_text
 from robot_fakes import real_cfg
 
 from src.config import REPO_ROOT, load_config
@@ -114,7 +115,7 @@ def test_checkerboard_intrinsics_recovers_known_camera() -> None:
 
 
 def test_yaml_value_written_in_place() -> None:
-    text = (REPO_ROOT / "configs" / "real.yaml").read_text()
+    text = placeholder_text((REPO_ROOT / "configs" / "real.yaml").read_text())
     intr = {"fx": 600.5, "fy": 601.0, "cx": 320.0, "cy": 240.0, "dist": [0.1, -0.2, 0, 0, 0]}
     out = set_yaml_value(text, ["cameras", "front", "intrinsics"], intr)
     before, after = yaml.safe_load(text), yaml.safe_load(out)
