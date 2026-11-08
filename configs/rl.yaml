@@ -47,7 +47,8 @@
 #   env actions            384 x 120 (RL horizon)        = 46,080 -> / 86 per s  = 535.8 s
 #   old log-prob recompute 128 x ceil(120 / 8) = 1,920 decisions / 31 per s     =  61.9 s
 #   update                 2 epochs x 1,920 decisions / 10.3 per s              = 372.8 s
-#                          (2 mini-batches of 64 x 2 epochs = 4 Adam steps; upstream ~4)
+#                          (2 mini-batches of 64 x 2 epochs = 4 Adam steps; upstream ~4;
+#                          fewer kept groups split equally: 11 -> 6 + 5 groups, 7 -> 1 x 7)
 #   fixed-batch diagnostic 32 trajectories x 15 decisions = 480 / 31 per s      =  15.5 s
 #   step                                                               = 986.0 s = 16.4 min
 #   evals (sanity only)    steps {0, 25, ..., 150}: 7 x 32 episodes x 2 trained tasks
@@ -106,7 +107,11 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   weight_decay: 0.01
   grad_clip: 1.0            # not a step-size lever under Adam (rescaling g cancels); lr/epochs are
   ppo_epochs: 2             # 2026-11-08: was 1
-  ppo_mini_batch: 64        # trajectories per optimizer step -> 2 per epoch, 4 per update
+  ppo_mini_batch: 64        # max trajectories (8 whole groups) per optimizer step. Each epoch
+                            # splits the kept groups into ceil(groups / 8) EQUAL whole-group
+                            # mini-batches (owner 2026-11-08; src/rl/trainer.py ppo_minibatches):
+                            # 16 groups -> 8 + 8 (2 per epoch, 4 per update); 11 (refill cap) ->
+                            # 6 + 5, not 8 + a 3-group tail with its own full Adam step
   micro_batch: 8            # decisions per forward/backward; memory only, gradient unchanged
   clip_low: 0.2
   clip_high: 0.28

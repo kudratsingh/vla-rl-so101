@@ -57,6 +57,7 @@ from src.rl.trainer import (
     GRPOTrainer,
     eval_schedule,
     gate_check_step,
+    ppo_minibatches,
     read_checkpoint_state,
 )
 from src.runs import device_info, hourly_usd
@@ -214,7 +215,10 @@ def estimate_probes(
         cap_batches = math.ceil(rl.rollout_batch / gpb) * rl.max_rollout_rounds
         collect_s = 0.0 if stored_batch else cap_batches * batch_actions / sh["actions_per_s"]
         batch_dec = sh["trained"] * sh["decisions_per_traj"]
-        mb_dec = min(rl.ppo_mini_batch, sh["trained"]) * sh["decisions_per_traj"]
+        # the largest of the trainer's equal whole-group mini-batches of a full batch
+        k = rl.samples_per_prompt
+        mb_groups = max(len(g) for g in ppo_minibatches(rl.rollout_batch, rl.ppo_mini_batch // k))
+        mb_dec = mb_groups * k * sh["decisions_per_traj"]
         fwd = batch_dec / sh["forward_per_s"]
         per_lr = adam_steps * mb_dec / sh["update_per_s"] + 2 * fwd
         total = collect_s + 2 * fwd + len(lrs) * per_lr

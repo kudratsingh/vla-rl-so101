@@ -47,6 +47,13 @@ Intentional differences (none changes the gradient of a step except the refill c
     the rollout's entropy is estimated from the sampled tokens' log-probs (free).
   * no KL / reference model: `kl_coef` must be 0 (ADR-0002); anything else is rejected.
   * the constant lr runs through a LambdaLR(1.0) scheduler so its state is checkpointed.
+  * mini-batches are EQUAL WHOLE-GROUP splits of the kept groups (`ppo_minibatches`, owner
+    2026-11-08): ceil(groups / (ppo_mini_batch / K)) mini-batches per epoch whose sizes differ by
+    at most one group, no group split. Upstream's batch is always full (uncapped refill), so its
+    contiguous `ppo_mini_batch` split never leaves a tail; ours can (refill cap hit, e.g. 11 kept
+    groups at 8 groups per mini-batch was 64 + a 24-trajectory tail with its own full Adam step;
+    now 6 + 5 groups). A full batch (groups a multiple of ppo_mini_batch / K) splits exactly as
+    before, so its gradients are unchanged.
 """
 
 from __future__ import annotations
@@ -120,7 +127,7 @@ class GRPOConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     ppo_epochs: int = 1
-    ppo_mini_batch: int = 128  # trajectories per optimizer step
+    ppo_mini_batch: int = 128  # max trajectories per optimizer step (equal whole-group split)
     micro_batch: int = 8  # decisions (chunks) per forward/backward; memory knob only
     clip_low: float = 0.2
     clip_high: float = 0.28
@@ -196,7 +203,10 @@ class GRPOConfig:
         if min(*counts, self.eval_every, self.eval_episodes, self.checkpoint_every) < 1:
             raise ValueError("batch/step/epoch/eval/checkpoint counts must be >= 1")
         if self.ppo_mini_batch < k or self.ppo_mini_batch % k:
-            raise ValueError("ppo_mini_batch (trajectories) must be a positive multiple of K")
+            raise ValueError(
+                f"ppo_mini_batch={self.ppo_mini_batch} (trajectories) must be a positive multiple "
+                f"of K={k}: mini-batches hold whole groups"
+            )
         if not (0 < self.clip_low < 1 and self.clip_high > 0):
             raise ValueError("need 0 < clip_low < 1 and clip_high > 0")
         if self.temperature <= 0:
@@ -223,6 +233,32 @@ class GRPOConfig:
             raise ValueError("group_reset_check must be error|warn|off")
         if self.max_episode_steps < 0:
             raise ValueError("max_episode_steps must be >= 0 (0 = env.max_episode_steps)")
+
+
+def ppo_minibatches(n_groups: int, groups_per_minibatch: int) -> list[range]:
+    """One PPO epoch's mini-batches as ranges of GROUP indices: ceil(n_groups / groups_per_mb)
+    mini-batches of whole groups whose sizes differ by at most one (larger ones first), together
+    covering every group exactly once, in order. 16 groups at 8 per mini-batch -> 8 + 8 (the
+    contiguous split upstream uses); 11 -> 6 + 5, not 8 + a 3-group tail with its own Adam step."""
+    if groups_per_minibatch < 1:
+        raise ValueError("groups_per_minibatch must be >= 1")
+    if n_groups < 1:
+        return []
+    n_mb = math.ceil(n_groups / groups_per_minibatch)
+    base, extra = divmod(n_groups, n_mb)
+    out: list[range] = []
+    start = 0
+    for i in range(n_mb):
+        size = base + (1 if i < extra else 0)
+        out.append(range(start, start + size))
+        start += size
+    return out
+
+
+def group_trajectories(groups: range, group_size: int) -> Tensor:
+    """Trajectory indices of `groups` (RolloutBatch layout: trajectory e = g * K + k)."""
+    g = torch.tensor(list(groups), dtype=torch.long)
+    return (g.unsqueeze(1) * group_size + torch.arange(group_size)).reshape(-1)
 
 
 def gate_check_step(rl: GRPOConfig) -> int:
@@ -664,6 +700,10 @@ class GRPOTrainer:
             diag_stats["diag/trajectories"] = float(len(traj))
             diag_stats["diag/time_s"] = time.perf_counter() - td
 
+        k = batch.group_size
+        if rl.ppo_mini_batch % k:
+            raise ValueError(f"ppo_mini_batch {rl.ppo_mini_batch} is not a multiple of K={k}")
+        minibatches = ppo_minibatches(batch.num_groups, rl.ppo_mini_batch // k)
         self.policy.train()
         sums = {"pg_loss": 0.0, "entropy": 0.0}
         opt_clip: list[float] = []
@@ -674,10 +714,10 @@ class GRPOTrainer:
         n_opt = 0
         n_epochs = rl.ppo_epochs if epochs is None else epochs
         for epoch in range(n_epochs):
-            for start in range(0, n_traj, rl.ppo_mini_batch):
+            for j, groups in enumerate(minibatches):
                 if opt_steps is not None and n_opt >= opt_steps:
                     break
-                traj_mb = torch.arange(start, min(n_traj, start + rl.ppo_mini_batch))
+                traj_mb = group_trajectories(groups, k)  # whole groups, gathered by group index
                 weights = seq_mean_token_mean_weights(token_mask[traj_mb])  # sums to 1
                 e_loc, s_idx = decision_valid[traj_mb].nonzero(as_tuple=True)
                 self.optimizer.zero_grad(set_to_none=True)
@@ -699,7 +739,7 @@ class GRPOTrainer:
                     sums["entropy"] += float((out.entropy.detach() * w).sum())
                     mb_clip += float(pl.clip_frac)
                     mb_k3 += float(pl.k3_kl)
-                    if epoch == 0 and start == 0:  # params == rollout params: ratio must be 1
+                    if epoch == 0 and j == 0:  # params == rollout params: ratio must be 1
                         dev_tok = (out.log_probs.detach() - old).abs()[w > 0]
                         first_dev = max(first_dev, float(dev_tok.max()))
                         first_dev_sum += float(dev_tok.sum())
@@ -729,6 +769,8 @@ class GRPOTrainer:
                 "train/trajectories": float(n_traj),
                 "train/decisions": float(decision_valid.sum()),
                 "train/optimizer_steps": float(n_opt),
+                # groups per mini-batch of one epoch (equal whole-group split, ppo_minibatches)
+                "train/minibatch_groups": [len(g) for g in minibatches],
                 "train/logprob_mismatch": mismatch,
                 "train/logprob_mismatch_mean": mismatch_mean,
                 "train/first_minibatch_max_abs_log_ratio": first_dev,
@@ -1106,7 +1148,10 @@ class GRPOTrainer:
             }
             t0 = time.perf_counter()
             snap = self._snapshot()
-            n_mb = math.ceil(batch.num_trajectories / self.rl.ppo_mini_batch)
+            # optimizer steps per epoch: the trainer's equal whole-group split of this batch
+            n_mb = len(
+                ppo_minibatches(batch.num_groups, self.rl.ppo_mini_batch // batch.group_size)
+            )
             every = torch.arange(batch.num_trajectories)
             pre_greedy = self._greedy(batch, every)
             out["pre_greedy_s"] = time.perf_counter() - t0

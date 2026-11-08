@@ -32,7 +32,7 @@ rl:                          # GRPO on the WO-03 toy task; keys documented in sr
   max_rollout_rounds: 3
   steps: 100
   lr: 1e-2
-  ppo_mini_batch: 32         # trajectories per optimizer step -> 4 steps per update
+  ppo_mini_batch: 32         # max trajectories per optimizer step, equal whole-group split -> 4
   micro_batch: 256
   clip_low: 0.2
   clip_high: 0.28

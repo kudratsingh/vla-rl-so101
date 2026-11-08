@@ -137,7 +137,13 @@ Applies to the next GRPO run only. No paid run has used it.
 
 - **Shape:** 16 prompts x K=8 (`rollout_batch: 16`, `samples_per_prompt: 8`), the same 128
   trajectories per update as K=16 x 8 but twice the prompts.
-- **lr 1e-4, `ppo_epochs: 2`** (4 Adam steps per update at `ppo_mini_batch: 64`). The lr follows
+- **Mini-batches** (owner 2026-11-08): each PPO epoch splits the kept groups into
+  ceil(groups / (`ppo_mini_batch` / K)) equal whole-group mini-batches, sizes within one group,
+  no group split (`src/rl/trainer.py` `ppo_minibatches`). A full batch splits as before (16 groups
+  -> 8 + 8). A batch cut short by the refill cap no longer gives a 1-7-group tail its own full
+  Adam step (11 groups: 6 + 5, was 8 + 3). The optimizer-step count is unchanged.
+- **lr 1e-4, `ppo_epochs: 2`** (4 Adam steps per update at `ppo_mini_batch: 64` with 9-16 kept
+  groups; 2 with 1-8). The lr follows
   the published LoRA recipes (RIPT-VLA, RLinf-VLA use 1e-4). It does not rest on the logged
   KL/clip, which is only weak evidence (above). An offline lr sweep (`scripts/wo03_rl.py --lr-sweep`)
   measures policy movement on one fixed batch before any further lr change.
