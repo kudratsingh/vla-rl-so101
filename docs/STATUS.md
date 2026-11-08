@@ -90,7 +90,13 @@ What changed:
   There are three gates: flat at step 38, decline from the best window, and entropy collapse. The
   decline gate fires only when two consecutive non-overlapping windows are each more than
   max(`gate_max_drop`, `gate_decline_z` x SE) below the best aligned window (z = 3: z = 2 stopped
-  35/100 simulated flat runs; the window SE is group-level, ~1-2 points, not ~0.5-1). They
+  35/100 simulated flat runs; the SE is group-level: simulated 1.1-2.1 points for a 10-step
+  window per task at p 0.08-0.20, 1.6-2.9 for a two-window difference). The flat gate (review
+  L-baseline) fits a per-task least-squares trend over steps 1-38 and measures the gain from step
+  1, the SFT policy; the old baseline window 1-10 had already taken 0-9 updates. PROPOSAL for the
+  owner: stop only if gain + `gate_flat_z` (0.5) x SE < 3 points. Simulated P(stop): truly flat
+  0.40-0.73, one task truly +5 0.06-0.09 (plain +3 bar on the trend 0.17-0.23, the old window
+  rule 0.32-0.33); `gate_flat_z: 0` is the plain bar. Table in `src/rl/gates.py`. They
   decide spending only; the protocol eval decides improvement. Periodic greedy evals run on the
   trained tasks only and are sanity logs. The removed config keys raise an error naming their
   replacement.
@@ -98,8 +104,9 @@ What changed:
   update batch against the PPO reference, before and after all optimizer steps. It logs
   `diag/{pre,post}/*`: |dlogp|, dlogp by advantage sign, mean(A*dlogp), k3 KL, clip fraction and
   outside-clip fraction. `train/grad_norm` and per-optimizer-step lists are also logged. The
-  uninformative `train/approx_kl` / `train/clip_frac` are removed. `docs/results.md` and ADR-0002
-  now say the old values were structurally ~0, not evidence of small updates.
+  mini-batch-averaged `train/approx_kl` / `train/clip_frac` are removed. `docs/results.md` and
+  ADR-0002 now say the old values were weak evidence (approx_kl halved by the on-policy mini-batch
+  1, measured after one Adam step on other prompts), not a measure of the per-update change.
 - Resume: checkpoints hold the optimizer, scheduler, RNG, trainable tensors and trainer state.
   `scripts/wo03_rl.py --resume <ckpt>` continues the step numbering. A CPU round trip is
   bit-identical. Resume from the newest `step_N` checkpoint without a suffix: a
@@ -152,21 +159,55 @@ What changed:
 - `make setup` = `uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla`
   (`docs/ENVIRONMENT.md`).
 
-Next paid run (proposed, not launched; each needs the owner's explicit go): the review's diagnostics,
-about $5 in total.
-1. Render-gap check on a 4090: `scripts/pod/demo_rebuild_job.sh` up to its approval gate (setup,
-   GPU-sim oracle check, render gap of the 0.1 set with the a4 `step_004000` adapter).
-   estimated: RTX 4090 x 0.6 h = $0.53. Continuing past the gate to rebuild the demos brings the
-   whole job to about 0.75 h = $0.67. This is a guess: no GPU timing exists for the job.
-2. One A100 pod with the SFT adapter (`--seed 3`):
-   - `--lr-sweep 5e-5,2e-4,5e-4,1e-3 --sweep-adam-steps 8`, 1.20 h;
-   - then `--probe-temperatures 0.7,1.0,1.3 --probe-groups 64`, 0.60 h;
-   - plus 0.5 h setup.
-   estimated: A100-80GB x 2.3 h = $4.12 (`--estimate` from `cost.throughput`: rollout 86
-   actions/s measured on WO-04 pod gzxhwhjhdtc1kc; update 10.3 decisions/s from the WO-02 SFT
-   probe, pod u87r9sjnwig58d; forward 31 decisions/s estimated). The 2.3 h excludes the 7B load
-   and GPU env build of each of the two separate `uv run` invocations; `setup_hours` 0.5 covers
-   only the image, `uv sync` and the download.
+Next paid run (proposed, not launched; each pod needs the owner's explicit go): the review's
+diagnostics.
+
+**FIRM CAP: $7.42 for the whole diagnostics pass**, enforced by the two pods' hard self-delete
+caps: RTX 4090 render-gap pod `SPEND_CAP_SECONDS=5400` (1.5 h, $1.34 at $0.89/h) and A100-80GB
+diagnostics pod `SPEND_CAP_SECONDS=12240` (3.4 h, $6.09 at $1.79/h). Expected $4.00 as planned,
+$5.00 with a +25% estimate-error margin, $6.34 if both approval gates wait their full 30 min. With
+the owner's go for the whole pass up front (pre-approval file, no A100 gate wait), the A100 cap
+drops to `SPEND_CAP_SECONDS=10440` (2.9 h, $5.19) and the firm cap to $6.53. The margin: seed 0's
+RL stage took 26.8 h against its probe's 23.1 h projection (+16%, job log of pod
+`9d8p7vyfyv6ca4`); PickPlace-only 28.7 h vs 26.8 h (+7%). Each cap = planned x 1.25 + the full
+gate wait + the 20 min the job keeps between its soft deadline and the hard cap for the upload.
+Timings below are from the WO-02/WO-04 job logs on the Hub (`KudratSingh22/vla-rl-so101-rl`
+`wo04/*/job.log`, `KudratSingh22/vla-rl-so101-sft` `wo02*/*/job.log`) unless marked estimated.
+
+1. Render-gap check on a 4090: `scripts/pod/demo_rebuild_job.sh` up to its approval gate (no
+   rebuild in this pass; a rebuild needs its own go and a larger cap). Planned 29 min = $0.43:
+   - pod start to job launch, and teardown: 4 min (1.6-4 min outside the job on 4090 pods
+     `jqtaavsbwvemin`, `cm7d9mlccy3xjm`, `82a5je0ve40rlp`);
+   - setup stage (apt, `uv sync`, CUDA check): 0.8 min (0.5-0.8 min measured on 4090 pods);
+   - GPU-sim v2 oracle check, 50 seen episodes x 3 tasks: 4 min (estimated; the A100 v1 check with
+     20 episodes x 3 took 1.6-1.9 min, and v2 makes ~2x the near-object decisions);
+   - render-gap invocation: 15 GB base download + 7B load 1.5 min (fetch ~10 s on 4090 pods),
+     replay of 75 episodes + 6 codec-floor episodes 3 min (estimated), greedy tokens on stored and
+     fresh frames, ~10,800 forwards (~5,000 frames x 2 + floor; the Mac preliminary run's first
+     3 episodes had 54-74 frames each) at 12.9 decisions/s = 14 min (4090 protocol eval: 2,700
+     episodes in ~1.05 h, sim included, so a lower bound on the rate);
+   - uploads 2 min; approval gate up to `APPROVAL_WAIT_S` 30 min (not in "planned").
+2. One A100 pod, `scripts/pod/diag_job.sh` (new; seed 3, SFT adapter a4 `step_004000`):
+   `--probe-temperatures 0.7,1.0,1.3 --probe-groups 64` (rollouts only, the short first step), then
+   an approval gate (or the pre-approval file), then `--lr-sweep 5e-5,2e-4,5e-4,1e-3
+   --sweep-adam-steps 8`, upload to `KudratSingh22/vla-rl-so101-rl` `diag/<pod>/`, self-delete.
+   Planned 119 min = $3.56:
+   - pod start to job launch 2.5 min (1.5-2.5 min: "pod up" minus job time, 4 WO-04 A100 pods);
+   - setup stage 1.9 min (0.4-1.9 min, 5 A100 job logs); adapter download 0.8 min (0.25-0.8);
+   - temperature-probe invocation: 15 GB base download + 7B load + 2 GPU env builds 1.5 min
+     (1.3-1.4 min: probe run start to first step, minus its baseline eval; base fetch 45-57 s,
+     env setup 5-7 s); rollouts 3 T x 16 env batches x 49.2 s = 39.4 min (49.2 s = the slowest
+     measured 32-env x 120-step batch, pod `s2ljj3drwg0ov0`; `--estimate` says 44.6 s);
+   - lr-sweep invocation: cached 7B load + env builds 0.5 min (10 s load + 5-7 s env setup
+     measured); collection, refill cap, 12 env batches x 49.2 s = 9.8 min; greedy + score
+     forwards of the 1,920-decision batch once, 2.1 min; per lr 8 Adam steps x 64 x 15 decisions /
+     10.3 per s + 2 forwards = 14.5 min, x 4 = 58.0 min (forward rate 31/s estimated; the WO-04
+     update with the recompute forward measured 241 s against 248 s predicted from these rates);
+   - uploads (incl. the ~0.3 GB `sweep_batch.pt`, estimated) and delete 3 min; approval gate 0
+     with the pre-approval file, else up to `APPROVAL_WAIT_S` 30 min (not in "planned"). The job
+     also refuses to start the sweep if the soft deadline leaves less than its estimate + 25%.
+   The sweep's per-lr old log-prob recompute is now done once (review L-sweep-recompute): the
+   `--estimate` fell from 1.20 h to 1.15 h.
 3. Only after 1-2, and after the recovery-SFT base clears rule 3: a GRPO run with the measured lr and
    temperature written into `configs/rl.yaml`, starting with `--probe-steps 3`. The worst case is
    estimated: A100-80GB x 41.3 h = $74 per 150-step seed, or 10.5 h = $18.72 if the flat gate stops
@@ -178,7 +219,8 @@ under protocol 0.2. It is priced from the measured eval runtime of ~1.05 h per c
 and PickPlace-only step 100 brings it to $5.0-5.3.
 
 Unverified on GPU: gate behaviour and thresholds (`gate_min_gain` 0.03 now applies to sampled
-rollout success and needs the owner's confirmation; `gate_max_drop` 0.04, `gate_decline_z` 3 and
+rollout success, as a gain from the SFT policy, and needs the owner's confirmation, as does
+`gate_flat_z` 0.5, simulated only; `gate_max_drop` 0.04, `gate_decline_z` 3 and
 `gate_entropy_min` 0.5 are not measured on GPU; z = 3 is from a CPU simulation only), diag/sweep forward cost, the throughput for the 16 x 8 / 2-epoch shape, the render
 hook timing on `physx_cuda`, the CUDA RNG restore (a GPU resume is not bit-identical), v2 oracle
 success on `physx_cuda`, recorder tail stepping on the GPU env, render-gap replay and 7B token

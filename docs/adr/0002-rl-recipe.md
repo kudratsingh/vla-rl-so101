@@ -121,12 +121,15 @@ ran no separate mid-run eval; a later protocol eval of two-task step 50 (21.3%) 
 step 100 (22.7%) found no peak.
 
 Both runs logged approx_kl ~3e-5 and clip fraction 0.000. Correction (2026-11-08, review
-`docs/reviews/2026-11-07-project-review.md` section 3.1): with one PPO epoch that metric is
-structurally ~0 and uninformative, because its mean includes mini-batch 1, which is exactly
-on-policy. It is not evidence that the per-update policy change was small. The run did take few
-steps: 150 updates x 2 optimizer steps at lr 5e-5 = 300 steps, against 8000 SFT steps at lr 5e-4.
-Small step size remains a hypothesis for the slow gain, not a verified cause, and the logged KL/clip
-neither supports nor refutes it.
+`docs/reviews/2026-11-07-project-review.md` section 3.1): with one PPO epoch the logged value is
+the mean over 2 mini-batches. Mini-batch 1 is exactly on-policy (KL 0), so the logged ~3e-5 is
+half of mini-batch 2's ~6e-5. That value was measured after one Adam step on other prompts, and
+nothing was measured on the trained prompts after the full update. Clip fraction is ~0 by
+construction at this step size: RMS |delta log p| is about 0.013, against a clip edge of about
+0.22. This is weak evidence that one step at lr 5e-5 moves the policy little, not a measure of the
+per-update change. The run did take few steps: 150 updates x 2 optimizer steps at lr 5e-5 = 300
+steps, against 8000 SFT steps at lr 5e-4. Small step size remains a hypothesis for the slow gain,
+not a verified cause; the logged KL/clip is consistent with it but does not settle it.
 
 ## Amendment 3 (proposed 2026-11-08, PR 1 `fix/pre-run-hardening`; waits for owner review)
 
@@ -136,15 +139,20 @@ Applies to the next GRPO run only. No paid run has used it.
   trajectories per update as K=16 x 8 but twice the prompts.
 - **lr 1e-4, `ppo_epochs: 2`** (4 Adam steps per update at `ppo_mini_batch: 64`). The lr follows
   the published LoRA recipes (RIPT-VLA, RLinf-VLA use 1e-4). It does not rest on the logged
-  KL/clip, which is uninformative (above). An offline lr sweep (`scripts/wo03_rl.py --lr-sweep`)
+  KL/clip, which is only weak evidence (above). An offline lr sweep (`scripts/wo03_rl.py --lr-sweep`)
   measures policy movement on one fixed batch before any further lr change.
 - **Gates** replace the 64-episode kill switch and the 32-episode peak stop. They use windows of
   `rollout/success_rate` (per trained task) and rollout entropy (`rl.gate_*`). They decide whether
   to keep spending. Only the protocol eval decides whether the policy improved. Periodic greedy
   evals run on the trained tasks only and are sanity logs. Thresholds: `gate_min_gain` 0.03 is
   the owner's +3 bar, but it now applies to sampled rollout success, a different quantity, so it
-  needs the owner's confirmation. `gate_max_drop` 0.04 and `gate_entropy_min` 0.5 are the agent's
-  judgment calls and have not been measured. The decline gate also needs the drop to exceed
+  needs the owner's confirmation. The flat gate's gain is a per-task least-squares trend over
+  steps 1-38, i.e. the change from the SFT policy (the first proposal's baseline window, steps
+  1-10, had already taken 0-9 updates). Proposed with it, for the owner: `gate_flat_z` 0.5 (stop
+  only if gain + 0.5 x SE < 3 points), which in simulation stops 40-73% of flat runs and 6-9% of
+  runs where one task truly gains 5 points (`src/rl/gates.py`). `gate_max_drop` 0.04 and
+  `gate_entropy_min` 0.5 are the agent's judgment calls and have not been measured. The decline
+  gate also needs the drop to exceed
   `gate_decline_z` (3) x its group-level SE on two consecutive non-overlapping windows, so
   sampling noise does not stop an improving run (z from a CPU simulation, `src/rl/gates.py`).
 - **Fixed-batch diagnostic** (`src/rl/diagnostics.py`): it scores the first 32 trajectories of
