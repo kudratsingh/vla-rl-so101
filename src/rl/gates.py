@@ -11,9 +11,15 @@ Why rollout success instead of the old greedy evals: the WO-04 kill switch compa
 greedy evals (paired-difference SD 4-6 points at p ~0.13 against a +3 bar) and the peak stop two
 32-episode evals; neither could tell +3 from 0. `rollout/success_rate` is free and covers every
 generated episode (~130-380 per step). The gates' unit is the GROUP, not the episode (a group's K
-samples share one scene): with 8-24 groups per trained task per step, a 10-step window holds 80-240
-groups per task, so under WO-04-like scene heterogeneity (72% of K=8 groups all-zero at p ~0.13)
-the window score has a group-level SE of ~1-2 points and a difference of two windows ~1.5-2.5.
+samples share one scene). configs/rl.yaml generates 8-24 groups per trained task per step (env
+batches of 4 groups alternate between the 2 tasks; the dynamic-sampling refill stops at 16 kept
+groups or 12 env batches). SIMULATED under the test noise model (scene p ~ Beta, concentration 2,
+K = 8, that refill; script in the PR #28 body), at p 0.08 / 0.13 / 0.20 the refill gives ~24 / 21 /
+16 groups per task per step, and:
+  one 10-step window, per task          SE 1.1 / 1.5 / 2.1 points
+  difference of two 10-step windows     SE 1.6 / 2.1 / 2.9 points
+  flat-gate trend gain (38 steps)       SE 2.0 / 2.6 / 3.6 points (the SE the gate logs matches
+                                        the simulated spread to within 2%)
 
 Per step the trainer records, for each trained task, the number of generated groups and the first
 two moments of the group-mean success (a group is the unit that is independent: its K samples
@@ -23,9 +29,29 @@ rollout policy's per-token entropy, src/rl/diagnostics.py). A window is the last
   per-task window rate  pooled group means of that task over the window; SE from their spread
   score                 equal-weight mean of the per-task window rates (robust to the step's task
                         mix, which the dynamic-sampling refill makes uneven)
-  flat gate             at `check_step`: gain = window ending at check_step - first window
-                        (steps 1..window); rule any_task: the best task's gain, mean: the score's.
-                        Stop if gain < min_gain. -> record status stopped_flat (no protocol eval)
+  flat gate             at `check_step`, per task: the group-level least-squares trend of success
+                        over EVERY recorded step 1..check_step; gain = its slope x (check_step - 1),
+                        the fitted change from step 1 (the base policy: step k's rollouts come from
+                        the policy after k - 1 updates) to the check step; gain_se from the group
+                        residuals. Rule any_task: stop if, for every task, gain + flat_z x gain_se
+                        < min_gain (mean: the task-mean gain and its SE). -> record status
+                        stopped_flat (no protocol eval). min_gain is the owner's +3 points, now a
+                        gain FROM THE SFT POLICY. Until 2026-11-08 the gain was window(29-38) -
+                        window(1-10); the first window's policies had 0-9 updates (mean 4.5), so
+                        early learning sat in the baseline (a linear learner's gain read ~25% low:
+                        centres 28 steps apart, not 37). It is still logged as
+                        gate/flat_window_gain. A linear trend reads a front-loaded learner low
+                        too: +4 points by step 10 then flat reads +2.6 (+6 reads +3.85).
+                        Operating characteristic, P(stop at step 38), SIMULATED (noise model
+                        above, 2 tasks, 4000 runs per cell, p0 0.08 / 0.13 / 0.20, linear gain):
+                          rule                    flat           one task +5    both tasks +5
+                          old window, z 0         .94/.85/.72    .32/.32/.33    .12/.14/.17
+                          trend, z 0              .89/.78/.65    .17/.20/.23    .04/.07/.10
+                          trend, z 0.5 (rl.yaml)  .73/.57/.40    .06/.08/.09    .01/.01/.02
+                          trend, z 1              .50/.33/.19    .02/.02/.03    .00/.00/.00
+                        z 0.5 is the smallest of 0 / 0.3 / 0.4 / 0.5 / 1 with P(stop | one task
+                        +5) <= 0.10 at every p0 (0.4: 0.101 / 0.106 at p0 0.13 / 0.20).
+                        tests/test_rl_gates.py pins the p0 0.13 cells. Owner's decision (PR #28).
   decline gate          the best window is tracked over ALIGNED windows only (ending at
                         first_step - 1 + k x window, so not the running max of overlapping
                         windows). Stop when, for BOTH the window ending at this step and the one
@@ -122,6 +148,7 @@ class RolloutGates:
         max_drop: float,
         entropy_min: float,
         decline_z: float = 3.0,
+        flat_z: float = 0.0,
     ) -> None:
         if window < 1:
             raise ValueError("gate window must be >= 1 step")
@@ -132,6 +159,8 @@ class RolloutGates:
             )
         if decline_z < 0:
             raise ValueError("decline_z must be >= 0")
+        if flat_z < 0:
+            raise ValueError("flat_z must be >= 0")
         self.tasks = list(tasks)
         self.window = window
         self.check_step = check_step
@@ -140,6 +169,7 @@ class RolloutGates:
         self.max_drop = max_drop
         self.entropy_min = entropy_min
         self.decline_z = decline_z
+        self.flat_z = flat_z
         self.history: list[StepRecord] = []
         self.best_score: float | None = None
         self.best_se = 0.0
@@ -263,8 +293,15 @@ class RolloutGates:
         reasons: list[GateReason] = []
         if self.check_step and step == self.check_step:
             gain, gain_se = self._flat_gain(step)
+            upper = gain + self.flat_z * gain_se
             m["gate/flat_gain"], m["gate/flat_gain_se"] = gain, gain_se
-            if gain < self.min_gain:
+            m["gate/flat_gain_upper"] = upper
+            for t, (g_t, se_t) in self._trend_gains(step).items():
+                m[f"gate/flat_gain/{t}"], m[f"gate/flat_gain_se/{t}"] = g_t, se_t
+            window_gain = self._window_gain(step)
+            if window_gain is not None:  # the pre-2026-11-08 estimator, logged for comparison
+                m["gate/flat_window_gain"] = window_gain
+            if upper < self.min_gain:
                 m["event/flat_run"] = 1.0
                 reasons.append("flat")
         now = self._declined(step) if self.max_drop > 0 else None
@@ -280,18 +317,52 @@ class RolloutGates:
         out.reason = reasons[0] if reasons else None
         return out
 
+    def _trend_gains(self, step: int) -> dict[str, tuple[float, float]]:
+        """Per task: (gain, SE) of the group-level least-squares trend of success over every
+        recorded step up to `step`, as the fitted change from the first recorded step (the base
+        policy: its rollouts precede any update) to `step`. Tasks with < 3 groups or one step
+        are left out."""
+        first = self.history[0].step
+        span = step - first
+        out: dict[str, tuple[float, float]] = {}
+        for t in self.tasks:
+            pts = [(r.step, r.tasks[t]) for r in self.history if r.step <= step and t in r.tasks]
+            pts = [(x, tt) for x, tt in pts if tt.groups > 0]
+            n = sum(tt.groups for _, tt in pts)
+            if n < 3 or len({x for x, _ in pts}) < 2:
+                continue
+            xbar = sum(x * tt.groups for x, tt in pts) / n
+            ybar = sum(tt.sum_rate for _, tt in pts) / n
+            sxx = sum(tt.groups * (x - xbar) ** 2 for x, tt in pts)
+            sxy = sum((x - xbar) * tt.sum_rate for x, tt in pts)
+            slope = sxy / sxx
+            tss = sum(tt.sum_rate_sq for _, tt in pts) - n * ybar * ybar
+            rss = max(0.0, tss - slope * sxy)
+            se = math.sqrt(rss / (n - 2) / sxx)
+            out[t] = (slope * span, se * span)
+        return out
+
     def _flat_gain(self, step: int) -> tuple[float, float]:
-        """(gain, its SE) of the window ending at `step` over the first full window. A task
-        missing from either window does not count; no common task -> gain -inf (flat)."""
+        """(gain, its SE) at `step` from the per-task trends. any_task: the task with the
+        highest gain + flat_z x SE; mean: the task mean. No task -> gain -inf (flat)."""
+        trends = self._trend_gains(step)
+        if not trends:
+            return -math.inf, 0.0
+        if self.rule == "any_task":
+            best = max(trends, key=lambda t: trends[t][0] + self.flat_z * trends[t][1])
+            return trends[best]
+        n = len(trends)
+        gain = sum(g for g, _ in trends.values()) / n
+        return gain, math.sqrt(sum(se**2 for _, se in trends.values())) / n
+
+    def _window_gain(self, step: int) -> float | None:
+        """Old estimator (diagnostic only): window ending at `step` - first full window, best
+        task (any_task) or task mean. Biased low: the first window's policies already had
+        0..window-1 updates."""
         first_step = self.history[0].step + self.window - 1
         now, first = self.task_rates(step), self.task_rates(first_step)
         common = [t for t in self.tasks if t in now and t in first]
         if not common:
-            return -math.inf, 0.0
-        gains = {t: now[t].rate - first[t].rate for t in common}
-        ses = {t: math.sqrt(now[t].se ** 2 + first[t].se ** 2) for t in common}
-        if self.rule == "any_task":
-            best = max(common, key=lambda t: gains[t])
-            return gains[best], ses[best]
-        n = len(common)
-        return sum(gains.values()) / n, math.sqrt(sum(s**2 for s in ses.values())) / n
+            return None
+        gains = [now[t].rate - first[t].rate for t in common]
+        return max(gains) if self.rule == "any_task" else sum(gains) / len(gains)

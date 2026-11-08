@@ -216,7 +216,7 @@ def test_update_matches_upstream_per_trajectory_loss_and_ignores_micro_batching(
 
 
 def test_tiny_loop_improves_success_deterministically(tmp_path: Path) -> None:
-    cfg = _cfg(steps=40, eval_every=10)  # flat gate at step 10 (windows 1-5 vs 6-10)
+    cfg = _cfg(steps=40, eval_every=10)  # flat gate at step 10 (trend over steps 1-10)
     first = _trainer(cfg, tmp_path / "a").run()
     again = _trainer(cfg, tmp_path / "b").run()
     assert first["eval_history"] == again["eval_history"]  # same seed -> same numbers
@@ -233,7 +233,7 @@ def test_tiny_loop_improves_success_deterministically(tmp_path: Path) -> None:
                 "diag/post/clip_frac", "diag/pre/k3_kl", "rollout/episodes_per_hour",
                 "rollout/time/policy_s", "rollout/time/sim_step_s", "gate/success_window"):  # fmt: skip
         assert any(key in r for r in train), key
-    for removed in ("train/clip_frac", "train/approx_kl"):  # uninformative aggregates (3.1)
+    for removed in ("train/clip_frac", "train/approx_kl"):  # weak mini-batch aggregates (3.1)
         assert not any(removed in r for r in train)
     # 128 trajectories / 32 per mini-batch = 4 optimizer steps, each with its own pre-step stats
     assert len(train[0]["train/opt_step_k3_kl"]) == 4 and train[0]["train/opt_step_k3_kl"][0] < 1e-9
@@ -438,9 +438,10 @@ def test_config_validation() -> None:
     # owner amendment after the WO-04 probes (2026-10-27, ADR-0002)
     assert (rl.temperature, rl.recompute_old_log_probs, rl.steps) == (1.0, True, 150)
     assert (rl.train_tasks, rl.max_episode_steps) == (("PickPlace", "Push"), 120)
-    # spend gates on rollout windows; flat gate at step 38 compares windows 1-10 and 29-38
+    # spend gates; flat gate at step 38: trend over steps 1-38, gain + 0.5 x SE vs +3 points
     assert gate_check_step(rl) == 38 and rl.gate_window == 10
     assert (rl.gate_min_gain, rl.gate_rule, rl.gate_stop) == (0.03, "any_task", True)
+    assert rl.gate_flat_z == 0.5
     assert rl.eval_episodes == 32 and rl.require_nonzero_baseline
     assert (rl.diag_every, rl.diag_trajectories) == (1, 32)
     pick = GRPOConfig.from_config(load_config("rl", REPO / "configs" / "rl_pickplace.yaml"))
@@ -496,15 +497,15 @@ def test_cost_estimate_matches_rl_yaml_arithmetic() -> None:
     assert est["dollars"] == pytest.approx(est["hours"] * 1.79)
     assert est["gate_check_step"] == 38
     assert est["gate_check_stop_h"] == pytest.approx((38 * step_s + 64 * 2 * 120 / 86) / 3600)
-    # Track B probes: lr sweep = one capped collection + per lr (8 Adam steps x 64 x 15 / 10.3 +
-    # 3 forwards of 1,920 decisions / 31) + one greedy forward; temperature probe = 16 env
-    # batches of 32 x 120 actions / 86 per temperature
+    # Track B probes: lr sweep = one capped collection + 2 forwards of 1,920 decisions / 31
+    # before the first lr (greedy, scores: cached for every lr) + per lr (8 Adam steps x 64 x 15
+    # / 10.3 + 2 forwards); temperature probe = 16 env batches of 32 x 120 actions / 86 per T
     probes = script.estimate_probes(
         load_config("rl"), lrs=[5e-5, 2e-4, 5e-4, 1e-3], adam_steps=8, stored_batch=False,
         temperatures=[0.7, 1.0, 1.3], groups=64,
     )  # fmt: skip
-    per_lr = 8 * 64 * 15 / 10.3 + 3 * 1920 / 31
-    assert probes["lr_sweep_h"] == pytest.approx((46_080 / 86 + 1920 / 31 + 4 * per_lr) / 3600)
+    per_lr = 8 * 64 * 15 / 10.3 + 2 * 1920 / 31
+    assert probes["lr_sweep_h"] == pytest.approx((46_080 / 86 + 2 * 1920 / 31 + 4 * per_lr) / 3600)
     assert probes["temp_probe_h"] == pytest.approx(3 * 16 * 32 * 120 / 86 / 3600)
 
 

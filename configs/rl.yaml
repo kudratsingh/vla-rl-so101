@@ -99,9 +99,9 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   max_rollout_rounds: 3     # dynamic-sampling refill cap, in multiples of one full round
   steps: 150                # owner amendment (ADR-0002): was 300
   # lr 1e-4 rests on the published LoRA recipes (RIPT-VLA, RLinf-VLA; RL4VLA also uses 1e-4 for
-  # LoRA), NOT on the logged approx_kl / clip_frac: those were averaged over mini-batches measured
-  # before their own optimizer step and are uninformative (review 3.1). `--lr-sweep` measures the
-  # on-batch movement per lr before any longer run.
+  # LoRA), NOT on the logged approx_kl / clip_frac: averaged over 2 mini-batches, the first exactly
+  # on-policy, they are only weak evidence of the per-update change (review 3.1). `--lr-sweep`
+  # measures the on-batch movement per lr before any longer run.
   lr: 1e-4                  # was 5e-5 (owner, WO-04), 1e-5 before that
   weight_decay: 0.01
   grad_clip: 1.0            # not a step-size lever under Adam (rescaling g cancels); lr/epochs are
@@ -126,16 +126,25 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   checkpoint_every: 25      # resume (--resume) loses at most 25 steps (~6.8 h worst case)
   # Spend gates (src/rl/gates.py), replacing the 64-episode kill switch and the 32-episode peak
   # stop (neither could tell +3 points from 0). They decide whether to KEEP SPENDING on this run;
-  # they do not decide whether RL improved the policy. Inputs: windowed rollout/success_rate over
-  # every generated episode (~130-380 per step), but the unit is the GROUP (its K samples share a
-  # scene): 8-24 groups per task per step, so under WO-04-like scene heterogeneity a 10-step
-  # window's score has a group-level SE of ~1-2 points (a two-window difference ~1.5-2.5). The
-  # episodes also come from a changing policy, hence not a measure of improvement. Plus the
-  # rollout's sampled-token entropy.
-  gate_window: 10           # steps per window
-  gate_check_frac: 0.25     # flat gate at step ceil(0.25 x 150) = 38: window 29-38 vs 1-10
-  gate_min_gain: 0.03       # owner's +3 points (WO-04), now on windowed SAMPLED success (owner to
-                            # confirm: sampled success moved 7.9% -> 12.6% over 150 K=16 steps)
+  # they do not decide whether RL improved the policy. Inputs: rollout/success_rate over every
+  # generated episode (~130-380 per step), but the unit is the GROUP (its K samples share a
+  # scene): 8-24 groups per task per step. SIMULATED (Beta concentration 2, K=8, this refill) at
+  # p 0.08-0.20: ~16-24 groups/task/step, a 10-step window's per-task SE 1.1-2.1 points, a
+  # two-window difference 1.6-2.9, the flat gate's trend gain 2.0-3.6. The episodes also come
+  # from a changing policy, hence not a measure of improvement. Plus the rollout's sampled-token
+  # entropy.
+  gate_window: 10           # steps per window (decline / entropy gates)
+  gate_check_frac: 0.25     # flat gate at step ceil(0.25 x 150) = 38: per-task least-squares
+                            # trend over steps 1-38, gain = fitted change from step 1 (the SFT
+                            # policy) to 38. Was window 29-38 vs 1-10, whose baseline had already
+                            # taken 0-9 updates (review L-baseline, PR #28)
+  gate_min_gain: 0.03       # owner's +3 points (WO-04), now a gain from the SFT policy in SAMPLED
+                            # success (owner to confirm: sampled success moved 7.9% -> 12.6% over
+                            # 150 K=16 steps, i.e. ~+1.2 points by step 38 at that pace)
+  gate_flat_z: 0.5          # PROPOSAL (owner decides, PR #28): stop only if gain + 0.5 x SE < 3
+                            # points. Simulated P(stop): flat run 0.73 / 0.57 / 0.40 (p 0.08 / 0.13
+                            # / 0.20), one task truly +5: 0.06 / 0.08 / 0.09 (z 0: 0.17-0.23; the
+                            # old window rule 0.32-0.33). 0 = the plain +3 bar
   gate_rule: any_task       # owner 2026-10-28: pass if ANY trained task gained it
   gate_max_drop: 0.04       # decline: stop if the window is > 4 points below its best
                             # non-overlapping window (replaces the step-50/100 peak stop) ...

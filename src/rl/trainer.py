@@ -134,7 +134,8 @@ class GRPOConfig:
     # Spend gates (src/rl/gates.py): decide whether to keep spending, never whether RL improved
     gate_window: int = 10  # steps per rollout-success / entropy window
     gate_check_frac: float = 0.25  # flat gate at ceil(frac x steps); 0 = off
-    gate_min_gain: float = 0.03  # flat: windowed rollout success gain over the first window
+    gate_min_gain: float = 0.03  # flat: rollout success gain from step 1 (trend) at the check step
+    gate_flat_z: float = 0.0  # flat stops only if gain + z x its SE < min_gain (src/rl/gates.py)
     gate_rule: Literal["any_task", "mean"] = "any_task"  # best trained task, or the task mean
     gate_max_drop: float = 0.0  # decline: score < best non-overlapping window - this; 0 = off
     gate_decline_z: float = 3.0  # decline also needs drop > z x SE of (best - window), twice
@@ -214,8 +215,8 @@ class GRPOConfig:
             raise ValueError("gate_rule must be any_task|mean")
         if self.gate_max_drop < 0 or self.gate_entropy_min < 0:
             raise ValueError("gate_max_drop and gate_entropy_min must be >= 0 (0 = off)")
-        if self.gate_decline_z < 0:
-            raise ValueError("gate_decline_z must be >= 0")
+        if self.gate_decline_z < 0 or self.gate_flat_z < 0:
+            raise ValueError("gate_decline_z and gate_flat_z must be >= 0")
         if self.diag_every < 0 or self.diag_trajectories < 0 or self.diag_trajectories % k:
             raise ValueError("diag_every >= 0, diag_trajectories >= 0 and a multiple of K")
         if self.group_reset_check not in ("error", "warn", "off"):
@@ -282,6 +283,9 @@ class DiagSpec:
     trajectories: int  # the batch's first N trajectories; 0 = all
     argmax: bool
     pre_greedy: Tensor | None = None  # cached pre-update greedy tokens (lr sweep)
+    # cached pre-update log-probs of ALL trajectories (lr sweep: identical params for every lr);
+    # also the old log-probs when rl.recompute_old_log_probs
+    pre_scores: Tensor | None = None
 
 
 @dataclass
@@ -289,6 +293,40 @@ class _Snapshot:
     params: list[Tensor]
     optimizer: dict[str, Any]
     scheduler: dict[str, Any]
+
+
+CHECKPOINT_KEYS = (
+    "step",
+    "completed_step",
+    "next_prompt_seed",
+    "next_task",
+    "seed",
+    "eval_history",
+    "gates",
+    "rl",
+)
+CHECKPOINT_FILES = ("trainable.pt", "optimizer.pt", "scheduler.pt", "rng.pt")
+
+
+def read_checkpoint_state(path: Path) -> dict[str, Any]:
+    """trainer_state.json of a resumable `save_checkpoint` directory. FileNotFoundError without
+    one; ValueError naming what is missing for a checkpoint written before resume support (PR #28:
+    main's checkpoints hold only adapter/, optimizer.pt and {step, next_prompt_seed,
+    eval_history}) or an incomplete one. Cheap: the entry script calls it before any model load."""
+    state_file = path / "trainer_state.json"
+    if not state_file.is_file():
+        raise FileNotFoundError(f"{path}: no trainer_state.json (a checkpoint dir?)")
+    state = cast(dict[str, Any], json.loads(state_file.read_text()))
+    missing = [k for k in CHECKPOINT_KEYS if k not in state]
+    missing += [name for name in CHECKPOINT_FILES if not (path / name).is_file()]
+    if not (path / "adapter").is_dir():
+        missing.append("adapter/")
+    if missing:
+        raise ValueError(
+            f"{path}: not a resumable checkpoint (written before resume support, PR #28, or "
+            f"incomplete): missing {missing}"
+        )
+    return state
 
 
 class GRPOTrainer:
@@ -336,6 +374,7 @@ class GRPOTrainer:
             max_drop=rl.gate_max_drop,
             entropy_min=rl.gate_entropy_min,
             decline_z=rl.gate_decline_z,
+            flat_z=rl.gate_flat_z,
         )
         self._envs: dict[str, VecEnv] = {}
         self._next_prompt = seed * TRAIN_SEED_STRIDE
@@ -345,8 +384,10 @@ class GRPOTrainer:
         self._start_step = 1
         self._history: list[tuple[int, float]] = []  # (step, greedy eval success)
         self._last_tallies: dict[str, TaskTally] = {}
+        self._last_eval_batch_s: list[float] = []
         self._last_entropy = (0.0, 0)
         self.resumed_from: Path | None = None
+        self.resume_overrides: dict[str, list[Any]] = {}  # rl key -> [checkpoint, this run]
 
     # ------------------------------------------------------------------ envs / logging
     def _env(self, task: str) -> VecEnv:
@@ -408,6 +449,7 @@ class GRPOTrainer:
         out["eval/episodes"] = float(episodes * len(self.train_tasks))
         out["eval/batch_s_median"] = statistics.median(batch_s)
         out["eval/time_s"] = time.perf_counter() - t0
+        self._last_eval_batch_s = batch_s  # per env batch, in order (probe: warm-up excluded)
         return out
 
     def _check_baseline(self, baseline: dict[str, float]) -> None:
@@ -586,8 +628,13 @@ class GRPOTrainer:
         token_mask = _token_mask(batch)  # (E, S, C, A)
         old_log_probs = batch.log_probs
         mismatch = mismatch_mean = 0.0
+        cached = diag.pre_scores if diag is not None else None
         if rl.recompute_old_log_probs:
-            old_log_probs = self._score(batch, torch.arange(n_traj), batch.log_probs)
+            old_log_probs = (
+                cached
+                if cached is not None
+                else self._score(batch, torch.arange(n_traj), batch.log_probs)
+            )
             dev_tok = (old_log_probs - batch.log_probs).abs()[token_mask]
             mismatch, mismatch_mean = float(dev_tok.max()), float(dev_tok.mean())
 
@@ -599,7 +646,12 @@ class GRPOTrainer:
             traj = self._diag_traj(batch, spec)
             ref = old_log_probs[traj]
             # recompute on: the pre-update scores ARE the reference (same params, same forward)
-            pre = ref if rl.recompute_old_log_probs else self._score(batch, traj, ref)
+            if rl.recompute_old_log_probs:
+                pre = ref
+            elif spec.pre_scores is not None:
+                pre = spec.pre_scores[traj]
+            else:
+                pre = self._score(batch, traj, ref)
             greedy = spec.pre_greedy
             if spec.argmax and greedy is None:
                 greedy = self._greedy(batch, traj)
@@ -735,7 +787,7 @@ class GRPOTrainer:
         counters from inside step `step`, so resuming re-runs part or all of that step on top of
         it. Refused unless `allow_partial` (`--resume-approximate`); then the gate windows and the
         eval history are cut back to completed_step so the re-run step can be recorded again."""
-        state = json.loads((path / "trainer_state.json").read_text())
+        state = read_checkpoint_state(path)
         step, completed = int(state["step"]), int(state["completed_step"])
         if step != completed:
             plain = sorted(
@@ -770,11 +822,24 @@ class GRPOTrainer:
             torch.load(path / "optimizer.pt", map_location=STORAGE, weights_only=True)
         )
         self._load_scheduler(torch.load(path / "scheduler.pt", weights_only=True))
+        # load_state_dict restores the SAVED lr / weight_decay (param groups, scheduler base_lrs)
+        # over this run's config. The config wins, so record.json describes what trains; Adam
+        # moments and step counts stay as loaded.
+        self._set_lr(self.rl.lr)
+        for group in self.optimizer.param_groups:
+            group["weight_decay"] = self.rl.weight_decay
         # our own file: python/numpy RNG states are tuples / ndarrays, not tensors
         set_rng_state(torch.load(path / "rng.pt", weights_only=False))
-        diff = {k: v for k, v in asdict(self.rl).items() if state["rl"].get(k) != _jsonable(v)}
+        saved_rl = state["rl"]
+        diff = {k: v for k, v in asdict(self.rl).items() if saved_rl.get(k) != _jsonable(v)}
+        self.resume_overrides = {k: [saved_rl.get(k), _jsonable(v)] for k, v in diff.items()}
         if diff:
-            log.warning("resuming %s with rl settings that differ from it: %s", path, diff)
+            log.warning(
+                "resuming %s with rl settings that differ from it (checkpoint -> this run; the "
+                "run's values apply, lr and weight_decay included; Adam moments kept): %s",
+                path,
+                self.resume_overrides,
+            )
         if int(state["seed"]) != self.seed:
             log.warning("resuming seed-%s checkpoint under seed %d", state["seed"], self.seed)
         self._completed_step = completed
@@ -894,9 +959,10 @@ class GRPOTrainer:
         bar = "!" * 78
         what = {
             "flat": (
-                f"FLAT: windowed rollout success gained {m.get('gate/flat_gain', 0.0):+.3f} "
-                f"(SE {m.get('gate/flat_gain_se', 0.0):.3f}) over the first {self.rl.gate_window}-"
-                f"step window, under {self.rl.gate_min_gain:.3f}. Check "
+                f"FLAT: rollout success trend gained {m.get('gate/flat_gain', 0.0):+.3f} "
+                f"(SE {m.get('gate/flat_gain_se', 0.0):.3f}) since step 1 (rule {self.rl.gate_rule}); "
+                f"gain + {self.rl.gate_flat_z:g} x SE = {m.get('gate/flat_gain_upper', 0.0):+.3f}"
+                f" is under {self.rl.gate_min_gain:.3f}. Check "
                 "rollout/frac_groups_dropped, temperature, diag/post/* (did updates move the "
                 "policy?)"
             ),
@@ -930,7 +996,8 @@ class GRPOTrainer:
         """Measure the real loop for the pod job's probe -> approval gate: build the envs, run the
         step-0 baseline eval (as `run` does), then `steps` RL steps. Saves nothing; the policy is
         discarded afterwards (the full run restarts from the SFT adapter). Step 1 carries CUDA
-        warm-up, so timings use steps 2.. when there are any."""
+        warm-up, so timings use steps 2.. when there are any; likewise the per-batch greedy eval
+        time skips the baseline's first env batch."""
         out: dict[str, Any] = {
             "steps": steps,
             "trainable_params": self.num_trainable,
@@ -944,6 +1011,7 @@ class GRPOTrainer:
                 self._env(task)
             out["env_setup_s"] = time.perf_counter() - t0
             baseline = self.evaluate(self.rl.eval_episodes)
+            eval_batch_s = list(self._last_eval_batch_s)
             self._log({"kind": "probe_eval", "step": 0, **baseline})
             out["baseline"] = baseline
             self._check_baseline(baseline)
@@ -977,7 +1045,15 @@ class GRPOTrainer:
                 "rollout_episodes_per_hour": total("rollout/episodes")
                 / total("rollout/time_s")
                 * 3600.0,
-                "eval_s_per_env_batch": baseline["eval/batch_s_median"],
+                # the baseline's first env batch is the process's first policy forward / render
+                # (CUDA warm-up): drop it as the RL timings drop step 1. With one batch (one
+                # trained task) fall back to the warm rollout batch (same envs and horizon)
+                "eval_s_per_env_batch": (
+                    statistics.median(eval_batch_s[1:])
+                    if len(eval_batch_s) > 1
+                    else min(eval_batch_s[0], total("rollout/time_s") / n_batches)
+                ),
+                "eval_s_first_env_batch": eval_batch_s[0],
                 "frac_groups_dropped": total("rollout/frac_groups_dropped") / len(timed),
                 "refill_cap_hit_frac": total("rollout/refill_cap_hit") / len(timed),
                 "first_minibatch_max_abs_log_ratio": max(
@@ -1006,8 +1082,10 @@ class GRPOTrainer:
         optimizer steps over its mini-batches (epoch-major, as the loop does), and score the
         WHOLE batch with the fixed-batch diagnostic (k3 KL, clip fraction, dlogp by advantage
         sign, greedy argmax flip rate). Saves the batch as run_dir/sweep_batch.pt; leaves the
-        policy and optimizer as they were. Costs one rollout collection + per lr: adam_steps x a
-        mini-batch forward/backward + 2 forwards of the batch (scores, greedy)."""
+        policy and optimizer as they were. Costs one rollout collection + 2 forwards of the batch
+        before the first lr (greedy tokens; log-probs, reused as every lr's old log-probs and
+        diag reference) + per lr: adam_steps x a mini-batch forward/backward + 2 forwards of the
+        batch (post scores, post greedy)."""
         if not lrs or adam_steps < 1:
             raise ValueError("need >= 1 lr and adam_steps >= 1")
         rows: list[dict[str, Any]] = []
@@ -1029,9 +1107,16 @@ class GRPOTrainer:
             t0 = time.perf_counter()
             snap = self._snapshot()
             n_mb = math.ceil(batch.num_trajectories / self.rl.ppo_mini_batch)
-            pre_greedy = self._greedy(batch, torch.arange(batch.num_trajectories))
+            every = torch.arange(batch.num_trajectories)
+            pre_greedy = self._greedy(batch, every)
             out["pre_greedy_s"] = time.perf_counter() - t0
-            spec = DiagSpec(trajectories=0, argmax=True, pre_greedy=pre_greedy)
+            # the same params before every lr: score once (old log-probs + diag reference)
+            t1 = time.perf_counter()
+            pre_scores = self._score(batch, every, batch.log_probs)
+            out["pre_score_s"] = time.perf_counter() - t1
+            spec = DiagSpec(
+                trajectories=0, argmax=True, pre_greedy=pre_greedy, pre_scores=pre_scores
+            )
             for lr in lrs:
                 self._restore(snap)
                 self._set_lr(float(lr))

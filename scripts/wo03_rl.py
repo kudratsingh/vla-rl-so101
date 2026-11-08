@@ -57,6 +57,7 @@ from src.rl.trainer import (
     GRPOTrainer,
     eval_schedule,
     gate_check_step,
+    read_checkpoint_state,
 )
 from src.runs import device_info, hourly_usd
 
@@ -197,9 +198,10 @@ def estimate_probes(
     """Projected GPU time of the Track B probes from cost.throughput (not included: setup, and
     the 7B load + GPU env build of each separate invocation).
 
-    lr sweep drivers: one rollout collection (worst case: the refill cap), then per lr the old
-    log-prob recompute, `adam_steps` mini-batch forward+backward passes and 2 no-grad forwards of
-    the whole batch (scores + greedy tokens), plus one greedy forward before the first lr.
+    lr sweep drivers: one rollout collection (worst case: the refill cap), 2 no-grad forwards of
+    the whole batch before the first lr (greedy tokens; log-probs, which serve every lr as old
+    log-probs and diag reference), then per lr `adam_steps` mini-batch forward+backward passes
+    and 2 no-grad forwards of the whole batch (post scores + greedy tokens).
     Temperature probe drivers: env stepping + rendering + sampling forwards of
     ceil(groups / groups-per-env-batch) env batches per temperature (no update)."""
     rl = GRPOConfig.from_config(cfg)
@@ -215,8 +217,7 @@ def estimate_probes(
         mb_dec = min(rl.ppo_mini_batch, sh["trained"]) * sh["decisions_per_traj"]
         fwd = batch_dec / sh["forward_per_s"]
         per_lr = adam_steps * mb_dec / sh["update_per_s"] + 2 * fwd
-        per_lr += fwd if rl.recompute_old_log_probs else 0.0
-        total = collect_s + fwd + len(lrs) * per_lr
+        total = collect_s + 2 * fwd + len(lrs) * per_lr
         out.update(
             {
                 "lr_sweep_collect_s": collect_s,
@@ -309,7 +310,8 @@ def print_probe(cfg: Config, probe: dict[str, Any], proj: dict[str, Any], gpu: s
         f"rollout {probe['rollout_s_per_env_batch']:.1f} s per {rl.rollout_envs}-env batch = "
         f"{split_txt}; update {probe['update_s_median']:.1f} s); rollout "
         f"{probe['rollout_episodes_per_hour']:,.0f} episodes/h; greedy eval "
-        f"{probe['eval_s_per_env_batch']:.1f} s per batch; env setup {probe['env_setup_s']:.0f} s"
+        f"{probe['eval_s_per_env_batch']:.1f} s per batch (first, warm-up: "
+        f"{probe['eval_s_first_env_batch']:.1f} s); env setup {probe['env_setup_s']:.0f} s"
     )
     baseline = (
         f"SFT baseline ({rl.eval_episodes} greedy episodes/trained task, a sanity check; the "
@@ -489,6 +491,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     rl = GRPOConfig.from_config(cfg)  # validate before touching envs or weights
     if cfg["rl"].get("env") != "toy":  # ManiSkill prompts must not reuse held-out episode seeds
         check_rl_seed(seed)
+    bad_tasks = sorted(set(rl.train_tasks) - set(cfg["env"]["tasks"]))
+    if bad_tasks:  # GRPOTrainer checks this too, but only after the 7B load
+        parser.error(f"rl.train_tasks {bad_tasks} not in env.tasks {list(cfg['env']['tasks'])}")
     if args.estimate:
         gpu = cfg["cost"]["gpu"]
         if args.lr_sweep or args.probe_temperatures:
@@ -519,16 +524,17 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         raise RuntimeError(
             f"device {device!r} has no CUDA here (use --device cpu or --preset tiny)"
         )
-    if args.resume is not None and not (args.resume / "trainer_state.json").is_file():
-        raise FileNotFoundError(
-            f"--resume {args.resume}: no trainer_state.json (a checkpoint dir?)"
-        )
+    # every check below fails before the run record, the env build and the 7B load
     if args.resume_approximate and args.resume is None:
         parser.error("--resume-approximate needs --resume")
-    if args.resume is not None and not args.resume_approximate:
-        # fail before the run record, env and 7B load: GRPOTrainer.load_checkpoint says why
-        st = json.loads((args.resume / "trainer_state.json").read_text())
-        if int(st["step"]) != int(st["completed_step"]):
+    if args.sweep_batch is not None and not args.sweep_batch.is_file():
+        parser.error(f"--sweep-batch {args.sweep_batch}: no such file")
+    if args.resume is not None:
+        try:
+            st = read_checkpoint_state(args.resume)  # FileNotFoundError: no trainer_state.json
+        except ValueError as exc:
+            parser.error(f"--resume: {exc}")
+        if not args.resume_approximate and int(st["step"]) != int(st["completed_step"]):
             parser.error(
                 f"--resume {args.resume} is an _interrupted checkpoint (step {st['step']}, "
                 f"completed_step {st['completed_step']}): resume from the newest step_N "
@@ -548,33 +554,35 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     run_id = f"{stamp}-{kind}-{cfg['preset']}-s{seed}-{uuid.uuid4().hex[:6]}"
     run_dir = REPO_ROOT / "runs" / run_id
     record = _new_run_record(cfg, run_id, device)
+    # `timeout` (the pod job's soft deadline) sends SIGTERM: exit through the finally blocks so the
+    # trainer saves an interrupted checkpoint and the run record gets its end time and dollars,
+    # also when it arrives during the env build or the 7B load (installed before the first write)
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     _write_run_record(run_dir, record)
     log.info("run %s (config %s)", run_id, record["config_hash"][:12])
-
-    env_factory, obs_fn, max_steps = build_env(cfg)
-    policy = build_policy(cfg, device)
-    describe = getattr(policy, "describe", None)
-    record["policy"] = describe() if callable(describe) else None
-    trainer = GRPOTrainer(
-        rl=rl,
-        policy=policy,
-        env_factory=env_factory,
-        obs_fn=obs_fn,
-        tasks=list(cfg["env"]["tasks"]),
-        max_episode_steps=max_steps,
-        run_dir=run_dir,
-        seed=seed,
-    )
-    if args.resume is not None:
-        # restores RNG state too: after seed_everything
-        trainer.load_checkpoint(args.resume, allow_partial=args.resume_approximate)
-        record["resumed_from"] = str(args.resume)
-        if args.resume_approximate:
-            record["resume_approximate"] = True
-    # `timeout` (the pod job's soft deadline) sends SIGTERM: exit through the finally blocks so the
-    # trainer saves an interrupted checkpoint and the run record gets its end time and dollars
-    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     try:
+        env_factory, obs_fn, max_steps = build_env(cfg)
+        policy = build_policy(cfg, device)
+        describe = getattr(policy, "describe", None)
+        record["policy"] = describe() if callable(describe) else None
+        trainer = GRPOTrainer(
+            rl=rl,
+            policy=policy,
+            env_factory=env_factory,
+            obs_fn=obs_fn,
+            tasks=list(cfg["env"]["tasks"]),
+            max_episode_steps=max_steps,
+            run_dir=run_dir,
+            seed=seed,
+        )
+        if args.resume is not None:
+            # restores RNG state too: after seed_everything
+            trainer.load_checkpoint(args.resume, allow_partial=args.resume_approximate)
+            record["resumed_from"] = str(args.resume)
+            if args.resume_approximate:
+                record["resume_approximate"] = True
+            if trainer.resume_overrides:  # rl key -> [checkpoint, this run]; this run's apply
+                record["resume_overrides"] = trainer.resume_overrides
         if args.probe_steps:
             probe = trainer.probe(args.probe_steps)
             cost = cfg.get("cost", {})  # measured GPU's list price on RunPod, else the config's

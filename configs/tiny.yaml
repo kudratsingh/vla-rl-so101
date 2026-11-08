@@ -43,7 +43,7 @@ rl:                          # GRPO on the WO-03 toy task; keys documented in sr
   eval_episodes: 256
   checkpoint_every: 50
   gate_window: 5                  # spend gates on windowed rollout success (src/rl/gates.py)
-  gate_check_frac: 0.25           # flat gate at step 25: windows 1-5 vs 21-25
+  gate_check_frac: 0.25           # flat gate at step 25: trend over steps 1-25
 
 toy:                         # synthetic verification task + 2-layer policy (src/rl/toy_*.py)
   grid_size: 5

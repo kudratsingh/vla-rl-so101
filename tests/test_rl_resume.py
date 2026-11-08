@@ -142,3 +142,57 @@ def test_entry_script_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert _rows(second) == {s: r for s, r in _rows(first).items() if s > 3}
     with pytest.raises(FileNotFoundError, match="trainer_state"):
         script.main(["--preset", "tiny", "--resume", str(tmp_path / "nope")])
+
+
+def test_resume_applies_this_runs_lr_and_weight_decay(tmp_path: Path) -> None:
+    """Optimizer/scheduler state_dicts carry the saved lr and weight_decay; the resumed run's
+    config must win (record.json shows it) while the Adam moments are kept."""
+    cfg = _cfg()
+    cfg["rl"].update(steps=6, lr=1e-4, gate_check_frac=0)
+    _trainer(cfg, tmp_path / "a", init_seed=0).run()
+    ckpt = tmp_path / "a" / "checkpoints" / "step_000006"
+    cfg["rl"].update(steps=8, lr=5e-4, weight_decay=0.1)
+    tr = _trainer(cfg, tmp_path / "b", init_seed=0)
+    tr.load_checkpoint(ckpt)
+    saved = torch.load(ckpt / "optimizer.pt", weights_only=True)
+    assert tr.optimizer.state_dict()["state"][0]["step"] == saved["state"][0]["step"] > 0
+    tr.run()
+    group = tr.optimizer.param_groups[0]
+    assert (group["lr"], group["weight_decay"]) == (5e-4, 0.1)
+    assert tr.scheduler.base_lrs == [5e-4]
+    assert tr.resume_overrides["lr"] == [1e-4, 5e-4]
+    assert tr.resume_overrides["weight_decay"] == [0.01, 0.1]
+
+
+def test_entry_script_fails_fast_and_records_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-PR-28 checkpoint is refused before any model load; a failure during the model load
+    still finishes the run record (status, end time, dollars)."""
+    spec = importlib.util.spec_from_file_location("wo03_rl", REPO / "scripts" / "wo03_rl.py")
+    assert spec is not None and spec.loader is not None
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    monkeypatch.setattr(script, "REPO_ROOT", tmp_path)
+
+    def boom(*_: object) -> None:
+        raise RuntimeError("model load failed")
+
+    monkeypatch.setattr(script, "build_policy", boom)
+    old = tmp_path / "old" / "step_000025"  # main's checkpoint layout
+    (old / "adapter").mkdir(parents=True)
+    (old / "optimizer.pt").write_bytes(b"")
+    (old / "trainer_state.json").write_text(
+        json.dumps({"step": 25, "next_prompt_seed": 400, "eval_history": []})
+    )
+    for extra in ([], ["--resume-approximate"]):
+        with pytest.raises(SystemExit):
+            script.main(["--preset", "tiny", "--resume", str(old), *extra])
+    with pytest.raises(SystemExit):
+        script.main(["--preset", "tiny", "--lr-sweep", "1e-3", "--sweep-batch", "nope.pt"])
+    assert not (tmp_path / "runs").exists()  # nothing got as far as a run record
+    with pytest.raises(RuntimeError, match="model load"):
+        script.main(["--preset", "tiny"])
+    (run,) = (tmp_path / "runs").iterdir()
+    record = json.loads((run / "record.json").read_text())
+    assert record["status"] == "failed" and record["end_utc"] and record["dollars"] is not None
