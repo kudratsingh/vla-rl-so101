@@ -1,0 +1,23 @@
+# Recovery SFT follow-up (docs/plans/recovery-sft.md section 11): higher-LR GRPO diagnostic, NOT
+# approved. Everything else is configs/rl_pickplace.yaml (WO-04 PickPlace-only rollout settings).
+# The base is the recovery pick, passed per run with --adapter. Matched probes (stage A, one owner
+# go), identical except lr (rl_pickplace_lr5e-5.yaml, this file, rl_pickplace_lr1e-3.yaml):
+#   uv run scripts/wo03_rl.py --preset rl --config configs/rl_pickplace_lr.yaml \
+#     --adapter <recovery pick> --probe-steps 3
+# Continuation (stage B, a separate owner go on the probe numbers): the same command without
+# --probe-steps, on the config rule 1 picks (this file, or rl_pickplace_lr1e-3.yaml).
+inherit: configs/rl_pickplace.yaml
+
+seed: 3                     # rl_train[3]: passes check_rl_seed; WO-04 used seeds 0-2
+
+rl:
+  lr: 5e-4                  # 10x WO-04's 5e-5 (STATUS.md on-hold proposal); 1e-3 if rule 1 fires
+  steps: 75
+  checkpoint_every: 25
+  # Kill switch at step 20 (owner): ceil(0.26 x 75) = ceil(19.5) = 20. Not 0.2667: the float
+  # product is 20.0025 and ceil gives 21.
+  early_stop_check_at_frac: 0.26
+  # rl_pickplace.yaml's peak stop (ref 50, stop 100) does not fit 75 steps (GRPOConfig.validate
+  # needs peak_stop_step <= steps), and a peak stop at the last step stops nothing: off.
+  peak_stop_step: 0
+  peak_ref_step: 0
