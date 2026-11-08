@@ -15,6 +15,14 @@ file header Apache-2.0, Copyright 2024 Bytedance Ltd.), verl/workers/rollout/rob
 Differences: envs are one batched (GPU) env instead of one process per env, so finished envs keep
 receiving (ignored) actions; and the loop stops as soon as every env is done.
 
+Action clip (`action_clip`, rad; rl.rollout_action_clip_deg): None (the default, and every RL run
+so far, WO-04 included) sends the policy's actions to env.step unchanged, so RL rollouts and the
+in-training evals do NOT apply protocol 0.2's 4 deg/step joint clip (src/eval/sim_eval.py
+run_batch(action_clip=...)). When set, every executed action is clipped per joint to within that
+bound of the previous executed action (of the policy-obs joint state at reset), exactly as
+protocol 0.2's eval does; the stored tokens and log-probs stay those of the SAMPLED action (the
+clip acts as part of the environment).
+
 The env must reset deterministically per seed: identical seeds must give identical initial states,
 otherwise a "group" does not share a prompt and the group baseline is wrong. `check_group_reset`
 verifies this on every batch at no cost (tolerances in its docstring).
@@ -57,6 +65,7 @@ from typing import Any, Literal, Protocol
 import torch
 from torch import Tensor
 
+from src.eval.sim_eval import clip_joint_step
 from src.rl.policy_api import RLPolicy
 
 log = logging.getLogger(__name__)
@@ -311,12 +320,17 @@ def collect_rollouts(
     task: str,
     group_reset_check: Literal["error", "warn", "off"] = "error",
     timer: RolloutTimer | None = None,
+    action_clip: float | None = None,
+    clip_stats: dict[str, int] | None = None,
 ) -> tuple[RolloutBatch, float]:
     """Run one batch of episodes: len(prompt_seeds) prompts x group_size samples each.
 
     The env must have exactly len(prompt_seeds) * group_size parallel envs. Returns the batch and
     the group-reset max diff (0.0 when groups share their initial observation). With `timer`, the
-    call's wall time is added to its sections (module docstring).
+    call's wall time is added to its sections (module docstring). `action_clip` (rad, None = off):
+    the per-joint step clip of the module docstring; `clip_stats`, when given, accumulates
+    "clipped_steps" (env steps of running episodes whose action the clip changed) and
+    "active_steps".
     """
     tm = timer if timer is not None else RolloutTimer()
     instrument_render(env, tm)
@@ -324,7 +338,7 @@ def collect_rollouts(
     try:
         return _collect(
             policy, env, obs_fn, prompt_seeds, group_size, temperature, max_episode_steps, task,
-            group_reset_check, tm,
+            group_reset_check, tm, action_clip, clip_stats,
         )  # fmt: skip
     finally:
         instrument_render(env, None)
@@ -342,6 +356,8 @@ def _collect(
     task: str,
     group_reset_check: Literal["error", "warn", "off"],
     tm: RolloutTimer,
+    action_clip: float | None = None,
+    clip_stats: dict[str, int] | None = None,
 ) -> tuple[RolloutBatch, float]:
     seeds = [int(s) for s in prompt_seeds for _ in range(group_size)]
     n = len(seeds)
@@ -365,6 +381,9 @@ def _collect(
     logp_steps: list[Tensor] = []
     mask_steps: list[Tensor] = []
     chunk_len = 0
+    # protocol 0.2's clip reference: the joint reading at reset, then the last executed action
+    ref = pobs["state"].detach().float().clone() if action_clip is not None else None
+    clipped = active_steps = 0
     while bool(active.any()):
         with tm.section("policy"):
             step = policy.sample(pobs, instructions, temperature)
@@ -377,7 +396,20 @@ def _collect(
         for c in range(chunk_len):
             if not bool(active.any()):
                 break
-            raw_obs, _, terminated, truncated, info = tm.env_step(env, step.actions[:, c])
+            action = step.actions[:, c]
+            if ref is not None and action_clip is not None:
+                if ref.shape != action.shape:
+                    raise ValueError(
+                        f"rl.rollout_action_clip_deg needs the policy-obs state to be the joint "
+                        f"reading, shaped like the action: state {tuple(ref.shape)} vs action "
+                        f"{tuple(action.shape)}"
+                    )
+                ref = ref.to(action.device, action.dtype)
+                safe = clip_joint_step(action, ref, action_clip)  # protocol 0.2's function
+                clipped += int(((safe != action).any(-1).to(STORAGE) & active).sum())
+                active_steps += int(active.sum())
+                action = ref = safe
+            raw_obs, _, terminated, truncated, info = tm.env_step(env, action)
             executed[:, c] = active
             episode_len += active.long()
             with tm.section("host_copy"):
@@ -390,6 +422,9 @@ def _collect(
         with tm.section("obs_fn"):
             pobs = obs_fn(raw_obs)
 
+    if clip_stats is not None:
+        clip_stats["clipped_steps"] = clip_stats.get("clipped_steps", 0) + clipped
+        clip_stats["active_steps"] = clip_stats.get("active_steps", 0) + active_steps
     num_slots = math.ceil(max_episode_steps / chunk_len)
     if len(token_steps) > num_slots:
         raise RuntimeError(f"{len(token_steps)} decisions exceed {num_slots} slots")

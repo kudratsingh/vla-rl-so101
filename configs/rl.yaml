@@ -179,6 +179,12 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   # RL rollout + in-training eval horizon (owner amendment, ADR-0002); the protocol eval
   # (scripts/wo02_eval.py) keeps env.max_episode_steps = 150.
   max_episode_steps: 120
+  # Protocol 0.2's per-joint step clip (4 deg/step, configs/real.yaml robot.safety) inside RL
+  # rollouts and the in-training evals. null = OFF, as in every RL run so far (WO-04): RL trains
+  # WITHOUT the clip that protocol 0.2 sim eval (and the real arm) applies. The next run keeps it
+  # off (comparable with WO-04 and the 0.1 protocol numbers) unless the owner chooses 4.0 to match
+  # 0.2 (docs/STATUS.md "RL rollout action clip").
+  rollout_action_clip_deg: null
 
 cost:
   gpu: A100-80GB

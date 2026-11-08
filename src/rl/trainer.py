@@ -157,6 +157,10 @@ class GRPOConfig:
     group_reset_check: Literal["error", "warn", "off"] = "error"
     train_tasks: tuple[str, ...] = ()  # RL rollouts and periodic evals on these; () = every task
     max_episode_steps: int = 0  # RL rollout + in-training eval horizon; 0 = env.max_episode_steps
+    # Per-joint step clip (deg) on every executed RL-rollout and in-training-eval action, as
+    # protocol 0.2's sim eval applies it (4 deg/step from configs/real.yaml). None = off: the
+    # default and every RL run so far (WO-04), so RL trains WITHOUT the clip 0.2 evaluates with.
+    rollout_action_clip_deg: float | None = None
 
     @classmethod
     def from_config(cls, cfg: Config) -> GRPOConfig:
@@ -180,7 +184,9 @@ class GRPOConfig:
         kwargs: dict[str, Any] = {}
         for key, value in rl.items():
             default = getattr(cls, key)
-            if isinstance(default, bool):
+            if key == "rollout_action_clip_deg":  # null = off
+                kwargs[key] = None if value is None else float(value)
+            elif isinstance(default, bool):
                 if not isinstance(value, bool):
                     raise TypeError(f"rl.{key} must be true/false, got {value!r}")
                 kwargs[key] = value
@@ -234,6 +240,14 @@ class GRPOConfig:
             raise ValueError("group_reset_check must be error|warn|off")
         if self.max_episode_steps < 0:
             raise ValueError("max_episode_steps must be >= 0 (0 = env.max_episode_steps)")
+        clip = self.rollout_action_clip_deg
+        if clip is not None and not 0 < clip <= 180:
+            raise ValueError("rollout_action_clip_deg must be null (off) or in (0, 180] deg/step")
+
+    @property
+    def action_clip_rad(self) -> float | None:
+        clip = self.rollout_action_clip_deg
+        return None if clip is None else math.radians(clip)
 
 
 def ppo_minibatches(n_groups: int, groups_per_minibatch: int) -> list[range]:
@@ -479,6 +493,7 @@ class GRPOTrainer:
                     max_episode_steps=self.max_episode_steps,
                     task=task,
                     group_reset_check="off",
+                    action_clip=self.rl.action_clip_rad,
                 )
                 batch_s.append(time.perf_counter() - tb)
                 successes.append(batch.rewards)
@@ -534,6 +549,7 @@ class GRPOTrainer:
         ent_sum, ent_tokens = 0.0, 0
         reset_diff = 0.0
         n_batches = 0
+        clip_stats: dict[str, int] = {}
         for _ in range(max_batches):
             task = self.train_tasks[self._next_task % len(self.train_tasks)]
             self._next_task += 1
@@ -550,6 +566,8 @@ class GRPOTrainer:
                 task=task,
                 group_reset_check=rl.group_reset_check,
                 timer=timer,
+                action_clip=rl.action_clip_rad,
+                clip_stats=clip_stats,
             )
             n_batches += 1
             reset_diff = max(reset_diff, diff)
@@ -591,6 +609,10 @@ class GRPOTrainer:
         }
         for key, value in timer.totals(elapsed).items():  # sums to rollout/time_s
             stats[f"rollout/time/{key}_s"] = value
+        if rl.rollout_action_clip_deg is not None:  # fraction of env steps the clip changed
+            stats["rollout/action_clip_frac"] = clip_stats.get("clipped_steps", 0) / max(
+                clip_stats.get("active_steps", 0), 1
+            )
         for t, (gen_t, kept_t, trained_t) in per_task.items():
             if gen_t:
                 stats[f"rollout/frac_groups_dropped/{t}"] = 1.0 - kept_t / gen_t
@@ -1351,6 +1373,7 @@ class GRPOTrainer:
                         task=task,
                         group_reset_check=rl.group_reset_check,
                         timer=timer,
+                        action_clip=rl.action_clip_rad,
                     )
                     by_task[task].append(batch.group_rewards)
                     es, et = entropy_from_sampled_log_probs(batch.log_probs, _token_mask(batch))
