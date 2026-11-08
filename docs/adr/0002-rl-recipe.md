@@ -170,9 +170,22 @@ Applies to the next GRPO run only. No paid run has used it.
   steps.
 - **RL seeds >= 10 are rejected**: their training seeds (`rl_seed * 10_000_000 + k`) would land in
   the protocol eval range (100M+) (`src/eval/seed_ranges.py`).
+- **Action clip ON (owner decision 2026-11-08, overriding the agent's recommendation to leave it
+  off):** `rl.rollout_action_clip_deg: 4.0` in `configs/rl.yaml` and `configs/rl_pickplace.yaml`,
+  protocol 0.2's per-joint step bound (`configs/real.yaml`: min(4 deg, 60 deg/s / 15 Hz)), applied
+  by protocol 0.2's own `clip_joint_step` to every executed rollout and in-training-eval action
+  (reference: the joint reading at reset, then the last executed action). It is part of the
+  environment: the batch keeps the SAMPLED tokens and their sampler log-probs, so old log-probs,
+  ratios and advantages are all on the sampled tokens (upstream SimpleVLA-RL has no clip). Training
+  and protocol 0.2 / real-arm execution now share action limits; WO-04 trained without the clip,
+  so the next run differs from WO-04 on this axis too. The diagnostics probes (temperature, lr
+  sweep) roll out with the same clip, and a paired clip on/off probe (`--probe-clip`: same prompts
+  and sampling seeds) measures its effect on sampled success, the group-drop rate and how often it
+  intervenes before any full-run proposal. The tiny preset and the code default stay null (off).
 
 Unverified on GPU: the gate behaviour, the diagnostic and sweep forward cost, the CUDA RNG
-restore, and the throughput for the 16 x 8 / 2-epoch shape.
+restore, the throughput for the 16 x 8 / 2-epoch shape, and the clip's effect on the a4 policy's
+sampled success and group-drop rate (the paired clip probe measures it).
 
 This meets half of the "what would reopen this" condition above: GRPO has shown no clear
 improvement on a base below the 20-60% band. The decision is with the owner.

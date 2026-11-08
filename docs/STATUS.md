@@ -170,9 +170,10 @@ What changed:
 Next paid run (proposed, not launched; each pod needs the owner's explicit go): the review's
 diagnostics.
 
-**FIRM CAP: $7.85 for the whole diagnostics pass** (was $7.42, then $7.65; re-priced 2026-11-08
-with live rates and storage, every cap counted from the pod create call instead of first boot,
-and an explicit allowance for the billed time between the create call and container boot).
+**FIRM CAP: $8.42 for the whole diagnostics pass** (was $7.42, $7.65, then $7.85; round 3,
+2026-11-08: +$0.57 for the A100's paired clip on/off probe, owner 2026-11-08. Re-priced with live
+rates and storage, every cap counted from the pod create call instead of first boot, and an
+explicit allowance for the billed time between the create call and container boot).
 Caps are rounded up to the cent. The cap is enforced by three layers: the job's own delete, the in-container hard-cap timer,
 and the outside watchdog (`scripts/pod/watchdog.py` on a GitHub runner and on the Mac; see "Pod
 deletion backstop" and `docs/runbooks/pod-launch.md`). Each layer fires before `DEADLINE` =
@@ -181,14 +182,17 @@ deletion backstop" and `docs/runbooks/pod-launch.md`). Each layer fires before `
 | Pod | GPU $/h (live, Secure) | Storage $/h | `SPEND_CAP_SECONDS` (max billable) | **Firm cap** | Expected (planned) | +25% | + full gate wait |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | RTX 4090, render gap (`demo_rebuild_job.sh` to its gate) | 0.89 | 0.0139 | **5940** (1.650 h) | **$1.50** | 29 min = $0.44 | $0.55 | $1.00 |
-| A100 80 GB, diagnostics (`diag_job.sh`), gate wait | 1.79 | 0.0139 | **12660** (3.517 h) | **$6.35** | 119 min = $3.58 | $4.47 | $5.37 |
-| A100 80 GB, diagnostics, pre-approved (no gate wait) | 1.79 | 0.0139 | 10860 (3.017 h) | $5.45 | $3.58 | $4.47 | n/a |
-| **Both pods** (with the A100 gate) | | | | **$7.85** | **$4.02** | **$5.02** | $6.37 |
-| Both pods (A100 pre-approved) | | | | $6.95 | $4.02 | $5.02 | |
+| A100 80 GB, diagnostics (`diag_job.sh`, with the clip probe), gate wait | 1.79 | 0.0139 | **13800** (3.833 h) | **$6.92** | 134 min = $4.03 | $5.04 | $5.94 |
+| A100 80 GB, diagnostics, pre-approved (no gate wait) | 1.79 | 0.0139 | 12000 (3.333 h) | $6.02 | $4.03 | $5.04 | n/a |
+| **Both pods** (with the A100 gate) | | | | **$8.42** | **$4.47** | **$5.59** | $6.94 |
+| Both pods (A100 pre-approved) | | | | $7.52 | $4.47 | $5.59 | |
+
+Without the clip probe (`CLIP_GROUPS=0`) the round-2 figures still hold: A100 12660 / 10860 s,
+$6.35 / $5.45, both pods $7.85.
 
 Sources and assumptions:
-- GPU rates were read at 2026-11-08T13:32:45Z and again, unchanged, at 2026-11-08T14:23:29Z with
-  RunPod's public, unauthenticated GraphQL `gpuTypes` query (read-only):
+- GPU rates were read at 2026-11-08T13:32:45Z and again, unchanged, at 2026-11-08T14:23:29Z and
+  2026-11-08T14:43:08Z with RunPod's public, unauthenticated GraphQL `gpuTypes` query (read-only):
   - RTX 4090: Secure $0.89/h, Community $0.34/h;
   - `NVIDIA A100 80GB PCIe`: Secure $1.79/h, Community $1.19/h;
   - `NVIDIA A100-SXM4-80GB`: Secure $1.79/h, Community $1.39/h.
@@ -225,8 +229,10 @@ Sources and assumptions:
   the container boots: cap = planned x 1.25 + the full gate wait (30 min) + the 20 min
   soft-deadline margin + the 480 s in-pod lead + 240 s from `T_req` to boot (the old 180 s
   `CAP_PRESTART_S` image-pull allowance plus ~60 s for the create call), rounded up to the minute:
-  5940 / 12660 / 10860 s. Measured from creation, the job's soft deadline falls at 71 / 183 / 153
-  min, which covers planned x 1.25 + gate + 4 min pre-boot = 70.25 / 182.75 / 152.75 min. If the
+  5940 / 13800 / 12000 s (A100 planned 134 min: 167.5 + 30 + 20 + 8 + 4 = 229.5 -> 230 min;
+  pre-approved 199.5 -> 200 min). Measured from creation, the job's soft deadline falls at
+  71 / 202 / 172 min, which covers planned x 1.25 + gate + 4 min pre-boot = 70.25 / 201.5 /
+  171.5 min. If the
   image pull and create call take longer than 240 s, the job loses that time at its end (the spend
   cap still holds); `createdAt` vs boot time in the pod log shows the real figure. The expected cost
   is unchanged apart from storage. (An earlier revision of this table, $7.65, had dropped the
@@ -251,17 +257,24 @@ Timings below are from the WO-02/WO-04 job logs on the Hub (`KudratSingh22/vla-r
      3 episodes had 54-74 frames each) at 12.9 decisions/s = 14 min (4090 protocol eval: 2,700
      episodes in ~1.05 h, sim included, so a lower bound on the rate);
    - uploads 2 min; approval gate up to `APPROVAL_WAIT_S` 30 min (not in "planned").
-2. One A100 pod, `scripts/pod/diag_job.sh` (new; seed 3, SFT adapter a4 `step_004000`):
+2. One A100 pod, `scripts/pod/diag_job.sh` (new; seed 3, SFT adapter a4 `step_004000`; every
+   probe uses `configs/rl.yaml`'s clip, 4.0 deg/step):
    `--probe-temperatures 0.7,1.0,1.3 --probe-groups 64` (rollouts only, the short first step), then
+   `--probe-clip --probe-groups 32` (paired clip on/off, rollouts only), then
    an approval gate (or the pre-approval file), then `--lr-sweep 5e-5,2e-4,5e-4,1e-3
    --sweep-adam-steps 8`, upload to `KudratSingh22/vla-rl-so101-rl` `diag/<pod>/`, self-delete.
-   Planned 119 min = $3.56:
+   Planned 134 min = $4.00 GPU ($4.03 with storage; round 2 without the clip probe: 119 min):
    - pod start to job launch 2.5 min (1.5-2.5 min: "pod up" minus job time, 4 WO-04 A100 pods);
    - setup stage 1.9 min (0.4-1.9 min, 5 A100 job logs); adapter download 0.8 min (0.25-0.8);
    - temperature-probe invocation: 15 GB base download + 7B load + 2 GPU env builds 1.5 min
      (1.3-1.4 min: probe run start to first step, minus its baseline eval; base fetch 45-57 s,
      env setup 5-7 s); rollouts 3 T x 16 env batches x 49.2 s = 39.4 min (49.2 s = the slowest
      measured 32-env x 120-step batch, pod `s2ljj3drwg0ov0`; `--estimate` says 44.6 s);
+   - paired clip probe (round 3), 14.2 min: its `--estimate` check in the gpu-check stage 0.1 min;
+     cached 7B load + 2 env builds 0.5 min (as the lr sweep's invocation); rollouts 2 arms x 8 env
+     batches (32 prompts x K=8 = 256 episodes per arm, 4 groups per 32-env batch) x 49.2 s =
+     13.1 min (`--estimate` 44.65 s per batch: 11.9 min); upload 0.5 min (estimated, small files).
+     estimated: A100-80GB x 0.24 h = $0.43 (GPU $0.42 + storage $0.003; +25% $0.53);
    - lr-sweep invocation: cached 7B load + env builds 0.5 min (10 s load + 5-7 s env setup
      measured); collection, refill cap, 12 env batches x 49.2 s = 9.8 min; greedy + score
      forwards of the 1,920-decision batch once, 2.1 min; per lr 8 Adam steps x 64 x 15 decisions /
@@ -273,7 +286,10 @@ Timings below are from the WO-02/WO-04 job logs on the Hub (`KudratSingh22/vla-r
    The sweep's per-lr old log-prob recompute is now done once (review L-sweep-recompute): the
    `--estimate` fell from 1.20 h to 1.15 h.
 3. Only after 1-2, and after the recovery-SFT base clears rule 3: a GRPO run with the measured lr and
-   temperature written into `configs/rl.yaml`, starting with `--probe-steps 3`. The worst case is
+   temperature written into `configs/rl.yaml` (clip 4.0, owner 2026-11-08), starting with
+   `--probe-steps 3`. **No full-run proposal until the paired clip probe has posted its numbers**
+   (sampled success and group-drop rate with vs without the clip set the refill cost of a clipped
+   run). The worst case is
    estimated: A100-80GB x 41.3 h = $74 per 150-step seed. `rl.gate_stop` is false for this first
    run (owner 2026-11-08), so the flat gate logs at step 38 and does not stop it. Budget the full
    run. (A stop at step 38 would have been 10.5 h = $18.72.)
@@ -402,9 +418,10 @@ hook timing on `physx_cuda`, the CUDA RNG restore (a GPU resume is not bit-ident
 success on `physx_cuda`, recorder tail stepping on the GPU env, render-gap replay and 7B token
 comparison, and the 0.2 clip and end-flag capture on CUDA.
 
-RL rollout action clip: see "Owner instructions 2026-11-08, round 2" below. Current RL rollouts do
-not apply protocol 0.2's 4 deg/step clip. `rl.rollout_action_clip_deg` (null = off) now makes the
-setting explicit.
+RL rollout action clip: see "Owner instructions 2026-11-08, round 3" below. **Owner decision
+2026-11-08: ON at 4.0 deg/step in `configs/rl.yaml` and `configs/rl_pickplace.yaml`** (env action
+only; PPO keeps the sampled tokens). The tiny preset and the code default stay null (off), as in
+WO-04.
 The robot items (servo temperature/current fault response, `park()` on healthy shutdown, camera
 timestamp, placement grid, `wo07_real_eval.py`) belong to PR 2, on PR #23's branch. The plan
 revision for PR #25 is on `wo-recovery-sft`. PR #25's `configs/rl_pickplace_lr*.yaml` use the
@@ -462,11 +479,8 @@ On PR #28 (`fix/pre-run-hardening`). Nothing ran on a GPU. Protocol `0.1-draft` 
   behaviour bit for bit. Setting it to 4.0 applies protocol 0.2's `clip_joint_step` to every
   executed rollout and in-training-eval action and logs `rollout/action_clip_frac`; the sampled
   tokens and log-probs are unchanged. **Owner choice:** off keeps the run comparable with WO-04
-  and the 0.1 numbers; 4.0 matches protocol 0.2 and the real arm. **Recommendation: off for the
-  next run.** That run already changes the shape, lr, epochs and gate logging, and adding the clip
-  would confound the comparison with WO-04. Evaluate its checkpoints under both 0.1 and 0.2: the
-  difference prices the train/eval mismatch. Switch to 4.0 for runs whose headline number is
-  protocol 0.2 or real-arm.
+  and the 0.1 numbers; 4.0 matches protocol 0.2 and the real arm. The agent recommended off.
+  **Superseded: the owner chose 4.0 on 2026-11-08 (round 3 below).**
 - **Follow-ups.** `push_dataset` (every demo push, wo01r included) refuses the two 0.1 repos
   unless `allow_protected` (`wo01_build_env.py --overwrite-hub` only); wo01r `--push` to one stops
   before the build. With `data.require_tail_finished` (on in `demos_v2*.yaml`), the build drops a
@@ -482,6 +496,68 @@ On PR #28 (`fix/pre-run-hardening`). Nothing ran on a GPU. Protocol `0.1-draft` 
   fail. Run `uv run python -m pytest` on the Mac instead.
   `tests/test_pod_backstop.py::test_cap_timer_retries_and_survives_restart` is timing-sensitive.
   It failed once while a `uv sync` was running alongside and passed 3 of 3 times on its own.
+
+### Owner instructions 2026-11-08, round 3: the RL action clip ON ($0, CPU only)
+
+On PR #28. Nothing ran on a GPU; no RunPod resource was touched (one public read-only GraphQL price
+query, 14:43:08Z: A100 PCIe / SXM Secure $1.79/h, RTX 4090 $0.89/h, unchanged). Protocol
+`0.1-draft` (`e9ce5bb47a88`), `src/env/success.py`, `src/eval/sim_eval.py`, `src/eval/protocol_v02.py`
+and every reported number are unchanged.
+
+- **Decision (owner, overriding the agent's "leave it off"):** `rl.rollout_action_clip_deg: 4.0`
+  explicitly in `configs/rl.yaml` and `configs/rl_pickplace.yaml` (inherited, repeated so it is
+  explicit). The next run's preset is `configs/rl.yaml` (the diagnostics pod's `RL_CFG` default
+  and the plan above); `rl_pickplace.yaml` carries the same setting should it be used. 4.0 =
+  protocol 0.2's bound, min(4 deg, 60 deg/s / 15 Hz) from `configs/real.yaml`; a test checks the
+  presets equal `protocol_v02.action_clip().bound_deg`. `configs/tiny.yaml` and the code default
+  stay null.
+- **One function:** the rollout already called protocol 0.2's `clip_joint_step`
+  (`src/eval/sim_eval.py`); nothing moved, so the eval is byte-identical (sim_eval.py and the 0.2
+  hash unchanged).
+- **Env action only:** `src/rl/rollout.py` stores the sampled tokens and sampler log-probs before
+  the clip; the clip changes only what `env.step` receives. Old log-probs (sampler or recomputed),
+  ratios and advantages are on the sampled tokens. `tests/test_rl_action_clip.py`: stored =
+  sampled decision by decision, the env got `clip_joint_step(sampled, prev)` and it differs from
+  the sampled action, and an update on that batch scores only sampled token rows with an
+  on-policy first-mini-batch ratio (< 1e-5) and `train/logprob_mismatch` < 1e-5.
+- **Config hashes:** `rl.yaml` / `rl_pickplace.yaml` hashes change (`eb4c1be43f8b` for rl.yaml at
+  this head). No reported number cites them: the WO-04 RL runs cite commits `7c896d0` / `4a76953`
+  (their configs are reproducible from those commits; round 1 had already changed these files),
+  and every reported eval used a `sim` / `sft` config, which this round does not touch.
+- **Probes read the same preset:** `--probe-temperatures`, `--lr-sweep` (its batch) and
+  `--probe-steps` roll out with `rl.rollout_action_clip_deg`; no separate default. Their lines
+  print it (`TEMP-PROBE ... action clip 4 deg/step`, `LR-SWEEP batch ... rollouts with action clip
+  4 deg/step`, `--estimate` prints `rollout_action_clip_deg`).
+- **Intervention logging:** per RL step in `metrics.jsonl` (`rollout/action_clip_frac` env steps,
+  `_joint_frac`, `_frac_by_joint` (6), `_mean_abs_delta_deg` / `_max_abs_delta_deg` = |a -
+  clip(a)| over the changed entries, `_env_steps`); per temperature (`probe/action_clip_*`), in the
+  lr sweep's batch stats, and in both clip-probe arms. Counted over running episodes only.
+- **Paired probe** (`scripts/wo03_rl.py --probe-clip [--probe-groups 32]`,
+  `GRPOTrainer.probe_clip`): rollouts only, no update. Both arms play the same prompts (reset
+  seeds, tasks round-robin) with the same sampling seeds (torch RNG reseeded per env batch),
+  K = the preset's 8, T = the preset's 1.0. Arm on applies the clip; arm off sends the sampled
+  action and counts how often the clip WOULD have changed it. Per arm: sampled success +- SE,
+  group-drop rate (all-equal groups; all-0 / all-1), entropy, mean episode length, intervention.
+  Paired (`src/rl/paired.py`; `src/eval/paired.py` is not on this branch): per-group success
+  difference +- SE over groups (the unit: a group's K samples share a scene), the episode count
+  table with an exact McNemar p (labelled optimistic: episodes in a group are not independent),
+  the paired dropped-group table, and a pairing check (first-decision tokens identical, 1.0 on
+  CPU). 32 prompts: the paired per-group difference has SE ~2.4 points at p ~0.13 (Beta
+  concentration 2, K = 8), so a 5-point change shows at 2 SE; 64 prompts would cost +13 min /
+  +$0.39 for SE ~1.7. Smoke: `tests/test_rl_clip_probe.py` (CPU, tiny preset + a 6-joint test env,
+  ~1 s; the toy env's state is not a joint reading, so the clip cannot apply to it).
+- **diag_job stage:** `probe-clip` runs after the temperature probe and BEFORE the lr-sweep gate,
+  under the launch approval: its numbers are what the owner wants before approving the sweep, and
+  its own gate would idle the A100 up to 30 min ($0.90) to guard a ~14 min ($0.43) stage. It
+  uploads its record, and the gate prints the last 4 `CLIP-PROBE` lines next to `TEMP-PROBE`.
+  `CLIP_GROUPS=0` skips it; the gpu-check stage `--estimate`s it first, which refuses a preset
+  with a null clip. Caps: above (13800 / 12000 s).
+- **Gates unchanged:** `rl.gate_stop: false` for the first training run in both presets, and
+  the gate-decision logging (`gate/would_stop*`, `record.gate_decisions`) is in place (checked).
+- **Unverified on GPU:** the clip-probe pairing on CUDA (multinomial on the CUDA generator after
+  `torch.manual_seed`; GPU kernel nondeterminism may lower the first-decision token match below
+  1.0), the per-step intervention tensors' overhead on `physx_cuda` (one host copy per env batch),
+  and how the clip changes the episode length, success and group-drop rate of the a4 SFT policy.
 
 ## Blockers and decisions pending the owner
 
@@ -523,6 +599,12 @@ On PR #28 (`fix/pre-run-hardening`). Nothing ran on a GPU. Protocol `0.1-draft` 
   switch passes if ANY trained task is +3 at step 38; PickPlace-only run, success = final protocol
   eval, seen, PickPlace, 300 episodes, >= 27.0% (missed: 20.7%); stratified multi-task only if it
   cleared that bar.
+
+- 2026-11-08 RL action clip ON: `rl.rollout_action_clip_deg: 4.0` (protocol 0.2's bound) in
+  `configs/rl.yaml` / `rl_pickplace.yaml`, env action only, PPO on the sampled tokens; the probes
+  use the same setting; a paired clip on/off probe runs before the lr-sweep gate; no full-run
+  proposal until its numbers are in (ADR-0002 amendment 3). `rl.gate_stop: false` for the first
+  run.
 
 ## Decisions taken by the agent (one line each, link ADR if any)
 

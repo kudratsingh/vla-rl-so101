@@ -76,7 +76,7 @@ against a mistyped id on the shared account.
 
 1. **Take `T_req`** just before the create call:
    ```zsh
-   CAP=12660; T_REQ=$(date +%s); DEADLINE=$((T_REQ + CAP)); echo "$T_REQ $DEADLINE"
+   CAP=13800; T_REQ=$(date +%s); DEADLINE=$((T_REQ + CAP)); echo "$T_REQ $DEADLINE"
    ```
 2. **Create the pod through the RunPod connector**:
    - image `nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04`, Secure Cloud, GPU type from the estimate;
@@ -89,8 +89,9 @@ against a mistyped id on the shared account.
      network volume) and port `22/tcp`.
 
    If the create call returns no id, list pods by name and treat any match as created.
-3. **Start both watchdogs at once**, before anything else (`CAP` is 5940 for the 4090 pod, 12660 or
-   10860 for the A100 pod; docs/STATUS.md):
+3. **Start both watchdogs at once**, before anything else (`CAP` is 5940 for the 4090 pod, 13800 or
+   12000 for the A100 pod with the paired clip probe (12660 / 10860 without it, `CLIP_GROUPS=0`);
+   docs/STATUS.md):
    ```zsh
    gh workflow run pod-watchdog.yml --repo kudratsingh/vla-rl-so101 \
      -f pod_id=<id> -f deadline_epoch=$DEADLINE -f cap_s=$CAP

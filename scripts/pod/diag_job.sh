@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
 # Review Track B diagnostics (docs/reviews/2026-11-07-project-review.md section 8) on one RunPod
 # A100-80GB pod: setup -> GPU check -> SFT adapter download -> temperature probe (rollouts only,
-# no update: the short first step, ~0.7 h) -> owner approval gate -> offline lr sweep on one
-# stored rollout batch (~1.2 h) -> upload runs/ + job log to the private Hub repo
-# (KudratSingh22/vla-rl-so101-rl, diag/<pod>/) -> terminate this pod. Trains nothing that is kept.
+# no update: the short first step, ~0.7 h) -> paired clip on/off probe (rollouts only, ~0.24 h;
+# owner 2026-11-08) -> owner approval gate -> offline lr sweep on one stored rollout batch
+# (~1.2 h) -> upload runs/ + job log to the private Hub repo (KudratSingh22/vla-rl-so101-rl,
+# diag/<pod>/) -> terminate this pod. Trains nothing that is kept.
+# Every probe reads the action clip from the preset (RL_CFG's rl.rollout_action_clip_deg;
+# configs/rl.yaml: 4.0 deg/step, owner 2026-11-08) and prints it; there is no separate default.
 # Launched over SSH from the repo root on the pod:
 #   nohup bash scripts/pod/diag_job.sh > /workspace/job.log 2>&1 &
 # Optional: SEED (3; RL seeds 0-2 are the WO-04 runs, check_rl_seed allows 0-9), SFT_ADAPTER (WO-02
 #   a4 step_004000), RL_CFG (configs/rl.yaml), TEMPS (0.7,1.0,1.3), PROBE_GROUPS (64),
+#   CLIP_GROUPS (32 prompts x the preset's K per arm; 0 skips the clip probe),
 #   LRS (5e-5,2e-4,5e-4,1e-3), SWEEP_ADAM_STEPS (8), APPROVAL_WAIT_S (1800), HUB_REPO.
 # Approval gate (CLAUDE.md rule 1): the lr sweep starts only once THIS pod's approval file
 #   (/workspace/APPROVED.<RUNPOD_POD_ID>, written after the pod's first boot: scripts/pod/
 #   approval_lib.sh; a stale or unscoped /workspace/APPROVED never counts) exists. The agent writes
-#   it over SSH with `approval_write` on the owner's explicit go after posting the TEMP-PROBE
-#   lines, OR before launch when the owner pre-approved the whole pass (a dollar cap); a valid
+#   it over SSH with `approval_write` on the owner's explicit go after posting the TEMP-PROBE and
+#   CLIP-PROBE lines, OR before launch when the owner pre-approved the whole pass (a dollar cap); a valid
 #   file that already exists when the gate is reached counts as that pre-approval. No valid file
 #   within APPROVAL_WAIT_S -> exit (upload + self-delete).
 # Needs /root/runpod.env (RUNPOD_POD_ID, pod-scoped RUNPOD_API_KEY, SPEND_CAP_SECONDS,
 # POD_HARD_DEADLINE) and /root/pod_start_epoch, both written by scripts/pod/pod_start_cmd.sh (the
 # pod's start command, which also arms the hard self-delete timer: docs/STATUS.md "Next paid run",
-# SPEND_CAP_SECONDS 12660 = 3.52 h), and /root/.hf_token. Every stage is time-limited and a watchdog
+# SPEND_CAP_SECONDS 13800 = 3.83 h with the clip probe; 12000 pre-approved), and /root/.hf_token. Every stage is time-limited and a watchdog
 # stops the job at the soft deadline (scripts/pod/job_lib.sh).
 # NOT RUN YET: needs the owner's explicit go (CLAUDE.md rule 1).
 set -uo pipefail
@@ -80,6 +84,7 @@ export SEED SFT_ADAPTER
 CFG="${RL_CFG:-configs/rl.yaml}"
 TEMPS="${TEMPS:-0.7,1.0,1.3}"
 PROBE_GROUPS="${PROBE_GROUPS:-64}"
+CLIP_GROUPS="${CLIP_GROUPS:-32}"
 LRS="${LRS:-5e-5,2e-4,5e-4,1e-3}"
 SWEEP_ADAM_STEPS="${SWEEP_ADAM_STEPS:-8}"
 
@@ -97,8 +102,14 @@ run_capped 1200 uv sync --frozen --extra gpu --extra dev || exit 11
 stage gpu-check
 run_capped 300 uv run python -c "import torch; assert torch.cuda.is_available(); print('[job] gpu', torch.cuda.get_device_name(), round(torch.cuda.mem_get_info()[1] / 1e9), 'GB')" || exit 12
 # both probe commands must parse (seed range, config) before any GPU minute is spent on them
+# (`set -o pipefail`: a failing --estimate fails the pipe; it prints the preset's clip setting)
 run_capped 300 uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
-  --probe-temperatures "$TEMPS" --probe-groups "$PROBE_GROUPS" | tail -1 || exit 13
+  --probe-temperatures "$TEMPS" --probe-groups "$PROBE_GROUPS" | tail -2 || exit 13
+if [ "$CLIP_GROUPS" != 0 ]; then
+  # refuses a preset whose rl.rollout_action_clip_deg is null: nothing to compare
+  run_capped 300 uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
+    --probe-clip --probe-groups "$CLIP_GROUPS" | tail -1 || exit 13
+fi
 SWEEP_H=$(run_capped 300 uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
   --lr-sweep "$LRS" --sweep-adam-steps "$SWEEP_ADAM_STEPS" | awk '/lr_sweep_h:/ {print $2}')
 [ -n "$SWEEP_H" ] || exit 13
@@ -120,11 +131,23 @@ run_until_deadline uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed 
   --adapter "$SFT_ADAPTER" --probe-temperatures "$TEMPS" --probe-groups "$PROBE_GROUPS" || exit 20
 upload "temperature probe"
 
+if [ "$CLIP_GROUPS" != 0 ]; then
+  stage probe-clip
+  # paired, rollouts only: the same prompts and sampling seeds with the preset's clip and without;
+  # per arm sampled success, group-drop rate, clip intervention (arm off: would have intervened).
+  # Before the gate: its numbers inform the owner's go on the lr sweep, and a gate of its own
+  # would idle the A100 for up to APPROVAL_WAIT_S (30 min = $0.90) to save a ~14 min ($0.43) stage
+  run_until_deadline uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" \
+    --adapter "$SFT_ADAPTER" --probe-clip --probe-groups "$CLIP_GROUPS" || exit 22
+  upload "clip probe"
+fi
+
 stage await-approval
 grep "\[wo03_rl\] TEMP-PROBE" /workspace/job.log | tail -4
+grep "\[wo03_rl\] CLIP-PROBE" /workspace/job.log | tail -4
 # the sweep must finish before the soft deadline, with the 25% estimate-error margin
 NEED_S=$(awk -v h="$SWEEP_H" 'BEGIN { printf "%d", h * 3600 * 1.25 + 120 }')
-echo "[job] pod up $(pod_minutes) min so far (setup + checks + temperature probe); next: lr sweep" \
+echo "[job] pod up $(pod_minutes) min so far (setup + checks + temperature + clip probes); next: lr sweep" \
   "$LRS x $SWEEP_ADAM_STEPS Adam steps, est. ${SWEEP_H} h (+25% = $(( NEED_S / 60 )) min);" \
   "soft deadline in $(( $(left) / 60 )) min"
 if [ "$(left)" -lt "$NEED_S" ]; then
