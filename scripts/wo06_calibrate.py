@@ -57,6 +57,8 @@ from src.robot.units import (
 )
 from src.robot.yamlio import update_yaml_file
 
+SHORT_NAMES = ("pan", "lift", "elbow", "wflex", "wroll", "grip")  # verify columns, JOINT_NAMES order
+
 FOLLOWER_STEPS = """
 WHAT YOU DO PHYSICALLY (follower):
   1. Arm on the table, clamped, power on, USB connected. Keep the workspace clear. Torque stays
@@ -291,7 +293,7 @@ def cmd_verify(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         while True:
             raw = bus.sync_read("Present_Position")
             q = units.to_canonical({f"{m}.pos": v for m, v in raw.items()})
-            line = "  ".join(f"{n[:8]}={math.degrees(v):7.1f}" for n, v in zip(JOINT_NAMES, q))
+            line = "  ".join(f"{n}={math.degrees(v):7.1f}" for n, v in zip(SHORT_NAMES, q))
             if fk is not None:
                 p = [float(v) for v in fk(q)]
                 inside = all(
