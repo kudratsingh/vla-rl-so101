@@ -1,9 +1,15 @@
 # Container start command for every project pod (entrypoint ["/bin/bash","-c"]): pass this WHOLE
 # file as the one start-command string, not a path (the repo is not on the pod at boot). Pod env:
-# SPEND_CAP_SECONDS (integer s), PUBLIC_KEY, optional CAP_PRESTART_S (180); RunPod injects
-# RUNPOD_POD_ID and a pod-scoped RUNPOD_API_KEY. docs/STATUS.md "Pod deletion backstop".
-# 1. Hard-cap timer FIRST, before apt: it fires at first boot + SPEND_CAP_SECONDS - CAP_PRESTART_S
-#    (the allowance for billed time before the container starts, e.g. the image pull; estimated).
+# SPEND_CAP_SECONDS (integer s), PUBLIC_KEY, POD_DEADLINE_EPOCH (integer epoch s: the launcher's
+# epoch taken just before the create call + SPEND_CAP_SECONDS), optional CAP_PRESTART_S (180) and
+# POD_DEADLINE_LEAD_S (480); RunPod injects RUNPOD_POD_ID and a pod-scoped RUNPOD_API_KEY.
+# docs/STATUS.md "Pod deletion backstop", docs/runbooks/pod-launch.md.
+# 1. Hard-cap timer FIRST, before apt: it fires at min(first boot + SPEND_CAP_SECONDS -
+#    CAP_PRESTART_S, POD_DEADLINE_EPOCH - POD_DEADLINE_LEAD_S). CAP_PRESTART_S is the allowance for
+#    billed time before the container starts (image pull; estimated); POD_DEADLINE_EPOCH counts from
+#    creation, so it needs no estimate. The lead (480 s) is longer than the outside watchdog's
+#    (scripts/pod/watchdog.py, 400 s), so the pod normally deletes itself first.
+#    A POD_DEADLINE_EPOCH that is set but not an integer epoch in seconds deletes the pod at once.
 #    The first-boot epoch lives on /workspace, so a container restart re-arms the timer with only
 #    the time left instead of a fresh cap. A non-integer cap deletes the pod at once.
 # 2. The timer runs /root/delete_self.sh (a copy of scripts/pod/delete_self.sh): REST v2 DELETE
@@ -24,12 +30,25 @@ case "$first" in '' | *[!0-9]*) first=$(date +%s) ;; esac
 boots=$(($(cat "$F.boots" 2>/dev/null || echo 0) + 1))
 echo "$boots" > "$F.boots"
 hard=$((first + cap - pre))
+dl=${POD_DEADLINE_EPOCH:-}
+dlead=${POD_DEADLINE_LEAD_S:-480}
+case "$dlead" in '' | *[!0-9]*) dlead=480 ;; esac
+src="first boot $first + cap $cap - prestart $pre"
+from=first_boot
+case "$dl" in
+  '') ;;
+  *[!0-9]* | ????????????*)  # not an integer, or > 11 digits (e.g. milliseconds): fail safe
+    log "POD_DEADLINE_EPOCH '$dl' is not an epoch in seconds: deleting the pod now"
+    hard=0; src="bad POD_DEADLINE_EPOCH"; from=bad ;;
+  *) if [ $((dl - dlead)) -lt "$hard" ]; then hard=$((dl - dlead)); src="creation deadline $dl - lead $dlead"; from=creation; fi ;;
+esac
 umask 077
 {
   printf 'export RUNPOD_POD_ID=%q\n' "${RUNPOD_POD_ID:-}"
   printf 'export RUNPOD_API_KEY=%q\n' "${RUNPOD_API_KEY:-}"
   printf 'export SPEND_CAP_SECONDS=%q\n' "${SPEND_CAP_SECONDS:-}"
   printf 'export POD_HARD_DEADLINE=%s\nexport POD_BOOT_N=%s\n' "$hard" "$boots"
+  printf 'export POD_DEADLINE_EPOCH=%q\n' "$dl"
 } > /root/runpod.env
 echo "$first" > /root/pod_start_epoch
 cat > /root/delete_self.sh <<'DELETE_SELF_EOF'
@@ -74,7 +93,7 @@ attempt() {
   [ "$rc" = 0 ] && case "$body" in *'"errors"'*) false ;; *'"podTerminate"'*) true ;; *) false ;; esac
 }
 if [ -z "${RUNPOD_POD_ID:-}" ] || [ -z "${RUNPOD_API_KEY:-}" ]; then
-  log "RUNPOD_POD_ID or RUNPOD_API_KEY empty: this pod cannot delete itself; only the Mac-side backstop can"
+  log "RUNPOD_POD_ID or RUNPOD_API_KEY empty: this pod cannot delete itself; only the outside watchdog (scripts/pod/watchdog.py) can"
   exit 2
 fi
 while :; do
@@ -96,7 +115,7 @@ DELETE_SELF_EOF
 umask 022
 rem=$((hard - $(date +%s)))
 [ "$rem" -gt 0 ] || rem=0
-log "boot $boots; hard cap: delete in $rem s (epoch $hard = first boot $first + cap $cap - prestart $pre)"
+log "boot $boots; hard cap: delete in $rem s (epoch $hard = $src)"
 (
   sleep "$rem"
   log "spend cap reached; deleting pod"
@@ -123,6 +142,7 @@ else
   st="$st http=$code"
 fi
 kill -0 "$(cat /root/cap_timer.pid)" 2> /dev/null && st="$st timer=armed" || st="$st timer=DEAD"
+st="$st cap_from=$from"
 echo "$st" > /root/backstop_status
 log "backstop: $st"
 mkdir -p /root/.ssh /run/sshd

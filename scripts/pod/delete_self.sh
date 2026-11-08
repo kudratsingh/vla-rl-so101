@@ -39,7 +39,7 @@ attempt() {
   [ "$rc" = 0 ] && case "$body" in *'"errors"'*) false ;; *'"podTerminate"'*) true ;; *) false ;; esac
 }
 if [ -z "${RUNPOD_POD_ID:-}" ] || [ -z "${RUNPOD_API_KEY:-}" ]; then
-  log "RUNPOD_POD_ID or RUNPOD_API_KEY empty: this pod cannot delete itself; only the Mac-side backstop can"
+  log "RUNPOD_POD_ID or RUNPOD_API_KEY empty: this pod cannot delete itself; only the outside watchdog (scripts/pod/watchdog.py) can"
   exit 2
 fi
 while :; do

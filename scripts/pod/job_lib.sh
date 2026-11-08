@@ -1,8 +1,9 @@
 # Sourced by the pod job scripts (diag_job.sh, demo_rebuild_job.sh, wo04_job.sh): time budget,
 # time-limited stages, soft-deadline watchdog and self-delete. Not executable on its own.
 #
-# Budget. H = the pod's hard cap: POD_HARD_DEADLINE written by scripts/pod/pod_start_cmd.sh (first
-# boot + SPEND_CAP_SECONDS - CAP_PRESTART_S); pods started by an older command fall back to
+# Budget. H = the pod's hard cap: POD_HARD_DEADLINE written by scripts/pod/pod_start_cmd.sh
+# (min(first boot + SPEND_CAP_SECONDS - CAP_PRESTART_S, POD_DEADLINE_EPOCH - 480 s), so the job ends
+# before the outside watchdog fires at POD_DEADLINE_EPOCH - 400 s); pods started by an older command fall back to
 # pod_start_epoch + SPEND_CAP_SECONDS. Soft deadline D = H - SOFT_MARGIN_S (1200 s).
 #   - every stage is time-limited to min(its own limit, D) with `timeout -k KILL_AFTER_S` (120 s):
 #     a child that ignores SIGTERM is SIGKILLed instead of blocking the job;

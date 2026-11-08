@@ -168,3 +168,49 @@ def test_cap_timer_retries_and_survives_restart(tmp_path: Path) -> None:
     t = _wait_deleted(proc, deleted, 10)
     assert t is not None and t <= 4, (t, log.read_text())
     assert (tmp_path / "fs/workspace/.first_boot_epoch.fake-pod.boots").read_text().strip() == "2"
+
+
+def _env_file(tmp: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in (tmp / "fs/root/runpod.env").read_text().splitlines():
+        k, _, v = line.removeprefix("export ").partition("=")
+        out[k] = v
+    return out
+
+
+def test_deadline_epoch_counts_from_creation(tmp_path: Path) -> None:
+    """POD_DEADLINE_EPOCH (create time + cap) fires the timer at deadline - lead even when the
+    boot-relative cap is far away (60 s here)."""
+    dl = int(time.time()) + 3
+    proc, log, deleted = _boot(tmp_path, 60, POD_DEADLINE_EPOCH=str(dl), POD_DEADLINE_LEAD_S="1")
+    t = _wait_deleted(proc, deleted, 10)
+    assert t is not None and t <= 2 + 4, (t, log.read_text() if log.exists() else "")
+    env = _env_file(tmp_path)
+    assert env["POD_HARD_DEADLINE"] == str(dl - 1) and env["POD_DEADLINE_EPOCH"] == str(dl)
+    status = (tmp_path / "fs/root/backstop_status").read_text()
+    assert "timer=armed" in status and "cap_from=creation" in status, status
+
+
+def test_deadline_epoch_later_than_boot_cap_keeps_boot_cap(tmp_path: Path) -> None:
+    """The earlier of the two wins: a deadline beyond first boot + cap leaves the boot cap."""
+    proc, _, deleted = _boot(tmp_path, 2, POD_DEADLINE_EPOCH=str(int(time.time()) + 600))
+    t = _wait_deleted(proc, deleted, 10)
+    assert t is not None and t <= 2 + 4, t
+    assert "cap_from=first_boot" in (tmp_path / "fs/root/backstop_status").read_text()
+
+
+def test_bad_deadline_epoch_deletes_at_once(tmp_path: Path) -> None:
+    """A deadline that is not an epoch in seconds (text, or milliseconds) fails safe: delete now,
+    though the boot cap alone would allow 60 s."""
+    for i, bad in enumerate(("soon", str(int(time.time() * 1000)))):
+        d = tmp_path / str(i)
+        d.mkdir()
+        proc, log, deleted = _boot(d, 60, POD_DEADLINE_EPOCH=bad)
+        t = _wait_deleted(proc, deleted, 10)
+        assert t is not None and t <= 3, (bad, t, log.read_text() if log.exists() else "")
+        assert _env_file(d)["POD_HARD_DEADLINE"] == "0"
+        # the timer can fire before the key check writes backstop_status: read the boot log
+        assert (
+            "is not an epoch in seconds: deleting the pod now"
+            in (d / "fs/root/boot.log").read_text()
+        )
