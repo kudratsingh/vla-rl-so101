@@ -12,9 +12,10 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 01 | done, merged | #7 (merged) | See benchmarks. Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). |
 | 02 | closed by owner decision, **below the original target band**; PR open | `wo-02-sft` | OpenVLA-OFT LoRA SFT, 4 attempts, all below the 20-60% band on seen positions (ADR-0001). Owner (2026-10-27): keep OFT, amend rule 3, close with the full protocol table of attempt 4 `step_004000` (25 demos/task): seen PickPlace 17.0%, Push 10.0%, Stack 2.7% (`docs/results.md`). |
 | 03 | done, merged after owner review | #4 (merged) | **Out of order** (started before WO-01/02). CPU only, toy env. |
-| 06 | part 1 merged, kit arrived, physical bring-up pending | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
+| 06 | part 1 merged, kit arrived, physical bring-up pending | #5 (merged), #24 (`wo-06-bringup`, PR open, merged into #29) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
 | 04 | **benchmark not met; next step waits for the owner**, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
-| 05, 07, 08, 09 | not started | | |
+| 07 | code only, **out of order** (started before WO-06 bring-up is verified): pilot client/server and real-eval harness on fakes, **unverified on hardware** | #23 (`wo-07-pilot`), #29 (`fix/robot-safety`), PRs open | Mock pilot, gRPC server, `scripts/wo07_real_eval.py` (protocol 0.2), placement grid. No real trials. |
+| 05, 08, 09 | not started | | |
 | pre-run hardening | PR open, **waits for owner review** (touches the RL loop) | `fix/pre-run-hardening` | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
 | robot safety (PR 2) | PR open against `wo-07-pilot`; merge after #23, #24 and #28 (it merges #24 and #28) | `fix/robot-safety` | Review 3.3 gaps 2, 3, 5 and 7, plus the owner's 2026-11-08 review changes (homing offsets, torque off unconfirmed, real-eval session fingerprint, parking off by default), $0, **unverified on hardware**. See "Robot safety hardening" below. |
 
@@ -212,9 +213,13 @@ Review 3.3 and section 9's robot item. The branch is PR #23's branch (`wo-07-pil
   is logged against a 10 ms budget. A fault means torque off at once, the deadman latched
   TORQUE_OFF, and a `SERVO FAULT` prompt to support the arm and cut the supply: not HOLD, not a
   park. Thresholds are 55 C (the firmware cut-out is 70 C) and 1500 mA sustained for 1 s. They
-  are **placeholders that need the owner's confirmation on the arm**. Teleop also reads both
-  registers after each scene prompt, before the follower moves. The monitor does not read while
-  a prompt waits.
+  are **placeholders that need the owner's confirmation on the arm**. It does not read while a
+  prompt waits. At every teleop prompt where the follower holds under torque (scene, keep,
+  resume) it reads both registers once before the wait and once after the answer, before the
+  follower moves; the final support prompt reads them once before its wait. A current found
+  over the limit by such an on-demand read is re-read after `current_trip_s` (1 s) before the
+  call returns. Over-current counts as sustained only over continuous monitoring (no gap
+  between current reads longer than max(2 × 533 ms, 1 s), at least two readings).
 - Torque-enable refusal. Every torque enable first runs `check_rest_pose` with torque off. It
   refuses when a joint rests more than 1 deg outside its calibrated range (the calibration file
   and the servo EEPROM must also agree) or more than 6 deg outside the safety limits. Covers
@@ -275,11 +280,47 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
     support the arm, then turns torque off. Checklist step 5 says how to enable parking after
     the rest-pose and park-path checks.
   - The placements are the same for SFT and SFT+RL. `--hardware` refuses any `--slot-seed`
-    other than `eval.slot_seed`. `sample_plan` is now prefix-stable in the trial count. Every
+    other than `eval.slot_seed`. `sample_plan` is prefix-stable in the trial count (for any n
+    since the review fixes). Every
     record carries `placement_plan_sha256`.
   - Settling interval: `eval.settle_s` = 3 s. The arm holds still, the servos are read once,
     then the operator scores the trial. The interval is part of judging rule `real-judge-1`
     (its text and hash) and of each trial's `settle` field.
+- PR #29 review fixes (2026-11-08, $0, fakes only):
+  - Torque off reaches every motor. `So101Driver.torque_off` no longer calls lerobot's
+    `disable_torque`, which stopped at the first motor whose write raised (lerobot's `write`
+    also raises on a status error bit such as overload/overheat, though the motor accepted the
+    write), leaving the servos after it energized. It broadcasts Torque_Enable=0, then writes it
+    to each motor in its own try (`bus._write(..., raise_on_error=False)`), then Lock=0. An
+    error bit counts as written (logged); motors with no reply are named in the
+    `torque_off_unconfirmed` latch. The disconnect path uses it too. Checked against lerobot
+    0.4.4's real `FeetechMotorsBus` with the packet I/O stubbed (no port).
+  - A connect that fails before the port opens no longer raises the "unconfirmed" alarm.
+  - Teleop: any other exception holds the follower, discards the episode and shows the bounded
+    support prompt before torque goes off.
+  - Real eval: an unexpected exception is never a healthy end (no park; hold + support;
+    `session_end` "error: ..."); a client bug in the move home trips the deadman.
+    `record.json` is written when the session is bound and after each trial, so a killed run
+    resumes itself. `--resume` refuses a run that a later run of the session continued. A
+    TORQUE OFF UNCONFIRMED at an earlier run's shutdown is warned about on resume (hardware:
+    type `checked`) and carried forward. The policy fingerprint includes the server's
+    `adapter_sha256` (content of the adapter files) and Hub revision; `--hardware` refuses a
+    server without it. The placement plan is prefix-stable for any n (independent RNG streams;
+    the plan, and so `grid_sha256`, changed: no session has run yet).
+  - Scoring (judging rule `real-judge-1` text, so its hash, changed): a trial that ran and
+    then faulted (servo / serial fault in the trial or at the settle read) skips the settle,
+    the operator supports the arm first, then scores it; it is never a free redo. Ctrl-C (or
+    EOF) at the score prompt records the trial as a failure (`score_interrupted`), so a resume
+    cannot re-roll it. **Owner check:** this applies "doubt counts as fail" to both cases; the
+    alternative (abort and redo) was rejected because it turns policy-caused faults into redos.
+  - `scripts/make_placement_grid.py` takes `--config/--preset` (only `real`).
+- **Accepted gap (owner decision pending):** the real-eval and pilot prompts in
+  `src/robot/client.py` (`run_trials` home and placement confirms, the score prompt, the
+  `safe_shutdown` support wait) wait without a time limit and without servo reads while the arm
+  holds under torque. The firmware's 70 C cut-out is the backstop. Procedural rule until the
+  owner decides: the operator stays at the arm with a hand on the inline switch and never
+  leaves it at a prompt. Moving `TorqueWait` into `src/robot` and bounding these prompts is
+  the follow-up.
 - Proposal, implemented behind config: a bounded torque-on wait at teleop prompts
   (`teleop.prompt_torque_timeout_s` = 60 s, `prompt_support_grace_s` = 10 s; `null` = old
   behaviour). Each torque-on prompt reads servo health before and after the wait. With no

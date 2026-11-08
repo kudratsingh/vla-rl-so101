@@ -3,11 +3,12 @@
 An ordered list of steps you can copy and paste, from a bare kit to 15 teleop sanity episodes.
 Work through it top to bottom. Each step lists the command, what it writes, the expected
 output, a pass/fail check, and what to send back to the agent. Every command was checked against
-the scripts on branch `wo-06-bringup` and against lerobot 0.4.4 as installed in `.venv`, and
+the scripts on branch `fix/robot-safety` (PR #29) and against lerobot 0.4.4 as installed in `.venv`, and
 exercised with fakes or on the CPU sim. None of it has run on the real arm yet, so the expected
 outputs are what the code prints, not observed hardware behaviour.
 
-**Motion markers.** Each marker cites the code that justifies it.
+**Motion markers.** Each marker cites the code that justifies it. Repo code is cited by symbol
+(function, class or config key), not by line number, so later edits do not break the citation.
 
 | Marker | Meaning |
 |---|---|
@@ -30,7 +31,7 @@ outputs are what the code prints, not observed hardware behaviour.
 The only stock CLIs used below are `lerobot-setup-motors` (motor IDs), `lerobot-find-cameras`
 and, optionally, `lerobot-find-port`. For anything that moves the follower, use only
 `scripts/wo06_teleop_record.py`, which sends every command through `src/robot/safety.py`
-(`src/robot/driver.py:268-271`).
+(`So101Driver.step` in `src/robot/driver.py`: `safety.filter`, then `_write`).
 
 ---
 
@@ -68,7 +69,8 @@ uv run pytest -q tests/test_safety.py tests/test_driver.py tests/test_units.py t
 ```
 
 - **Writes:** `.venv` only.
-- **Expected:** `robot deps ok`, then `40 passed`.
+- **Expected:** `robot deps ok`, then all passed, 0 failed (61 at the time of writing; the count
+  grows as tests are added).
 - **Pass/fail:** any import error or test failure is a fail. Stop and send the agent the output.
 - **Why 🟢:** nothing opens a serial port. The tests use fakes only (`tests/robot_fakes.py:1`).
 - **Report back:** the servo label and the measured voltage, both arms, and the `pytest` summary line.
@@ -226,7 +228,7 @@ The expected directions come from the sim's FK (`src/env/kinematics.py`) evaluat
 
 - **Fixes:** a joint moving the wrong way → flip its entry in `robot.units.arm_sign`. A constant
   error → `robot.units.arm_offset_deg` (degrees). A reversed gripper → swap `gripper_closed_rad`
-  and `gripper_open_rad` (`configs/real.yaml:18-22`). Copy-paste edit that keeps the comments:
+  and `gripper_open_rad` (`configs/real.yaml` block `robot.units`). Copy-paste edit that keeps the comments:
   `uv run python -c "from src.robot.yamlio import update_yaml_file as u; u('configs/real.yaml', ['robot','units','arm_sign'], [1,1,1,1,1])"`.
   Then rerun step 4 with `--write-limits`.
 - **Also note the resting pose:** fold the arm into the pose it will rest in when teleop
@@ -358,7 +360,7 @@ uv run scripts/wo06_calibrate.py --preset real verify --device leader
   in the same pose as the follower (verified in step 5) and every joint agrees within ~5°.
   Trigger closed ≈ −10°, open ≈ +100°.
 - **Pass/fail:** leader verify follows the same direction rules as step 5. Teleop applies the
-  follower's `robot.units` to the leader (`scripts/wo06_teleop_record.py:414`, `UnitMap.from_config`),
+  follower's `robot.units` to the leader (`main` in `scripts/wo06_teleop_record.py`, `UnitMap.from_config`),
   so a leader-only sign or offset difference can't be fixed in the config. Recalibrate whichever
   arm disagrees.
 - **Why 🟡:** the leader never receives a goal position: `get_action` is `sync_read` only
@@ -400,9 +402,9 @@ What happens and what you do:
 2. `[Push 1/1] arrange the scene, hold the leader, ENTER (q = end):`. Hold the leader mid-workspace:
    gripper above the table, every joint away from its stops, trigger mid-way. Press ENTER.
    **Bounded torque-on wait (proposal, on by default):** every prompt answered while the
-   follower holds under torque (this one, `keep this episode ...`, `type 'resume' ...` and the
-   final support prompt) reads the servos' temperature and current before it waits and again
-   after you answer. If you do not answer within `teleop.prompt_torque_timeout_s` (60 s), it
+   follower holds under torque (this one, `keep this episode ...`, `type 'resume' ...`) reads
+   the servos' temperature and current before it waits and again after you answer; the final
+   support prompt reads them once before it waits (torque goes off right after it). If you do not answer within `teleop.prompt_torque_timeout_s` (60 s), it
    prints `No answer for 60 s with torque ON. SUPPORT THE ARM NOW ... Torque goes OFF in 10 s
    (ENTER = now) and the session ends.` Support the arm: after `teleop.prompt_support_grace_s`
    (10 s) torque goes off and the session ends (saved episodes are kept, an unsaved one is
@@ -410,16 +412,17 @@ What happens and what you do:
    reads the servo bus in the background. `null` restores the old wait-forever behaviour (not
    recommended).
 3. **Sync (not recorded):** the follower eases onto the leader's pose, clipped to the safety limits,
-   at ≤ 4°/step and 60°/s (`configs/real.yaml:28-29`). A fully closed or open trigger, or a leader
+   at ≤ 4°/step and 60°/s (`configs/real.yaml` keys `robot.safety.max_joint_step_deg` and
+   `max_velocity_deg_s`). A fully closed or open trigger, or a leader
    joint at its stop, does not block this, also when the follower starts outside a limit (gripper
    resting closed, arm folded on its stops): like the safety filter, the sync then accepts the
-   joint where the filter holds it (`scripts/wo06_teleop_record.py:170-215`). If the
+   joint where the filter holds it (`Session.sync_to_leader` in `scripts/wo06_teleop_record.py`). If the
    script prints `safety rejects the leader pose (...)`, move the leader's gripper into
    `workspace_box_m`. If it prints `not in sync after 10 s ...`, it lists the joints that are lagging.
    Ctrl-C prints `sync aborted`. In every case the follower holds, and you get the prompt again.
 4. `recording (30 s max, Ctrl-C to end) ...`. Move slowly. **Bring the follower low over the table,
    then press Ctrl-C once.** The current control tick finishes, `episode ended` prints, and the
-   follower holds that pose (line 328).
+   follower holds that pose (the `arm.hold()` at the end of the recording loop in `_episodes`).
 5. `keep this episode (N frames)? [Y]es / [n]o, redo / [q]uit:` → type `q`.
 6. With `robot.park.enabled: false` (the default for this first rehearsal): the follower holds,
    and you get `... Put a hand under the forearm ..., then press ENTER: torque goes OFF`.
@@ -464,9 +467,10 @@ What happens and what you do:
   ends. In the pilot and the real eval the trial record, the shutdown result and the session
   end say `torque_off_unconfirmed`. Leave the supply off until the cause is found.
 - **Why 🔴:** `So101Driver.connect` enables torque through LeRobot's `configure()`
-  (`src/robot/driver.py:158`). Each tick, the safety filter runs and then the bus write follows
-  (`src/robot/driver.py:268-271`). The sync and recording loops drive the follower
-  (`scripts/wo06_teleop_record.py:170-215,311-328`).
+  (`self.follower.connect(calibrate=False)` in `So101Driver.connect`). Each tick, the safety
+  filter runs and then the bus write follows (`So101Driver.step`: `safety.filter`, then
+  `_write`). The sync and recording loops drive the follower (`Session.sync_to_leader` and the
+  recording loop in `_episodes`, `scripts/wo06_teleop_record.py`).
 - **Report back:** the full terminal log (or the `safety`/`STOPPED` lines), and whether
   anything moved unexpectedly.
 
@@ -483,7 +487,8 @@ uv run scripts/wo06_teleop_record.py --preset real              # 3 tasks x 5 ep
 
 For a private Hub copy, decide before you start: run `uv run hf auth login` once, then add `--push`
 to the command above. The upload runs after the session, only if at least one episode was saved,
-and always private (`scripts/wo06_teleop_record.py:464-466`). Never use `lerobot-record`, which
+and always private (`dataset.push_to_hub(private=True)` at the end of `main` in
+`scripts/wo06_teleop_record.py`). Never use `lerobot-record`, which
 uploads publicly by default.
 
 For each episode: arrange the scene, then hold the leader mid-range (trigger mid-way) and press ENTER.
@@ -494,8 +499,12 @@ seconds; Ctrl-C is ignored) ...`: wait for the next prompt. If saving fails it p
 torque. It does not follow the leader at the prompts, so moving the leader then does nothing.
 Watch servo heat. If the servos feel hot, end the session with `q`, power off, and let them cool.
 The servo monitor (step 9) cuts torque by itself at its thresholds. Do not rely on it alone:
-its thresholds are unconfirmed. It does not read while the script waits at a prompt; it reads
-once when you press ENTER, before the follower moves.
+its thresholds are unconfirmed. It does not read while a prompt waits. At every prompt where
+the follower holds under torque (scene, keep, resume) it reads temperature and current once
+before the wait and once after you answer, before the follower moves, and the wait is capped at
+`teleop.prompt_torque_timeout_s` (60 s). The final support prompt reads them once before its
+wait. A current found over the limit is re-read after 1 s at once, so a sustained over-current
+trips before the prompt waits.
 
 - **Writes:** `data/real_teleop/vla-rl-so101-real-teleop/`, a LeRobotDataset v3.0 at 15 fps
   with 224×224 video and float32[6] canonical-radian state/action. The per-frame `task` is the
@@ -505,10 +514,11 @@ once when you press ENTER, before the follower moves.
   strings, which differ for PickPlace and Push.
 - **Expected:** 15 × `[<Task> k/5] ...`, then `saved 15 episodes to .../data/real_teleop/vla-rl-so101-real-teleop`.
 - **Pass/fail:** 15 saved, with no unexpected motion. There is no resume: rerunning with `--overwrite`
-  deletes the saved episodes (`scripts/wo06_teleop_record.py:419-422`). Copy the folder aside
+  deletes the saved episodes (the `--overwrite` / `shutil.rmtree(root)` branch of `main` in
+  `scripts/wo06_teleop_record.py`). Copy the folder aside
   before any rerun.
 - **Why 🔴:** same path as step 9. The stored `action` is the safe command actually sent
-  (`scripts/wo06_teleop_record.py:321`).
+  (`ACTION_KEY: out.safety.command` in the recording loop of `_episodes`).
 - **Report back:** the `saved N episodes` line, per-task notes (success by eye, any
   `STOPPED`/`REJECTED` lines), and the Hub URL if you pushed.
 
@@ -525,10 +535,19 @@ once when you press ENTER, before the follower moves.
   off after 10 s (step 9, item 2). A servo fault or a serial error has already turned
   torque off: support the arm. Ctrl-C during the sync aborts it and holds. During recording it ends
   the episode, not the session. Outside a prompt Ctrl-C never interrupts a servo-bus or dataset
-  call: it is a flag checked between control ticks (`scripts/wo06_teleop_record.py:218-234`), and
+  call: it is a flag checked between control ticks (`ctrl_c_as_flag` in
+  `scripts/wo06_teleop_record.py`), and
   it is ignored while an episode saves or the follower settles into its hold. Ctrl-C at the
   "support the arm" prompt is ignored too (`Ctrl-C ignored: the follower still holds ...`): only
-  ENTER turns torque off, so support the arm first, or cut the servo supply.
+  ENTER, or the bounded wait running out (60 s with torque on, then the 10 s grace), turns
+  torque off, so support the arm first, or cut the servo supply. Any other error (the dataset,
+  the image pipeline, a bug) also holds the follower, discards the episode and shows the same
+  support prompt before the script exits with the error.
+- **Pilot and real eval (`scripts/wo07_pilot.py`, `scripts/wo07_real_eval.py`):** their prompts
+  (move home, place the objects, score the trial, support the arm at the end) wait **without a
+  time limit and without servo reads** while the arm holds under torque (accepted gap,
+  `docs/STATUS.md`). Never leave the arm at one of those prompts: stay at the arm with a hand
+  on the inline switch, and switch the supply off if you must step away.
 - **If anything looks wrong at any moment, or the script prints `TORQUE OFF UNCONFIRMED`:**
   switch off the follower's servo supply at the inline power switch. Torque goes off instantly
   and the arm drops, so keep it low.

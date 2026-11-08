@@ -18,7 +18,12 @@ never reported as end-to-end until the capture offset below has been measured an
   measured on this Mac.
 - What the stamp excludes: exposure, sensor readout, USB transfer, AVFoundation / driver
   buffering and decode. On a USB webcam these terms can total tens of ms, and more if
-  auto-exposure is on. Lock exposure first (WO-06 checklist step 7).
+  auto-exposure is on. **No exposure lock exists yet**: exposure / white-balance / focus locking
+  is not implemented (project review gap 4, open, out of scope for PR #29), and no WO-06
+  checklist step covers it. Until it is, keep `deploy.capture_offset_ms: null`, so the client
+  keeps printing `end-to-end latency: NOT measured` and no `end_to_end_estimate_ms` is reported.
+  The capture timestamp itself is not verified either: the procedure below measures an offset,
+  it does not make the driver stamp capture.
 
 A driver-side capture timestamp aligned with the host clock is therefore not available without
 new code below LeRobot. Measure the offset optically once instead.
@@ -30,8 +35,11 @@ two Python processes on the same Mac share it. One process shows the clock on sc
 other saves camera frames named by their LeRobot stamp. The offset for each frame is
 `stamp - clock value visible in the frame`.
 
-1. Prerequisites: WO-06 step 6 (camera index, `cameras.front` in `configs/real.yaml`), with
-   exposure locked as it will be for WO-07. The arm can stay unpowered.
+1. Prerequisites: WO-06 step 6 (camera index, `cameras.front` in `configs/real.yaml`), and an
+   exposure lock that will also be in force for WO-07. That lock does not exist yet (gap 4,
+   above): do this measurement only once it does. A value measured under auto-exposure is
+   invalid by the rule below; leave `deploy.capture_offset_ms` null until then. The arm can stay
+   unpowered.
 2. Terminal A: a large running clock. Zoom the terminal font (Cmd +) until the digits fill
    about a third of the camera view, then point the robot camera at the screen:
 
