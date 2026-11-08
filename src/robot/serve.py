@@ -12,8 +12,12 @@ Service ``vla_rl_so101.Policy``, two unary RPCs, generic handlers with raw-bytes
 .proto, no grpcio-tools codegen, nothing generated for mypy):
 
 * ``Info`` -> chunk_len, action_dim, image_size, protocol_version / protocol_hash (of the server's
-  checkout), policy_id (adapter id or mock name) and the policy's ``describe()``. The client
-  refuses to run on any mismatch.
+  checkout), policy_id (the loaded adapter id or a mock name, never empty), the policy's
+  ``describe()`` and ``server_run`` (the server's run id and device). The client refuses to run
+  on any mismatch, and on a policy_id other than ``server.policy_checkpoint`` when that is set.
+
+``main`` keeps a run record (``runs/<id>/record.json``) for the server's whole uptime: on the pod
+it picks up the GPU name and RUNPOD_POD_ID, so the paid side of a real-arm session is priced.
 * ``Act(request_id, instruction, image uint8 (S, S, 3) RGB, state float32 (6,) rad)`` ->
   ``actions float32 (C, 6)`` rad plus ``infer_ms`` (policy call) and ``server_ms`` (request
   received -> reply serialised). Bad requests abort INVALID_ARGUMENT, policy errors INTERNAL.
@@ -29,11 +33,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import struct
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent import futures
+from pathlib import Path
 from typing import Any, Protocol
 
 import grpc
@@ -43,6 +49,7 @@ import numpy.typing as npt
 from src.config import Config, add_config_args, load_config
 from src.eval.protocol import PROTOCOL_VERSION, protocol_hash
 from src.robot.units import NUM_JOINTS
+from src.runs import RUNS_DIR, Run, new_run_id
 
 log = logging.getLogger(__name__)
 
@@ -135,6 +142,7 @@ class MockPolicy:
     ``mode`` (mutable, read on every call): ``ok`` | ``nan`` (non-finite chunk) | ``bad_shape`` |
     ``error`` (raises) | ``hang`` (blocks until ``release`` is set, at most ``hang_s`` real seconds).
     ``infer_s`` is charged to the injected ``sleep`` (a fake clock in tests, so latency is exact).
+    ``reset`` restarts the walk at the first waypoint (the pilot calls it before every trial).
     """
 
     def __init__(
@@ -163,6 +171,9 @@ class MockPolicy:
         self.release = threading.Event()
         self.calls = 0
         self.instructions: list[str] = []
+
+    def reset(self) -> None:
+        self.calls = 0
 
     def act(self, obs: Mapping[str, np.ndarray], instruction: str) -> np.ndarray:
         self.calls += 1
@@ -236,11 +247,16 @@ class PolicyServer:
         image_size: int,
         policy_id: str,
         clock: Callable[[], float] = time.perf_counter,
+        server_run: Mapping[str, Any] | None = None,
     ):
+        if not policy_id or policy_id.strip().lower() in ("none", "null"):
+            raise ValueError(f"policy_id must name the served checkpoint, got {policy_id!r}")
         self.policy = policy
         self.image_size = int(image_size)
-        self.policy_id = str(policy_id)
+        self.policy_id = policy_id
         self.clock = clock
+        self.server_run = dict(server_run) if server_run is not None else None
+        self.requests = 0
         self._lock = threading.Lock()
 
     def info(self) -> dict[str, Any]:
@@ -253,6 +269,7 @@ class PolicyServer:
             "protocol_hash": protocol_hash(),
             "policy_id": self.policy_id,
             "describe": self.policy.describe(),
+            "server_run": self.server_run,  # run_id + device of the server's own run record
         }
 
     def handle_info(self, request: bytes, context: Any) -> bytes:
@@ -267,6 +284,7 @@ class PolicyServer:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"bad Act request: {e}")
             raise  # abort raises; this keeps mypy and a non-grpc caller honest
         with self._lock:
+            self.requests += 1
             t0 = self.clock()
             try:
                 actions = np.asarray(self.policy.act(obs, instruction), dtype=np.float32)
@@ -324,25 +342,55 @@ def build_server(
     return server, bound
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def _sigterm(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt  # a stopped pod sends SIGTERM: close the run record the same way
+
+
+def main(argv: Sequence[str] | None = None) -> Path:
     parser = argparse.ArgumentParser(description="WO-07 policy server (GPU box)")
     add_config_args(parser)
     parser.add_argument("--adapter", default=None, help="LoRA dir or user/repo/path[@rev]")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default=DEFAULT_HOST, help="bind address (keep 127.0.0.1)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     cfg = load_config(args.preset, args.config)
-    policy = load_oft(cfg, args.device, args.adapter)
-    image_size = int((cfg.get("env") or {}).get("image_size", 224))
-    servicer = PolicyServer(policy, image_size=image_size, policy_id=str(args.adapter))
-    server, port = build_server(servicer, args.host, args.port)
-    print(f"serving {args.adapter} on {args.host}:{port}; Ctrl-C to stop")
-    try:
-        server.wait_for_termination()
-    except KeyboardInterrupt:
-        server.stop(grace=1.0)
+    policy_cfg = cfg.get("policy") or {}
+    adapter = args.adapter or policy_cfg.get("adapter")  # what make_policy actually loads
+    if adapter is None and not policy_cfg.get("tiny_random", False):
+        parser.error("no adapter: pass --adapter or set policy.adapter (never serve a bare base)")
+    policy_id = "tiny-random" if adapter is None else str(adapter)
+    signal.signal(signal.SIGTERM, _sigterm)
+    with Run(
+        work_order="WO-07",
+        script=__file__,
+        cfg=cfg,
+        device=args.device,
+        runs_dir=args.runs_dir,
+        run_id=new_run_id("WO-07", "serve"),
+    ) as run:
+        dev = run.record["device"]
+        server_run = {"run_id": run.id} | {
+            k: dev.get(k) for k in ("device", "name", "runpod_pod_id")
+        }
+        run.results.update(policy_id=policy_id, adapter=adapter, host=args.host)
+        policy = load_oft(cfg, args.device, adapter)
+        image_size = int((cfg.get("env") or {}).get("image_size", 224))
+        servicer = PolicyServer(
+            policy, image_size=image_size, policy_id=policy_id, server_run=server_run
+        )
+        server, port = build_server(servicer, args.host, args.port)
+        run.results["port"] = port
+        print(f"serving {policy_id} on {args.host}:{port} (run {run.id}); Ctrl-C to stop")
+        try:
+            server.wait_for_termination()
+        except KeyboardInterrupt:
+            server.stop(grace=1.0)
+        finally:
+            run.results["requests"] = servicer.requests
+    return run.record_path
 
 
 if __name__ == "__main__":
