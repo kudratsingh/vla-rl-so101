@@ -16,6 +16,14 @@ and RL rollout renders on the NVIDIA GPU sim. Two modes:
               stored joint state, so only the image differs). A codec floor -- the first
               `--floor-episodes` fresh episodes per task written through the same AV1 recorder and
               decoded again -- gives the pixel and token differences that are codec noise alone.
+              HEADLINE = t = 0 (owner 2026-11-08): the first frame of each episode, rendered from
+              the reset state before any replay physics, so only the renderer (and codec) differ:
+              pixels_t0, tokens_stored_vs_fresh_t0, state_max_abs_diff_t0_rad. The POOLED
+              all-frame numbers (pixels_all, tokens_stored_vs_fresh_all) are reported separately:
+              open-loop replay physics drift (state_mean_max_abs_diff_rad) contributes to them, so
+              they are not a pure renderer gap. `comparison` labels the run: a CPU run against a
+              set rendered on the Mac CPU renderer, or the rebuilt set re-rendered on the backend
+              that recorded it, is a SAME-RENDERER PIPELINE CHECK, not a Mac-vs-GPU gap.
   dry-run     (tiny default) build, then render-gap against the dataset just built: CPU on both
               sides, so the gap must be codec noise only.
 
@@ -54,6 +62,16 @@ from src.config import Config, add_config_args, load_config
 from src.runs import Run
 
 RELEASE_TOL = 1e-3  # rad: last gripper command counts as "at the release target"
+HEADLINE_NOTE = (
+    "headline = t0: the first frame of each episode, rendered from the reset state before any "
+    "replay physics (pixels_t0, tokens_stored_vs_fresh_t0, state_max_abs_diff_t0_rad)"
+)
+POOLED_NOTE = (
+    "pooled = every frame of the open-loop replay (pixels_all, tokens_stored_vs_fresh_all): replay "
+    "physics drift (state_mean_max_abs_diff_rad) contributes to this gap, so it is not a pure "
+    "renderer difference; reported separately from the t0 headline"
+)
+SAME_RENDERER = "same-renderer pipeline check"
 PIXEL_THRESH = 16  # |diff| (0-255) above which a pixel counts as changed
 MODES = ("build", "render-gap", "dry-run")
 
@@ -239,7 +257,12 @@ def render_gap(
     }
     cuda = str(cfg.get("device", "cpu")).startswith("cuda")
     floor: list[dict[str, Any]] = []  # fresh episodes to push through the codec afterwards
-    out: dict[str, Any] = {"dataset": repo_id, "tasks": {}}
+    out: dict[str, Any] = {
+        "dataset": repo_id,
+        "headline": HEADLINE_NOTE,
+        "pooled_note": POOLED_NOTE,
+        "tasks": {},
+    }
     for task in cfg["env"]["tasks"]:
         rows = [r for r in side if r["task_family"] == task][:episodes_per_task]
         if not rows:
@@ -251,6 +274,7 @@ def render_gap(
         dq_t0: list[float] = []
         dq_all: list[float] = []
         tok: dict[str, list[Any]] = {"stored": [], "fresh": [], "state": [], "instr": []}
+        tok0: dict[str, list[Any]] = {"stored": [], "fresh": [], "state": [], "instr": []}
         for cell in sorted({str(r["cell"]) for r in rows}):
             todo = [r for r in rows if str(r["cell"]) == cell]
             n = len(todo) if cuda else 1
@@ -292,6 +316,11 @@ def render_gap(
                         if t == 0:
                             pix_t0.append(stats)
                             dq_t0.append(dq)
+                            if policy is not None:  # every episode's t0 frame, whatever the stride
+                                tok0["stored"].append(stored)
+                                tok0["fresh"].append(fresh[i].clone())
+                                tok0["state"].append(st)
+                                tok0["instr"].append(instr[i])
                         if policy is not None and t % token_stride == 0:
                             tok["stored"].append(stored)
                             tok["fresh"].append(fresh[i].clone())
@@ -307,20 +336,23 @@ def render_gap(
             env.close()
         res: dict[str, Any] = {
             "episodes": len(rows),
+            # HEADLINE (t0: reset state, before any replay physics)
             "pixels_t0": _summary(pix_t0),
-            "pixels_all": _summary(pix_all),
             "state_max_abs_diff_t0_rad": round(max(dq_t0), 6) if dq_t0 else None,
+            # POOLED all frames: replay physics drift contributes (POOLED_NOTE)
+            "pixels_all": _summary(pix_all),
             "state_mean_max_abs_diff_rad": round(float(np.mean(dq_all)), 6) if dq_all else None,
         }
-        if policy is not None and tok["stored"]:
-            res["tokens_stored_vs_fresh"] = _token_stats(
-                policy,
-                torch.stack(tok["stored"]),
-                torch.stack(tok["fresh"]),
-                torch.stack(tok["state"]),
-                tok["instr"],
-                batch,
-            )
+        for key, buf in (("tokens_stored_vs_fresh_t0", tok0), ("tokens_stored_vs_fresh_all", tok)):
+            if policy is not None and buf["stored"]:
+                res[key] = _token_stats(
+                    policy,
+                    torch.stack(buf["stored"]),
+                    torch.stack(buf["fresh"]),
+                    torch.stack(buf["state"]),
+                    buf["instr"],
+                    batch,
+                )
         res["seconds"] = round(time.monotonic() - t0, 1)
         out["tasks"][task] = res
     if floor:
@@ -355,56 +387,108 @@ def codec_floor(
     k = 0
     for task in dict.fromkeys(ep["task"] for ep in floor):
         pix: list[tuple[float, float, float]] = []
+        pix0: list[tuple[float, float, float]] = []
         tok: dict[str, list[Any]] = {"raw": [], "dec": [], "state": [], "instr": []}
+        tok0: dict[str, list[Any]] = {"raw": [], "dec": [], "state": [], "instr": []}
         for ep in (e for e in floor if e["task"] == task):
             for img, st, _, t in ep["frames"]:
                 d = _to_uint8_hwc(dec[k][IMAGE_KEY])
                 k += 1
-                pix.append(_pixel_stats(img, d))
-                if policy is not None and t % token_stride == 0:
-                    tok["raw"].append(img)
-                    tok["dec"].append(d)
-                    tok["state"].append(st)
-                    tok["instr"].append(ep["instr"])
-        res: dict[str, Any] = {"pixels": _summary(pix)}
-        if policy is not None and tok["raw"]:
-            res["tokens_raw_vs_decoded"] = _token_stats(
-                policy,
-                torch.stack(tok["raw"]),
-                torch.stack(tok["dec"]),
-                torch.stack(tok["state"]),
-                tok["instr"],
-                batch,
-            )
+                stats = _pixel_stats(img, d)
+                pix.append(stats)
+                bufs = [tok] if t % token_stride == 0 else []
+                if t == 0:
+                    pix0.append(stats)
+                    bufs.append(tok0)
+                if policy is not None:
+                    for b in bufs:
+                        b["raw"].append(img)
+                        b["dec"].append(d)
+                        b["state"].append(st)
+                        b["instr"].append(ep["instr"])
+        # "pixels" / "tokens_raw_vs_decoded" pool every floor frame; *_t0 the first frames only
+        res: dict[str, Any] = {"pixels_t0": _summary(pix0), "pixels": _summary(pix)}
+        for key, buf in (("tokens_raw_vs_decoded_t0", tok0), ("tokens_raw_vs_decoded", tok)):
+            if policy is not None and buf["raw"]:
+                res[key] = _token_stats(
+                    policy,
+                    torch.stack(buf["raw"]),
+                    torch.stack(buf["dec"]),
+                    torch.stack(buf["state"]),
+                    buf["instr"],
+                    batch,
+                )
         out[task] = res
     return out
 
 
+def _f(x: Any, spec: str) -> str:
+    return "-" if x is None else format(x, spec)
+
+
+def _pct(frac: float | None) -> str:
+    return _f(None if frac is None else 100 * frac, "6.2f")
+
+
 def print_gap(gap: dict[str, Any]) -> None:
+    """Two tables: the t = 0 HEADLINE (renderer + codec only), then the POOLED all-frame numbers,
+    to which replay physics drift contributes."""
+    print(f"comparison: {gap.get('comparison', '?')}")
+    print("HEADLINE, t = 0 (first frame of each episode, reset state, before any replay physics)")
     head = (
-        f"{'task':<10} {'eps':>4} {'t0 |d|':>7} {'all |d|':>8} {'PSNR':>6} {'chg%':>6}"
-        f" {'dq0':>8} {'tok=':>6} {'tok0=':>6} {'floor |d|':>9} {'floor tok=':>10}"
+        f"{'task':<10} {'eps':>4} {'t0 |d|':>7} {'PSNR':>6} {'chg%':>6} {'dq0':>8}"
+        f" {'tok0=':>6} {'chunk0=':>7} {'floor0 |d|':>10} {'floor0 tok=':>11}"
     )
     print(head)
     print("-" * len(head))
     for task, r in gap["tasks"].items():
-        tk = r.get("tokens_stored_vs_fresh", {})
+        p0, tk0 = r["pixels_t0"], r.get("tokens_stored_vs_fresh_t0", {})
         fl = r.get("codec_floor", {})
-        ft = fl.get("tokens_raw_vs_decoded", {})
-
-        def f(x: Any, spec: str) -> str:
-            return "-" if x is None else format(x, spec)
-
         print(
-            f"{task:<10} {r['episodes']:>4} {f(r['pixels_t0']['mean_abs'], '7.3f')}"
-            f" {f(r['pixels_all']['mean_abs'], '8.3f')} {f(r['pixels_all']['psnr_db'], '6.1f')}"
-            f" {f(100 * r['pixels_all']['frac_pixels_changed'], '6.2f')}"
-            f" {f(r['state_max_abs_diff_t0_rad'], '8.1e')}"
-            f" {f(tk.get('token_agreement'), '6.3f')}"
-            f" {f(tk.get('first_action_token_agreement'), '6.3f')}"
-            f" {f(fl.get('pixels', {}).get('mean_abs'), '9.3f')}"
-            f" {f(ft.get('token_agreement'), '10.3f')}"
+            f"{task:<10} {r['episodes']:>4} {_f(p0['mean_abs'], '7.3f')}"
+            f" {_f(p0['psnr_db'], '6.1f')}"
+            f" {_pct(p0['frac_pixels_changed'])}"
+            f" {_f(r['state_max_abs_diff_t0_rad'], '8.1e')}"
+            f" {_f(tk0.get('token_agreement'), '6.3f')} {_f(tk0.get('chunk_identical'), '7.3f')}"
+            f" {_f(fl.get('pixels_t0', {}).get('mean_abs'), '10.3f')}"
+            f" {_f(fl.get('tokens_raw_vs_decoded_t0', {}).get('token_agreement'), '11.3f')}"
         )
+    print("\nPOOLED, all frames (replay physics drift contributes: NOT a pure renderer gap)")
+    head = (
+        f"{'task':<10} {'eps':>4} {'all |d|':>8} {'PSNR':>6} {'chg%':>6} {'dq mean':>8}"
+        f" {'tok=':>6} {'tok first=':>10} {'floor |d|':>9} {'floor tok=':>10}"
+    )
+    print(head)
+    print("-" * len(head))
+    for task, r in gap["tasks"].items():
+        pa, tk = r["pixels_all"], r.get("tokens_stored_vs_fresh_all", {})
+        fl = r.get("codec_floor", {})
+        print(
+            f"{task:<10} {r['episodes']:>4} {_f(pa['mean_abs'], '8.3f')}"
+            f" {_f(pa['psnr_db'], '6.1f')}"
+            f" {_pct(pa['frac_pixels_changed'])}"
+            f" {_f(r['state_mean_max_abs_diff_rad'], '8.1e')}"
+            f" {_f(tk.get('token_agreement'), '6.3f')}"
+            f" {_f(tk.get('first_action_token_agreement'), '10.3f')}"
+            f" {_f(fl.get('pixels', {}).get('mean_abs'), '9.3f')}"
+            f" {_f(fl.get('tokens_raw_vs_decoded', {}).get('token_agreement'), '10.3f')}"
+        )
+
+
+def comparison_label(cfg: Config, repo_id: str, mode: str, device: str) -> str:
+    """What a render-gap run compares, assuming the 0.1 sets were rendered on the Mac CPU renderer
+    (MoltenVK) and the rebuilt set (data.hub_repo) on the GPU renderer. Same renderer on both
+    sides: the dry run, a CPU run on a 0.1 set, the rebuilt set re-rendered on the GPU."""
+    rebuilt = repo_id == str(cfg.get("data", {}).get("hub_repo", ""))
+    cuda = device.startswith("cuda")
+    if mode == "dry-run" or (cuda and rebuilt):
+        return f"{SAME_RENDERER} (the set re-rendered on the renderer that recorded it)"
+    if not cuda and not rebuilt:
+        return (
+            f"{SAME_RENDERER} (Mac CPU renderer on both sides; NOT a Mac-vs-GPU renderer gap "
+            "measurement)"
+        )
+    return f"renderer gap: {repo_id} stored frames vs this {device} renderer"
 
 
 # ------------------------------------------------------------------------------------ main
@@ -515,9 +599,12 @@ def main(argv: list[str] | None = None) -> int:
                 work_dir=run.dir,
             )
             gap["backend"] = {"device": device, "render": run.record["device"]}
+            gap["comparison"] = comparison_label(cfg, repo_id, mode, device)
             (run.dir / "render_gap.json").write_text(json.dumps(gap, indent=2))
             run.results["render_gap"] = gap
-            print(f"\nrender gap: {repo_id} stored frames vs this backend ({device})")
+            print(
+                f"\nrender gap: {repo_id} stored frames vs this backend ({device}), {gap['comparison']}"
+            )
             print_gap(gap)
             print(f"wrote {run.dir / 'render_gap.json'}")
     print(f"record: {run.record_path}")

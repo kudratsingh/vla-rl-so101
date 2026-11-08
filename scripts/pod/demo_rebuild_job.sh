@@ -93,7 +93,10 @@ raise SystemExit(0 if min(rates.values()) >= 0.95 else 1)
 EOF
 
 stage probe-render-gap
-# review 3.2 diagnostic: the 0.1 set's Mac renders vs this GPU renderer, SFT adapter tokens on both
+# review 3.2 diagnostic: the 0.1 set's Mac renders vs this GPU renderer, SFT adapter tokens on both.
+# HEADLINE = t = 0 (first frame of each episode, before any replay physics: pixels_t0,
+# tokens_stored_vs_fresh_t0); the pooled all-frame numbers include replay physics drift and are
+# reported separately (render_gap.json headline / pooled_note)
 run_until_deadline uv run scripts/wo01r_rebuild_demos.py --preset sim --config "$CFG" \
   --mode render-gap "${GAP_ARGS[@]}" || exit 20
 upload "render-gap probe"

@@ -59,11 +59,18 @@ def test_tiny_dry_run_builds_full_tails_and_zero_render_gap(
     assert gap["state_max_abs_diff_t0_rad"] == 0.0 and gap["state_mean_max_abs_diff_rad"] == 0.0
     floor = gap["codec_floor"]
     assert gap["pixels_all"]["mean_abs"] == pytest.approx(floor["pixels"]["mean_abs"], abs=0.05)
-    tokens = gap["tokens_stored_vs_fresh"]
+    tokens = gap["tokens_stored_vs_fresh_all"]  # pooled: replay physics drift contributes
     assert tokens["frames"] > 0
     assert tokens["token_agreement"] == pytest.approx(
         floor["tokens_raw_vs_decoded"]["token_agreement"], abs=0.02
     )
+    # headline t0: one frame per episode (reset state, before any replay physics), any stride
+    t0 = gap["tokens_stored_vs_fresh_t0"]
+    assert t0["frames"] == gap["episodes"] == gap["pixels_t0"]["frames"]
+    assert floor["pixels_t0"]["frames"] >= 1 and "tokens_raw_vs_decoded_t0" in floor
+    rg = res["render_gap"]
+    assert rg["comparison"].startswith("same-renderer pipeline check")
+    assert "t0" in rg["headline"] and "physics drift" in rg["pooled_note"]
 
 
 def test_existing_presets_keep_the_01_recorder_and_cannot_clobber_the_01_repos() -> None:
@@ -82,3 +89,20 @@ def test_existing_presets_keep_the_01_recorder_and_cannot_clobber_the_01_repos()
     v2 = load_config("sim", CONFIG_DIR / "demos_v2.yaml")
     assert build.TailSettings.from_cfg(v2) == build.TailSettings(15, 45, True)
     assert build.oracle_profile(v2) == "v2" and v2["data"]["chunk_pad"] == "drop"
+
+
+def test_render_gap_comparison_labels() -> None:
+    """A Mac CPU run on a 0.1 set (both sides the Mac CPU renderer) is a same-renderer pipeline
+    check, not a Mac-vs-GPU gap; a GPU run on the 0.1 set is the renderer gap."""
+    from src.config import CONFIG_DIR, load_config
+
+    rebuild = _load("wo01r_rebuild_demos")
+    cfg = load_config("sim", CONFIG_DIR / "demos_v2.yaml")
+    old, new = cfg["render_gap"]["dataset"], cfg["data"]["hub_repo"]
+    label = rebuild.comparison_label
+    assert label(cfg, old, "render-gap", "cpu").startswith("same-renderer pipeline check")
+    assert "NOT a Mac-vs-GPU" in label(cfg, old, "render-gap", "cpu")
+    assert label(cfg, old, "render-gap", "cuda").startswith("renderer gap")
+    assert label(cfg, new, "render-gap", "cuda").startswith("same-renderer pipeline check")
+    assert label(cfg, new, "render-gap", "cpu").startswith("renderer gap")
+    assert label(cfg, new, "dry-run", "cpu").startswith("same-renderer pipeline check")
