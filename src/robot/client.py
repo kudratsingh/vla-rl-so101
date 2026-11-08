@@ -38,16 +38,32 @@ slower than the period therefore stretches the boundary gap (``boundary_gap_ms``
 ``write_hz`` per trial); overlapping the query with the last action is left for WO-08.
 
 A serial error ends everything: the driver has already cut torque, and nothing is written after
-it. A HOLD trip ends the trial; resuming needs an operator acknowledgement (``Deadman.reset``).
-Ctrl-C holds (a deadman trip), then ``safe_shutdown`` waits for the operator to support the arm
-before disabling torque.
+it. A servo fault (over-temperature / over-current, ``src/robot/servo_health.py``) is the same:
+torque is already off, and the operator is told to support the arm. A HOLD trip ends the trial;
+resuming needs an operator acknowledgement (``Deadman.reset``). Ctrl-C during motion (a trial or
+the move home) holds (a deadman trip); the port is released first in case the Ctrl-C landed inside
+a bus transaction.
+
+Shutdown (``safe_shutdown``). Healthy (``healthy=True``: the session completed, or the operator
+quit / pressed Ctrl-C at a prompt with the arm idle, and the deadman has not tripped): park at
+``robot.park.qpos`` through the safety filter, then torque off. Otherwise (any fault, an abort
+during motion, a declined resume): hold, the operator supports the arm, then torque off; after a
+serial or servo fault torque is already off and nothing is written.
 
 Latency, all from the injected ``clock`` (``time.perf_counter`` on the arm; the camera stamps with
-the same clock): capture -> preprocessed (state read + image pipeline) -> send -> recv -> first
-write, plus the server's ``infer_ms`` / ``server_ms``. The WO-07 metric is
-``capture_to_first_write_ms``; when the query beats the period it includes ``pace_wait_ms``, the
-wait for the write tick. LeRobot stamps a frame after its driver read, so this is
-host-stamped capture to bus write: sensor exposure and USB / driver buffering are NOT included.
+the same clock): frame stamp -> preprocessed (state read + image pipeline) -> send -> recv ->
+first write, plus the server's ``infer_ms`` / ``server_ms``. The logged metric is
+``frame_return_to_first_write_ms``; when the query beats the period it includes ``pace_wait_ms``,
+the wait for the write tick. It is NOT the end-to-end (capture -> command) latency of the WO-07
+benchmark: LeRobot 0.4.4 stamps a frame with ``time.perf_counter()`` in its read thread after
+``VideoCapture.read()`` returned and after the BGR->RGB conversion
+(``lerobot/cameras/opencv/camera_opencv.py:443-451``), and OpenCV 4.11's AVFoundation camera
+backend keeps no capture timestamp (``CvCaptureCAM::getProperty`` answers only width, height,
+fps and format; ``CAP_PROP_POS_MSEC`` returns 0 for a live camera; the delegate never reads the
+sample buffer's presentation time). Exposure, sensor readout, USB transfer, AVFoundation
+buffering and decode are therefore excluded. ``docs/bringup/latency-measurement.md`` measures that
+offset once (optical event -> frame stamp); with ``deploy.capture_offset_ms`` set, ``summarize``
+adds an ``end_to_end_estimate_ms`` labelled with it, and never otherwise.
 """
 
 from __future__ import annotations
@@ -69,7 +85,14 @@ import numpy.typing as npt
 from src.config import Config
 from src.eval import protocol
 from src.robot.camera import CameraFault, Frame
-from src.robot.driver import DeadmanTripped, SerialFault, So101Driver
+from src.robot.driver import (
+    SERVO_FAULT_PROMPT,
+    DeadmanTripped,
+    ParkSettings,
+    SerialFault,
+    ServoFault,
+    So101Driver,
+)
 from src.robot.safety import DeadmanResponse
 from src.robot.serve import ACT_METHOD, INFO_METHOD, WIRE_VERSION, WireError, pack, unpack
 from src.robot.units import NUM_JOINTS
@@ -77,6 +100,9 @@ from src.robot.units import NUM_JOINTS
 log = logging.getLogger(__name__)
 
 MAX_LOGGED_INTERVENTIONS = 20
+# LeRobot frame stamp (after the driver returned the frame) -> first bus write. Excludes capture:
+# never call it end-to-end (module doc, docs/bringup/latency-measurement.md).
+LATENCY_KEY = "frame_return_to_first_write_ms"
 
 
 # ------------------------------------------------------------------------------------------------
@@ -98,6 +124,8 @@ class DeployConfig:
     latency_target_ms: float
     stop_on_reject: bool
     policy_checkpoint: str | None = None  # server.policy_checkpoint: Info's policy_id must match
+    capture_offset_ms: float | None = None  # optical event -> frame stamp, measured; None = not
+    park: ParkSettings | None = None  # healthy-shutdown park pose (robot.park)
 
     def __post_init__(self) -> None:
         if not 1 <= self.exec_steps <= self.chunk_len:
@@ -115,6 +143,7 @@ class DeployConfig:
         chunk_len = int(d["chunk_len"])
         exec_steps = d.get("exec_steps")
         checkpoint = (cfg.get("server") or {}).get("policy_checkpoint")
+        offset = d.get("capture_offset_ms")
         return cls(
             control_hz=float(cfg["robot"]["control_hz"]),
             chunk_len=chunk_len,
@@ -130,6 +159,8 @@ class DeployConfig:
             latency_target_ms=float(d["latency_target_ms"]),
             stop_on_reject=bool(d.get("stop_on_reject", True)),
             policy_checkpoint=None if checkpoint is None else str(checkpoint),
+            capture_offset_ms=None if offset is None else float(offset),
+            park=ParkSettings.from_config(cfg),
         )
 
 
@@ -292,6 +323,7 @@ class FrameSource(Protocol):
 @dataclass
 class TrialResult:
     stop_reason: str = ""  # max_steps | safety_reject | deadman | stale_chunk | serial_fault |
+    # servo_fault | home_failed |
     # server_{timeout,unavailable,error,bad_reply} | operator_abort | client_error
     stop_detail: str = ""
     deadman_response: str | None = None
@@ -309,7 +341,7 @@ class TrialResult:
     t_first_write: float | None = None
     t_last_write: float | None = None
 
-    def latency_ms(self, key: str = "capture_to_first_write_ms") -> list[float]:
+    def latency_ms(self, key: str = LATENCY_KEY) -> list[float]:
         return [t[key] for t in self.timings if key in t]
 
     @property
@@ -353,6 +385,11 @@ class DeployLoop:
     def _sleep_to(self, t0: float) -> None:
         self.sleep(max(0.0, self.period - (self.clock() - t0)))
 
+    def frame_time(self) -> float | None:
+        """A fresh frame's stamp, or None on a lost frame (the deadman then trips)."""
+        frame = self._read_frame()
+        return None if frame is None else frame.capture_time
+
     def go_home(self) -> dict[str, Any]:
         """Drive to ``home_qpos`` through the full safety filter at control_hz, reading a fresh
         frame every tick. MOVES THE ARM. Residuals under ``home_tol_deg`` count as reached and are
@@ -395,6 +432,8 @@ class DeployLoop:
             if not res.stop_reason:
                 res.stop_reason = "max_steps"
             self.arm.hold()  # stop where it is; the next command starts from the measured pose
+        except ServoFault as e:  # torque already off: no hold, no park
+            res.stop_reason, res.stop_detail = "servo_fault", str(e)
         except DeadmanTripped:
             res.stop_reason = res.stop_reason or "deadman"
         except SerialFault as e:
@@ -434,7 +473,7 @@ class DeployLoop:
             res.decisions += 1
             timing = {
                 "decision": res.decisions,
-                "capture_to_preprocessed_ms": _ms(t_capture, t_pre),
+                "frame_return_to_preprocessed_ms": _ms(t_capture, t_pre),
                 "preprocessed_to_send_ms": _ms(t_pre, reply.t_send),
                 "rtt_ms": _ms(reply.t_send, reply.t_recv),
                 "infer_ms": reply.infer_ms,
@@ -472,7 +511,7 @@ class DeployLoop:
                 if i == 0:
                     timing["pace_wait_ms"] = wait * 1e3
                     timing["recv_to_first_write_ms"] = _ms(reply.t_recv, t_write)
-                    timing["capture_to_first_write_ms"] = _ms(t_capture, t_write)
+                    timing[LATENCY_KEY] = _ms(t_capture, t_write)
                     if res.t_last_write is not None:  # last write of the previous chunk -> this
                         timing["boundary_gap_ms"] = _ms(res.t_last_write, t_write)
                     res.timings.append(timing)
@@ -522,8 +561,10 @@ def stats(values: Sequence[float]) -> dict[str, float | int | None]:
 
 
 LATENCY_NOTE = (
-    "host-stamped capture (LeRobot stamps after its driver read) to bus write; excludes sensor "
-    "exposure and USB / driver buffering"
+    "frame_return_to_first_write_ms: LeRobot's frame stamp (perf_counter in its read thread, "
+    "after VideoCapture.read() returned and the BGR->RGB conversion) to the first bus write. "
+    "EXCLUDES capture: exposure, sensor readout, USB transfer, AVFoundation buffering, decode. "
+    "Not end-to-end; see docs/bringup/latency-measurement.md"
 )
 
 
@@ -548,6 +589,7 @@ def trial_record(
     outcome_source: str,
     home: Mapping[str, Any] | None,
     camera_calibrated: bool,
+    servo_health: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "task": task,
@@ -576,20 +618,25 @@ def trial_record(
             "first_interventions": result.first_interventions,
         },
         "latency": {
-            "capture_to_first_write_ms": stats(result.latency_ms()),
+            LATENCY_KEY: stats(result.latency_ms()),
             "rtt_ms": stats(result.latency_ms("rtt_ms")),
             "infer_ms": stats(result.latency_ms("infer_ms")),
             "boundary_gap_ms": stats(result.latency_ms("boundary_gap_ms")),
             "write_hz": None if result.write_hz is None else round(result.write_hz, 3),
             "max_frame_age_ms": round(result.max_frame_age_ms, 3),
-            "per_decision_capture_to_first_write_ms": [round(v, 3) for v in result.latency_ms()],
+            f"per_decision_{LATENCY_KEY}": [round(v, 3) for v in result.latency_ms()],
             "note": LATENCY_NOTE,
         },
+        "servo_health": None if servo_health is None else dict(servo_health),  # session so far
         "camera_calibrated": camera_calibrated,
     }
 
 
-def summarize(trials: Sequence[Mapping[str, Any]], latency_target_ms: float) -> dict[str, Any]:
+def summarize(
+    trials: Sequence[Mapping[str, Any]],
+    latency_target_ms: float,
+    capture_offset_ms: float | None = None,
+) -> dict[str, Any]:
     cells: dict[str, dict[str, Any]] = {}
     for t in trials:
         c = cells.setdefault(
@@ -607,19 +654,33 @@ def summarize(trials: Sequence[Mapping[str, Any]], latency_target_ms: float) -> 
         c["success_rate"] = c["successes"] / c["n"] if c["n"] else None
         c["wilson_95"] = [round(lo, 4), round(hi, 4)]
         c["stop_reasons"] = dict(c["stop_reasons"])
-    lat = [v for t in trials for v in t["latency"]["per_decision_capture_to_first_write_ms"]]
+    lat = [v for t in trials for v in t["latency"][f"per_decision_{LATENCY_KEY}"]]
     lat_stats = stats(lat)
     p95 = lat_stats["p95"]
-    return {
+    out: dict[str, Any] = {
         "protocol_version": protocol.PROTOCOL_VERSION,
         "protocol_hash": protocol.protocol_hash(),
         "cells": cells,
-        "capture_to_first_write_ms": lat_stats,
+        LATENCY_KEY: lat_stats,
         "write_hz": stats([h for t in trials if (h := t["latency"].get("write_hz")) is not None]),
         "latency_target_ms": latency_target_ms,
-        "latency_p95_under_target": None if p95 is None else bool(p95 < latency_target_ms),
+        # p95 of a metric that excludes capture: necessary, not sufficient, for the WO-07 target
+        "frame_return_p95_under_target": None if p95 is None else bool(p95 < latency_target_ms),
         "latency_note": LATENCY_NOTE,
+        "end_to_end_estimate_ms": None,
     }
+    if capture_offset_ms is not None:
+        e2e = stats([v + capture_offset_ms for v in lat])
+        out["end_to_end_estimate_ms"] = {
+            **e2e,
+            "capture_offset_ms": capture_offset_ms,
+            "method": "frame_return_to_first_write_ms + deploy.capture_offset_ms (measured once, "
+            "docs/bringup/latency-measurement.md)",
+            "p95_under_target": (
+                None if e2e["p95"] is None else bool(e2e["p95"] < latency_target_ms)
+            ),
+        }
+    return out
 
 
 def utc_now() -> str:
@@ -684,6 +745,10 @@ class ScriptedOperator:
         return None
 
 
+PlacementFn = Callable[[int], tuple[str, dict[str, Any]]]
+"""trial_idx -> (what to tell the operator to place where, the placement for the record)."""
+
+
 def run_trials(
     loop: DeployLoop,
     operator: Operator,
@@ -697,39 +762,59 @@ def run_trials(
     max_steps: int | None = None,
     trials: list[dict[str, Any]] | None = None,
     on_trial_start: Callable[[int], None] | None = None,
+    indices: Sequence[int] | None = None,
+    placement_fn: PlacementFn | None = None,
+    record_extra: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Home -> trial -> outcome, ``n_trials`` times. Returns (trial records, why the session
-    ended). A serial fault / torque-off, an operator abort or a declined resume ends the session.
+    """Home -> trial -> outcome for each trial index (``indices``, default ``range(n_trials)``).
+    Returns (trial records, why the session ended). A serial / servo fault (torque off), an
+    operator abort (Ctrl-C during the move home or a trial) or a declined resume ends the session.
     Records are appended to ``trials`` as they finish, so a Ctrl-C at a prompt keeps them.
-    ``on_trial_start(k)`` runs right before each policy trial (the mock pilot resets its path)."""
+    ``on_trial_start(k)`` runs right before each policy trial (the mock pilot resets its path);
+    ``placement_fn(k)`` supplies the placement prompt and record (scripts/wo07_real_eval.py);
+    ``record_extra`` is merged into every record."""
     if task not in protocol.TASKS or cell not in protocol.CELLS:
         raise ValueError(f"unknown task/cell {task}/{cell}")
     arm = loop.arm
     trials = [] if trials is None else trials
-    for k in range(n_trials):
+    for k in range(n_trials) if indices is None else indices:
         obj = trial_object(task, cell, k)
         instruction = protocol.instruction(task, obj)
         tag = f"[{task}/{cell} {k + 1}/{n_trials}]"
+        if placement_fn is None:
+            place_msg, placement = f"place the {obj.label} (grid slot {k})", None
+        else:
+            place_msg, placement = placement_fn(k)
         if not operator.confirm(f"{tag} clear the workspace; ENTER moves the arm HOME"):
             return trials, "operator_quit"
         start = utc_now()
+        result: TrialResult | None = None
         try:
             home: dict[str, Any] = loop.go_home()
+        except ServoFault as e:  # torque already off
+            home = {"reached": False, "error": str(e)}
+            result = TrialResult(stop_reason="servo_fault", stop_detail=str(e))
         except (DeadmanTripped, SerialFault) as e:
             home = {"reached": False, "error": str(e)}
-        if home["reached"]:
-            if not operator.confirm(f"{tag} place the {obj.label} (grid slot {k}); ENTER starts"):
+        except KeyboardInterrupt:  # arm in motion: hold, never park (port released by trip)
+            arm.trip("operator Ctrl-C during the move home")
+            home = {"reached": False, "error": "operator Ctrl-C"}
+            result = TrialResult(stop_reason="operator_abort", stop_detail="Ctrl-C during home")
+        ran = False
+        if result is None and home["reached"]:
+            if not operator.confirm(f"{tag} {place_msg}; ENTER starts"):
                 return trials, "operator_quit"
             if log_row is not None:
                 loop.on_decision = lambda t, k=k: log_row(kind="decision", trial_idx=k, **t)
             if on_trial_start is not None:
                 on_trial_start(k)
             result = loop.run_trial(instruction, max_steps)
-        else:
+            ran = True
+        elif result is None:
             result = TrialResult(stop_reason="home_failed", stop_detail=str(home))
             if not arm.deadman.tripped:
                 arm.hold()
-        aborted = result.stop_reason in ("operator_abort", "home_failed")
+        aborted = not ran or result.stop_reason == "operator_abort"
         outcome = "aborted" if aborted else operator.outcome(result)
         rec = trial_record(
             result,
@@ -744,7 +829,12 @@ def run_trials(
             outcome_source=operator.source,
             home=home,
             camera_calibrated=camera_calibrated,
+            servo_health=None if arm.monitor is None else arm.monitor.summary(),
         )
+        if placement is not None:
+            rec["placement"] = placement
+        if record_extra:
+            rec.update(record_extra)
         trials.append(rec)
         if log_row is not None:
             log_row(kind="trial", **rec)
@@ -762,31 +852,97 @@ def run_trials(
     return trials, "completed"
 
 
-def _torque_already_off(arm: So101Driver, reason: str) -> None:
+HEALTHY_ENDS = ("completed", "operator_quit", "operator_ctrl_c")
+"""Session ends with the arm idle at a prompt: eligible for a park (if the deadman is clear)."""
+
+
+def _torque_already_off(arm: So101Driver, reason: str, operator: Operator) -> None:
     msg = f"torque is already OFF ({reason}): the arm is limp; check it is resting safely"
     if not arm.torque_off():  # retry, harmless if it is already off
         msg += ". TORQUE OFF FAILED: CUT THE ARM'S POWER NOW"
     log.critical(msg)
     print(msg, flush=True)
+    if arm.servo_fault is not None:  # tell the operator to support the arm; wait for an ack
+        print(SERVO_FAULT_PROMPT.format(reason=arm.servo_fault), flush=True)
+        try:
+            operator.wait("press ENTER once the arm rests safely and the servo supply is off: ")
+        except (KeyboardInterrupt, EOFError):
+            pass
 
 
-def safe_shutdown(arm: So101Driver, operator: Operator) -> None:
-    """End of a real-arm session (also after Ctrl-C): hold the measured pose so the arm stays up,
-    let the operator support it, then disable torque (the arm goes limp). A second Ctrl-C at the
-    prompt goes straight to torque off. Leaving the driver's ``with`` block disables torque again.
-    After a serial fault (deadman latched TORQUE_OFF) nothing is written and there is no HOLDING
-    prompt: torque is already off.
+def safe_shutdown(
+    arm: So101Driver,
+    operator: Operator,
+    *,
+    healthy: bool = False,
+    park: ParkSettings | None = None,
+    frame_time_fn: Callable[[], float | None] | None = None,
+) -> str:
+    """End of a real-arm session. Returns how it ended: parked | supported | torque_was_off.
+
+    * Deadman latched TORQUE_OFF (serial or servo fault): nothing is written; torque-off retried;
+      after a servo fault the operator is told to support the arm and acknowledges.
+    * ``healthy`` (see ``HEALTHY_ENDS``) with ``park`` and a frame source, deadman clear: park at
+      ``park.qpos`` through the safety filter, then torque off. A park that fails falls through.
+    * Otherwise: hold the measured pose so the arm stays up, let the operator support it, then
+      disable torque (the arm goes limp). A second Ctrl-C at the prompt goes straight to torque off.
+    Leaving the driver's ``with`` block disables torque again.
     """
     if arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF:
-        _torque_already_off(arm, arm.deadman.reason)
-        return
+        _torque_already_off(arm, arm.deadman.reason, operator)
+        return "torque_was_off"
+    if healthy and park is not None and frame_time_fn is not None and not arm.deadman.tripped:
+        print("session ended normally: parking the arm (it moves), then torque off", flush=True)
+        if arm.park(park, frame_time_fn):
+            print("arm PARKED; torque OFF", flush=True)
+            return "parked"
+        if arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF:
+            _torque_already_off(arm, arm.deadman.reason, operator)
+            return "torque_was_off"
+        print("park did not complete: the arm holds; support it", flush=True)
     try:
         arm.hold()
     except SerialFault as e:  # the driver already cut torque
-        _torque_already_off(arm, str(e))
-        return
+        _torque_already_off(arm, str(e), operator)
+        return "torque_was_off"
     try:
         operator.wait("arm HOLDING; support it, then press ENTER to disable torque: ")
     except (KeyboardInterrupt, EOFError):
         pass
     arm.torque_off()
+    return "supported"
+
+
+def shutdown_session(loop: DeployLoop, operator: Operator, end: str) -> str:
+    """``safe_shutdown`` for a session that ended with ``end``: park only on a healthy end
+    (``HEALTHY_ENDS``, deadman clear), never on a fault or an abort during motion."""
+    healthy = end in HEALTHY_ENDS and not loop.arm.deadman.tripped
+    return safe_shutdown(
+        loop.arm,
+        operator,
+        healthy=healthy,
+        park=loop.dcfg.park,
+        frame_time_fn=loop.frame_time,
+    )
+
+
+def latency_lines(summary: Mapping[str, Any]) -> list[str]:
+    """Console lines for the latency part of ``summarize`` (never labelled end-to-end unless an
+    optical capture offset was measured)."""
+    lat = summary[LATENCY_KEY]
+    target = summary["latency_target_ms"]
+    lines = [
+        (
+            f"  frame return -> first write ms (EXCLUDES capture): median {lat['median']}  "
+            f"p95 {lat['p95']}  (n {lat['n']}; WO-07 target < {target:.0f} is end-to-end)"
+        )
+    ]
+    e2e = summary.get("end_to_end_estimate_ms")
+    if e2e:
+        lines.append(
+            f"  end-to-end estimate ms (+ measured capture offset {e2e['capture_offset_ms']}): "
+            f"median {e2e['median']}  p95 {e2e['p95']}"
+        )
+    else:
+        lines.append("  end-to-end latency: NOT measured (docs/bringup/latency-measurement.md)")
+    return lines

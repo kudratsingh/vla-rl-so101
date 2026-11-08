@@ -19,9 +19,13 @@ Needs: a leader arm in ``teleop.leader`` (otherwise exits with a message), both 
 Torque is ON from connect until the session ends. Per episode: arrange the scene, press ENTER, the
 follower first eases onto the leader's pose clipped to the safety limits (rate-limited, not
 recorded), then recording runs for ``teleop.episode_time_s`` or until Ctrl-C, then the follower
-holds its pose; keep, redo or quit. ``q`` or Ctrl-C at any prompt ends the session the safe way:
-hold, ask the operator to support the arm, then torque off. A lost frame / stall holds the arm and
-asks you; a serial error cuts torque. Outside the prompts Ctrl-C never interrupts a bus or dataset
+holds its pose; keep, redo or quit. ``q`` or Ctrl-C at any prompt (or the last episode) ends the
+session the healthy way: the follower PARKS at ``robot.park.qpos`` through the safety filter (it
+moves; Ctrl-C stops the park), then torque goes off. If the park cannot complete, or the session
+ends after a deadman stop (no ``resume``), it holds, asks the operator to support the arm, then
+torque off. A lost frame / stall holds the arm and asks you; a serial error cuts torque; a servo
+over-temperature / over-current (``robot.servo_monitor``) cuts torque AT ONCE and tells you to
+support the arm (no hold, no park). Outside the prompts Ctrl-C never interrupts a bus or dataset
 call: it is a flag checked between control ticks (ends the sync or the episode), and ignored
 while an episode saves. ``--verbose`` also prints the safety filter's per-tick INFO clips.
 """
@@ -60,7 +64,14 @@ from src.robot.camera import (
     PolicyImagePipeline,
     sim_mismatches,
 )
-from src.robot.driver import DeadmanTripped, SerialFault, So101Driver, StepResult
+from src.robot.driver import (
+    DeadmanTripped,
+    ParkSettings,
+    SerialFault,
+    ServoFault,
+    So101Driver,
+    StepResult,
+)
 from src.robot.safety import DeadmanResponse, load_sim_fk
 from src.robot.units import JOINT_NAMES, UnitMap
 
@@ -142,11 +153,26 @@ def make_leader(lc: dict[str, Any]) -> Any:
 
 
 class Session:
-    def __init__(self, arm: So101Driver, leader: Any, cam: OpenCVFrameSource, units: UnitMap):
+    def __init__(
+        self,
+        arm: So101Driver,
+        leader: Any,
+        cam: OpenCVFrameSource,
+        units: UnitMap,
+        park: ParkSettings | None = None,
+    ):
         self.arm, self.leader, self.cam, self.units = arm, leader, cam, units
+        self.park = park  # healthy-end park pose; None = hold + support prompt only
         self.period = 1.0 / arm.safety.config.control_hz
         self.target: np.ndarray | None = None  # last leader pose, canonical rad
         self.stop = False  # Ctrl-C under ctrl_c_as_flag; the loops check it between ticks
+
+    def frame_time(self) -> float | None:
+        try:
+            return float(self.cam.read().capture_time)
+        except CameraFault as e:
+            print(f"camera: {e}")
+            return None
 
     def tick(self) -> tuple[Any, StepResult]:
         """One control step. Returns (camera frame or None, step result)."""
@@ -241,16 +267,26 @@ def discard_episode(dataset: Any) -> None:
         dataset.episode_buffer = dataset.create_episode_buffer()
 
 
-def end_session(arm: So101Driver) -> None:
-    """Hold at the measured pose, then let the operator support the arm before torque goes off.
+def end_session(arm: So101Driver, sess: Session | None = None) -> None:
+    """End an operator-ended session (``q`` / Ctrl-C at a prompt, the last episode, no ``resume``).
 
-    Called on every operator-ended session (``q`` / Ctrl-C at a prompt, no ``resume``). Torque
-    goes off afterwards, when the driver's ``with`` block closes normally. Only ENTER (or a closed
-    stdin) gets there: Ctrl-C at this prompt is ignored, a panicked second press must not drop
-    the arm.
+    Healthy (deadman clear) with ``sess.park`` set: park through the safety filter, then torque
+    off (``So101Driver.park``; Ctrl-C during the park stops it). Otherwise, or if the park does
+    not complete: hold at the measured pose, then let the operator support the arm before torque
+    goes off, when the driver's ``with`` block closes normally. Only ENTER (or a closed stdin)
+    gets there: Ctrl-C at this prompt is ignored, a panicked second press must not drop the arm.
     """
     if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
         return  # torque is already off
+    if sess is not None and sess.park is not None and not arm.deadman.tripped:
+        print("ending the session: the follower PARKS (it moves; Ctrl-C stops it), then torque off")
+        sess.stop = False
+        if arm.park(sess.park, sess.frame_time, stop_fn=lambda: sess.stop):
+            print("follower parked; torque OFF")
+            return
+        if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
+            return  # a servo / serial fault during the park: torque is already off
+        print("park did not complete: the follower holds")
     try:
         arm.hold()
     except SerialFault:
@@ -300,10 +336,11 @@ def _episodes(
         while k < n_eps:
             msg = f"[{task} {k + 1}/{n_eps}] arrange the scene, hold the leader, ENTER (q = end): "
             if ask(msg) == QUIT:
-                end_session(arm)
+                end_session(arm, sess)
                 return saved
             sess.stop = False  # drop a Ctrl-C pressed while saving / holding
             try:
+                arm.check_servos()  # heat built up while the arm held at the prompt
                 if not sess.sync_to_leader():
                     arm.hold()
                     print("follower holds; retry")
@@ -328,12 +365,14 @@ def _episodes(
                 arm.hold()  # zero position error while the prompts wait (servo heat)
             except DeadmanTripped as e:
                 print(f"\nSTOPPED: {e}\nEpisode discarded.")
+                if isinstance(e, ServoFault):
+                    print("SUPPORT THE ARM NOW: torque is OFF (servo fault).")
                 dataset.clear_episode_buffer()
                 if arm.deadman.response is not DeadmanResponse.HOLD:
                     raise  # torque is off: end the session
                 ans = ask("arm is holding; type 'resume' to clear the deadman, else end: ")
                 if ans != "resume":
-                    end_session(arm)
+                    end_session(arm, sess)
                     return saved
                 arm.deadman.reset("operator typed resume")
                 arm.safety.reset_reference()
@@ -342,7 +381,7 @@ def _episodes(
             keep = ask(f"keep this episode ({n_frames} frames)? [Y]es / [n]o, redo / [q]uit: ")
             if keep == QUIT:
                 dataset.clear_episode_buffer()
-                end_session(arm)
+                end_session(arm, sess)
                 return saved
             if n_frames > 0 and keep in ("", "y", "yes"):
                 print("saving episode (encoding video, a few seconds; Ctrl-C is ignored) ...")
@@ -356,7 +395,7 @@ def _episodes(
                 k += 1
             else:
                 dataset.clear_episode_buffer()
-    end_session(arm)
+    end_session(arm, sess)
     return saved
 
 
@@ -453,7 +492,7 @@ def main() -> None:
             OpenCVFrameSource(cfg["cameras"]["front"]) as cam,
             So101Driver.from_config(cfg, fk) as arm,  # torque ON from here, holding the pose
         ):
-            sess = Session(arm, leader, cam, units)
+            sess = Session(arm, leader, cam, units, park=ParkSettings.from_config(cfg))
             record_session(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
     finally:
         dataset.finalize()

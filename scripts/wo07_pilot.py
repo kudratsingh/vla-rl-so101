@@ -8,7 +8,9 @@
 --hardware  OWNER ONLY, never run by tests or agents: real arm, real camera, the policy server
             through an SSH tunnel (configs/real.yaml server). Refuses without --i-am-present, then
             needs 'go' typed. Moves the arm to the home pose before every trial; the operator
-            scores every trial y/n; Ctrl-C holds the arm, then torque goes off after ENTER.
+            scores every trial y/n. A normal end parks the arm (robot.park) then turns torque
+            off; Ctrl-C during motion holds it, then torque goes off after ENTER; a servo
+            over-temperature / over-current fault cuts torque at once.
 
     uv run scripts/wo07_pilot.py --preset real --mock                     # real-time, ~1 min
     uv run scripts/wo07_pilot.py --preset real --mock --fake-clock --trials 3
@@ -46,13 +48,15 @@ from src.robot.client import (
     PolicyClient,
     ScriptedOperator,
     check_server,
+    latency_lines,
     run_trials,
-    safe_shutdown,
+    shutdown_session,
     summarize,
 )
 from src.robot.driver import So101Driver
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
+from src.robot.servo_health import monitor_from_config
 from src.robot.units import UnitMap
 from src.runs import RUNS_DIR, Run, new_run_id
 
@@ -69,7 +73,10 @@ HARDWARE_BANNER = """
  THIS WILL MOVE THE REAL ARM.
  Before every trial it drives to the home pose (deploy.home_qpos) through the safety filter,
  then the policy moves it. Keep the workspace clear and a hand on the power switch.
- Ctrl-C holds the arm; after ENTER, torque goes off and the arm drops: support it.
+ A normal end (all trials, or q / Ctrl-C at a prompt) PARKS the arm at robot.park.qpos
+ (it moves), then torque goes off. Ctrl-C while the arm moves holds it; after ENTER
+ torque goes off and the arm drops: support it. A servo over-temperature / over-current
+ fault cuts torque AT ONCE: the arm drops, support it.
 ==========================================================================================
 """
 
@@ -134,9 +141,9 @@ def session(
         except KeyboardInterrupt:
             end = "operator_ctrl_c"
         finally:
-            safe_shutdown(loop.arm, operator)
-            summary = summarize(trials, loop.dcfg.latency_target_ms)
-            run.results.update(session_end=end, trials=trials, summary=summary)
+            shutdown = shutdown_session(loop, operator, end)
+            summary = summarize(trials, loop.dcfg.latency_target_ms, loop.dcfg.capture_offset_ms)
+            run.results.update(session_end=end, shutdown=shutdown, trials=trials, summary=summary)
         print_summary(run.id, summary, end)
     return run.record_path
 
@@ -150,11 +157,8 @@ def print_summary(run_id: str, summary: dict[str, Any], end: str) -> None:
             f"  {name}: {c['successes']}/{c['n']} = {rate}  Wilson95 [{100 * lo:.0f}, {100 * hi:.0f}]"
             f"  aborted {c['aborted']}  stops {c['stop_reasons']}"
         )
-    lat = summary["capture_to_first_write_ms"]
-    print(
-        f"  capture->first write ms: median {lat['median']}  p95 {lat['p95']}  (n {lat['n']}, "
-        f"target < {summary['latency_target_ms']:.0f})"
-    )
+    for line in latency_lines(summary):
+        print(line)
     print(f"  realised write Hz per trial: median {summary['write_hz']['median']}")
     print(f"  protocol {summary['protocol_version']} {summary['protocol_hash'][:12]}")
 
@@ -191,6 +195,8 @@ def run_mock(
             UnitMap.from_config(cfg),
             make_safety(cfg, fk or load_sim_fk(), clock=clock),
             clock=clock,
+            monitor=monitor_from_config(cfg),
+            sleep=sleep,
         )
         pipe = PolicyImagePipeline.from_config(cfg)
         with (

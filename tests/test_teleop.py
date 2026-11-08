@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import signal
 import time
 from typing import Any
@@ -13,8 +14,9 @@ from robot_fakes import FakeFollower, real_cfg, toy_fk
 
 from src.config import REPO_ROOT
 from src.robot.camera import CameraFault, Frame
-from src.robot.driver import DeadmanTripped, So101Driver
+from src.robot.driver import DeadmanTripped, ParkSettings, ServoFault, So101Driver
 from src.robot.safety import make_safety
+from src.robot.servo_health import monitor_from_config
 from src.robot.units import JOINT_NAMES, UnitMap
 
 _spec = importlib.util.spec_from_file_location(
@@ -218,3 +220,34 @@ def test_failed_save_discards_the_episode_and_keeps_holding(
     assert "saving failed (ValueError" in capsys.readouterr().out and not answers
     assert saved == 0 and data.episode_buffer["size"] == 0
     assert fol.bus.torque_enabled and fol.sent[-1] == pytest.approx(fol.pos)
+
+
+def test_healthy_end_parks_the_follower_then_torque_off(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prompts = _scripted_input(monkeypatch, ["q"])  # q at the first scene prompt: healthy end
+    sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
+    park = (0.0, 0.0, 0.0, math.radians(10.0), 0.0, math.radians(5.0))
+    sess.park = ParkSettings(qpos=park, tol_rad=math.radians(1.0), timeout_s=5.0)
+    instr = teleop.protocol_instructions(["Push"])
+    saved = teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2, lambda im: im)
+    assert saved == 0 and len(prompts) == 1  # no "support the arm" prompt: it parked
+    assert "follower parked; torque OFF" in capsys.readouterr().out
+    assert fol.sent[-1]["wrist_flex.pos"] == pytest.approx(10.0)
+    steps = np.diff([0.0, *(a["wrist_flex.pos"] for a in fol.sent)])
+    assert max(steps) <= 4.0 + 1e-9  # through the safety filter's velocity cap
+    assert not fol.bus.torque_enabled and not sess.arm.deadman.tripped
+
+
+def test_hot_servo_after_a_prompt_cuts_torque_before_any_motion(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _scripted_input(monkeypatch, [""])
+    sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
+    sess.arm.monitor = monitor_from_config(real_cfg())
+    fol.temperature_c["gripper"] = 61.0  # heated up while holding at the scene prompt
+    instr = teleop.protocol_instructions(["Push"])
+    with pytest.raises(ServoFault):
+        teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2, lambda im: im)
+    assert "SUPPORT THE ARM NOW" in capsys.readouterr().out
+    assert not fol.sent and not fol.bus.torque_enabled  # nothing moved, torque off at once

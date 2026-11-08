@@ -32,13 +32,16 @@ from src.robot.client import (
     ServerMismatch,
     TrialResult,
     check_server,
+    latency_lines,
     run_trials,
     safe_shutdown,
+    shutdown_session,
     summarize,
 )
 from src.robot.driver import So101Driver
 from src.robot.safety import make_safety
 from src.robot.serve import DEFAULT_HOST, MockPolicy, PolicyServer, build_server, pack, unpack
+from src.robot.servo_health import monitor_from_config
 from src.robot.units import UnitMap
 
 _spec = importlib.util.spec_from_file_location(
@@ -86,7 +89,9 @@ def rig(
     servicer = PolicyServer(policy, image_size=dcfg.image_size, policy_id=policy_id, clock=clock)
     server, port = build_server(servicer, port=0)
     fol = FakeFollower(track=track)
-    arm = So101Driver(fol, UnitMap(), make_safety(cfg, toy_fk, clock=clock), clock=clock)
+    arm = So101Driver(
+        fol, UnitMap(), make_safety(cfg, toy_fk, clock=clock), clock=clock, sleep=clock.sleep
+    )
     arm.connect()
     cam = FakeCam(clock)
     client = PolicyClient(
@@ -152,7 +157,7 @@ def test_trial_goes_through_safety_and_measures_latency() -> None:
         period_ms = 1e3 / r.dcfg.control_hz
         assert res.latency_ms("boundary_gap_ms") == pytest.approx([period_ms] * 2)
         assert res.write_hz == pytest.approx(r.dcfg.control_hz)
-        # capture -> first bus write: the query, then the wait for the write tick
+        # frame stamp -> first bus write: the query, then the wait for the write tick
         assert res.latency_ms() == pytest.approx([50.0, period_ms, period_ms])
         assert res.latency_ms("pace_wait_ms") == pytest.approx(
             [0.0, period_ms - 50, period_ms - 50]
@@ -403,7 +408,7 @@ def test_mock_pilot_writes_trial_records(tmp_path: Path) -> None:
         assert t["policy_id"] == "mock:pickplace-waypoints" and t["home"]["reached"]
         assert t["outcome"] == "success" and t["outcome_source"] == "scripted"
         # the 60 ms query beats the 66.7 ms period: writes stay at 15 Hz, as in sim
-        assert t["latency"]["capture_to_first_write_ms"]["median"] == pytest.approx(
+        assert t["latency"]["frame_return_to_first_write_ms"]["median"] == pytest.approx(
             1e3 / 15, abs=1e-3
         )
         assert t["latency"]["boundary_gap_ms"]["max"] == pytest.approx(1e3 / 15, abs=1e-3)
@@ -474,3 +479,86 @@ def test_serve_main_names_its_adapter_and_keeps_a_run_record(
     assert rec["results"]["policy_id"] == adapter and rec["results"]["requests"] == 0
     assert seen["server_run"]["run_id"] == rec["run_id"]
     assert seen["server_run"]["device"] == "cpu"
+
+
+def test_healthy_end_parks_then_torque_off_a_motion_abort_does_not() -> None:
+    with rig() as r:
+        trials, end = run_trials(
+            r.loop,
+            ScriptedOperator(),
+            task="PickPlace",
+            cell="seen",
+            n_trials=1,
+            info=r.server_info,
+            camera_calibrated=False,
+            max_steps=16,
+        )
+        assert end == "completed"
+        op = PromptLog()
+        assert shutdown_session(r.loop, op, end) == "parked"
+        park = r.dcfg.park
+        assert park is not None and park.qpos == tuple(TEST_HOME)  # robot.park.qpos null -> home
+        assert not r.fol.bus.torque_enabled and not op.prompts  # no support prompt needed
+        q = UnitMap().to_canonical(r.fol.sent[-1])
+        np.testing.assert_allclose(q, TEST_HOME, atol=math.radians(3.0))
+    with rig() as r:  # Ctrl-C while the arm drives home: hold, support prompt, never a park
+        r.cam.interrupt_after = 3
+        trials, end = run_trials(
+            r.loop,
+            ScriptedOperator(),
+            task="PickPlace",
+            cell="seen",
+            n_trials=2,
+            info=r.server_info,
+            camera_calibrated=False,
+            max_steps=16,
+        )
+        assert trials[0]["stop_reason"] == "operator_abort" and trials[0]["outcome"] == "aborted"
+        assert r.arm.deadman.tripped and r.arm.deadman.response is not None
+        op = PromptLog()
+        n = len(r.fol.sent)
+        assert shutdown_session(r.loop, op, end) == "supported"
+        assert len(r.fol.sent) == n + 1 and r.fol.sent[-1] == pytest.approx(r.fol.pos)  # a hold
+        assert op.prompts and "support it" in op.prompts[0] and not r.fol.bus.torque_enabled
+
+
+def test_servo_fault_mid_trial_is_torque_off_with_support_prompt(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with rig() as r:
+        r.arm.monitor = monitor_from_config(real_cfg())
+
+        def overheat(timing: dict[str, float]) -> None:
+            r.fol.temperature_c["gripper"] = 66.0
+
+        r.loop.on_decision = overheat
+        res = r.loop.run_trial(INSTRUCTION, max_steps=40)
+        assert res.stop_reason == "servo_fault" and res.deadman_response == "torque_off"
+        assert not r.fol.bus.torque_enabled
+        n = len(r.fol.sent)
+        op = PromptLog()
+        assert shutdown_session(r.loop, op, "completed") == "torque_was_off"  # no park, no hold
+        assert len(r.fol.sent) == n and "SERVO FAULT" in capsys.readouterr().out
+        assert op.prompts and "servo supply is off" in op.prompts[0]
+
+
+def test_latency_is_never_labelled_end_to_end_without_a_measured_offset() -> None:
+    lat = [50.0, 60.0, 70.0]
+    trials = [
+        {
+            "task": "PickPlace",
+            "cell": "seen",
+            "outcome": "success",
+            "stop_reason": "max_steps",
+            "latency": {"per_decision_frame_return_to_first_write_ms": lat, "write_hz": 15.0},
+        }
+    ]
+    s = summarize(trials, 150.0)
+    assert s["frame_return_to_first_write_ms"]["median"] == 60.0
+    assert s["end_to_end_estimate_ms"] is None and "capture_to_first_write_ms" not in s
+    assert "EXCLUDES capture" in s["latency_note"]
+    assert any("NOT measured" in line for line in latency_lines(s))
+    s2 = summarize(trials, 150.0, capture_offset_ms=40.0)
+    assert s2["end_to_end_estimate_ms"]["median"] == 100.0
+    assert s2["end_to_end_estimate_ms"]["capture_offset_ms"] == 40.0
+    assert any("measured capture offset" in line for line in latency_lines(s2))
