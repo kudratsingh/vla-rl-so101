@@ -163,24 +163,25 @@ What changed:
 Next paid run (proposed, not launched; each pod needs the owner's explicit go): the review's
 diagnostics.
 
-**FIRM CAP: $7.65 for the whole diagnostics pass** (was $7.42; re-priced 2026-11-08 with live
-rates and storage, and with every cap now counted from the pod create call instead of first
-boot). The cap is enforced by three layers: the job's own delete, the in-container hard-cap timer,
+**FIRM CAP: $7.85 for the whole diagnostics pass** (was $7.42, then $7.65; re-priced 2026-11-08
+with live rates and storage, every cap counted from the pod create call instead of first boot,
+and an explicit allowance for the billed time between the create call and container boot).
+Caps are rounded up to the cent. The cap is enforced by three layers: the job's own delete, the in-container hard-cap timer,
 and the outside watchdog (`scripts/pod/watchdog.py` on a GitHub runner and on the Mac; see "Pod
 deletion backstop" and `docs/runbooks/pod-launch.md`). Each layer fires before `DEADLINE` =
 `T_req` + `SPEND_CAP_SECONDS`, where `T_req` is the epoch taken just before the create call.
 
 | Pod | GPU $/h (live, Secure) | Storage $/h | `SPEND_CAP_SECONDS` (max billable) | **Firm cap** | Expected (planned) | +25% | + full gate wait |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| RTX 4090, render gap (`demo_rebuild_job.sh` to its gate) | 0.89 | 0.0139 | **5700** (1.583 h) | **$1.43** | 29 min = $0.44 | $0.55 | $1.00 |
-| A100 80 GB, diagnostics (`diag_job.sh`), gate wait | 1.79 | 0.0139 | **12420** (3.450 h) | **$6.22** | 119 min = $3.58 | $4.47 | $5.37 |
-| A100 80 GB, diagnostics, pre-approved (no gate wait) | 1.79 | 0.0139 | 10620 (2.950 h) | $5.32 | $3.58 | $4.47 | n/a |
-| **Both pods** (with the A100 gate) | | | | **$7.65** | **$4.02** | **$5.02** | $6.37 |
-| Both pods (A100 pre-approved) | | | | $6.75 | $4.02 | $5.02 | |
+| RTX 4090, render gap (`demo_rebuild_job.sh` to its gate) | 0.89 | 0.0139 | **5940** (1.650 h) | **$1.50** | 29 min = $0.44 | $0.55 | $1.00 |
+| A100 80 GB, diagnostics (`diag_job.sh`), gate wait | 1.79 | 0.0139 | **12660** (3.517 h) | **$6.35** | 119 min = $3.58 | $4.47 | $5.37 |
+| A100 80 GB, diagnostics, pre-approved (no gate wait) | 1.79 | 0.0139 | 10860 (3.017 h) | $5.45 | $3.58 | $4.47 | n/a |
+| **Both pods** (with the A100 gate) | | | | **$7.85** | **$4.02** | **$5.02** | $6.37 |
+| Both pods (A100 pre-approved) | | | | $6.95 | $4.02 | $5.02 | |
 
 Sources and assumptions:
-- GPU rates were read at 2026-11-08T13:32:45Z with RunPod's public, unauthenticated GraphQL
-  `gpuTypes` query (read-only):
+- GPU rates were read at 2026-11-08T13:32:45Z and again, unchanged, at 2026-11-08T14:23:29Z with
+  RunPod's public, unauthenticated GraphQL `gpuTypes` query (read-only):
   - RTX 4090: Secure $0.89/h, Community $0.34/h;
   - `NVIDIA A100 80GB PCIe`: Secure $1.79/h, Community $1.19/h;
   - `NVIDIA A100-SXM4-80GB`: Secure $1.79/h, Community $1.39/h.
@@ -188,7 +189,8 @@ Sources and assumptions:
   The diagnostics timings come from WO-04 pods, which were A100-SXM4-80GB (ADR-0002, pods
   `5rdd45j801bk5b` and `gzxhwhjhdtc1kc`). Both A100 types cost $1.79/h on Secure Cloud. The plan
   uses Secure Cloud, as every earlier pod did.
-- Storage rates are from RunPod's pricing docs (docs.runpod.io/pods/pricing, read 2026-11-08):
+- Storage rates are from RunPod's pricing docs (docs.runpod.io/pods/pricing, read 2026-11-08,
+  re-read 14:23Z):
   "Pods are billed by the second for compute and storage". Container disk costs $0.10/GB/month
   while running. Volume disk costs $0.10/GB/month running and $0.20/GB/month stopped. A network
   volume costs $0.07/GB/month and keeps billing after the pod is gone, so this plan does not use
@@ -209,12 +211,19 @@ Sources and assumptions:
   falls 1200 s before that. The firm cap is therefore (GPU + storage) $/h x cap, as long as any one
   layer works. If none has verified the pod gone by `DEADLINE` (RunPod's API down for every caller),
   the watchdog alerts and keeps trying for 900 s more, which is +$0.23 on the 4090 and +$0.45 on the
-  A100, outside the firm cap. After that, only the console can stop the pod.
-- The caps grew by 5 / 3 min because they now count from creation, and the in-pod timer and the
-  watchdog fire 480 / 400 s before the deadline. Each cap is planned x 1.25 + the full gate wait +
-  the 20 min soft-deadline margin + the 480 s in-pod lead. The usable time from creation (87 / 199 /
-  169 min) still covers 86.25 / 198.75 / 168.75 min. The expected cost is unchanged apart from
-  storage.
+  A100, outside the firm cap. After that, only the console can stop the pod. (A watchdog that starts
+  or wakes late gets its 900 s from when it reaches the terminate phase, so a very late start could
+  add more; the GitHub copy normally starts within a minute of the create call.)
+- The caps count from `T_req`, so they now carry an explicit allowance for the billed time before
+  the container boots: cap = planned x 1.25 + the full gate wait (30 min) + the 20 min
+  soft-deadline margin + the 480 s in-pod lead + 240 s from `T_req` to boot (the old 180 s
+  `CAP_PRESTART_S` image-pull allowance plus ~60 s for the create call), rounded up to the minute:
+  5940 / 12660 / 10860 s. Measured from creation, the job's soft deadline falls at 71 / 183 / 153
+  min, which covers planned x 1.25 + gate + 4 min pre-boot = 70.25 / 182.75 / 152.75 min. If the
+  image pull and create call take longer than 240 s, the job loses that time at its end (the spend
+  cap still holds); `createdAt` vs boot time in the pod log shows the real figure. The expected cost
+  is unchanged apart from storage. (An earlier revision of this table, $7.65, had dropped the
+  pre-boot allowance: its slack was 15-45 s.)
 - The margin: seed 0's RL stage took 26.8 h against its probe's 23.1 h projection (+16%, job log
   of pod `9d8p7vyfyv6ca4`). PickPlace-only took 28.7 h against 26.8 h (+7%).
 - Spend approval is pending, and nothing is launched. The GitHub watchdog only works once this PR
@@ -305,33 +314,48 @@ Outside watchdog (2026-11-08, owner request, $0, checked against a fake API, not
   hard cap + 5 min could let the pod run past the cap.
 - **What it does.** `scripts/pod/watchdog.py` (stdlib only) starts right after the create call
   and counts from `T_req`. When `--cap-s` is given, it tightens the deadline to the pod's
-  `createdAt` + cap. It polls every 60 s and exits 0 once the pod is verified gone. At `DEADLINE` -
-  400 s it terminates through REST v2 `DELETE api.runpod.io/v2/pods/{id}`, then REST v1 `DELETE
-  rest.runpod.io/v1/pods/{id}`, then GraphQL `podTerminate`. Both REST endpoints are in RunPod's
-  public OpenAPI specs (api.runpod.io/v2/openapi.json and rest.runpod.io/v1/openapi.json, read
-  2026-11-08), and v2 also returns `createdAt`. A pod counts as gone after two consecutive reads at
-  least 10 s apart (404, `TERMINATED` or GraphQL null); otherwise the delete is sent again.
+  `createdAt` + cap.
+  - **Confirm at launch.** It re-reads the pod for up to 120 s until the key sees it under a
+    `vla-rl-so101*` name (event `confirmed`). A pod that no source shows (wrong id, or not visible
+    to the key) gives an alert and exit 3 at once; 401/403 from both REST APIs gives exit 5 at
+    once. Both launchers count as armed only after `confirmed` (the Mac launcher waits for it; the
+    GitHub run has a separate "Confirm pod visible" step). It never deletes a pod it has not
+    confirmed, because the RunPod account is shared.
+  - **Gone needs two sources.** A REST 404 also means "not accessible to the caller" (v2 OpenAPI),
+    so "gone" needs two of REST v2, REST v1 and GraphQL to agree (404, `TERMINATED` or a null
+    pod), and a pod shown by any source counts as present.
+  - **Watch.** It polls every 60 s. It exits 0 early only if the pod deleted itself: every read
+    over at least 120 s shows it gone.
+  - **Terminate.** At `DEADLINE` - 400 s it sends REST v2 `DELETE api.runpod.io/v2/pods/{id}`,
+    then REST v1 `DELETE rest.runpod.io/v1/pods/{id}`, then GraphQL `podTerminate`. A DELETE 404
+    does not count as accepted, so the next endpoint is tried. If an accepted delete leaves the pod
+    in place, every retry sends all three. Both REST endpoints are in RunPod's public OpenAPI specs
+    (api.runpod.io/v2/openapi.json and rest.runpod.io/v1/openapi.json, read 2026-11-08), and v2
+    also returns `createdAt`. A pod counts as gone after two consecutive reads at least 10 s apart.
 - **When it cannot verify the pod is gone.** If that has not happened by `DEADLINE`, it alerts
-  (macOS notification and bell, or a GitHub `::error::` annotation). It keeps trying for 900 s and
-  then exits 2.
-- **Safeguards.** A pod this key never saw gives exit 3, because a 404 can mean "not visible to
-  this key". A name without the `vla-rl-so101` prefix gives exit 4, and nothing is deleted. The key
-  is read only from the environment and is redacted from the JSONL log.
+  (macOS notification and bell, or a GitHub `::error::` annotation). It keeps trying for 900 s from
+  the later of `DEADLINE` and its own entry into the terminate phase, always at least one full
+  attempt, and again after a clock jump (a laptop waking from sleep). Then it exits 2.
+- **Safeguards.** A name without the `vla-rl-so101` prefix gives exit 4, and nothing is deleted.
+  The key is read only from the environment and is redacted from the JSONL log.
 - **Where it runs.**
-  - The GitHub copy is `.github/workflows/pod-watchdog.yml`, on `workflow_dispatch`, with
-    `secrets.RUNPOD_API_KEY`, a 360 min job timeout, refusal of deadlines more than 5.5 h away, and
-    concurrency per pod id. It only works once this PR is on `main`. Its logs are public.
+  - The GitHub copy is `.github/workflows/pod-watchdog.yml`, on `workflow_dispatch`. The key is an
+    environment secret of the `pod-watchdog` environment, limited to `main`, so no workflow on
+    another branch can read it. The job has a 360 min timeout, refuses deadlines more than 5.5 h
+    away, and has concurrency per pod id. It only works once this PR is on `main`. Its logs are
+    public.
   - The Mac copy is `scripts/pod/watchdog_mac.sh`: it reads the key from the Keychain item
-    `vla-rl-so101-runpod` and runs under `nohup caffeinate -i -s`. On battery with the lid closed,
-    the Mac still sleeps.
+    `vla-rl-so101-runpod`, runs under `nohup caffeinate -i -s`, and exits 0 only after `confirmed`.
+    On battery with the lid closed, the Mac still sleeps.
 - **Start command change.** `pod_start_cmd.sh` now also takes `POD_DEADLINE_EPOCH` and fires at
-  min(first boot + cap - 180, `POD_DEADLINE_EPOCH` - 480). A value that is set but is not an epoch
-  in seconds deletes the pod at once. `/root/backstop_status` gains `cap_from=creation|first_boot`.
-- **Tests and runbook.** `tests/test_pod_watchdog.py` (15 cases, ~9 s) and 3 new cases in
+  min(first boot + cap - 180, `POD_DEADLINE_EPOCH` - 480). A value that is set but is not a decimal
+  epoch in seconds (text, milliseconds, or a leading zero, which bash reads as octal) deletes the
+  pod at once. `/root/backstop_status` gains `cap_from=creation|first_boot`.
+- **Tests and runbook.** `tests/test_pod_watchdog.py` (26 cases, ~20 s) and 4 new cases in
   `tests/test_pod_backstop.py` cover this. The launch order is in `docs/runbooks/pod-launch.md`.
-- **Owner, once:** create the Keychain item and the repo secret `RUNPOD_API_KEY`, ideally from a
-  dedicated key. RunPod documents no pod-only key scope; Restricted keys are scoped per Serverless
-  endpoint only.
+- **Owner, once:** create the Keychain item, the `pod-watchdog` environment (deployment branch
+  `main`) and its secret `RUNPOD_API_KEY`, ideally from a dedicated key. RunPod documents no
+  pod-only key scope; Restricted keys are scoped per Serverless endpoint only.
 
 Outside our control:
 - The pod cannot delete itself in four cases:

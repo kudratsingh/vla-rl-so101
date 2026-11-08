@@ -200,9 +200,10 @@ def test_deadline_epoch_later_than_boot_cap_keeps_boot_cap(tmp_path: Path) -> No
 
 
 def test_bad_deadline_epoch_deletes_at_once(tmp_path: Path) -> None:
-    """A deadline that is not an epoch in seconds (text, or milliseconds) fails safe: delete now,
-    though the boot cap alone would allow 60 s."""
-    for i, bad in enumerate(("soon", str(int(time.time() * 1000)))):
+    """A deadline that is not an epoch in seconds (text, milliseconds, or a leading zero, which
+    bash arithmetic reads as octal and "09..." would abort the script before the timer is armed)
+    fails safe: delete now, though the boot cap alone would allow 60 s."""
+    for i, bad in enumerate(("soon", str(int(time.time() * 1000)), "0900000000")):
         d = tmp_path / str(i)
         d.mkdir()
         proc, log, deleted = _boot(d, 60, POD_DEADLINE_EPOCH=bad)
@@ -214,3 +215,29 @@ def test_bad_deadline_epoch_deletes_at_once(tmp_path: Path) -> None:
             "is not an epoch in seconds: deleting the pod now"
             in (d / "fs/root/boot.log").read_text()
         )
+
+
+def test_leading_zero_values_do_not_abort_the_start_command(tmp_path: Path) -> None:
+    """Leading zeros are octal to bash arithmetic ('09' is a hard error that would abort the whole
+    start command before the timer is armed). SPEND_CAP_SECONDS '09700' is refused like any
+    non-decimal cap (delete now); padded optional values fall back to their defaults."""
+    a = tmp_path / "opt"
+    a.mkdir()
+    p, _, deleted = _boot(a, 900, CAP_PRESTART_S="090", POD_DEADLINE_LEAD_S="09")
+    st = a / "fs/root/backstop_status"
+    t0 = time.time()
+    try:
+        while time.time() - t0 < 10 and not st.exists():
+            time.sleep(0.1)
+    finally:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait(timeout=5)
+    assert "timer=armed" in st.read_text() and not deleted.exists()
+    first = int((a / "fs/root/pod_start_epoch").read_text())
+    assert _env_file(a)["POD_HARD_DEADLINE"] == str(first + 900 - 180)  # default prestart
+    b = tmp_path / "cap"
+    b.mkdir()
+    p2, log2, deleted2 = _boot(b, 60, SPEND_CAP_SECONDS="09700")
+    t2 = _wait_deleted(p2, deleted2, 10)
+    assert t2 is not None and t2 <= 3, (t2, log2.read_text() if log2.exists() else "")
+    assert "is not a decimal integer: deleting the pod now" in (b / "fs/root/boot.log").read_text()

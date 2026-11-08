@@ -11,7 +11,9 @@
 #    (scripts/pod/watchdog.py, 400 s), so the pod normally deletes itself first.
 #    A POD_DEADLINE_EPOCH that is set but not an integer epoch in seconds deletes the pod at once.
 #    The first-boot epoch lives on /workspace, so a container restart re-arms the timer with only
-#    the time left instead of a fresh cap. A non-integer cap deletes the pod at once.
+#    the time left instead of a fresh cap. A non-integer cap deletes the pod at once. Numbers with
+#    a leading zero are refused too: bash arithmetic reads them as octal, and "08"/"09" would abort
+#    this whole script before the timer is armed (cap/deadline: delete now; the others: default).
 # 2. The timer runs /root/delete_self.sh (a copy of scripts/pod/delete_self.sh): REST v2 DELETE
 #    then GraphQL podTerminate, every curl time-limited, repeated until the container dies.
 # 3. apt (sshd, curl) under timeout; then a key check -> /root/backstop_status; then sshd.
@@ -21,23 +23,23 @@ mkdir -p /root /workspace
 log() { echo "[boot] $* ($(date -u +%FT%TZ))" | tee -a "$L"; }
 cap=${SPEND_CAP_SECONDS:-}
 pre=${CAP_PRESTART_S:-180}
-case "$pre" in '' | *[!0-9]*) pre=180 ;; esac
-case "$cap" in '' | *[!0-9]*) log "SPEND_CAP_SECONDS '$cap' is not an integer: deleting the pod now"; cap=0; pre=0 ;; esac
+case "$pre" in '' | *[!0-9]* | 0?*) pre=180 ;; esac
+case "$cap" in '' | *[!0-9]* | 0?*) log "SPEND_CAP_SECONDS '$cap' is not a decimal integer: deleting the pod now"; cap=0; pre=0 ;; esac
 F=/workspace/.first_boot_epoch.${RUNPOD_POD_ID:-nopod}  # per pod: a reused network volume must not carry an old epoch
 [ -s "$F" ] || date +%s > "$F"
 first=$(cat "$F")
-case "$first" in '' | *[!0-9]*) first=$(date +%s) ;; esac
+case "$first" in '' | *[!0-9]* | 0*) first=$(date +%s) ;; esac
 boots=$(($(cat "$F.boots" 2>/dev/null || echo 0) + 1))
 echo "$boots" > "$F.boots"
 hard=$((first + cap - pre))
 dl=${POD_DEADLINE_EPOCH:-}
 dlead=${POD_DEADLINE_LEAD_S:-480}
-case "$dlead" in '' | *[!0-9]*) dlead=480 ;; esac
+case "$dlead" in '' | *[!0-9]* | 0?*) dlead=480 ;; esac
 src="first boot $first + cap $cap - prestart $pre"
 from=first_boot
 case "$dl" in
   '') ;;
-  *[!0-9]* | ????????????*)  # not an integer, or > 11 digits (e.g. milliseconds): fail safe
+  *[!0-9]* | 0* | ????????????*)  # not an integer, leading 0 (octal), > 11 digits (ms): fail safe
     log "POD_DEADLINE_EPOCH '$dl' is not an epoch in seconds: deleting the pod now"
     hard=0; src="bad POD_DEADLINE_EPOCH"; from=bad ;;
   *) if [ $((dl - dlead)) -lt "$hard" ]; then hard=$((dl - dlead)); src="creation deadline $dl - lead $dlead"; from=creation; fi ;;

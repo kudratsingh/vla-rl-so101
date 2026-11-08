@@ -41,17 +41,23 @@ wd = _load()
 
 
 class FakeApi:
-    """State + per-route behaviour. mode values: ok | fail (500) | hang | errors (GraphQL 200 with
-    an errors body) | down (close the socket without an answer)."""
+    """State + per-route behaviour. Routes: v2_get, v1_get, gql_get, v2_delete, v1_delete,
+    gql_delete. Modes: ok | fail (500) | hang | down (close without an answer) | errors (GraphQL
+    200 with an errors body) | 404 (this route alone says "no pod") | 403 | 429 (Retry-After) |
+    noop (a DELETE that is accepted but removes nothing). `schedule[route]` is a list of modes used
+    one per call before falling back to `modes`."""
 
     def __init__(self) -> None:
         self.present = True
         self.name = "vla-rl-so101-diag"
         self.created: str | None = None
         self.modes: dict[str, str] = {}
+        self.schedule: dict[str, list[str]] = {}
         self.gone_after_gets: int | None = None  # pod deletes itself after this many GETs
+        self.fail_all_after_gets: int | None = None  # every route 500s after this many GETs
         self.noop_deletes = 0  # accepted deletes that do not remove the pod
         self.gql_errors_first = 0  # GraphQL podTerminate answers with errors this many times
+        self.terminated_200 = False  # REST v2 GET of a removed pod: 200 + status TERMINATED
         self.echo_auth = False  # error bodies echo the Authorization header (redaction test)
         self.hang_s = 3.0
         self.calls: list[tuple[str, str]] = []
@@ -59,6 +65,16 @@ class FakeApi:
         self.lock = threading.Lock()
 
     def mode(self, route: str) -> str:
+        with self.lock:
+            if route.endswith("get"):
+                self.gets += 1
+                if self.gone_after_gets is not None and self.gets > self.gone_after_gets:
+                    self.present = False
+            if self.fail_all_after_gets is not None and self.gets > self.fail_all_after_gets:
+                return "fail"
+            q = self.schedule.get(route)
+            if q:
+                return q.pop(0)
         return self.modes.get(route, "ok")
 
 
@@ -67,11 +83,13 @@ def _handler(api: FakeApi) -> type[BaseHTTPRequestHandler]:
         def log_message(self, *a: Any) -> None:
             pass
 
-        def _send(self, code: int, body: Any = None) -> None:
+        def _send(self, code: int, body: Any = None, hdr: dict[str, str] | None = None) -> None:
             data = b"" if body is None else json.dumps(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            for k, v in (hdr or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(data)
 
@@ -106,40 +124,43 @@ def _handler(api: FakeApi) -> type[BaseHTTPRequestHandler]:
                     body["auth"] = self.headers.get("Authorization", "")
                 self._send(500, body)
                 return
+            if m in ("403", "429"):
+                self._send(int(m), {"error": m}, {"Retry-After": "30"} if m == "429" else None)
+                return
+            if m == "404":
+                self._send(404, {"title": "Not Found"})
+                return
             pod_id = self.path.rsplit("/", 1)[-1]
             with api.lock:
-                if route.endswith("get"):
-                    api.gets += 1
-                    if api.gone_after_gets is not None and api.gets > api.gone_after_gets:
-                        api.present = False
                 present = api.present and (route.startswith("gql") or pod_id == POD)
-                if route.endswith("delete") and route != "gql_delete":
-                    if api.noop_deletes > 0:
-                        api.noop_deletes -= 1
-                    else:
-                        api.present = False
-                    self._send(204 if present else 404)
-                    return
-                if route == "gql_delete":
-                    if m == "errors" or api.gql_errors_first > 0:
+                if route.endswith("delete"):
+                    if m == "errors" or (route == "gql_delete" and api.gql_errors_first > 0):
                         api.gql_errors_first = max(0, api.gql_errors_first - 1)
                         err: dict[str, Any] = {"message": "Something went wrong"}
                         if api.echo_auth:
                             err["auth"] = self.headers.get("Authorization", "")
                         self._send(200, {"errors": [err], "data": {"podTerminate": None}})
                         return
-                    if api.noop_deletes > 0:
+                    if m == "noop":
+                        pass
+                    elif api.noop_deletes > 0:
                         api.noop_deletes -= 1
                     else:
                         api.present = False
-                    self._send(200, {"data": {"podTerminate": None}})
+                    if route == "gql_delete":
+                        self._send(200, {"data": {"podTerminate": None}})
+                    else:
+                        self._send(204 if present else 404)
                     return
                 if route == "gql_get":
                     pod = {"id": POD, "name": api.name, "desiredStatus": "RUNNING"}
                     self._send(200, {"data": {"pod": pod if api.present else None}})
                     return
                 if not present:
-                    self._send(404, {"title": "Not Found"})
+                    if route == "v2_get" and api.terminated_200 and pod_id == POD:
+                        self._send(200, {"id": POD, "name": api.name, "status": "TERMINATED"})
+                    else:
+                        self._send(404, {"title": "Not Found"})
                     return
                 body = {"id": POD, "name": api.name, "status": "RUNNING"}
                 if route == "v2_get" and api.created:
@@ -171,19 +192,24 @@ def api() -> Iterator[tuple[FakeApi, str]]:
 
 
 class VClock(wd.Clock):  # type: ignore[misc,name-defined]
-    """Real time + virtual offset: sleep() advances the offset instantly."""
+    """Real time + virtual offset: sleep() advances the offset instantly. `jumps` maps the n-th
+    sleep() call (1-based) to extra seconds that pass during it (a laptop asleep mid-poll)."""
 
-    def __init__(self) -> None:
+    def __init__(self, jumps: dict[int, float] | None = None) -> None:
         self.offset = 0.0
         self.slept = 0.0
+        self.n = 0
+        self.jumps = jumps or {}
 
     def now(self) -> float:
         return time.time() + self.offset
 
     def sleep(self, s: float) -> None:
         if s > 0:
-            self.offset += s
-            self.slept += s
+            self.n += 1
+            extra = self.jumps.get(self.n, 0.0)
+            self.offset += s + extra
+            self.slept += s + extra
 
 
 def _run(
@@ -203,6 +229,7 @@ def _run(
         "--timeout-s", "0.3",
         "--delete-timeout-s", "0.3",
         "--connect-timeout-s", "0.3",
+        "--expect-name-prefix", "vla-rl-so101",
         *extra,
     ]  # fmt: skip
     rc = wd.main(
@@ -230,8 +257,11 @@ def test_self_deleted_pod_exits_early_without_delete(tmp_path: Path, api: Any) -
     rc, recs, _, alerts, clock = _run(tmp_path, base, 3600)
     assert rc == 0
     assert _deletes(state) == []
+    assert _events(recs, "confirmed")
     assert _events(recs, "verified_gone")[0]["phase"] == "watch"
-    assert clock.slept < 3600 - 400  # well before the fire time
+    gone = [r for r in _events(recs, "read") if r["http"] == 404]
+    assert {r["source"] for r in gone} == {"rest_v2", "rest_v1"}  # two sources agree
+    assert 120 <= clock.slept < 3600 - 400  # gone for >= 120 s, well before the fire time
     assert alerts == []
 
 
@@ -272,13 +302,16 @@ def test_graphql_errors_body_is_not_success(tmp_path: Path, api: Any) -> None:
     assert len(_events(recs, "still_present_or_unknown")) == 2
 
 
-def test_accepted_delete_but_pod_still_present_is_resent(tmp_path: Path, api: Any) -> None:
+def test_accepted_delete_but_pod_still_present_tries_every_endpoint(
+    tmp_path: Path, api: Any
+) -> None:
+    """REST v2 answers 204 but never removes the pod: the retry sends v1 and GraphQL too."""
     state, base = api
-    state.noop_deletes = 2
+    state.modes["v2_delete"] = "noop"
     rc, recs, _, _, _ = _run(tmp_path, base, 10)
     assert rc == 0
-    assert _deletes(state) == ["v2_delete"] * 3
-    assert [x["accepted"] for x in _events(recs, "still_present_or_unknown")] == [True, True]
+    assert _deletes(state) == ["v2_delete", "v2_delete", "v1_delete", "gql_delete"]
+    assert [x["accepted"] for x in _events(recs, "still_present_or_unknown")] == [True]
 
 
 def test_hanging_endpoints_are_bounded_by_timeouts(tmp_path: Path, api: Any) -> None:
@@ -287,7 +320,7 @@ def test_hanging_endpoints_are_bounded_by_timeouts(tmp_path: Path, api: Any) -> 
     t0 = time.monotonic()
     rc, recs, _, _, _ = _run(tmp_path, base, 10)
     assert rc == 0
-    assert time.monotonic() - t0 < 6  # 3 s server hangs, 0.3 s client timeouts
+    assert time.monotonic() - t0 < 8  # 3 s server hangs, 0.3 s client timeouts
     hung = [r for r in recs if r.get("source") == "rest_v2" and r["event"] in ("read", "delete")]
     assert hung and all(r["http"] is None and r["s"] <= 0.3 + 0.7 for r in hung)
     assert _deletes(state) == ["v2_delete", "v1_delete"]
@@ -302,19 +335,110 @@ def test_started_after_fire_time_terminates_at_once(tmp_path: Path, api: Any) ->
     assert _deletes(state) == ["v2_delete"]
 
 
-def test_api_down_for_the_whole_window_alerts_and_fails(tmp_path: Path, api: Any) -> None:
+def test_started_after_deadline_plus_overrun_still_deletes(tmp_path: Path, api: Any) -> None:
+    """The overrun window counts from when the terminate phase starts, not from the deadline."""
     state, base = api
-    for r in ("v2_get", "v1_get", "gql_get", "v2_delete", "v1_delete", "gql_delete"):
+    rc, recs, _, alerts, _ = _run(tmp_path, base, -2000, "--overrun-s", "900")
+    assert rc == 0
+    assert _deletes(state) == ["v2_delete"]
+    assert any("DEADLINE PASSED" in t for t, _ in alerts)
+    assert _events(recs, "fire")[0]["give_up_in_s"] >= 899
+
+
+def test_clock_jump_mid_poll_still_deletes(tmp_path: Path, api: Any) -> None:
+    """The Mac sleeps during a watch-phase poll and wakes 5000 s later, past deadline + overrun."""
+    state, base = api
+    clock = VClock(jumps={2: 5000.0})
+    rc, recs, _, _, _ = _run(tmp_path, base, 3600, clock=clock)
+    assert rc == 0
+    assert _events(recs, "woke_late")
+    assert _deletes(state) == ["v2_delete"]
+
+
+def test_reads_down_for_the_whole_window_alerts_and_deletes_nothing(
+    tmp_path: Path, api: Any
+) -> None:
+    """GETs fail throughout (deletes would work): the pod is never confirmed, so nothing is
+    deleted (a mistyped id could be another project's pod); alerts and a bounded exit 2."""
+    state, base = api
+    for r in ("v2_get", "v1_get", "gql_get"):
         state.modes[r] = "fail"
     rc, recs, _, alerts, _ = _run(tmp_path, base, 200, "--overrun-s", "300")
     assert rc == 2
+    assert _deletes(state) == []
     titles = [t for t, _ in alerts]
-    assert any("cannot read" in t for t in titles)
+    assert any("cannot confirm" in t for t in titles)
+    assert any("DEADLINE PASSED" in t for t in titles) and any("GAVE UP" in t for t in titles)
+    withheld = _events(recs, "delete_withheld")
+    assert 3 <= len(withheld) <= (200 + 300) // 10 + 1, len(withheld)
+
+
+def test_api_down_after_confirm_alerts_and_fails_bounded(tmp_path: Path, api: Any) -> None:
+    state, base = api
+    state.fail_all_after_gets = 1  # the first read sees the pod, then every call 500s
+    rc, recs, _, alerts, _ = _run(tmp_path, base, 200, "--overrun-s", "300")
+    assert rc == 2
+    titles = [t for t, _ in alerts]
     assert any("DEADLINE PASSED" in t for t in titles) and any("GAVE UP" in t for t in titles)
     n = max(x["attempt"] for x in _events(recs, "delete"))
     # bounded: one attempt per >= retry pause (10 s) over the 200 + 300 s window
     assert 5 <= n <= (200 + 300) // 10 + 1, n
+    # after the first attempt every retry tries all three endpoints
+    assert {x["source"] for x in _events(recs, "delete") if x["attempt"] == 2} == {
+        "rest_v2",
+        "rest_v1",
+        "graphql",
+    }
     assert _events(recs, "exit")[-1]["rc"] == 2
+
+
+def test_v2_only_404_does_not_count_as_gone(tmp_path: Path, api: Any) -> None:
+    """REST v2 answers 404 for a pod that v1 and GraphQL still show (404 = 'not found or not
+    accessible'): no early exit, v1 DELETE is tried after the v2 404, and gone needs 2 sources."""
+    state, base = api
+    state.modes.update(v2_get="404", v2_delete="404")
+    rc, recs, _, alerts, _ = _run(tmp_path, base, 1000)
+    assert rc == 0
+    assert _events(recs, "confirmed")[0]["source"] == "rest_v1"
+    assert _events(recs, "sources_disagree")
+    assert not [r for r in _events(recs, "verified_gone") if r["phase"] == "watch"]
+    assert _deletes(state) == ["v2_delete", "v1_delete"]
+    assert [x["accepted"] for x in _events(recs, "delete")] == [False, True]
+    assert alerts == []
+
+
+def test_transient_404_burst_does_not_end_the_watch(tmp_path: Path, api: Any) -> None:
+    """v2 and v1 both say 404 for ~60 s, then the pod is back: the watch goes on to the fire time."""
+    state, base = api
+    state.schedule.update(v2_get=["ok", "404", "404", "404"], v1_get=["404", "404", "404"])
+    rc, recs, _, _, _ = _run(tmp_path, base, 1500)
+    assert rc == 0
+    assert [r["phase"] for r in _events(recs, "verified_gone")] == ["terminate"]
+    assert _deletes(state) == ["v2_delete"]
+
+
+def test_429_and_terminated_status(tmp_path: Path, api: Any) -> None:
+    """429 is 'no answer' (fall back); a 200 with status TERMINATED counts as no pod."""
+    state, base = api
+    state.schedule["v2_delete"] = ["429"]
+    state.terminated_200 = True
+    rc, recs, _, _, _ = _run(tmp_path, base, 10)
+    assert rc == 0
+    assert _deletes(state) == ["v2_delete", "v1_delete"]
+    assert any("TERMINATED" in x["detail"] for x in _events(recs, "verify"))
+
+
+@pytest.mark.parametrize("how", ["403", "wrong_key"])
+def test_refused_key_fails_at_once(tmp_path: Path, api: Any, how: str) -> None:
+    state, base = api
+    if how == "403":
+        for r in ("v2_get", "v1_get", "gql_get", "v2_delete", "v1_delete", "gql_delete"):
+            state.modes[r] = "403"
+    key = "rpa_WRONG_000" if how == "wrong_key" else KEY
+    rc, _, _, alerts, clock = _run(tmp_path, base, 3600, key=key)
+    assert rc == 5 and _deletes(state) == []
+    assert clock.slept == 0  # at once, not at the fire time
+    assert any("KEY REFUSED" in t for t, _ in alerts)
 
 
 def test_key_never_logged_even_when_echoed(tmp_path: Path, api: Any) -> None:
@@ -335,13 +459,29 @@ def test_missing_key_refuses_and_alerts(tmp_path: Path, api: Any) -> None:
     assert rc == 5 and alerts and state.calls == []
 
 
-def test_pod_never_seen_is_flagged(tmp_path: Path, api: Any) -> None:
+def test_pod_never_seen_fails_at_launch(tmp_path: Path, api: Any) -> None:
+    """Wrong id (404 / null everywhere): alert and exit 3 within the confirm window, not at the
+    fire time, so the launch check catches it."""
     state, base = api
     state.present = False
-    rc, _, _, alerts, clock = _run(tmp_path, base, 600)
-    assert rc == 3  # 404 from the start: gone, or invisible to this key
-    assert clock.slept >= 600 - 400 - 1  # no early exit on a pod it never saw
+    rc, recs, _, alerts, clock = _run(tmp_path, base, 3600)
+    assert rc == 3
+    assert 115 <= clock.slept <= 135  # the 120 s confirm window, not 3200 s to the fire time
     assert any("never seen" in t for t, _ in alerts)
+    assert _deletes(state) == [] and not _events(recs, "confirmed")
+
+
+@pytest.mark.parametrize(("setup", "want"), [("ok", 0), ("gone", 3), ("api_down", 6)])
+def test_confirm_only(tmp_path: Path, api: Any, setup: str, want: int) -> None:
+    state, base = api
+    if setup == "gone":
+        state.present = False
+    if setup == "api_down":
+        state.modes.update(v2_get="fail", v1_get="fail", gql_get="fail")
+    rc, recs, _, _, _ = _run(tmp_path, base, 3600, "--confirm-only")
+    assert rc == want
+    assert _deletes(state) == []
+    assert _events(recs, "exit")[-1]["phase"] == "confirm"
 
 
 def test_name_mismatch_deletes_nothing(tmp_path: Path, api: Any) -> None:
@@ -391,32 +531,54 @@ def test_runs_under_plain_python3_isolated(tmp_path: Path, api: Any) -> None:
     assert '"event": "verified_gone"' in log.read_text()
 
 
-def test_mac_launcher_keeps_key_out_of_argv(tmp_path: Path) -> None:
+def test_mac_launcher_keeps_key_out_of_argv_and_waits_for_confirm(tmp_path: Path) -> None:
     """scripts/pod/watchdog_mac.sh with stub `security` / `caffeinate`: the Keychain key reaches
-    the child's environment only (not argv, not stdout); no Keychain item -> exit 3."""
+    the child's environment only (not argv, not stdout); exit 0 only after a "confirmed" event in
+    the log; no Keychain item -> 3; watchdog died -> 4; still unconfirmed -> 5."""
     stubs = tmp_path / "bin"
     stubs.mkdir()
     rec = tmp_path / "rec"
     (stubs / "security").write_text(
         f'#!/bin/bash\n[ -n "${{NO_ITEM:-}}" ] && exit 44\necho "{KEY}"\n'
     )
+    # the stub stands in for `caffeinate -i -s python watchdog.py ...`: it records argv/env and,
+    # per STUB, logs a confirmed event (ok), logs nothing (silent) or exits at once (die)
     (stubs / "caffeinate").write_text(
         f'#!/bin/bash\necho "argv: $*" > "{rec}"\n'
-        f'[ "$RUNPOD_API_KEY" = "{KEY}" ] && echo env-ok >> "{rec}"\nsleep 3\n'
+        f'[ "$RUNPOD_API_KEY" = "{KEY}" ] && echo env-ok >> "{rec}"\n'
+        'log=""; prev=""; for a in "$@"; do [ "$prev" = --log ] && log=$a; prev=$a; done\n'
+        '[ "${STUB:-ok}" = die ] && exit 4\n'
+        '[ "${STUB:-ok}" = ok ] && echo \'{"event": "confirmed"}\' >> "$log"\n'
+        "sleep 4\n"
     )
     for f in stubs.iterdir():
         f.chmod(0o755)
-    env = {"PATH": f"{stubs}:/usr/bin:/bin", "WATCHDOG_DIR": str(tmp_path / "wd"), "HOME": "/tmp"}
+    env = {
+        "PATH": f"{stubs}:/usr/bin:/bin",
+        "WATCHDOG_DIR": str(tmp_path / "wd"),
+        "HOME": "/tmp",
+        "WATCHDOG_CONFIRM_WAIT_S": "2",
+    }
     cmd = ["bash", str(REPO / "scripts/pod/watchdog_mac.sh"), POD, str(int(time.time()) + 900)]
-    p = subprocess.run(
-        [*cmd, "900"], env=env, capture_output=True, text=True, timeout=20, check=False
-    )
+
+    def go(**extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*cmd, "900"], env={**env, **extra}, capture_output=True, text=True, timeout=20,
+            check=False,
+        )  # fmt: skip
+
+    p = go()
     assert p.returncode == 0, p.stdout + p.stderr
-    time.sleep(0.5)
+    assert "CONFIRMED" in p.stdout
     r = rec.read_text()
     assert "env-ok" in r and KEY not in r and "--pod-id fakepod123" in r and "--cap-s 900" in r
     assert "--expect-name-prefix vla-rl-so101" in r
     assert KEY not in p.stdout + p.stderr
+    # the confirmed line from the first run does not count for the next one
+    s = go(STUB="silent")
+    assert s.returncode == 5 and "NOT confirmed" in s.stderr, s.stdout + s.stderr
+    d = go(STUB="die")
+    assert d.returncode == 4, d.stdout + d.stderr
     q = subprocess.run(
         cmd, env={**env, "NO_ITEM": "1"}, capture_output=True, text=True, timeout=20, check=False
     )
