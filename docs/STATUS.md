@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-10-31
+Updated: 2026-11-07
 
 ## Current work order
 
@@ -12,7 +12,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 01 | done, merged | #7 (merged) | See benchmarks. Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). |
 | 02 | closed by owner decision, **below the original target band**; PR open | `wo-02-sft` | OpenVLA-OFT LoRA SFT, 4 attempts, all below the 20-60% band on seen positions (ADR-0001). Owner (2026-10-27): keep OFT, amend rule 3, close with the full protocol table of attempt 4 `step_004000` (25 demos/task): seen PickPlace 17.0%, Push 10.0%, Stack 2.7% (`docs/results.md`). |
 | 03 | done, merged after owner review | #4 (merged) | **Out of order** (started before WO-01/02). CPU only, toy env. |
-| 06 | part 1 merged, part 2 waits for the arm | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. |
+| 06 | part 1 merged, kit arrived, physical bring-up pending | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
 | 04 | **benchmark not met; next step waits for the owner**, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
 | 05, 07, 08, 09 | not started | | |
 
@@ -55,11 +55,35 @@ settling, so their rows use wall-clock x rate).
 | pod `82a5je0ve40rlp` (rollout videos, 5 checkpoints) | 04 | RTX 4090, $0.89/h | 0.18 | 0.17 | yes, 2026-10-28 |
 | pod `7gbl8q46qlxf1z` (protocol eval of two-task step 50, PickPlace-only step 100) | 04 | RTX 4090, $0.89/h | 2.17 | ~1.93 | yes, 2026-10-31 (~$2) |
 
-Running total (all finished): WO-02 ~$13.56 of its $15 cap; WO-04 ~$142.53; total ~$156.09 of the ~$200 budget.
+Recorded spend from the rows above is about **$156.10** ($13.56 for WO-02 and $142.54 for
+WO-04), including estimated charges. The revised **$1,100 cloud compute cap** leaves about
+**$944** based on that ledger. The first $700 of the cap covers the core plan, leaving about
+$544 for core work. The separate $400 reserve covers the original WO-05 ablations if approved.
+
+| Remaining work | Planning allowance | Release condition |
+|---|---:|---|
+| WO-06 hardware bring-up, WO-07 mock deployment, WO-09 writeup | $0 cloud | Run locally. |
+| WO-07 supervised SFT pilot and real evaluation | $45 | Verify WO-06 first. Use pilot timings to reprice the full comparison (900 trials across two checkpoints). |
+| Recovery SFT and matched sim evaluations | $30 | Collect expert corrections in sim from representative failure states and keep evaluation data held out. Measure the SFT gain before adding RL. |
+| Higher-learning-rate GRPO diagnostic | $60 | Check the SFT baseline against the existing RL entry criteria. Compare short probes with matching rollout settings and price any continuation separately. |
+| WO-04 confirmatory GRPO and sim evaluation | $210 | Up to three training seeds at $70 each if the diagnostic justifies replication. Keep the same evaluation protocol and early-stop gates. |
+| WO-08 targeted retraining and real re-evaluation | $140 | Up to two cycles, based on failure evidence from WO-07. |
+| Core contingency | ~$59 | Retries, storage, or higher measured runtime. |
+| WO-05 demo-count and samples-per-prompt ablations | $400 | Reuse matching runs and revisit scope after the sim result. Each SFT base must satisfy the RL entry criteria before a paid RL follow-up. |
+
+Allowances use the project's measured runs and the [RunPod Secure Cloud Pod list rates](https://www.runpod.io/pricing)
+checked on 2026-11-07 ($0.89/h for RTX 4090 and $1.79/h for A100 80 GB). Reconcile actual spend
+and price the selected GPU, storage and duration before approving each run. The cap does not
+authorize provisioning. Each paid run still needs explicit owner approval and its applicable
+probe gate.
 
 ## Blockers and decisions pending the owner
 
-- WO-04: GRPO has not produced a clear gain (PickPlace seen +3.7 to +5.7 points across four checkpoints, no peak, ~$44 of budget left). WO-05 is blocked on the owner's next step. On hold by the owner (2026-10-31): a 75-step PickPlace-only run at lr 5e-4; priced ~$50 at 4 epochs x 8 prompts, ~$38 at 4 epochs x 6 prompts, ~$36 at 2 epochs x 8 prompts, because updates look too small (approx_kl ~3e-5, clip fraction 0).
+- WO-04: GRPO has not produced a clear gain (PickPlace seen +3.7 to +5.7 points across four
+  checkpoints, no peak). The 75-step PickPlace-only proposal at lr 5e-4 ($36–50 estimated on
+  2026-10-31) remains on hold. The core plan prioritizes the hardware baseline and recovery SFT
+  before approving a higher-LR diagnostic. WO-05 paid ablations remain deferred pending the
+  sim results and a separate scope decision.
 
 ## Owner decisions in effect
 

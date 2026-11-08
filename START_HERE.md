@@ -7,7 +7,7 @@
 4. You launch every paid run. The agent gives you config hash + cost; you run it on RunPod
    (dev = RTX 4090, rl = A100-80GB) and paste the run id back.
 5. Review only WO-03 and WO-04 PRs. Everything else: merge when the benchmark line is met.
-6. Spend is tracked in `docs/STATUS.md`. Target ≈ $200 compute total.
+6. See the [compute cap](docs/PLAN.md#budget) and [spend ledger](docs/STATUS.md#spend).
 
 Kill switches:
 - A flat RL run at 25% of steps → stop it, don't let it finish.
