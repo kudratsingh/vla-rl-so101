@@ -138,6 +138,7 @@ class StepRecord:
 class GateResult:
     metrics: dict[str, float] = field(default_factory=dict)
     reason: GateReason | None = None  # the gate that fired (None: keep spending)
+    reasons: list[GateReason] = field(default_factory=list)  # every gate that fired this step
 
 
 class RolloutGates:
@@ -319,6 +320,7 @@ class RolloutGates:
             m["event/entropy_collapse"] = 1.0
             reasons.append("entropy")
         out.reason = reasons[0] if reasons else None
+        out.reasons = reasons
         return out
 
     def _trend_gains(self, step: int) -> dict[str, tuple[float, float]]:

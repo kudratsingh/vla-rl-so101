@@ -55,8 +55,9 @@
 #                          x 120 actions / 86 per s                             =   0.17 h
 #   run: 150 x 986 s + 0.17 h = 41.3 h x $1.79 = ~$74 per seed, worst case. The K=16 runs hit the
 #   refill cap on only 16-26% of steps (~11.5 min/step measured), so expect less if the new base
-#   drops fewer groups. Flat-gate stop at step 38: ~10.5 h = ~$19.
-#   estimated: A100-80GB x 41.3 h = $74 per seed (worst case); flat-gate stop 10.5 h = $19
+#   drops fewer groups. A flat-gate stop at step 38 would be ~10.5 h = ~$19, but gate_stop is false
+#   for the first run (owner 2026-11-08): budget the full 41.3 h.
+#   estimated: A100-80GB x 41.3 h = $74 per seed (worst case; gate_stop false: no early stop)
 # vs the previous 8 x K=16, 1 epoch shape: same 128 trajectories and the same rollout cap (4 env
 # batches per round), +186 s/step for the second epoch, +15 s for the diagnostic.
 #
@@ -158,7 +159,12 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
                             # windows; z = 2 stopped 35/100 simulated flat runs (src/rl/gates.py)
   gate_entropy_min: 0.5     # nats/token at T: below this sampling has collapsed onto the argmax
                             # (WO-04 K=16 run: 1.32 -> 1.07 over 150 steps); judgment, not measured
-  gate_stop: true
+  # Owner 2026-11-08: the first RL training run on this recipe OBSERVES the gates before they are
+  # trusted to stop a run (gate_flat_z 0.5 is simulated only). Every gate still evaluates and logs
+  # gate/would_stop, gate/would_stop_reason and gate/first_would_stop_step per step; the run record's
+  # gate_decisions says when each gate would have stopped it, incl. the flat gate at step 38 (where
+  # WO-04 seeds 1-2 stopped under the older rule). Set true again once a run has been observed.
+  gate_stop: false
   # Fixed-batch policy-movement diagnostic (src/rl/diagnostics.py): diag/pre/* and diag/post/*
   # = per-token |dlogp| by advantage sign, k3 KL and clip fraction of the first 32 trajectories of
   # each update, before and after ALL its optimizer steps; + train/grad_norm. ~15 s per step.

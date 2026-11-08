@@ -76,7 +76,7 @@ from torch import Tensor
 
 from src.config import Config
 from src.rl.diagnostics import argmax_flip_frac, entropy_from_sampled_log_probs, movement_stats
-from src.rl.gates import RolloutGates, TaskTally
+from src.rl.gates import GateResult, RolloutGates, TaskTally
 from src.rl.grpo import (
     ADV_EPS,
     clip_higher_policy_loss,
@@ -112,6 +112,7 @@ REMOVED_KEYS = {
     "peak_ref_step": "gate_max_drop",
 }
 StopReason = Literal["flat", "decline", "entropy"]
+GATES: tuple[StopReason, ...] = ("flat", "decline", "entropy")
 
 
 @dataclass(frozen=True)
@@ -147,7 +148,7 @@ class GRPOConfig:
     gate_max_drop: float = 0.0  # decline: score < best non-overlapping window - this; 0 = off
     gate_decline_z: float = 3.0  # decline also needs drop > z x SE of (best - window), twice
     gate_entropy_min: float = 0.0  # entropy collapse: window rollout entropy < this; 0 = off
-    gate_stop: bool = True  # False: gates only log their events
+    gate_stop: bool = True  # False: gates only log their events (gate/would_stop every step)
     # Fixed-batch pre/post-update diagnostic (src/rl/diagnostics.py)
     diag_every: int = 1  # steps; 0 = off
     diag_trajectories: int = 32  # the update batch's first trajectories (whole groups); 0 = all
@@ -424,6 +425,11 @@ class GRPOTrainer:
         self._last_entropy = (0.0, 0)
         self.resumed_from: Path | None = None
         self.resume_overrides: dict[str, list[Any]] = {}  # rl key -> [checkpoint, this run]
+        # gate decisions, logged whether or not rl.gate_stop acts on them (owner 2026-11-08):
+        # (step, gates that fired) for every step a gate would have stopped the run, and the flat
+        # gate's numbers at its check step
+        self._gate_log: list[tuple[int, list[str]]] = []
+        self._flat_check: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ envs / logging
     def _env(self, task: str) -> VecEnv:
@@ -817,6 +823,8 @@ class GRPOTrainer:
             "eval_history": self._history,
             "gates": self.gates.state_dict(),
             "rl": asdict(self.rl),
+            # optional on load (checkpoints written before 2026-11-08 round 2 lack it)
+            "gate_decisions": {"log": self._gate_log, "flat_check": self._flat_check},
         }
         (path / "trainer_state.json").write_text(json.dumps(state, indent=2))
         return path
@@ -893,6 +901,14 @@ class GRPOTrainer:
         ]
         self.gates.load_state_dict(state["gates"])
         self.gates.truncate(completed)
+        decisions = state.get("gate_decisions") or {}
+        self._gate_log = [
+            (int(st), [str(r) for r in rs])
+            for st, rs in decisions.get("log", [])
+            if int(st) <= completed
+        ]
+        fc = decisions.get("flat_check")
+        self._flat_check = fc if fc is not None and int(fc["step"]) <= completed else None
         self.resumed_from = path
         log.info("resumed from %s: continuing at step %d", path, self._start_step)
 
@@ -956,6 +972,7 @@ class GRPOTrainer:
                 self.gates.record(step, self._last_tallies, ent_sum, ent_tokens)
                 gate = self.gates.evaluate(step)
                 row.update(gate.metrics)
+                row.update(self._gate_decision(step, gate))
                 if step in schedule:
                     row.update(self.evaluate(schedule[step]))
                     self._history.append((step, row["eval/success"]))
@@ -983,10 +1000,14 @@ class GRPOTrainer:
             raise
         finally:
             self.close()
+        gates = self.gate_summary()
+        self._log({"kind": "gate_summary", "step": self._completed_step, **gates})
+        self._console_gate_summary(gates)
         hist = self._history
         return {
             "steps_completed": self._completed_step,
             "stop_reason": reason,
+            "gate_decisions": gates,
             "stopped_flat": reason == "flat",
             "resumed_from": None if self.resumed_from is None else str(self.resumed_from),
             "initial_eval_success": hist[0][1] if hist else None,
@@ -996,6 +1017,97 @@ class GRPOTrainer:
             "trainable_params": self.num_trainable,
             "wall_time_s": time.perf_counter() - t_start,
         }
+
+    def _gate_decision(self, step: int, gate: GateResult) -> dict[str, Any]:
+        """Per-step gate decision for metrics.jsonl, logged whether or not rl.gate_stop acts on
+        it: gate/would_stop (0/1), gate/would_stop_reason (comma-separated gates that fired, ""
+        if none), gate/first_would_stop_step (first step any gate fired so far; 0 = none yet)."""
+        if gate.reasons:
+            self._gate_log.append((step, list(gate.reasons)))
+        check = gate_check_step(self.rl)
+        if check and step == check:
+            m = gate.metrics
+            self._flat_check = {
+                "step": step,
+                "would_stop": "flat" in gate.reasons,
+                "gain": _finite(m.get("gate/flat_gain")),
+                "gain_se": _finite(m.get("gate/flat_gain_se")),
+                "gain_upper": _finite(m.get("gate/flat_gain_upper")),
+                "window_gain_old_rule": _finite(m.get("gate/flat_window_gain")),
+                "min_gain": self.rl.gate_min_gain,
+                "flat_z": self.rl.gate_flat_z,
+                "rule": self.rl.gate_rule,
+                "per_task": {
+                    k.removeprefix("gate/flat_gain/"): _finite(v)
+                    for k, v in m.items()
+                    if k.startswith("gate/flat_gain/")
+                },
+            }
+        first = self._gate_log[0][0] if self._gate_log else 0
+        return {
+            "gate/would_stop": float(bool(gate.reasons)),
+            "gate/would_stop_reason": ",".join(gate.reasons),
+            "gate/first_would_stop_step": float(first),
+        }
+
+    def gate_summary(self) -> dict[str, Any]:
+        """When each spend gate would have stopped this run (whether or not rl.gate_stop let it),
+        and the flat gate's decision at its check step (step 38 in configs/rl.yaml, where WO-04
+        seeds 1-2 stopped under the older rule). For the run record and the console."""
+        check = gate_check_step(self.rl)
+        first_by_gate: dict[str, int | None] = dict.fromkeys(GATES)
+        fired: dict[str, int] = dict.fromkeys(GATES, 0)
+        for st, reasons in self._gate_log:
+            for r in reasons:
+                fired[r] += 1
+                if first_by_gate[r] is None:
+                    first_by_gate[r] = st
+        first = self._gate_log[0] if self._gate_log else None
+        reached = bool(check) and self._completed_step >= check
+        fc = self._flat_check
+        return {
+            "gate_stop": self.rl.gate_stop,
+            "steps_completed": self._completed_step,
+            "first_would_stop_step": first[0] if first else None,
+            "first_would_stop_reasons": first[1] if first else [],
+            "first_step_by_gate": first_by_gate,
+            "steps_fired_by_gate": fired,
+            "flat_check_step": check or None,
+            "flat_check": fc,
+            # None: the check step was not reached (or the flat gate is off)
+            "would_have_stopped_at_flat_check": None if fc is None else bool(fc["would_stop"]),
+            "any_gate_would_have_stopped_by_flat_check_step": (
+                (first is not None and first[0] <= check) if reached else None
+            ),
+        }
+
+    def _console_gate_summary(self, g: dict[str, Any]) -> None:
+        check = g["flat_check_step"]
+        fc = g["flat_check"]
+        if fc is not None:
+            verdict = "WOULD HAVE STOPPED" if fc["would_stop"] else "would NOT have stopped"
+            flat = (
+                f"flat gate at step {check} {verdict} the run (gain {_fmt(fc['gain'])}, SE "
+                f"{_fmt(fc['gain_se'])}, gain + {fc['flat_z']:g} x SE = {_fmt(fc['gain_upper'])} vs "
+                f"min_gain {fc['min_gain']:.3f}, rule {fc['rule']})"
+            )
+        elif check:
+            flat = f"flat gate check step {check} not reached ({g['steps_completed']} steps)"
+        else:
+            flat = "flat gate off"
+        first = g["first_would_stop_step"]
+        firsts = ", ".join(
+            f"{k} {v if v is not None else '-'}" for k, v in g["first_step_by_gate"].items()
+        )
+        log.info(
+            "GATE SUMMARY (rl.gate_stop=%s): %s; first step any gate would have stopped: %s %s; "
+            "first step per gate: %s",
+            str(self.rl.gate_stop).lower(),
+            flat,
+            first if first is not None else "none",
+            g["first_would_stop_reasons"] or "",
+            firsts,
+        )
 
     def _gate_warning(self, step: int, reason: StopReason, m: dict[str, float]) -> None:
         bar = "!" * 78
@@ -1022,7 +1134,11 @@ class GRPOTrainer:
                 f"nats/token < {self.rl.gate_entropy_min:.3f}: sampling has collapsed"
             ),
         }[reason]
-        action = "STOPPING (rl.gate_stop=true)" if self.rl.gate_stop else "continuing (gate_stop)"
+        action = (
+            "STOPPING (rl.gate_stop=true)"
+            if self.rl.gate_stop
+            else "continuing: rl.gate_stop=false, logged only (gate/would_stop)"
+        )
         log.warning(
             "\n%s\nSPEND GATE at step %d: %s. %s. This gate decides spending only; the protocol "
             "eval decides improvement.\n%s",
@@ -1299,6 +1415,15 @@ def _constant_lr(_: int) -> float:
 def _token_mask(batch: RolloutBatch) -> Tensor:
     """(E, S, C, A) bool: tokens of executed actions."""
     return batch.action_mask.unsqueeze(-1).expand_as(batch.tokens)
+
+
+def _finite(value: float | None) -> float | None:
+    """JSON-safe gate number: None for a missing or non-finite value (no trend -> -inf)."""
+    return None if value is None or not math.isfinite(value) else float(value)
+
+
+def _fmt(value: float | None) -> str:
+    return "-" if value is None else f"{value:+.3f}"
 
 
 def _jsonable(value: Any) -> Any:

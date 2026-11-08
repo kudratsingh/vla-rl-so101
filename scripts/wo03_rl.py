@@ -337,10 +337,13 @@ def print_probe(cfg: Config, probe: dict[str, Any], proj: dict[str, Any], gpu: s
         f"{probe['group_reset_diff_frac']:.5f}, groups dropped {probe['frac_groups_dropped']:.0%} "
         f"(refill cap hit on {probe['refill_cap_hit_frac']:.0%} of steps); {diag}"
     )
+    flat_stop = (
+        "flat-gate stop" if rl.gate_stop else "flat-gate check (logged only, gate_stop false)"
+    )
     projected = (
         f"projected (estimate from {probe['steps']} probe steps, step 1 excluded): full run "
         f"{proj['steps']} steps = {proj['run_h']:.1f} h = ${proj['run_usd']:.2f} per seed on {gpu} "
-        f"@ ${proj['usd_per_hour']:.2f}/h; flat-gate stop at step {proj['gate_check_step']} = "
+        f"@ ${proj['usd_per_hour']:.2f}/h; {flat_stop} at step {proj['gate_check_step']} = "
         f"{proj['gate_check_stop_h']:.1f} h = ${proj['gate_check_stop_usd']:.2f}; worst case "
         f"(refill cap every step) {proj['worst_case_h']:.1f} h = ${proj['worst_case_usd']:.2f}; "
         f"+ protocol eval {proj['protocol_eval_h']:.1f} h = ${proj['protocol_eval_usd']:.2f}"
@@ -564,6 +567,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     _write_run_record(run_dir, record)
     log.info("run %s (config %s)", run_id, record["config_hash"][:12])
+    trainer: GRPOTrainer | None = None
     try:
         env_factory, obs_fn, max_steps = build_env(cfg)
         policy = build_policy(cfg, device)
@@ -623,6 +627,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         record["status"] = "failed"
         raise
     finally:
+        if trainer is not None and not (
+            args.probe_steps or args.lr_sweep or args.probe_temperatures
+        ):
+            # when each spend gate would have stopped the run (also with rl.gate_stop false, and
+            # for an interrupted run): first step per gate, the flat-gate decision at its check
+            record["gate_decisions"] = trainer.gate_summary()
         _finish_record(record, time.perf_counter() - t_start)
         _write_run_record(run_dir, record)
     log.info(
