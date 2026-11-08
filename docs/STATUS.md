@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-11-07
+Updated: 2026-11-08
 
 ## Current work order
 
@@ -15,6 +15,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 06 | part 1 merged, kit arrived, physical bring-up pending | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
 | 04 | **benchmark not met; next step waits for the owner**, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
 | 05, 07, 08, 09 | not started | | |
+| pre-run hardening | PR open, **waits for owner review** (touches the RL loop) | `fix/pre-run-hardening` | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
 
 ## Benchmarks met
 
@@ -76,6 +77,119 @@ checked on 2026-11-07 ($0.89/h for RTX 4090 and $1.79/h for A100 80 GB). Reconci
 and price the selected GPU, storage and duration before approving each run. The cap does not
 authorize provisioning. Each paid run still needs explicit owner approval and its applicable
 probe gate.
+
+## Pre-run hardening (PR 1, branch `fix/pre-run-hardening`, 2026-11-08, $0)
+
+This implements the $0 items of the review's section 9 (`docs/reviews/2026-11-07-project-review.md`).
+Nothing ran on a GPU. Protocol `0.1-draft` (`src/eval/protocol.py`, hash `e9ce5bb47a88`) and
+`src/env/success.py` are unchanged, and no reported number changed.
+
+What changed:
+- RL gates (`src/rl/gates.py`): the 64-episode kill switch and the 32-episode peak stop are
+  replaced by windows of `rollout/success_rate` per trained task plus rollout entropy (`rl.gate_*`).
+  There are three gates: flat at step 38, decline from the best window, and entropy collapse. The
+  decline gate fires only when two consecutive non-overlapping windows are each more than
+  max(`gate_max_drop`, `gate_decline_z` x SE) below the best aligned window (z = 3: z = 2 stopped
+  35/100 simulated flat runs; the window SE is group-level, ~1-2 points, not ~0.5-1). They
+  decide spending only; the protocol eval decides improvement. Periodic greedy evals run on the
+  trained tasks only and are sanity logs. The removed config keys raise an error naming their
+  replacement.
+- Fixed-batch diagnostic (`src/rl/diagnostics.py`): it scores the first 32 trajectories of each
+  update batch against the PPO reference, before and after all optimizer steps. It logs
+  `diag/{pre,post}/*`: |dlogp|, dlogp by advantage sign, mean(A*dlogp), k3 KL, clip fraction and
+  outside-clip fraction. `train/grad_norm` and per-optimizer-step lists are also logged. The
+  uninformative `train/approx_kl` / `train/clip_frac` are removed. `docs/results.md` and ADR-0002
+  now say the old values were structurally ~0, not evidence of small updates.
+- Resume: checkpoints hold the optimizer, scheduler, RNG, trainable tensors and trainer state.
+  `scripts/wo03_rl.py --resume <ckpt>` continues the step numbering. A CPU round trip is
+  bit-identical. Resume from the newest `step_N` checkpoint without a suffix: a
+  `step_N_interrupted` one (weights may hold part of step N) is refused unless
+  `--resume-approximate`, which re-runs step N and sets `record.resume_approximate`. Checkpoints are written every 25 steps and are about 1.2 GB each for OFT.
+- `configs/rl.yaml` (ADR-0002 amendment 3, proposed): 16 prompts x K=8, lr 1e-4, `ppo_epochs` 2.
+  The lr follows the published LoRA recipes (RIPT-VLA, RLinf-VLA), not the logged KL.
+  `configs/rl_pickplace.yaml` inherits these settings. RL seeds >= 10 are rejected
+  (`src/eval/seed_ranges.py` `check_rl_seed`: an explicit [0, 10) bound, then the overlap check;
+  PR #25's copy has only the overlap check, which lets seeds 11-299 through, so keep this version
+  when #25 merges).
+- Rollout timing split (`src/rl/rollout.py`): policy / sim_step / render / obs_fn / host_copy /
+  reset / other. It goes to `metrics.jsonl` (`rollout/time/*_s`) and to the PROBE line.
+- Probe modes on `scripts/wo03_rl.py`: `--lr-sweep` (offline, on one stored batch) and
+  `--probe-temperatures` (rollouts only, the same prompts at each temperature). Both can be costed
+  with `--estimate`.
+- Demos: the recorder can keep recording through release and retreat. With
+  `configs/demos_v2.yaml` it records at least 15 frames past success, until the oracle has
+  finished, with a cap of 45 frames, and rejects a demo if success no longer holds at its end. The
+  SFT loader can drop chunks that would contain pad frames (`data.chunk_pad: drop`). The code
+  defaults are the 0.1 settings (no tail, oracle v1, `chunk_pad: repeat`), so `sim.yaml`,
+  `sft*.yaml` and `rl.yaml` keep their behaviour and config hashes; `demos_v2.yaml` (and
+  `demos_v2_tiny.yaml` for the CPU dry run) opt in, and an SFT config for the v2 set must set
+  `chunk_pad: drop`. `wo01_build_env.py --push` refuses the two 0.1 demo repos unless
+  `--overwrite-hub`. Measured on the existing 0.1 demo set: 11 of 25 PickPlace and 13 of 25
+  Stack demos end below the 0.45 rad release target.
+- Oracle v2 (`src/data/oracle.py`) slows to 0.5 cm/step over the last 6 cm and the descent. Results
+  on the Mac CPU sim, tiny preset, 100 episodes per cell: seen PickPlace / Push / Stack 100 / 100 /
+  100%, shifted 96 / 92 / 96%. Under v1 the same cells were 100 / 98 / 100% and 99 / 91 / 96%.
+  Near-object decisions per episode rose from ~1.5 to ~2.6-3.0. v1 stays the default and
+  reproduces the 0.1-era oracle exactly; v2 is opt-in (`data.oracle_profile: v2`).
+- Demo rebuild (`scripts/wo01r_rebuild_demos.py`, `scripts/pod/demo_rebuild_job.sh`,
+  `configs/demos_v2.yaml`): it rebuilds 25 demos per task on the GPU renderer into a new Hub repo
+  (`KudratSingh22/vla-rl-so101-demos-25-v2`); it does not write to the 0.1 repos. It also has a
+  render-gap mode that compares stored and fresh frames and greedy tokens against a codec floor.
+  Preliminary single run on the Mac CPU (run 20261108T083504Z-wo01r-sim-c025, dirty tree at
+  2af16f6, first 3 of 25 episodes per task (223/163/209 frames), pixels and joints only, token
+  comparison skipped): the pixel gap is within 0.03 mean-abs (<= 1.4%) of the codec floor on all 3
+  tasks (e.g. PickPlace 2.070 vs 2.042) and joint drift is 0. The full 25-episode check with
+  tokens on the 4090 is still pending (see Next).
+- Protocol 0.2 (`src/eval/protocol_v02.py`, new; `scripts/wo02_eval.py --protocol 0.2`). Its hash
+  combines the file bytes of the protocol, the eval loop (`src/eval/sim_eval.py`: episode seeds,
+  clip, success latch, episode end), env, success, camera and robot model with the canonical
+  run settings, the clip, the episode-seed probes and the sim-stack pins. Per-episode records go to
+  `runs/<id>/episodes.jsonl` under both protocols. Under 0.2 only, a 4 deg/step joint clip from
+  `configs/real.yaml` applies. Runs that deviate get `protocol_complete: false` and a list of the
+  deviations. 0.2 is not frozen: its hash is pinned when its first number is reported.
+- Camera jitter is now drawn from the episode RNG instead of the global torch RNG. It is off in
+  every current preset.
+- `make setup` = `uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla`
+  (`docs/ENVIRONMENT.md`).
+
+Next paid run (proposed, not launched; each needs the owner's explicit go): the review's diagnostics,
+about $5 in total.
+1. Render-gap check on a 4090: `scripts/pod/demo_rebuild_job.sh` up to its approval gate (setup,
+   GPU-sim oracle check, render gap of the 0.1 set with the a4 `step_004000` adapter).
+   estimated: RTX 4090 x 0.6 h = $0.53. Continuing past the gate to rebuild the demos brings the
+   whole job to about 0.75 h = $0.67. This is a guess: no GPU timing exists for the job.
+2. One A100 pod with the SFT adapter (`--seed 3`):
+   - `--lr-sweep 5e-5,2e-4,5e-4,1e-3 --sweep-adam-steps 8`, 1.20 h;
+   - then `--probe-temperatures 0.7,1.0,1.3 --probe-groups 64`, 0.60 h;
+   - plus 0.5 h setup.
+   estimated: A100-80GB x 2.3 h = $4.12 (`--estimate` from `cost.throughput`: rollout 86
+   actions/s measured on WO-04 pod gzxhwhjhdtc1kc; update 10.3 decisions/s from the WO-02 SFT
+   probe, pod u87r9sjnwig58d; forward 31 decisions/s estimated). The 2.3 h excludes the 7B load
+   and GPU env build of each of the two separate `uv run` invocations; `setup_hours` 0.5 covers
+   only the image, `uv sync` and the download.
+3. Only after 1-2, and after the recovery-SFT base clears rule 3: a GRPO run with the measured lr and
+   temperature written into `configs/rl.yaml`, starting with `--probe-steps 3`. The worst case is
+   estimated: A100-80GB x 41.3 h = $74 per 150-step seed, or 10.5 h = $18.72 if the flat gate stops
+   it at step 38.
+
+Proposed, not run: a rerun of the existing SFT `step_004000` and the two RL step-150 checkpoints
+under protocol 0.2. It is priced from the measured eval runtime of ~1.05 h per checkpoint on a
+4090, plus ~5% for the clip. estimated: RTX 4090 x 3.4-3.8 h = $3.0-3.4. Adding two-task step 50
+and PickPlace-only step 100 brings it to $5.0-5.3.
+
+Unverified on GPU: gate behaviour and thresholds (`gate_min_gain` 0.03 now applies to sampled
+rollout success and needs the owner's confirmation; `gate_max_drop` 0.04, `gate_decline_z` 3 and
+`gate_entropy_min` 0.5 are not measured on GPU; z = 3 is from a CPU simulation only), diag/sweep forward cost, the throughput for the 16 x 8 / 2-epoch shape, the render
+hook timing on `physx_cuda`, the CUDA RNG restore (a GPU resume is not bit-identical), v2 oracle
+success on `physx_cuda`, recorder tail stepping on the GPU env, render-gap replay and 7B token
+comparison, and the 0.2 clip and end-flag capture on CUDA.
+
+Deferred: the 4 deg/step clip inside RL rollouts (review Track B item 4), so RL rollouts and 0.2
+eval do not yet see the same action limits; `src.eval.sim_eval.clip_joint_step` is ready to reuse.
+The robot items (servo temperature/current fault response, `park()` on healthy shutdown, camera
+timestamp, placement grid, `wo07_real_eval.py`) belong to PR 2, on PR #23's branch. The plan
+revision for PR #25 is on `wo-recovery-sft`. PR #25's `configs/rl_pickplace_lr*.yaml` use the
+removed `early_stop_*` / `peak_stop_step` keys and need renaming when it merges, or they fail fast.
 
 ## Blockers and decisions pending the owner
 

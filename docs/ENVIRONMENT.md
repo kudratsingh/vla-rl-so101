@@ -78,6 +78,18 @@ full bring-up procedure is `docs/bringup/WO-06-checklist.md`.
 Policy inference for OpenVLA-OFT runs on the GPU box and is served to the Mac over gRPC;
 SmolVLA can run on the Mac CPU/MPS for smoke tests only.
 
+## Install — development (all extras, any machine)
+
+`make setup` runs the full sync from the frozen lock; `make smoke` must pass after it.
+
+```bash
+uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla   # = make setup
+make check && make smoke   # ruff, black, mypy --strict on src/; CPU smoke tests (tiny preset)
+```
+
+On a Mac, `make` exports the MoltenVK / FFmpeg 7 variables above. CI (`.github/workflows/ci.yml`)
+syncs `dev` + `gpu`.
+
 ## Hardware
 
 - SO-101 follower (leader optional). Feetech STS3215 servos, Waveshare bus board, 5 V 4 A supply

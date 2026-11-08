@@ -6,6 +6,13 @@ For every task in `env.tasks`: run seeded oracle episodes on the `seen` cell unt
 have run; report oracle success over all episodes run. All tasks go into ONE LeRobotDataset
 (v3.0) at `<data.dataset_root>/<repo name>`, rebuilt from scratch each time.
 
+A config can record each demo past its success step through release and retreat
+(`TailSettings`, `data.post_success_steps` / `data.post_success_max_steps`) and pick the
+`data.oracle_profile` oracle (src/data/oracle.py). The defaults are the 0.1-era settings the
+existing sets (KudratSingh22/vla-rl-so101-demos, -demos-25) were recorded with: no tail, oracle
+v1. configs/demos_v2.yaml opts in to the v2 oracle and the 15/45 tail. `--push` refuses those two
+0.1 repos unless `--overwrite-hub` is passed: every reported SFT/RL number trained on them.
+
     uv run scripts/wo01_build_env.py --preset tiny             # CPU, < 2 min
     uv run scripts/wo01_build_env.py --preset sim --push       # GPU box; pushes privately to the Hub
 """
@@ -17,6 +24,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +42,8 @@ from src.runs import Run
 # Demo episodes use seeds DEMO_SEED_BASE + cfg.seed * 100_000 + k (k = 0, 1, ...), disjoint from
 # small eval seeds, so evaluating on the "seen" cell never replays a training episode.
 DEMO_SEED_BASE = 1_000_000
+# The 0.1-era demo sets every reported SFT/RL number trained on: --push needs --overwrite-hub
+PROTECTED_HUB_REPOS = ("KudratSingh22/vla-rl-so101-demos", "KudratSingh22/vla-rl-so101-demos-25")
 
 EnvApi = tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]
 
@@ -66,6 +76,44 @@ class LazyRecorder:
         return self.rec
 
 
+@dataclass(frozen=True)
+class TailSettings:
+    """How far a demo is recorded past the step its success check first fires.
+
+    The 0.1-era demo sets stopped at that step, often mid-release (11 of 25 PickPlace and 13 of 25
+    Stack demos end with the gripper at 0.22-0.29 rad, short of the 0.45 release target, with no
+    retreat; review 2026-11-07 section 3.2). With `min_steps > 0` recording continues for at
+    least `min_steps` frames and until the oracle has finished its script (release target
+    reached, retreat done), capped at `max_steps` frames. The DEFAULTS (0 / 0 / no final check)
+    reproduce the 0.1 recorder, so sim.yaml / sft_a4.yaml keep their behaviour and config hash;
+    configs/demos_v2.yaml (and demos_v2_tiny.yaml) opt in with 15 / 45 / true.
+    """
+
+    min_steps: int = 0  # data.post_success_steps (demos_v2: 15)
+    max_steps: int = 0  # data.post_success_max_steps (demos_v2: 45)
+    require_final_success: bool = False  # data.require_final_success: success holds at the end
+
+    @classmethod
+    def from_cfg(cls, cfg: dict[str, Any]) -> TailSettings:
+        data = cfg.get("data", {})
+        out = cls(
+            min_steps=int(data.get("post_success_steps", cls.min_steps)),
+            max_steps=int(data.get("post_success_max_steps", cls.max_steps)),
+            require_final_success=bool(
+                data.get("require_final_success", cls.require_final_success)
+            ),
+        )
+        if not 0 <= out.min_steps <= out.max_steps:
+            raise ValueError(f"need 0 <= post_success_steps <= post_success_max_steps: {out}")
+        return out
+
+
+def oracle_profile(cfg: dict[str, Any]) -> str:
+    from src.data.oracle import DEFAULT_PROFILE
+
+    return str(cfg.get("data", {}).get("oracle_profile", DEFAULT_PROFILE))
+
+
 def run_task(
     task: str,
     cfg: dict[str, Any],
@@ -80,14 +128,19 @@ def run_task(
     make_env, policy_obs, make_oracle = api
     t_start = time.monotonic()
     env = make_env(cfg, task, num_envs=num_envs, cell="seen", render=True)
-    oracle = make_oracle(task, env)
+    profile = oracle_profile(cfg)
+    oracle = make_oracle(task, env, profile)
+    tail = TailSettings.from_cfg(cfg)
     n = int(getattr(env.unwrapped, "num_envs", 1))
-    max_steps = int(cfg["env"]["max_episode_steps"])
+    horizon = int(cfg["env"]["max_episode_steps"])
     max_episodes = max(eval_episodes, 3 * demos, n)
     seed0 = DEMO_SEED_BASE + int(cfg.get("seed", 0)) * 100_000
 
-    n_run = n_success = recorded = env_steps = 0
+    n_run = n_success = recorded = env_steps = tail_lost = 0
     lengths: list[int] = []
+    rec_lengths: list[int] = []
+    tails: list[int] = []
+    finished_tails = 0
     failed_pool: list[tuple[int, str, list[Any], list[Any], list[Any]]] = []
     while (recorded < demos or n_run < eval_episodes) and n_run < max_episodes:
         seeds = [seed0 + n_run + i for i in range(n)]
@@ -97,13 +150,19 @@ def run_task(
         instructions = list(env.unwrapped.get_instructions())
         oracle.reset(obs)
         keep = recorded < demos or (allow_failed and len(failed_pool) < demos)
+        # batches run only for the success statistic stop at the success step
+        tmin, tmax = (tail.min_steps, tail.max_steps) if keep else (0, 0)
         images: list[np.ndarray[Any, Any]] = []
         states: list[np.ndarray[Any, Any]] = []
         actions: list[np.ndarray[Any, Any]] = []
-        done = torch.zeros(n, dtype=torch.bool)
-        success = torch.zeros(n, dtype=torch.bool)
-        length = torch.zeros(n, dtype=torch.long)
-        for _ in range(max_steps):
+        done = torch.zeros(n, dtype=torch.bool)  # this env's recording has ended
+        success = torch.zeros(n, dtype=torch.bool)  # success check fired within the horizon
+        length = torch.zeros(n, dtype=torch.long)  # frames recorded
+        succ_len = torch.zeros(n, dtype=torch.long)  # steps up to and including first success
+        tail_n = torch.zeros(n, dtype=torch.long)  # frames recorded after the success step
+        final_ok = torch.zeros(n, dtype=torch.bool)  # success check at the last recorded step
+        finished = torch.zeros(n, dtype=torch.bool)  # oracle script complete when recording ended
+        for t in range(horizon + tmax):
             po = policy_obs(obs)
             action = oracle.act(obs)
             if keep:
@@ -112,27 +171,41 @@ def run_task(
                 actions.append(torch.as_tensor(action).detach().cpu().float().numpy())
             obs, _, term, trunc, info = env.step(action)
             env_steps += n
-            length += (~done).long()
+            live = ~done
+            length += live.long()
             succ = torch.as_tensor(info["success"]).detach().cpu().bool().reshape(n)
-            success |= succ & ~done
+            newly = live & ~success & succ & (t < horizon)
+            success |= newly
+            succ_len[newly] = t + 1
+            tail_n += (live & success & ~newly).long()
+            final_ok = torch.where(live, succ, final_ok)
             ended = torch.as_tensor(term).cpu().bool() | torch.as_tensor(trunc).cpu().bool()
-            done |= succ | ended.reshape(-1).expand(n)
+            fail_end = live & ~success & (ended.reshape(-1).expand(n) | (t + 1 >= horizon))
+            fin = oracle.finished().cpu()
+            tail_end = live & success & (((tail_n >= tmin) & fin) | (tail_n >= tmax))
+            finished = torch.where(tail_end, fin, finished)
+            done |= fail_end | tail_end
             if bool(done.all()):
                 break
 
         for i in range(n):
-            ep_len, ok = int(length[i]), bool(success[i])
+            ok = bool(success[i])
+            ep_len = int(succ_len[i]) if ok else int(length[i])
             n_run += 1
             n_success += int(ok)
             lengths.append(ep_len)
             if not keep:
                 continue
+            rec_len = int(length[i])
             frames = (
-                [im[i] for im in images[:ep_len]],
-                [st[i] for st in states[:ep_len]],
-                [ac[i] for ac in actions[:ep_len]],
+                [im[i] for im in images[:rec_len]],
+                [st[i] for st in states[:rec_len]],
+                [ac[i] for ac in actions[:rec_len]],
             )
             if ok and recorded < demos:
+                if tail.require_final_success and not bool(final_ok[i]):
+                    tail_lost += 1  # success did not hold through release / retreat
+                    continue
                 for img, st, ac in zip(*frames, strict=True):
                     recorder.add_frame(img, st, ac, instructions[i])
                 recorder.save_episode(
@@ -141,9 +214,16 @@ def run_task(
                         "seed": seeds[i],
                         "cell": "seen",
                         "oracle_success": True,
+                        "success_step": int(succ_len[i]),
+                        "post_success_frames": int(tail_n[i]),
+                        "oracle_finished": bool(finished[i]),
+                        "oracle_profile": profile,
                     }
                 )
                 recorded += 1
+                rec_lengths.append(rec_len)
+                tails.append(int(tail_n[i]))
+                finished_tails += int(finished[i])
             elif not ok and allow_failed and len(failed_pool) < demos:
                 failed_pool.append((seeds[i], instructions[i], *frames))
 
@@ -153,7 +233,13 @@ def run_task(
             for img, st, ac in zip(imgs, sts, acs, strict=True):
                 recorder.add_frame(img, st, ac, instruction)
             recorder.save_episode(
-                {"task_family": task, "seed": seed, "cell": "seen", "oracle_success": False}
+                {
+                    "task_family": task,
+                    "seed": seed,
+                    "cell": "seen",
+                    "oracle_success": False,
+                    "oracle_profile": profile,
+                }
             )
             filled += 1
     env.close()
@@ -165,6 +251,12 @@ def run_task(
         "demos_recorded": recorded,
         "failed_demos_filled": filled,
         "mean_episode_len": float(np.mean(lengths)) if lengths else 0.0,
+        "mean_demo_frames": float(np.mean(rec_lengths)) if rec_lengths else 0.0,
+        "mean_post_success_frames": float(np.mean(tails)) if tails else 0.0,
+        "demos_oracle_finished": finished_tails,
+        "demos_rejected_tail_lost_success": tail_lost,
+        "oracle_profile": profile,
+        "tail": asdict(tail),
         "env_steps": env_steps,
         "num_envs": n,
         "wall_s": round(wall, 2),
@@ -172,7 +264,10 @@ def run_task(
 
 
 def print_table(stats: dict[str, dict[str, Any]]) -> None:
-    head = f"{'task':<10} {'episodes':>8} {'oracle':>8} {'demos':>6} {'len':>6} {'sps':>7} {'wall_s':>7}"
+    head = (
+        f"{'task':<10} {'episodes':>8} {'oracle':>8} {'demos':>6} {'len':>6} {'frames':>6}"
+        f" {'tail':>5} {'sps':>7} {'wall_s':>7}"
+    )
     print(head)
     print("-" * len(head))
     for task, s in stats.items():
@@ -182,11 +277,12 @@ def print_table(stats: dict[str, dict[str, Any]]) -> None:
         sps = s["env_steps"] / max(s["wall_s"], 1e-9)
         print(
             f"{task:<10} {s['episodes']:>8} {100 * s['oracle_success_rate']:>7.1f}% {demos:>6}"
-            f" {s['mean_episode_len']:>6.1f} {sps:>7.0f} {s['wall_s']:>7.1f}"
+            f" {s['mean_episode_len']:>6.1f} {s['mean_demo_frames']:>6.1f}"
+            f" {s['mean_post_success_frames']:>5.1f} {sps:>7.0f} {s['wall_s']:>7.1f}"
         )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
@@ -195,6 +291,11 @@ def main() -> int:
         "--device", choices=["cpu", "cuda"], default=None, help="override cfg.device"
     )
     parser.add_argument("--push", action="store_true", help="push the dataset to the Hub (private)")
+    parser.add_argument(
+        "--overwrite-hub",
+        action="store_true",
+        help=f"allow --push to a 0.1-era demo repo ({', '.join(PROTECTED_HUB_REPOS)})",
+    )
     parser.add_argument(
         "--eval-episodes",
         type=int,
@@ -207,9 +308,15 @@ def main() -> int:
         default=None,
         help="parallel envs (default: make_env's — cfg env.num_envs on cuda, 1 on cpu)",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     cfg = load_config(args.preset, args.config)
+    hub_repo = str(cfg.get("data", {}).get("hub_repo", ""))
+    if args.push and hub_repo in PROTECTED_HUB_REPOS and not args.overwrite_hub:
+        parser.error(
+            f"refusing to --push over {hub_repo}: it holds a 0.1-era demo set that reported "
+            "SFT/RL numbers trained on; set data.hub_repo to a new repo or pass --overwrite-hub"
+        )
     if args.device:
         cfg["device"] = args.device
     num_envs = args.num_envs

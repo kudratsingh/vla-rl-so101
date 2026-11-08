@@ -38,6 +38,7 @@ def test_reads_grpo_metrics_and_shows_sim_aggregates(tmp_path: Path) -> None:
                 "step": 3,
                 "rollout/frac_groups_dropped": 0.6,
                 "train/approx_kl": 0.02,
+                "diag/post/k3_kl": 0.004,
             },
             {"task": "PickPlace", "cell": "seen", "seed": 0, "episodes": 100, "successes": 20},
             {"task": "PickPlace", "cell": "seen", "seed": 1, "episodes": 100, "successes": 30},
@@ -49,6 +50,7 @@ def test_reads_grpo_metrics_and_shows_sim_aggregates(tmp_path: Path) -> None:
     )
     run = load_runs(tmp_path)[0]
     assert run["series"]["rollout/frac_groups_dropped"] == [[3.0, 0.6]]
+    assert run["series"]["diag/post/k3_kl"] == [[3.0, 0.004]]  # fixed-batch diagnostic kept
     assert run["cost_usd"] == 5.25
     assert run["commit"] == "bbbbbbbb"
     assert run["protocol_hash"] == "a" * 64

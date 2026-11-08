@@ -106,6 +106,11 @@ before allowing for having looked at four checkpoints.
   than the protocol (20.7%, 22.0%). Two-task PickPlace read 37.5% at step 50 and 34.4% at step 75,
   then 21.9% at step 100. The protocol eval of step 50 reads 21.3%: that peak was eval noise (about
   +/-15 points at 32 episodes). In-training evals are not a safe way to pick a checkpoint here.
-- WO-04 the updates are very small: approx_kl ~3e-5, clip fraction 0.000 in every 25-step window of
-  both runs. PickPlace-only sampled success still rose (7.9% -> 12.6%, entropy 1.31 -> 1.08,
+- WO-04 logged update metrics: approx_kl ~3e-5, clip fraction 0.000 in every 25-step window of
+  both runs. Correction (2026-11-08, `docs/reviews/2026-11-07-project-review.md` section 3.1): with
+  one PPO epoch these logged values are structurally ~0 and uninformative. The logged mean includes
+  mini-batch 1, which is exactly on-policy (ratio 1), and mini-batch 2 is measured after one Adam
+  step on other prompts. They neither show nor rule out that the updates were too small; that
+  remains a hypothesis. PR 1 (`fix/pre-run-hardening`) replaces them with a fixed-batch pre/post-
+  update diagnostic (`diag/*`). PickPlace-only sampled success still rose (7.9% -> 12.6%, entropy 1.31 -> 1.08,
   groups dropped 61% -> 51%); two-task stayed flat (6.8% -> 7.7%, entropy ~1.5).
