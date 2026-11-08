@@ -16,7 +16,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 04 | **benchmark not met; next step waits for the owner**, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
 | 05, 07, 08, 09 | not started | | |
 | pre-run hardening | PR open, **waits for owner review** (touches the RL loop) | `fix/pre-run-hardening` | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
-| robot safety (PR 2) | PR open against `wo-07-pilot`; merge after #23, #24 and #28 (it merges #24 and #28) | `fix/robot-safety` | Review 3.3 gaps 2, 3, 5 and 7, $0, **unverified on hardware**. See "Robot safety hardening" below. |
+| robot safety (PR 2) | PR open against `wo-07-pilot`; merge after #23, #24 and #28 (it merges #24 and #28) | `fix/robot-safety` | Review 3.3 gaps 2, 3, 5 and 7, plus the owner's 2026-11-08 review changes (homing offsets, torque off unconfirmed, real-eval session fingerprint, parking off by default), $0, **unverified on hardware**. See "Robot safety hardening" below. |
 
 ## Benchmarks met
 
@@ -199,7 +199,7 @@ Review 3.3 and section 9's robot item. The branch is PR #23's branch (`wo-07-pil
 (`wo-06-bringup`) and #28 (`fix/pre-run-hardening`) merged in. Tested only with
 `tests/robot_fakes.py`. **Nothing here has run on the arm or camera.**
 
-- Healthy shutdown parks. `So101Driver.park` drives to `robot.park.qpos` (`null` =
+- Healthy shutdown can park (off by default since the owner's review, below). `So101Driver.park` drives to `robot.park.qpos` (`null` =
   `deploy.home_qpos`, the sim REST_QPOS) through the full safety filter, then turns torque off.
   It is wired into `scripts/wo07_pilot.py`, `scripts/wo07_real_eval.py` (`shutdown_session`:
   session completed, `q`, or Ctrl-C at a prompt) and the healthy end of
@@ -242,10 +242,57 @@ Review 3.3 and section 9's robot item. The branch is PR #23's branch (`wo-07-pil
   SEEN_REGION, slot ids A1-F6, the robot base outline from the URDF meshes, axes, and a 10 cm scale
   bar. Print at 100% and measure the bar. `--check` fails if the committed PDF is stale.
 
+Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes only:
+
+- Homing offsets are checked before every torque enable. `check_rest_pose` compares each servo's
+  stored Homing_Offset (STS3215 EEPROM address 31, 2 bytes, sign bit 11; read and decoded by
+  lerobot 0.4.4 `FeetechMotorsBus.read_calibration`, checked in `.venv`) with the calibration
+  file's `homing_offset`. A mismatch refuses torque, even when the ranges match, and the message
+  says to redo calibration (checklist step 3). Regression test: ranges identical, one offset
+  differs, refused with no torque-enable or goal write.
+- Torque off unconfirmed. A failed torque-off write latches `So101Driver.torque_off_unconfirmed`
+  for the rest of the process. Nothing clears it: not a deadman reset, not a later torque-off
+  that succeeds. While it is set, every goal-position write (step, hold, move_to, park) and every
+  torque enable is refused. The operator message says to switch off the servo supply at the
+  inline power switch. Trial records get `torque_off_unconfirmed: true` and stop reason
+  `torque_off_unconfirmed` (the trial's own reason is kept as `stop_reason_before`). They are
+  stamped after every other field and never scored. The shutdown result, `session_end` and the
+  summary keep the flag (`scripts/wo07_pilot.py`, `scripts/wo07_real_eval.py`). Tested with a
+  fake bus whose torque-off write raises.
+- Real-eval session fingerprint. Six components are hashed separately: protocol (0.2 hash, 0.1
+  reference, judging rule and grid hashes), policy (server policy_id,
+  `server.policy_checkpoint`), camera (`cameras` block), calibration (the motors' loaded
+  calibration incl. homing offsets, the file sha256, `robot.units`), safety (effective
+  SafetyConfig, `robot.safety`, `robot.servo_monitor`) and motion (control rate, deploy
+  settings incl. chunk execution and timeouts, trial steps, home/park incl. `enabled`, gripper
+  floor, settling interval). The fingerprint is stored in every trial record. `--resume` refuses
+  when it differs and names the component and the changed keys. The table refuses to pool
+  trials whose fingerprints differ. On hardware it is computed before the port opens.
+- Owner decisions applied:
+  - 55 C and 1500 mA for 1 s are kept and marked provisional (real.yaml, checklist).
+  - The -5 deg gripper floor is kept for the first rehearsal (documented).
+  - Automatic parking is OFF: `robot.park.enabled: false`. A healthy end now holds, prompts to
+    support the arm, then turns torque off. Checklist step 5 says how to enable parking after
+    the rest-pose and park-path checks.
+  - The placements are the same for SFT and SFT+RL. `--hardware` refuses any `--slot-seed`
+    other than `eval.slot_seed`. `sample_plan` is now prefix-stable in the trial count. Every
+    record carries `placement_plan_sha256`.
+  - Settling interval: `eval.settle_s` = 3 s. The arm holds still, the servos are read once,
+    then the operator scores the trial. The interval is part of judging rule `real-judge-1`
+    (its text and hash) and of each trial's `settle` field.
+- Proposal, implemented behind config: a bounded torque-on wait at teleop prompts
+  (`teleop.prompt_torque_timeout_s` = 60 s, `prompt_support_grace_s` = 10 s; `null` = old
+  behaviour). Each torque-on prompt reads servo health before and after the wait. With no
+  answer in time, the script says "SUPPORT THE ARM NOW", waits through the grace period, turns
+  torque off and ends the session. The wait is `select()` on stdin in the single control
+  thread; there is no background reader, so the bus keeps one owner.
+
 Unverified on hardware: every item above. In particular: the thresholds, the read cost on the
 Mac's USB-serial link, whether the park pose rests safely with torque off, the refusal
-tolerances against a real calibration, the port-busy recovery on a real interrupted packet, the
-capture offset, and the printed grid's scale and alignment with the real base.
+tolerances against a real calibration, the Homing_Offset read on the real servos, the
+behaviour of a real failed torque-off write, `select()` on the Mac terminal for the bounded
+wait, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
+grid's scale and alignment with the real base.
 
 ## Blockers and decisions pending the owner
 
@@ -283,6 +330,16 @@ capture offset, and the printed grid's scale and alignment with the real base.
   groups and projects <= $60; otherwise stop and report. Seeds 1-2 only after seed 0 passes the
   step-38 check.
 
+- 2026-11-08 Robot safety (PR #29 review): check homing offsets before any torque enable;
+  a failed torque-off is reported as "torque off unconfirmed" with motion blocked for the rest
+  of the process and the flag kept in records; real-eval resume and pooling bound to the
+  effective camera, calibration, safety and motion settings plus protocol and checkpoint;
+  servo thresholds 55 C / 1500 mA for 1 s kept as provisional; -5 deg gripper floor kept for
+  the first rehearsal; automatic parking off (`robot.park.enabled: false`) until a supported
+  rest pose and a clear park path are verified after WO-06 step 5; single owner of the serial
+  bus (no background reader); fixed placement grid and doubt = fail approved; the same slot
+  sequence for SFT and SFT+RL; a settling interval before scoring.
+
 - 2026-10-28 WO-04 follow-up (ADR-0002 amendment 2): no per-task advantage normalization; kill
   switch passes if ANY trained task is +3 at step 38; PickPlace-only run, success = final protocol
   eval, seen, PickPlace, 300 episodes, >= 27.0% (missed: 20.7%); stratified multi-task only if it
@@ -290,7 +347,8 @@ capture offset, and the printed grid's scale and alignment with the real base.
 
 ## Decisions taken by the agent (one line each, link ADR if any)
 
-- 2026-11-08 Servo fault thresholds 55 C / 1500 mA for 1 s, read every 4th tick (placeholders: firmware Max_Temperature_Limit 70 C; lerobot sets the gripper's Protection_Current to 250 counts = 1625 mA); owner to confirm on the arm.
+- 2026-11-08 Servo fault thresholds 55 C / 1500 mA for 1 s, read every 4th tick (firmware Max_Temperature_Limit 70 C; lerobot sets the gripper's Protection_Current to 250 counts = 1625 mA); kept by the owner as provisional, to confirm with rehearsal temperatures.
+- 2026-11-08 Settling interval 3 s (`eval.settle_s`) before a real trial is scored; bounded torque-on teleop prompt wait 60 s + 10 s grace (`teleop.prompt_torque_timeout_s`, `prompt_support_grace_s`), the owner's proposal implemented on by default.
 - 2026-11-08 Real judging rule `real-judge-1`: judged once after the arm stops, all success conditions true at that moment, doubt = n (stricter than the sim's latched success).
 - 2026-11-08 Real placement: a stratified 6 x 6 slot lattice of SHIFTED_REGION (seen = inner 4 x 4) instead of continuous positions, so an operator can place objects by hand; one slot seed pairs the SFT and SFT+RL sessions.
 - 2026-10-26 Python 3.11 kept; LeRobot pinned to 0.4.4, the last release supporting 3.11 (0.5+ needs ≥3.12).
