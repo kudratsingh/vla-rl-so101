@@ -10,7 +10,7 @@
 #   up to ~3.2 over the 4964 demo frames alone if few corrections are kept.
 # - mixing: the 25 demos/task + corrections capped at 60 episodes and 1650 frames per task (about
 #   the 25 demos' 1655 frames/task), frames sampled uniformly -> corrections <= ~50% of each task.
-# Checkpoint selection: scripts/wo02_eval.py --cells seen --seeds 7 (NOT protocol seeds 0-2).
+# Checkpoint selection: scripts/wo02_eval.py --protocol 0.2 --cells seen --seeds 7 (NOT 0-2).
 #   uv run scripts/wo02r_collect_corrections.py --preset sim --push               # data
 #   uv run scripts/wo02_sft.py --preset sim --config configs/sft_a5_recovery.yaml # train
 inherit: configs/sft_a4.yaml

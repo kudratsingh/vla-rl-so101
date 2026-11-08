@@ -120,9 +120,44 @@ stop did not fire (step 100 28.1% vs step 50 25.0%). The best checkpoint was ste
 ran no separate mid-run eval; a later protocol eval of two-task step 50 (21.3%) and PickPlace-only
 step 100 (22.7%) found no peak.
 
-Per-update policy change is very small in both runs (approx_kl ~3e-5, clip fraction 0.000): 150
-updates x 2 optimizer steps at lr 5e-5 = 300 steps, against 8000 SFT steps at lr 5e-4. This is the
-leading hypothesis for the slow gain, not a verified cause.
+Both runs logged approx_kl ~3e-5 and clip fraction 0.000. Correction (2026-11-08, review
+`docs/reviews/2026-11-07-project-review.md` section 3.1): with one PPO epoch that metric is
+structurally ~0 and uninformative, because its mean includes mini-batch 1, which is exactly
+on-policy. It is not evidence that the per-update policy change was small. The run did take few
+steps: 150 updates x 2 optimizer steps at lr 5e-5 = 300 steps, against 8000 SFT steps at lr 5e-4.
+Small step size remains a hypothesis for the slow gain, not a verified cause, and the logged KL/clip
+neither supports nor refutes it.
+
+## Amendment 3 (proposed 2026-11-08, PR 1 `fix/pre-run-hardening`; waits for owner review)
+
+Applies to the next GRPO run only. No paid run has used it.
+
+- **Shape:** 16 prompts x K=8 (`rollout_batch: 16`, `samples_per_prompt: 8`), the same 128
+  trajectories per update as K=16 x 8 but twice the prompts.
+- **lr 1e-4, `ppo_epochs: 2`** (4 Adam steps per update at `ppo_mini_batch: 64`). The lr follows
+  the published LoRA recipes (RIPT-VLA, RLinf-VLA use 1e-4). It does not rest on the logged
+  KL/clip, which is uninformative (above). An offline lr sweep (`scripts/wo03_rl.py --lr-sweep`)
+  measures policy movement on one fixed batch before any further lr change.
+- **Gates** replace the 64-episode kill switch and the 32-episode peak stop. They use windows of
+  `rollout/success_rate` (per trained task) and rollout entropy (`rl.gate_*`). They decide whether
+  to keep spending. Only the protocol eval decides whether the policy improved. Periodic greedy
+  evals run on the trained tasks only and are sanity logs. Thresholds: `gate_min_gain` 0.03 is
+  the owner's +3 bar, but it now applies to sampled rollout success, a different quantity, so it
+  needs the owner's confirmation. `gate_max_drop` 0.04 and `gate_entropy_min` 0.5 are the agent's
+  judgment calls and have not been measured. The decline gate also needs the drop to exceed
+  `gate_decline_z` (3) x its group-level SE on two consecutive non-overlapping windows, so
+  sampling noise does not stop an improving run (z from a CPU simulation, `src/rl/gates.py`).
+- **Fixed-batch diagnostic** (`src/rl/diagnostics.py`): it scores the first 32 trajectories of
+  each update batch before and after all optimizer steps. It logs |delta log p|, delta log p split
+  by advantage sign, k3 KL, clip fraction and `grad_norm`. The mini-batch-averaged
+  `train/approx_kl` and `train/clip_frac` are removed.
+- **Resume** from optimizer, scheduler, step and RNG state (`--resume`); checkpoints every 25
+  steps.
+- **RL seeds >= 10 are rejected**: their training seeds (`rl_seed * 10_000_000 + k`) would land in
+  the protocol eval range (100M+) (`src/eval/seed_ranges.py`).
+
+Unverified on GPU: the gate behaviour, the diagnostic and sweep forward cost, the CUDA RNG
+restore, and the throughput for the 16 x 8 / 2-epoch shape.
 
 This meets half of the "what would reopen this" condition above: GRPO has shown no clear
 improvement on a base below the 20-60% band. The decision is with the owner.

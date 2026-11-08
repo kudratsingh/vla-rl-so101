@@ -91,12 +91,17 @@ class PolicyLoss:
     """`loss` carries the gradient; the rest are detached weighted sums (sum(w * x)).
 
     Because a mini-batch's weights sum to 1, summing these over its micro-batches gives the
-    mini-batch's weighted means: clip_frac and approx_kl exactly as upstream logs them.
+    mini-batch's weighted means: clip_frac and approx_kl exactly as upstream logs them, and k3_kl.
+    They are measured with the parameters BEFORE this mini-batch's optimizer step, so the first
+    mini-batch of the first epoch is exactly on-policy (ratio 1, all three 0): averaging them over
+    an update, as upstream logs them, says little about how far the update moved the policy
+    (review 3.1). The trainer's fixed-batch diagnostic (src/rl/diagnostics.py) measures that.
     """
 
     loss: Tensor
     clip_frac: Tensor
     approx_kl: Tensor
+    k3_kl: Tensor
 
 
 def clip_higher_policy_loss(
@@ -118,7 +123,9 @@ def clip_higher_policy_loss(
     no KL term, no entropy bonus (all absent upstream with kl_coef=0, entropy_coeff=0).
 
     clip_frac counts tokens where the clipped branch is active (pg2 > pg1), as upstream.
-    approx_kl is upstream's `ppo_kl` = mean(old_logp - logp); a diagnostic only.
+    approx_kl is upstream's `ppo_kl` = mean(old_logp - logp) (the k1 estimator: unbiased but
+    sign-indefinite per token); k3_kl = mean((ratio - 1) - log ratio) >= 0 per token, the
+    low-variance estimator of KL(old || new) for tokens sampled from old. Diagnostics only.
     Tokens with weight 0 (padding) are zeroed with `where`, so garbage there cannot leak NaNs.
     """
     if not (log_probs.shape == old_log_probs.shape == advantages.shape == weights.shape):
@@ -139,4 +146,11 @@ def clip_higher_policy_loss(
         clipped = (pg2 > pg1) & valid
         clip_frac = (clipped.float() * weights).sum()
         approx_kl = (torch.where(valid, neg_log_ratio, torch.zeros_like(log_probs)) * weights).sum()
-    return PolicyLoss(loss=loss, clip_frac=clip_frac.detach(), approx_kl=approx_kl.detach())
+        k3 = torch.where(valid, (ratio - 1.0) - log_ratio, torch.zeros_like(log_probs))
+        k3_kl = (k3 * weights).sum()
+    return PolicyLoss(
+        loss=loss,
+        clip_frac=clip_frac.detach(),
+        approx_kl=approx_kl.detach(),
+        k3_kl=k3_kl.detach(),
+    )

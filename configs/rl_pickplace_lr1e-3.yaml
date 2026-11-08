@@ -1,5 +1,5 @@
 # docs/plans/recovery-sft.md section 11, stage A: configs/rl_pickplace_lr.yaml at lr 1e-3, probed
-# only if rule 1 fires (lr 5e-4 probe clip fraction 0.000). Same base, RL seed, prompts, rollouts.
+# only if rule 1 (the fixed-batch `--lr-sweep`) picks 1e-3. Same base, RL seed, prompts, rollouts.
 inherit: configs/rl_pickplace_lr.yaml
 
 rl:

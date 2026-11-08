@@ -1,0 +1,30 @@
+# WO-01r demo rebuild (review 2026-11-07 section 3.2; fix list: recorder, oracle, GPU renderer).
+#   uv run scripts/wo01r_rebuild_demos.py --preset sim --mode render-gap     # 0.1 set vs this GPU
+#   uv run scripts/wo01r_rebuild_demos.py --preset sim --mode build --push   # the v2 set
+# Pod job: scripts/pod/demo_rebuild_job.sh. Same scene, camera, image size and seeds as the 0.1
+# set (KudratSingh22/vla-rl-so101-demos-25: sim.yaml + 25 demos/task, Mac CPU renderer); only the
+# recorder tail, the oracle profile and the renderer change. Written to a NEW Hub repo: the 0.1
+# set stays untouched, so the WO-02 attempt-4 numbers keep their data.
+inherit: configs/sim.yaml
+
+data:
+  demos_per_task: 25
+  hub_repo: KudratSingh22/vla-rl-so101-demos-25-v2
+  oracle_profile: v2            # src/data/oracle.py ORACLE_PROFILES; the 0.1 set used v1
+  post_success_steps: 15        # record >= 15 frames past the success step ...
+  post_success_max_steps: 45    # ... until release + retreat are done, at most 45 (0.1 set: 0 / 0)
+  require_final_success: true   # success must still hold on the last recorded frame
+  chunk_pad: drop               # SFT on this set: no padded chunks in the loss (0.1 runs: repeat)
+
+render_gap:                     # --mode render-gap defaults
+  dataset: KudratSingh22/vla-rl-so101-demos-25
+  # WO-02 attempt 4 step_004000, the SFT base of every RL run (scripts/pod/wo04_job.sh SFT_ADAPTER)
+  adapter: KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000
+  policy_config: configs/sft_a4.yaml
+  episodes_per_task: 25
+  token_stride: 1
+
+cost:                           # scripts/pod/demo_rebuild_job.sh estimate (not yet measured)
+  gpu: RTX-4090
+  usd_per_hour: 0.89
+  est_hours: 0.75               # setup ~0.4 h, render gap ~0.15 h (7B load + 75 episodes), build ~0.2 h

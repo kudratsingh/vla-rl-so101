@@ -16,6 +16,14 @@ branch step. Frames start at the restore point: the SFT policy's own actions are
 --mode control: fresh oracle demos from reset on CONTROL seeds (kind=control_demo), for the
 matched control (configs/sft_a5_control.yaml). No policy is loaded.
 
+Both modes record exactly as scripts/wo01_build_env.py records the config's demo set: the same
+`data.oracle_profile` (v1 by default, v2 in configs/demos_v2.yaml) and the same tail past the
+success step (`data.post_success_steps` / `post_success_max_steps` / `require_final_success`;
+default none, the 0.1 recorder). The SFT rollouts that mine failures play `--protocol` (default
+0.2: the real arm's 4 deg/step joint clip, as `scripts/wo02_eval.py --protocol 0.2` does), so
+the mined failures are the ones the paired protocol eval sees; one EpisodeRecord per rollout
+goes to runs/<id>/episodes.jsonl (seed -1: recovery seeds are not protocol seeds).
+
 Default config: configs/sft_tiny.yaml for --preset tiny (TINY_DEFAULTS below), else
 configs/sft_a5_recovery.yaml (its `recovery:` block). Writes runs/<id>/record.json.
 """
@@ -24,11 +32,14 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.util
+import json
 import math
 import os
 import sys
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +61,8 @@ from src.data.recovery import (
     yield_table,
 )
 from src.eval import seed_ranges as SR
+
+PROTOCOL_MODULES = {"0.1-draft": "src.eval.protocol", "0.2": "src.eval.protocol_v02"}
 
 DEFAULTS: dict[str, Any] = {
     "hub_repo": None,  # corrections dataset (None: local/vla-rl-so101-correction-<preset>)
@@ -88,6 +101,18 @@ def settings(cfg: Config) -> dict[str, Any]:
     return out
 
 
+def build_env_module() -> Any:
+    """scripts/wo01_build_env.py (TailSettings, oracle_profile): record like the demo set."""
+    spec = importlib.util.spec_from_file_location(
+        "wo01_build_env", REPO_ROOT / "scripts" / "wo01_build_env.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod  # dataclasses resolve annotations through sys.modules
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def output_location(cfg: Config, kind: str, hub_repo: str | None) -> tuple[str, Path]:
     repo = hub_repo or f"local/vla-rl-so101-{kind}-{cfg.get('preset', 'dev')}"
     repo_id, root = dataset_location({**cfg, "data": {**cfg.get("data", {}), "hub_repo": repo}})
@@ -110,18 +135,33 @@ class LazyRecorder:
 
 
 def oracle_episodes(
-    env: Any, oracle: Any, obs: Any, obs_fn: Callable[[Any], Any], max_steps: int
-) -> tuple[torch.Tensor, torch.Tensor, list[list[tuple[Any, Any, Any]]]]:
-    """Run the (already reset) oracle until every env succeeds or times out.
+    env: Any,
+    oracle: Any,
+    obs: Any,
+    obs_fn: Callable[[Any], Any],
+    max_steps: int,
+    tail: Any = None,
+) -> tuple[torch.Tensor, torch.Tensor, list[list[tuple[Any, Any, Any]]], dict[str, torch.Tensor]]:
+    """Run the (already reset) oracle until every env has failed (env end or `max_steps`) or has
+    succeeded and finished its tail: the episode-end rule of scripts/wo01_build_env.py.
 
-    Returns (success (N,), length (N,), per-env frames [(image, state, action)] up to length):
-    state = qpos at t, action = the oracle command at t (the WO-01 demo convention)."""
+    `tail` (wo01_build_env.TailSettings; None = no tail, the 0.1 recorder): after the success
+    step, keep recording for >= tail.min_steps frames and until the oracle has finished its
+    script, at most tail.max_steps frames. Returns (keep (N,): success within `max_steps`, still
+    holding at the last recorded frame if tail.require_final_success; length (N,) recorded
+    frames; per-env frames [(image, state, action)] up to length, state = qpos at t, action = the
+    oracle command at t (the WO-01 demo convention); per-env sidecar fields)."""
     n = int(env.unwrapped.num_envs)
+    tmin, tmax = (int(tail.min_steps), int(tail.max_steps)) if tail is not None else (0, 0)
     frames: list[list[tuple[Any, Any, Any]]] = [[] for _ in range(n)]
     done = torch.zeros(n, dtype=torch.bool)
     success = torch.zeros(n, dtype=torch.bool)
     length = torch.zeros(n, dtype=torch.long)
-    for _ in range(max_steps):
+    succ_len = torch.zeros(n, dtype=torch.long)
+    tail_n = torch.zeros(n, dtype=torch.long)
+    final_ok = torch.zeros(n, dtype=torch.bool)
+    finished = torch.zeros(n, dtype=torch.bool)
+    for t in range(max_steps + tmax):
         po = obs_fn(obs)
         action = oracle.act(obs)
         img = po["image"].detach().cpu().numpy()
@@ -130,14 +170,39 @@ def oracle_episodes(
         for i in torch.nonzero(~done).flatten().tolist():
             frames[i].append((img[i], st[i], ac[i]))
         obs, _, term, trunc, info = env.step(action)
-        length += (~done).long()
+        live = ~done
+        length += live.long()
         succ = torch.as_tensor(info["success"]).detach().cpu().bool().reshape(n)
-        success |= succ & ~done
+        newly = live & ~success & succ & (t < max_steps)
+        success |= newly
+        succ_len[newly] = t + 1
+        tail_n += (live & success & ~newly).long()
+        final_ok = torch.where(live, succ, final_ok)
         ended = torch.as_tensor(term).cpu().bool() | torch.as_tensor(trunc).cpu().bool()
-        done |= succ | ended.reshape(-1).expand(n)
+        fail_end = live & ~success & (ended.reshape(-1).expand(n) | (t + 1 >= max_steps))
+        fin = oracle.finished().cpu()
+        tail_end = live & success & (((tail_n >= tmin) & fin) | (tail_n >= tmax))
+        finished = torch.where(tail_end, fin, finished)
+        done |= fail_end | tail_end
         if bool(done.all()):
             break
-    return success, length, frames
+    keep = success & final_ok if tail is not None and tail.require_final_success else success
+    meta = {
+        "success_step": succ_len,
+        "post_success_frames": tail_n,
+        "oracle_finished": finished,
+    }
+    return keep, length, frames, meta
+
+
+def _tail_meta(meta: dict[str, torch.Tensor], i: int, ok: bool, profile: str) -> dict[str, Any]:
+    """The sidecar fields wo01_build_env writes for its demos, for env row i."""
+    out: dict[str, Any] = {"oracle_profile": profile}
+    if ok:
+        out["success_step"] = int(meta["success_step"][i])
+        out["post_success_frames"] = int(meta["post_success_frames"][i])
+        out["oracle_finished"] = bool(meta["oracle_finished"][i])
+    return out
 
 
 def save(
@@ -160,9 +225,16 @@ def find_branches(
     max_steps: int,
     back: int,
     allow_reset: bool = False,
+    *,
+    action_clip: float | None = None,
+    log_episode: Callable[[Any], None] | None = None,
 ) -> tuple[list[Branch], list[Any], dict[str, Any]]:
-    """SFT rollouts on `seeds` -> candidate branches, the traces (snapshots), rollout stats."""
-    from src.eval.sim_eval import run_batch_traced
+    """SFT rollouts on `seeds` -> candidate branches, the traces (snapshots), rollout stats.
+
+    `action_clip`: the protocol's per-joint step clip (0.2), as in the protocol eval; the trace
+    records the executed (clipped) actions, so a branch's `grip_cmd` is what the arm was sent.
+    `log_episode` receives one sim_eval.EpisodeRecord per rollout."""
+    from src.eval.sim_eval import episode_records, run_batch_traced
 
     n = int(env.unwrapped.num_envs)
     branches: list[Branch] = []
@@ -173,6 +245,7 @@ def find_branches(
     successes = 0
     for b, start in enumerate(range(0, len(seeds), n)):
         batch = seeds[start : start + n]
+        end: dict[str, torch.Tensor] = {}
         ok, length, trace = run_batch_traced(
             policy.act_batch,
             env,
@@ -180,8 +253,13 @@ def find_branches(
             batch,
             max_steps,
             snapshot_fn=state_mod.snapshot,
+            action_clip=action_clip,
+            end_info=end,
         )
         traces.append(trace)
+        if log_episode is not None:
+            for rec in episode_records(task, "seen", -1, batch, ok, length, end):
+                log_episode(rec)
         steps = [bd.step for bd in trace.boundaries]
         for row, seed in enumerate(batch):
             if bool(ok[row]):
@@ -233,8 +311,14 @@ def run_corrections(
     *,
     keep_failed: bool,
     adapter: str,
+    action_clip: float | None = None,
+    protocol: str = "0.2",
+    log_episode: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
     from src.data.oracle import make_oracle
+
+    bmod = build_env_module()
+    profile, tail = str(bmod.oracle_profile(cfg)), bmod.TailSettings.from_cfg(cfg)
 
     env_mod: Any = importlib.import_module("src.env")
     state_mod: Any = importlib.import_module("src.env.state")
@@ -253,6 +337,8 @@ def run_corrections(
         max_steps,
         int(rc["branch_back"]),
         bool(rc["allow_reset_branch"]),
+        action_clip=action_clip,
+        log_episode=log_episode,
     )
     chosen = interleave(candidates, int(rc["cap_per_mode"]))
     tried: list[Branch] = []
@@ -270,15 +356,15 @@ def run_corrections(
         if err > float(rc["restore_tol"]):
             raise RuntimeError(f"{task}: restored state differs from the snapshot by {err:.2e}")
         instructions = list(env.unwrapped.get_instructions())
-        oracle = make_oracle(task, env)
+        oracle = make_oracle(task, env, profile)
         oracle.reset(
             obs,
             start_phase="infer",
             grasped=torch.tensor([g.in_hand for g in padded]),
             grip_cmd=torch.tensor([g.grip_cmd for g in padded]),
         )
-        success, length, frames = oracle_episodes(
-            env, oracle, obs, env_mod.policy_obs, int(rc["oracle_max_steps"])
+        success, length, frames, tmeta = oracle_episodes(
+            env, oracle, obs, env_mod.policy_obs, int(rc["oracle_max_steps"]), tail
         )
         for i, g in enumerate(group):
             ok = bool(success[i])
@@ -299,6 +385,8 @@ def run_corrections(
                 "in_hand": g.in_hand,
                 "source_policy": adapter,
                 "backend": snap.backend,
+                "protocol": protocol,
+                **_tail_meta(tmeta, i, ok, profile),
             }
             save(recorder, ep, instructions[i], meta)
             kept += int(ok)
@@ -311,14 +399,25 @@ def run_corrections(
         "correction_frames": frames_kept,
         "yield_by_mode": yield_table(tried, oks),
         "restore_max_err": max_err,
+        "oracle_profile": profile,
+        "tail": asdict(tail),
         "seeds": [seeds[0], seeds[-1]],
     }
 
 
 def run_control(
-    task: str, rc: dict[str, Any], env: Any, recorder: LazyRecorder, *, keep_failed: bool
+    task: str,
+    cfg: Config,
+    rc: dict[str, Any],
+    env: Any,
+    recorder: LazyRecorder,
+    *,
+    keep_failed: bool,
 ) -> dict[str, Any]:
     from src.data.oracle import make_oracle
+
+    bmod = build_env_module()
+    profile, tail = str(bmod.oracle_profile(cfg)), bmod.TailSettings.from_cfg(cfg)
 
     env_mod: Any = importlib.import_module("src.env")
     n = int(env.unwrapped.num_envs)
@@ -332,10 +431,10 @@ def run_control(
         batch = pool[start : start + n]
         obs, _ = env.reset(seed=batch)
         instructions = list(env.unwrapped.get_instructions())
-        oracle = make_oracle(task, env)
+        oracle = make_oracle(task, env, profile)
         oracle.reset(obs)
-        success, length, frames = oracle_episodes(
-            env, oracle, obs, env_mod.policy_obs, int(rc["oracle_max_steps"])
+        success, length, frames, tmeta = oracle_episodes(
+            env, oracle, obs, env_mod.policy_obs, int(rc["oracle_max_steps"]), tail
         )
         for i, seed in enumerate(batch):
             run += 1
@@ -348,12 +447,19 @@ def run_control(
                 "cell": "seen",
                 "oracle_success": ok,
                 "kind": "control_demo",
+                **_tail_meta(tmeta, i, ok, profile),
             }
             ep = frames[i][: int(length[i])]
             save(recorder, ep, instructions[i], meta)
             kept += 1
             frames_kept += len(ep)
-    return {"episodes_run": run, "control_demos": kept, "control_frames": frames_kept}
+    return {
+        "episodes_run": run,
+        "control_demos": kept,
+        "control_frames": frames_kept,
+        "oracle_profile": profile,
+        "tail": asdict(tail),
+    }
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
@@ -366,6 +472,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument("--sim-device", choices=["cuda", "cpu"], default=None)
     parser.add_argument("--push", action="store_true", help="push the dataset to the Hub (private)")
+    parser.add_argument(
+        "--protocol",
+        choices=sorted(PROTOCOL_MODULES),
+        default="0.2",
+        help="protocol whose action clip the SFT rollouts play (default 0.2, the paired eval's)",
+    )
     args = parser.parse_args(argv)
     cfg = load_config(args.preset, args.config or default_config(args.preset))
     rc = settings(cfg)
@@ -383,6 +495,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     repo_id, root = output_location(
         cfg, kind, rc["hub_repo"] if args.mode == "corrections" else rc["control_hub_repo"]
     )
+    protected = tuple(build_env_module().PROTECTED_HUB_REPOS)
+    if args.push and repo_id in protected:  # PR 1's denylist: never overwrite a 0.1 demo set
+        raise ValueError(f"refusing to --push {kind} episodes over {repo_id}, a 0.1-era demo set")
     recorder = LazyRecorder(repo_id, root)
     policy = None
     adapter = str(args.adapter or cfg["policy"].get("adapter") or "tiny-random")
@@ -394,8 +509,25 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         policy = make_policy(cfg, device, adapter=None if adapter == "tiny-random" else adapter)
         policy.eval()
 
+    protocol: dict[str, Any] = {}
+    action_clip: float | None = None
+    if policy is not None:
+        pmod: Any = importlib.import_module(PROTOCOL_MODULES[args.protocol])
+        protocol = {
+            "protocol_version": pmod.PROTOCOL_VERSION,
+            "protocol_hash": pmod.protocol_hash(),
+        }
+        if args.protocol == "0.2":
+            action_clip = float(pmod.action_clip().bound_rad)
+            protocol["action_clip_rad"] = action_clip
+
     with runs.Run(work_order="WO-02R", script=__file__, cfg=cfg, device=device) as run:
         stats: dict[str, Any] = {}
+        records: list[str] = []
+
+        def log_episode(rec: Any) -> None:
+            records.append(json.dumps(asdict(rec)))
+
         for task in cfg["env"]["tasks"]:
             env = env_mod.make_env(sim_cfg, task, num_envs=num_envs, cell="seen")
             try:
@@ -409,13 +541,19 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                         recorder,
                         keep_failed=keep_failed,
                         adapter=adapter,
+                        action_clip=action_clip,
+                        protocol=args.protocol,
+                        log_episode=log_episode,
                     )
                 else:
-                    stats[task] = run_control(task, rc, env, recorder, keep_failed=keep_failed)
+                    stats[task] = run_control(task, cfg, rc, env, recorder, keep_failed=keep_failed)
             finally:
                 env.close()
-            run.log_metrics(task=task, **{k: v for k, v in stats[task].items() if k != "seeds"})
+            skip = {"seeds", "tail"}
+            run.log_metrics(task=task, **{k: v for k, v in stats[task].items() if k not in skip})
             print(f"[wo02r] {task}: {stats[task]}", flush=True)
+        if policy is not None:
+            (Path(run.dir) / "episodes.jsonl").write_text("".join(r + "\n" for r in records))
         dataset: dict[str, Any] = {"repo_id": repo_id, "root": os.path.relpath(root, REPO_ROOT)}
         if recorder.rec is not None:
             recorder.rec.finalize()
@@ -424,7 +562,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 dataset["hub_url"] = recorder.rec.push_to_hub(private=True)
         else:
             dataset.update(episodes=0, frames=0)
-        run.results.update(mode=args.mode, settings=rc, tasks=stats, dataset=dataset)
+        run.results.update(mode=args.mode, settings=rc, tasks=stats, dataset=dataset, **protocol)
+        if policy is not None:
+            run.results["episode_records"] = "episodes.jsonl"
         run.results["source_policy"] = adapter if policy is not None else None
         print(
             f"[wo02r] dataset {repo_id}: {dataset['episodes']} episodes, {dataset['frames']} frames"

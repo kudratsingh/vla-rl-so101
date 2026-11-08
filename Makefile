@@ -7,8 +7,8 @@ export DYLD_FALLBACK_LIBRARY_PATH ?= /opt/homebrew/opt/ffmpeg@7/lib
 export MVK_CONFIG_LOG_LEVEL ?= 0
 endif
 
-setup:
-	uv sync --extra dev --extra gpu --extra smolvla
+setup:    ## every extra, from the frozen lock (docs/ENVIRONMENT.md "Install — development")
+	uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla
 
 check:
 	uv run ruff check src tests scripts

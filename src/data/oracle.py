@@ -9,12 +9,23 @@ Observation keys used: obs["agent"]["qpos"], obs["extra"]{tcp_pose, obj_pose, go
 obj_half_height} — the privileged state the env exposes for this purpose only (plus
 is_grasped for a mid-episode start, `reset(start_phase="infer")`: recovery corrections from a
 restored policy state, src/env/state.py).
+
+Speed profiles (`OracleProfile`, `data.oracle_profile`): "v1" is the oracle that recorded the
+0.1-era demo sets (KudratSingh22/vla-rl-so101-demos, -demos-25): 1.5 cm/step nominal approach
+(the joint cap holds the real TCP to ~0.9 cm/step), 1 cm/step descent, so the last 10 cm before
+the grasp take ~1.5 policy chunks of 8 steps; it is the default. "v2" (opt-in via
+`data.oracle_profile: v2`, configs/demos_v2.yaml; review 2026-11-07 section 3.2) runs
+the last `approach_slow_radius` (6 cm) of the approach and the descent to the grasp / push height
+at 0.5 cm/step: ~2.6-3.0 chunks in the last 10 cm (scripts/wo01_oracle_eval.py near_decisions).
+Everything else (waypoints, carry, release, retries) is identical; v1 reproduces the 0.1 oracle
+bit for bit.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
@@ -36,6 +47,26 @@ PUSHER_OFFSET = 0.012  # closed-finger pad centre sits this far from the TCP alo
 PUSHER_HALF = 0.007  # half thickness of the closed fingers along the push direction
 PHASE_TIMEOUT = 45
 MAX_RETRIES = 2
+
+
+@dataclass(frozen=True)
+class OracleProfile:
+    """TCP speeds (m per control step) for the approach to the object; see the module docstring."""
+
+    hover_speed: float = 0.015  # transit to the point HOVER above the object (push: behind it)
+    approach_slow_radius: float = 0.0  # last metres of that transit run at approach_speed
+    approach_speed: float = 0.015
+    descend_speed: float = 0.01  # hover point -> grasp / push height
+
+
+ORACLE_PROFILES: dict[str, OracleProfile] = {
+    "v1": OracleProfile(),
+    "v2": OracleProfile(approach_slow_radius=0.06, approach_speed=0.005, descend_speed=0.005),
+}
+# v1 by default so configs that do not set data.oracle_profile (sim.yaml, sft_a4.yaml) keep
+# recording the 0.1 oracle under their unchanged config hash; configs/demos_v2.yaml opts in to v2.
+DEFAULT_PROFILE = "v1"
+
 
 _SEEDS = torch.tensor(
     [
@@ -121,9 +152,22 @@ class Oracle:
         "Push": ("hover", "descend", "push", "retreat", "done"),
     }
 
-    def __init__(self, task: str, num_envs: int, device: torch.device | str = "cpu") -> None:
+    def __init__(
+        self,
+        task: str,
+        num_envs: int,
+        device: torch.device | str = "cpu",
+        profile: str | OracleProfile = DEFAULT_PROFILE,
+    ) -> None:
         if task not in self.PHASES:
             raise ValueError(f"unknown task {task!r}")
+        if isinstance(profile, str):
+            if profile not in ORACLE_PROFILES:
+                raise ValueError(
+                    f"unknown oracle profile {profile!r}; one of {list(ORACLE_PROFILES)}"
+                )
+            profile = ORACLE_PROFILES[profile]
+        self.profile = profile
         self.task = task
         self.n = num_envs
         # The state machine is small and branchy: run it on CPU, return actions on `out_device`.
@@ -230,6 +274,9 @@ class Oracle:
         self.c0 = st["tcp_R"][:, :, 1].clone()
         self.c1 = self.c0.clone()
         self.speed = torch.full((n,), 0.01, device=dev)
+        # per segment: the last `slow_radius` metres run at min(speed, slow_speed)
+        self.slow_radius = torch.zeros(n, device=dev)
+        self.slow_speed = torch.full((n,), math.inf, device=dev)
         self.s = torch.ones(n, device=dev)
         self.grasp_off = torch.zeros(n, 3, device=dev)  # obj - tcp while grasped
         self.push_dir = torch.zeros(n, 3, device=dev)
@@ -247,6 +294,9 @@ class Oracle:
         closing: torch.Tensor,
         speed: float,
         tilt: torch.Tensor | None = None,
+        *,
+        slow_radius: float = 0.0,
+        slow_speed: float = math.inf,
     ) -> None:
         if not bool(mask.any()):
             return
@@ -263,6 +313,8 @@ class Oracle:
             tilt = tilt[mask]
         self.tilt1[mask] = tilt
         self.speed[mask] = speed
+        self.slow_radius[mask] = slow_radius
+        self.slow_speed[mask] = slow_speed
         self.s[mask] = 0.0
 
     def _enter(self, mask: torch.Tensor, st: dict[str, torch.Tensor]) -> None:
@@ -275,6 +327,8 @@ class Oracle:
         cur_c = st["tcp_R"][:, :, 1]
         up = torch.tensor([0.0, 0.0, 1.0], device=self.device)
         zero_tilt = torch.zeros(self.n, device=self.device)
+        pr = self.profile
+        slow = (pr.approach_slow_radius, pr.approach_speed)
 
         def sel(nm: str) -> torch.Tensor:
             return mask & torch.tensor([x == nm for x in name], device=self.device)
@@ -284,13 +338,15 @@ class Oracle:
             if bool(m.any()):
                 c = _face_closing(obj_yaw, _horiz(cur_c))  # least wrist roll; sign = current
                 g = obj_p - GRASP_CLEARANCE * c + up * HOVER
-                self._set_segment(m, st, g, c, 0.015)
+                self._set_segment(
+                    m, st, g, c, pr.hover_speed, slow_radius=slow[0], slow_speed=slow[1]
+                )
                 self.grip_goal[m] = GRIPPER_OPEN
             m = sel("descend")
             if bool(m.any()):
                 g = self.p1.clone()
                 g[:, 2] = obj_p[:, 2] + 0.003
-                self._set_segment(m, st, g, self.c1, 0.01, zero_tilt)
+                self._set_segment(m, st, g, self.c1, pr.descend_speed, zero_tilt)
             m = sel("close")
             if bool(m.any()):
                 self.grip_goal[m] = GRIPPER_CLOSED
@@ -332,13 +388,16 @@ class Oracle:
                 c = torch.where((c * cur_c).sum(-1, keepdim=True) < 0, -c, c)  # least wrist roll
                 g = self._pusher_tcp(obj_p, st["half"], d, c, back=0.02)
                 g[:, 2] = obj_p[:, 2] + HOVER
-                self._set_segment(m, st, g, c, 0.015)
+                self._set_segment(
+                    m, st, g, c, pr.hover_speed, slow_radius=slow[0], slow_speed=slow[1]
+                )
                 self.grip_goal[m] = GRIPPER_CLOSED
             m = sel("descend")
             if bool(m.any()):
                 g = self.p1.clone()
                 g[:, 2] = 0.016
-                self._set_segment(m, st, g, self.c1, 0.01)  # tilt only if top-down is out of reach
+                # tilt only if top-down is out of reach
+                self._set_segment(m, st, g, self.c1, pr.descend_speed)
             m = sel("retreat")
             if bool(m.any()):
                 g = tcp_p - 0.02 * self.push_dir
@@ -375,10 +434,21 @@ class Oracle:
                 self.tilt0[m] = self.tilt1[m]  # keep the tilt chosen for the descent
                 self.s[m] = 0.0
                 self.speed[m] = 0.006
+                self.slow_radius[m] = 0.0
 
-        # advance along the segment
-        seg_len = (self.p1 - self.p0).norm(dim=-1).clamp(min=1e-6)
-        self.s = torch.clamp(self.s + self.speed / seg_len, max=1.0)
+        # advance along the segment. Segments with a slow zone (v2 approach) track the actual
+        # TCP: the command leads the TCP's projection on the segment by at most one step and never
+        # moves back, so when the joint cap makes the arm lag, entering the last `slow_radius`
+        # metres (measured at the TCP) really slows the arm instead of letting it catch up.
+        seg = self.p1 - self.p0
+        seg_len = seg.norm(dim=-1).clamp(min=1e-6)
+        s_tcp = (((st["tcp"][:, :3] - self.p0) * seg).sum(-1) / seg_len**2).clamp(0.0, 1.0)
+        slow = (1.0 - s_tcp) * seg_len < self.slow_radius
+        speed = torch.where(slow, torch.minimum(self.speed, self.slow_speed), self.speed)
+        s_next = self.s + speed / seg_len
+        led = torch.minimum(s_next, torch.maximum(self.s, s_tcp + speed / seg_len))
+        s_next = torch.where(self.slow_radius > 0, led, s_next)
+        self.s = torch.clamp(s_next, max=1.0)
         s = self.s[:, None]
         pos = self.p0 + s * (self.p1 - self.p0)
         tilt = self.tilt0 + self.s * (self.tilt1 - self.tilt0)
@@ -450,6 +520,14 @@ class Oracle:
         if bool(changed.any()):
             self._enter(changed, st)
 
+    def finished(self) -> torch.Tensor:
+        """(N,) bool: the script has run to its end (released / retreated, holding still)."""
+        return self.phase == len(self.names) - 1
+
+    def contact_phase(self) -> int:
+        """Index of the first phase that touches the object (close / push)."""
+        return self.names.index("push" if self.task == "Push" else "close")
+
     def _looks_solved(self, i: int, st: dict[str, torch.Tensor]) -> bool:
         o, g, h = st["obj"][i, :3], st["goal"][i, :3], float(st["half"][i])
         if self.task == "PickPlace":
@@ -462,7 +540,7 @@ class Oracle:
         return float((o - g)[:2].norm()) < S.TARGET_RADIUS
 
 
-def make_oracle(task: str, env: Any) -> Oracle:
+def make_oracle(task: str, env: Any, profile: str | OracleProfile = DEFAULT_PROFILE) -> Oracle:
     """Oracle for `task` sized to `env` (ManiSkill env or the CPU serial batch from make_env)."""
     base = env.unwrapped
-    return Oracle(task, int(base.num_envs), getattr(base, "device", "cpu"))
+    return Oracle(task, int(base.num_envs), getattr(base, "device", "cpu"), profile)

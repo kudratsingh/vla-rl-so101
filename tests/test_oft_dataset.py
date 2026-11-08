@@ -110,8 +110,10 @@ def test_lerobot_chunks_repeat_last_action(fake_recorder: Path) -> None:
     cfg = load_config("tiny", "configs/sft_tiny.yaml")
     cfg["env"]["tasks"] = list(TASKS)
     cfg["data"]["demos_per_task"] = 1  # first demo of each task: episodes 0 and 2
+    cfg["data"].pop("chunk_pad", None)  # default = the 0.1-era behaviour: padded chunks kept
     ds, info = load_sft_frames(cfg, chunk_len=8)
     assert info["episodes_per_task"] == {"PickPlace": [0], "Push": [2]}
+    assert info["chunk_pad"] == "repeat" and info["pad_frames_dropped"] == 0
     assert len(ds) == LENGTHS[0] + LENGTHS[2] and info["fps"] == 15
     first = ds[0]
     assert first["image"].shape == (3, 24, 24) and first["image"].dtype == torch.float32
@@ -127,6 +129,27 @@ def test_lerobot_chunks_repeat_last_action(fake_recorder: Path) -> None:
     with pytest.raises(ValueError, match="need 3"):
         cfg["data"]["demos_per_task"] = 3
         load_sft_frames(cfg, chunk_len=8)
+
+
+def test_padded_chunks_are_dropped_with_chunk_pad_drop(fake_recorder: Path) -> None:
+    cfg = load_config("tiny", "configs/sft_tiny.yaml")
+    cfg["env"]["tasks"] = list(TASKS)
+    cfg["data"]["demos_per_task"] = 1  # episodes 0 (5 frames) and 2 (6 frames)
+    cfg["data"]["chunk_pad"] = "drop"  # the v2 set's opt-in (configs/demos_v2.yaml)
+    ds, info = load_sft_frames(cfg, chunk_len=3)
+    assert info["chunk_pad"] == "drop" and info["pad_frames_dropped"] == 2 + 2
+    assert len(ds) == (5 - 2) + (6 - 2)
+    chunks = [ds[i]["actions"][:, 0] for i in range(len(ds))]
+    # every kept chunk is a real 3-step window; together they still cover every action
+    assert all(bool((c[1:] - c[:-1] == 1).all()) for c in chunks)
+    assert torch.allclose(chunks[2], torch.tensor([2.0, 3.0, 4.0]))  # last kept frame of ep 0
+    assert {float(a) for c in chunks for a in c} == {0, 1, 2, 3, 4, 200, 201, 202, 203, 204, 205}
+    # generic sources (no LeRobot columns) use the per-item `_is_pad` flags
+    frames = synthetic_frames(["x"], episodes_per_instruction=2, frames_per_episode=5, chunk_len=3)
+    assert len(ChunkedDemoDataset(frames, chunk_len=3, chunk_pad="drop")) == 2 * 3
+    short = synthetic_frames(["x"], episodes_per_instruction=1, frames_per_episode=2, chunk_len=3)
+    with pytest.raises(ValueError, match="padded"):
+        ChunkedDemoDataset(short, chunk_len=3, chunk_pad="drop")
 
 
 def test_synthetic_frames_feed_the_policy() -> None:
@@ -196,6 +219,21 @@ def test_extra_datasets_capped_and_frame_matched(tmp_path: Path) -> None:
     extra = info["extra_datasets"][0]
     assert extra["kind"] == "control_demo" and extra["frames_per_task"] == {"PickPlace": 6}
     assert len(ds) == 11 + 6
+
+    # chunk_pad: drop (v2 set): caps and the match count TRAINED frames, n - (chunk_len - 1)
+    for path in (recovery, control):
+        path.write_text(path.read_text().replace("  extra_", "  chunk_pad: drop\n  extra_"))
+    ds, info = load_sft_frames(load_config("tiny", recovery), chunk_len=3)
+    extra = info["extra_datasets"][0]
+    assert extra["episodes_per_task"] == {"PickPlace": [0, 2, 3]}  # 2 + 1 + 3 trained frames
+    assert extra["frames_per_task"] == {"PickPlace": 6}
+    assert len(ds) == (5 - 2) + (6 - 2) + 6 and info["pad_frames_dropped"] == 2 * 5
+    assert all(bool((ds[i]["actions"][1:, 0] > ds[i]["actions"][:-1, 0]).all()) for i in range(13))
+    ds, info = load_sft_frames(load_config("tiny", control), chunk_len=3)
+    # 1 trained frame per 3-frame control demo: all 4 (4 <= 6), where recorded frames would
+    # have matched 2 demos (6 recorded, 2 trained frames) against the corrections' 6
+    assert info["extra_datasets"][0]["frames_per_task"] == {"PickPlace": 4}
+    assert len(ds) == 7 + 4
 
     rows = [{"task_family": "PickPlace", "cell": "seen", "oracle_success": True,
              "episode_index": i, "num_frames": 10} for i in range(3)]  # fmt: skip

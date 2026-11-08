@@ -15,6 +15,19 @@ owner's explicit go on its own probe numbers (CLAUDE.md rule 1).
   and 10).
 - The matched ordinary-demo control (section 7) is unchanged.
 
+**Sync with PR 1, 2026-11-08** (`fix/pre-run-hardening` merged into this branch; $0, CPU only):
+- `check_rl_seed` is PR 1's: RL seeds outside [0, 10) are rejected before the overlap check.
+- The three `configs/rl_pickplace_lr*.yaml` use PR 1's gate keys (`gate_check_frac: 0.26`,
+  `gate_window: 5`) and inherit PR 1's `rl_pickplace.yaml` shape; their costs are repriced from
+  `--estimate` (section 13).
+- Corrections and control demos are recorded the way `scripts/wo01_build_env.py` records the
+  config's demo set: same oracle profile and same tail past success (section 4).
+- Failure mining plays protocol 0.2 (the 4 deg/step clip) and writes per-episode records; the
+  three protocol evals run under `--protocol 0.2`; `src/eval/paired.py` computes the paired
+  readout of section 10 from the per-episode records.
+- With `chunk_pad: drop` (the v2 set), the correction cap and the control match count the frames
+  that enter the SFT loss, not recorded frames (section 5).
+
 ## 0. Order (review Track B)
 
 The review orders Track B as: $0 fixes (PR 1), then ~$5 of diagnostics, then this plan on a
@@ -29,7 +42,10 @@ failure mining:
 2. SFT from scratch on that set (A100, 8000 steps, ~$5), then the full protocol eval (~$1).
 3. Then sections 3-10 below, with that new base in place of `step_004000`: mine failures, record
    corrections and the matched control on top of it, and warm-start both arms from it. Its own
-   protocol table is the baseline in section 9.
+   protocol table is the baseline in section 9. The two arm configs are then copies of
+   `configs/sft_a5_*.yaml` on the v2 set's `data` block (`configs/demos_v2.yaml`: oracle v2,
+   15/45-frame tail, final success required, `chunk_pad: drop`) with `policy.adapter` = the new
+   base and the cap of section 5 recomputed; they are written once that base exists.
 
 Without that decision the plan runs as written, from `step_004000`. Either way the corrections and
 the control are recorded on the same pod and backend.
@@ -62,7 +78,8 @@ on protocol seeds 1-2 only, the part of the table the selection never saw.
 This plan never selects, mines or trains on protocol seeds. `src/eval/seed_ranges.py` lists every
 range and `check_disjoint` / `assert_seeds_in` enforce it. The collection script calls them before
 any rollout, and `scripts/wo03_rl.py` now rejects ManiSkill RL seeds whose training prompts
-would land in another range (RL seed >= 10 overlaps the protocol, `check_rl_seed`).
+would land in another range (`check_rl_seed` rejects any seed outside [0, 10); seed 10 would
+overlap the protocol).
 
 | Range | Seeds | Used for |
 |---|---|---|
@@ -80,11 +97,15 @@ generalization tests. No episode of any protocol eval run is ever mined.
 ## 3. Failure-state sampling and taxonomy
 
 `scripts/wo02r_collect_corrections.py --preset sim` rolls `step_004000` out greedily, exactly as
-the protocol eval does (whole 8-action chunks, horizon 150, GPU sim). It uses 192 recovery seeds
-per task (3 batches of 64). `run_batch_traced` (src/eval/sim_eval.py) is the protocol's episode
+the protocol 0.2 eval does (whole 8-action chunks, horizon 150, GPU sim, the 4 deg/step joint clip
+from `configs/real.yaml`; `--protocol 0.2` is the default). It uses 192 recovery seeds per task
+(3 batches of 64), and writes one per-episode record per rollout to `runs/<id>/episodes.jsonl`
+(the eval's record format, protocol seed -1) with the protocol version and hash in the run
+record. `run_batch_traced` (src/eval/sim_eval.py) is the protocol's episode
 loop plus a read-only trace. It records qpos, the privileged `obs["extra"]`, every `info` flag
-and the executed action at each step, and an env snapshot plus the last command at every chunk
-boundary. A test checks that its outcomes match `run_batch` exactly. ManiSkill's reset runs no
+and the executed (clipped) action at each step, and an env snapshot plus the last command at
+every chunk boundary. Tests check that its outcomes, executed actions and end flags match
+`run_batch` exactly, with and without the clip. ManiSkill's reset runs no
 physics step, so its contact query returns the previous episode's last step. The trace therefore
 records `is_grasped = False` at step 0 (a fresh episode is never grasped; a test grasps, resets
 and checks it). At ~10-17% baseline success, about 160 failures per task are expected for
@@ -141,8 +162,18 @@ oracle finishes without a re-grasp. A correction is kept only if the env's own s
 fires (rule 5). It is recorded from the restore point onward, never the policy's actions, in the
 WO-01 frame convention (state = qpos at t, action = oracle command at t). It goes to a separate
 dataset `KudratSingh22/vla-rl-so101-corrections-a4` (private) with sidecar `kind=correction`,
-`failure_mode`, `event_step`, `branch_step`, `in_hand`, `source_policy` and `backend`. Per mode,
-the oracle yield (successes / tried) is reported.
+`failure_mode`, `event_step`, `branch_step`, `in_hand`, `source_policy`, `backend`, `protocol`
+and `oracle_profile`. Per mode, the oracle yield (successes / tried) is reported.
+
+Corrections and control demos are recorded the way `scripts/wo01_build_env.py` records the
+config's own demo set (PR 1): the same `data.oracle_profile` and the same tail past the success
+step (`data.post_success_steps` / `post_success_max_steps` / `require_final_success`, with the
+`success_step`, `post_success_frames` and `oracle_finished` sidecar fields). For the as-written
+plan (`configs/sft_a5_*.yaml`, base `step_004000` on the 0.1 set) that is oracle v1 and no tail,
+the 0.1 recorder, so the frame counts and costs below are unchanged. On the rebuilt base
+(section 0) the configs take the v2 set's settings (oracle v2, 15/45-frame release + retreat
+tail, final success required, `chunk_pad: drop`), and corrections then also teach the full
+release.
 
 Caveat: corrections come from GPU PhysX, while the 25 demos were recorded on Mac CPU PhysX. The
 matched control is recorded on the same pod and backend as the corrections, so this difference
@@ -157,6 +188,24 @@ at **60 episodes and 1,650 frames per task**. The cap is the longest prefix in r
 are used. `scripts/wo02_sft.py` runs the 1% normalisation-bounds clip check on the whole mix and
 on each dataset separately. If displaced-arm corrections fall outside the adapter's bounds, the
 run fails instead of clipping the labels.
+
+With `chunk_pad: drop` (any config on the v2 set) the loader leaves each episode's last
+`chunk_len - 1` = 7 frames out of the loss, in every part of the mix, and the cap and the control
+match (section 7) count those trained frames: n - 7 per episode. Counting recorded frames instead
+would let the arm with more, shorter episodes (the corrections) lose more frames to the drop and
+end up with fewer trained frames than its cap says. `configs/sft_a5_*.yaml` keep
+`chunk_pad: repeat` (the 0.1 set), where both counts are the same.
+
+Frame counts on the rebuilt base, measured on the Mac CPU sim (single local build of
+`configs/demos_v2.yaml`, not pushed, run `20261108T095637Z-wo01-sim-45cc`; the GPU-sim build
+will differ slightly): the v2 set has 7,174 frames (PickPlace / Push / Stack 2,362 / 2,531 /
+2,281), 6,649 trained frames under `chunk_pad: drop` (2,187 / 2,356 / 2,106), against 4,964
+(about 1,655 per task) in the 0.1 set. The same "corrections <= about half of each task" rule
+then gives a cap of about 2,100-2,350 trained frames per task, set from the GPU-built set's own
+per-task counts, and 2,000 steps (16,000 samples) are about 1.2 passes over the full mix. Push
+reached its 45-frame tail cap before the oracle finished in 14 of 25 demos, and 6 Push
+candidates were rejected because success no longer held at the end of the tail (PR 1's
+recorder; the oracle success rate is still 100%).
 
 ## 6. Training: warm start, step budget (fixed now)
 
@@ -191,26 +240,31 @@ demos/task, so it is a diagnostic arm only and never an RL base.
 ## 8. Checkpoint selection (non-protocol seeds)
 
 For each arm, every saved checkpoint (500, 1000, 1500, 2000) is evaluated on the seen cell with
-**selection seed 7** (`wo02_eval.py --cells seen --seeds 7 --episodes 100`, 3 tasks x 100). The
-run is marked `protocol_complete: false`. The checkpoint with the highest 3-task mean is picked,
+**selection seed 7** (`wo02_eval.py --protocol 0.2 --cells seen --seeds 7 --episodes 100`, 3
+tasks x 100, the same clip as the protocol eval). The run is marked `protocol_complete: false`. The checkpoint with the highest 3-task mean is picked,
 and a tie goes to the earlier step. This rule is fixed now. The protocol table is computed only
 for the two picked checkpoints.
 
-## 9. Evaluation on the unchanged protocol
+## 9. Evaluation under protocol 0.2
 
-The protocol file is unchanged (hash `e9ce5bb47a88`). On one 4090 pod and one commit, the full
-protocol (3 tasks x 3 cells x 3 seeds x 100, horizon 150, GPU sim) runs for:
+`src/eval/protocol.py` (`0.1-draft`, hash `e9ce5bb47a88`) is unchanged and every reported number
+keeps citing it. The paired comparison runs under PR 1's protocol 0.2 (`src/eval/protocol_v02.py`:
+0.1-draft's tasks, cells, seeds and episode seeds, plus the real arm's 4 deg/step joint clip and a
+composite hash). On one 4090 pod and one commit, the full protocol (3 tasks x 3 cells x 3 seeds x
+100, horizon 150, GPU sim) runs with `scripts/wo02_eval.py --protocol 0.2` for:
 
-1. `step_004000` again: a reproduction check against run cdd3 and the paired baseline for drift.
+1. `step_004000` again: the paired baseline. Its difference from run cdd3 (0.1-draft, no clip) is
+   the clip plus any drift, not a reproduction check. PR 1's proposed 0.2 rerun of `step_004000`
+   counts as this run only if it ran at the same commit and hash.
 2. The recovery pick.
 3. The control pick.
 
-All three runs play the same episode seeds (the protocol's seed formula), and each must write
+All three runs play the same episode seeds (the protocol's seed formula), and each writes
 per-episode records (`runs/<id>/episodes.jsonl`, PR 1: task, cell, seed, episode seed, success,
-length, end reason and end-state flags). A run without them does not count for section 10.
-PR 1's `wo02_eval.py` writes them under `0.1-draft` too. If the owner has frozen protocol 0.2 by
-then, all three run under 0.2 instead. Either way, one protocol, one hash and one commit apply to
-all three.
+length, end reason, clipped steps and end-state flags). A run without them, with
+`protocol_deviations` not empty, or with a different protocol hash does not count for section 10.
+One protocol, one hash and one commit apply to all three. 0.2 is not frozen yet: the first number
+reported from these runs freezes it, and its hash is then pinned in a test (PR 1).
 
 Every number cites the hash and its run id. Results are labelled single SFT run. Negative results
 go to docs/results.md as well.
@@ -221,7 +275,14 @@ Primary metric: pooled seen success over the 3 tasks (900 episodes per checkpoin
 **paired**: the arms play identical episode seeds, so differences are read from the per-episode
 records (section 9) with a one-sided exact McNemar test on the discordant episodes. The
 two-proportion test used in results.md is reported alongside. "p < 0.05" below means the paired
-test.
+test. `src/eval/paired.py` computes it from two eval run dirs and refuses runs whose protocol
+version or hash differ or whose episodes do not match:
+
+```
+uv run python -m src.eval.paired runs/<baseline eval> runs/<recovery eval>               # seeds 0-2
+uv run python -m src.eval.paired runs/<baseline eval> runs/<recovery eval> --seeds 1,2
+uv run python -m src.eval.paired runs/<control eval> runs/<recovery eval>
+```
 
 - **Recovery improves**: recovery minus baseline (re-evaluated in step 9) is >= +3.0 points
   pooled seen over seeds 0-2 with p < 0.05 (primary; the seed-0 leak inflates the baseline, so
@@ -246,12 +307,12 @@ per mode are reported. None of them gates.
 
 Two stages, each its own owner go.
 
-**Stage A: offline lr sweep on one fixed batch, then one matched probe (about $3-5).** From the
+**Stage A: offline lr sweep on one fixed batch, then one matched probe (about $5).** From the
 recovery pick, on one A100 pod:
 
 ```
-uv run scripts/wo03_rl.py --preset rl --config configs/rl_pickplace.yaml --adapter <pick> \
-  --seed 3 --lr-sweep 5e-5,2e-4,5e-4,1e-3 --sweep-adam-steps 8
+uv run scripts/wo03_rl.py --preset rl --config configs/rl_pickplace_lr.yaml --adapter <pick> \
+  --lr-sweep 5e-5,2e-4,5e-4,1e-3 --sweep-adam-steps 8
 ```
 
 This is PR 1's fixed-batch diagnostic. It collects one rollout batch and stores it as
@@ -259,36 +320,29 @@ This is PR 1's fixed-batch diagnostic. It collects one rollout batch and stores 
 and scores the **whole** batch against the pre-update log-probs. It logs post-update k3 KL, clip
 and outside-clip fraction, dlogp split by advantage sign, mean(A*dlogp), the greedy argmax flip
 rate and grad_norm. Every lr sees the same batch, so lr is the only variable, and 5e-5 (the WO-04
-lr) is the reference. Rule 1 picks the lr. Then one `--probe-steps 3` at that lr measures s/step,
-the drop rate and the post-update `diag/post/*` medians on live batches.
+lr) is the reference. Rule 1 picks the lr. Then one `--probe-steps 3` on the config of that lr
+(`configs/rl_pickplace_lr5e-5.yaml`, `rl_pickplace_lr.yaml` = 5e-4, `rl_pickplace_lr1e-3.yaml`;
+for 2e-4, a copy with only `lr` changed) measures s/step, the drop rate and the post-update
+`diag/post/*` medians on live batches.
 
-**Stage B: continuation (about $9-30).** Proposed on the stage A numbers: 75 steps at the lr rule 1
-picks, then the readout below.
+**Stage B: continuation (about $11-40).** Proposed on the stage A numbers: 75 steps at the lr rule
+1 picks, then the readout below.
 
 Every setting, as `scripts/wo03_rl.py --preset rl --estimate` validates it:
 
-- inherited unchanged from `configs/rl_pickplace.yaml` (WO-04's PickPlace-only run): K = 16, 8
-  prompts per update (128 trajectories), 32 envs, temperature 1.0, horizon 120, recompute old
-  log-probs, ppo_epochs 1, ppo_mini_batch 64 (two optimizer steps per update), refill cap 3,
-  PickPlace trained, Push and Stack eval-only, 64-episode kill-switch evals and 32-episode periodic
-  evals every 25 steps on rl_eval seeds, `early_stop_rule: any_task`, min improvement 0.03;
-- changed: base = the recovery pick (`--adapter`); `seed: 3`; `lr` 5e-5 / 5e-4 / 1e-3; `steps:
-  75`, `checkpoint_every: 25`;
-- `early_stop_check_at_frac: 0.26`, so the kill switch is at ceil(0.26 x 75) = ceil(19.5) = step
-  20 (the inherited 0.25 would give step 19; 0.2667 gives 21 in float arithmetic);
-- `peak_stop_step: 0` (off): the inherited ref 50 / stop 100 fails `GRPOConfig.validate` at 75
-  steps, and a peak stop at the last step stops nothing.
-
-**After PR 1 merges**, several of these settings change:
-- The removed keys raise an error that names their replacement. The configs map as follows:
-  `early_stop_check_at_frac: 0.26` -> `gate_check_frac: 0.26`, plus `gate_window: 5` (a flat
-  gate at step 20 comparing steps 16-20 with 1-5); `early_stop_rule` -> `gate_rule: any_task`;
-  `early_stop_min_improvement` -> `gate_min_gain: 0.03`; `peak_stop_step: 0` -> the decline gate
-  (`gate_max_drop`).
-- `configs/rl_pickplace.yaml` then inherits PR 1's shape: 16 prompts x K=8, `ppo_epochs` 2 and
-  periodic evals on PickPlace only. The three stage configs still differ only in lr.
-- The stage B cost below is for the WO-04 shape. It must be repriced with `--estimate` on the
-  PR 1 shape, which is about +25% per step in the worst case (16.4 vs 13.1 min/step).
+- inherited unchanged from `configs/rl_pickplace.yaml` (PR 1 shape, PickPlace-only): 16 prompts x
+  K = 8 per update (128 trajectories), 32 envs, temperature 1.0, horizon 120, recompute old
+  log-probs, `ppo_epochs` 2, `ppo_mini_batch` 64 (4 optimizer steps per update), refill cap 3,
+  PickPlace trained, 32-episode periodic greedy evals every 25 steps on PickPlace only (sanity
+  logs; Push and Stack are measured by the protocol eval), the fixed-batch diagnostic every step
+  (32 trajectories), `gate_rule: any_task`, `gate_min_gain: 0.03`, the decline gate
+  (`gate_max_drop` 0.04, `gate_decline_z` 3) and the entropy gate (`gate_entropy_min` 0.5);
+- changed (`configs/rl_pickplace_lr*.yaml`): base = the recovery pick (`--adapter`); `seed: 3`;
+  `lr` 5e-5 / 5e-4 / 1e-3; `steps: 75`, `checkpoint_every: 25`;
+- `gate_check_frac: 0.26` with `gate_window: 5`: the flat gate is at ceil(0.26 x 75) = ceil(19.5)
+  = step 20 and compares the steps 16-20 window with steps 1-5 (the inherited 0.25 would give step
+  19). This replaces the WO-04 `early_stop_check_at_frac` kill switch and the `peak_stop_step`
+  peak stop, which PR 1 removed (the trainer refuses the old keys and names the replacement).
 
 The owner's diagnostic rules apply:
 
@@ -341,46 +395,62 @@ Rates: RTX 4090 $0.89/h, A100 80 GB $1.79/h (STATUS.md, 2026-11-07). Measured in
 - 4090 SFT runs at 1.547-1.575 s/step (attempt 2/3 probes);
 - pod setup + probe + one 30-min approval-gate timeout takes 0.58 h (the two gate-expired pods, about 0.08 h active; `APPROVAL_WAIT_S=1800`, scripts/pod/wo02_job.sh);
 - WO-04 PickPlace-only took 30.5 h for probe + 150 steps + eval, so (30.5 - 0.85) / 150 = about 0.20 h per step on an A100 including its evals (pod `s2ljj3drwg0ov0`);
-- the WO-04 probes took 0.80-0.86 h.
+- the WO-04 probes took 0.80-0.86 h;
+- `scripts/wo03_rl.py --estimate` on `configs/rl_pickplace_lr.yaml` (PR 1 shape: 16 x 8,
+  `ppo_epochs` 2, the per-step diagnostic; throughputs measured on WO-04 pod gzxhwhjhdtc1kc and
+  WO-02 pod u87r9sjnwig58d, the scoring rate estimated): 16.43 min = 0.274 h per step worst case
+  (refill cap every step), 20.6 h for 75 steps, 41.2 h for 150; `--lr-sweep` 4 x 8 Adam steps
+  1.20 h. For the WO-04 shape the same estimator gave 0.221 h/step against the measured 0.20
+  (16.6 h for 75 steps), so the worst case below is likely ~10% high.
+
+Protocol 0.2 adds the 4 deg/step clip to every eval and to the failure-mining rollouts. PR 1
+allows +5% eval time for it (the clip lengthens only successful episodes; not measured), applied
+below to the rollouts, the selection sweep and the protocol evals.
 
 Recovery SFT + matched evaluations (one RTX 4090 pod, with gates after the probe and after collection):
 
 | Step | Basis | h |
 |---|---|---|
 | Setup + probe: restore round trip on GPU, 1 rollout batch, 20 SFT steps; first gate wait | 0.58 h measured (incl. a 30-min gate timeout) | 0.6 |
-| SFT rollouts, 3 x 192 recovery seeds | 576 eps x 0.39 h / 1,000 | 0.23 |
+| SFT rollouts, 3 x 192 recovery seeds (0.2 clip) | 576 eps x 0.39 h / 1,000 x 1.05 | 0.24 |
 | Oracle branches (<= 3 x ~120) + control demos (3 x 60) + AV1 recording | estimate; the probe measures it | 0.5 |
 | Second approval gate (after collection), up to its timeout | 30-min `APPROVAL_WAIT_S`; less if the owner answers sooner | 0.5 |
 | Recovery SFT, 2,000 steps | 2,000 x 1.565 s | 0.87 |
 | Control SFT, 2,000 steps | 2,000 x 1.565 s | 0.87 |
-| Selection sweep, 8 checkpoints x 300 seen episodes (seed 7) | 2,400 x 0.39 h / 1,000 | 0.94 |
-| Full protocol x 3 (baseline, recovery, control) | 3 x 1.05 h | 3.15 |
+| Selection sweep, 8 checkpoints x 300 seen episodes (seed 7, 0.2 clip) | 2,400 x 0.39 h / 1,000 x 1.05 | 0.98 |
+| Full protocol 0.2 x 3 (baseline, recovery, control) | 3 x 1.05 h x 1.05 | 3.31 |
 | Uploads and slack | estimate | 0.3 |
-| **Total** | | **~8.0 h = ~$7.1** (pod cap $12, ~70% contingency) |
+| **Total** | | **~8.2 h = ~$7.3** (pod cap $12, ~65% contingency) |
 
-estimated: RTX-4090 x 8.0 h = $7.1, within the **$30** allowance.
+estimated: RTX-4090 x 8.2 h = $7.3, within the **$30** allowance. On the as-written path (oracle
+v1, no tail) the recorded frames are those of the 0.1 recorder, so only the clip changes this
+line (it was 8.0 h = $7.1). On the rebuilt base (section 0) the oracle branches and control
+demos are recorded with the v2 oracle and the 15-45-frame tail, so the 0.5 h recording line
+grows; the probe measures it.
 
-GRPO diagnostic (A100 run + 4090 protocol eval):
+GRPO diagnostic (A100 run + 4090 protocol 0.2 eval), PR 1 shape:
 
 | Stage | Exit | A100 h | $ |
 |---|---|---|---|
-| A (own go) | offline lr sweep, 4 lrs x 8 Adam steps (`--estimate`, PR 1), + 0.5 h setup | 1.7 | 3.0 |
-| A | + one 3-step probe at the chosen lr | 2.55 | 4.6 |
-| B (own go) | flat gate at step 20 | 0.85 + 20 x 0.20 = 4.85 | 8.7 |
-| B | full 75 steps + 4090 protocol eval ($0.93 + setup) | 0.85 + 75 x 0.20 = 15.85 | 28.4 + 1.2 = 29.6 |
-| A + B | worst case: sweep + probe + full run | 18.4 | ~34 |
+| A (own go) | offline lr sweep, 4 lrs x 8 Adam steps (`--estimate`), + 0.5 h setup | 1.20 + 0.5 = 1.7 | 3.0 |
+| A | + one 3-step probe at the chosen lr: WO-04 probe overhead (0.85 - 3 x 0.218 = 0.19 h) + 3 x 0.274 | 1.7 + 1.0 = 2.7 | 4.8 |
+| B (own go) | flat gate at step 20 | 0.85 + 20 x 0.274 = 6.3 | 11.3 |
+| B | full 75 steps + 4090 protocol 0.2 eval (1.45 h = $1.3) | 0.85 + 20.6 = 21.4 | 38.4 + 1.3 = 39.7 |
+| A + B | worst case: sweep + probe + full run | 24.1 | ~44.5 |
 
-estimated: stage A A100-80GB x 2.55 h = $4.6 (sweep + one probe); stage B A100-80GB x 15.85 h + RTX-4090 x 1.4 h =
-$29.6. Together ~$34 worst case, within the **$60** allowance (pod cap $40).
-`scripts/wo03_rl.py --estimate` gives 16.6 h / $29.7 for the 75-step run (worst-case refill), in
-line with the measured rate.
+estimated: stage A A100-80GB x 2.7 h = $4.8 (sweep + one probe); stage B A100-80GB x 21.4 h +
+RTX-4090 x 1.45 h = $39.7. Together ~$44.5 worst case, within the **$60** allowance but above the
+former $40 pod cap: the stage A + B pod cap needs to be ~$46 (owner decision 3, section 14). At
+the WO-04 shape this was 18.4 h / ~$34; the PR 1 shape costs ~25% more per step (16.4 vs 13.1
+min).
 
-Confirmatory seeds: 3 x $29.6 = **~$89** at 75 steps, within **$210**. If the owner wants 150 steps
-per seed: 0.85 + 150 x 0.20 = 30.85 h = $55.2 + $1.2 = ~$56 per seed, **~$169** for three, still
-within $210. A seed stopped at step 20 costs about $8.7.
+Confirmatory seeds: 3 x $39.7 = **~$119** at 75 steps, within **$210**. At 150 steps per seed:
+0.85 + 41.2 = 42.0 h = $75.2 + $1.3 = ~$76.5 per seed, **~$230** for three, **over** the $210
+allowance in the worst case (75-step seeds, two 150-step seeds, or the owner raising the
+allowance). A seed stopped at its step-20 flat gate costs about $11.3.
 
-All stages together, worst case from the caps: $12 + $40 + $169 = **~$221** of the $300 total
-allowance.
+All stages together, worst case from the caps: $12 + $46 + $119 = **~$177** with 75-step seeds,
+or $12 + $46 + $230 = ~$288 with 150-step seeds, of the $300 total allowance.
 Most likely, the plan stops at one of the gates well before that.
 
 ## 14. Owner decisions needed
@@ -396,10 +466,11 @@ Most likely, the plan stops at one of the gates well before that.
    table would carry the label. The control arm exceeds 25 demos/task under any reading, so it
    stays diagnostic only.
 2. Go / no-go on the recovery pod (about $7, cap $12) after its probe numbers.
-3. After section 10, two separate decisions: whether to run the stage A probes (about $3-5),
-   then, on the probe numbers, whether to run the stage B continuation (about $9-30). Both stages
-   share the $40 pod cap.
-4. After section 11: whether to run the confirmatory seeds, at 75 or 150 steps. Whether WO-04's
+3. After section 10, two separate decisions: whether to run the stage A probes (about $5),
+   then, on the probe numbers, whether to run the stage B continuation (about $11-40). Both
+   stages share one pod cap, which needs to be ~$46 for the PR 1 shape's worst case (was $40).
+4. After section 11: whether to run the confirmatory seeds, at 75 steps (~$119) or 150 steps
+   (~$230, over the $210 allowance in the worst case). Whether WO-04's
    2-of-3-task benchmark needs a two-task (PickPlace + Push) confirmatory run instead. It would
    cost about the same, at about 0.18 h/step (A100 ledger, pod `9d8p7vyfyv6ca4`: (28.4 - 0.85) / 150).
 
@@ -407,17 +478,21 @@ Most likely, the plan stops at one of the gates well before that.
 
 ```
 # pod (Linux, RTX 4090): setup as scripts/pod/wo02_job.sh, then
-uv run scripts/wo02r_collect_corrections.py --preset sim --push                 # corrections
+uv run scripts/wo02r_collect_corrections.py --preset sim --push                 # corrections (0.2 clip)
 uv run scripts/wo02r_collect_corrections.py --preset sim --mode control --push  # control demos
 uv run scripts/wo02_sft.py --preset sim --config configs/sft_a5_recovery.yaml
 uv run scripts/wo02_sft.py --preset sim --config configs/sft_a5_control.yaml
-for ck in <4 checkpoints per arm>; do
-  uv run scripts/wo02_eval.py --preset sim --config configs/sft_a5_recovery.yaml \
+for ck in <4 checkpoints per arm>; do                                   # selection, seed 7
+  uv run scripts/wo02_eval.py --preset sim --config configs/sft_a5_<arm>.yaml --protocol 0.2 \
     --adapter $ck --cells seen --seeds 7 --episodes 100
 done
-uv run scripts/wo02_eval.py --preset sim --adapter <step_004000>       # full protocol, baseline
-uv run scripts/wo02_eval.py --preset sim --adapter <recovery pick>
-uv run scripts/wo02_eval.py --preset sim --adapter <control pick>
+uv run scripts/wo02_eval.py --preset sim --protocol 0.2 --adapter <step_004000>   # baseline
+uv run scripts/wo02_eval.py --preset sim --protocol 0.2 --adapter <recovery pick>
+uv run scripts/wo02_eval.py --preset sim --protocol 0.2 --adapter <control pick>
+# Mac or pod, $0: the section 10 readouts from the three runs' episodes.jsonl
+uv run python -m src.eval.paired runs/<baseline> runs/<recovery>
+uv run python -m src.eval.paired runs/<baseline> runs/<recovery> --seeds 1,2
+uv run python -m src.eval.paired runs/<control> runs/<recovery>
 ```
 
 The pod job script (probe stage, approval gate, upload, self-delete) follows the pattern of

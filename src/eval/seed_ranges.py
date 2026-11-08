@@ -15,7 +15,9 @@ its seeds. Ranges are half-open [start, stop):
 | rl_eval     | 4_000_000_000 + i                                      | src/rl/trainer.py |
 
 The rl_train span bound: 150 steps x 8 prompts x <= 3 refill rounds is ~3,600 prompts per seed.
-RL seeds >= 10 would land on the protocol range (100M+); `check_rl_seed` rejects them.
+RL seeds >= 10 (MAX_RL_SEED = EVAL_SEED_BASE // TRAIN_SEED_STRIDE) would reach the protocol band
+(100M+, including future protocol seeds >= 10 not listed here); `check_rl_seed` rejects any seed
+outside [0, MAX_RL_SEED), then checks the training range against every listed range.
 All seeds stay below 2**32 (numpy RandomState).
 """
 
@@ -41,6 +43,7 @@ RECOVERY_SEED_BASE = 3_000_000_000
 CONTROL_SEED_BASE = 3_100_000_000
 TASK_STRIDE = 1_000_000  # recovery / control seeds per task
 MAX_SEED = 2**32
+MAX_RL_SEED = EVAL_SEED_BASE // TRAIN_SEED_STRIDE  # 10: rl_seed * 10M stays below the 100M band
 
 
 @dataclass(frozen=True)
@@ -135,6 +138,13 @@ def control_seeds(task: str, n: int, start: int = 0) -> list[int]:
 
 
 def check_rl_seed(rl_seed: int) -> None:
-    """Guard for a ManiSkill GRPO run: its training-prompt seeds must not touch any other range."""
+    """Guard for a ManiSkill GRPO run: rl_seed in [0, MAX_RL_SEED), and its training-prompt seeds
+    must not touch any other range."""
+    if not 0 <= rl_seed < MAX_RL_SEED:
+        raise ValueError(
+            f"RL seed {rl_seed} must be in [0, {MAX_RL_SEED}): seeds >= {MAX_RL_SEED} put training "
+            f"prompts (rl_seed x {TRAIN_SEED_STRIDE:_}) in the protocol/eval seed band "
+            f"({EVAL_SEED_BASE:_}+)"
+        )
     others = [r for r in standard_ranges(rl_seeds=()) if not r.name.startswith("rl_train")]
     check_disjoint([rl_train_range(rl_seed), *others])
