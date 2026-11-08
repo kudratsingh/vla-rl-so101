@@ -1,0 +1,564 @@
+#!/usr/bin/env python
+"""WO-07 real evaluation: 50 trials per protocol cell on the real SO-101, operator-scored.
+
+One task per session, cells in protocol order (seen, shifted, unseen_objects), ``eval.trials_per_cell``
+(= protocol REAL_TRIALS_PER_CELL, 50) trials per cell. Per trial: the arm goes home through the
+safety filter, the operator places the objects on the slots this script prints (placement grid
+``docs/assets/placement-grid-a3.pdf``, slots sampled by ``src/eval/real_grid.py`` from
+``--slot-seed``: the same seed gives SFT and SFT+RL sessions the same placements, trial by trial),
+the policy runs (``src/robot/client.py``), then the operator scores it y/n under the judging rule
+below. Every trial record carries protocol 0.2's composite hash (``src/eval/protocol_v02.py``) with
+the 0.1-draft version and hash as a reference, the placement, the judging-rule version and the
+real-eval file hashes. ``record.json`` holds the Wilson table.
+
+Judging rule (``JUDGING_RULE``; project review 2026-11-07 section 3.2: a real judge must be
+defined before WO-07): judged ONCE, after the trial has ended and the arm holds still (the
+prompt only appears then), by eye, without touching anything. Real trials have no success latch:
+the sim stops at its first success step, the arm keeps acting until ``trial_max_steps`` or a stop,
+so a success undone before the end is a failure (stricter than sim).
+
+Resumable: ``--resume <run id>`` continues a session (any earlier run of it). The task, cells,
+trials per cell, slot seed, label, policy id and protocol hashes come from that run and must still
+match; trials without a y/n score (aborted: Ctrl-C, home failed, a fault) are redone with the same
+placement. Each invocation is its own run record, holding every trial of the session so far.
+
+--mock      CPU, in-process, safe anywhere: MockPolicy behind gRPC on 127.0.0.1, the fake arm and
+            camera from tests/robot_fakes.py, the real safety filter and sim FK. Scripted scores.
+            NOT a result.
+--hardware  OWNER ONLY, never run by tests or agents: gated exactly like scripts/wo07_pilot.py
+            (refuses without --i-am-present, then needs 'go' typed). A normal end parks the arm
+            (robot.park), then torque off; Ctrl-C during motion holds, then torque off after ENTER;
+            a servo over-temperature / over-current fault cuts torque at once.
+
+    uv run scripts/wo07_real_eval.py --preset real --mock --fake-clock --trials 2 --max-steps 16
+    uv run scripts/wo07_real_eval.py --preset real --hardware --i-am-present --task PickPlace \\
+        --label sft
+    uv run scripts/wo07_real_eval.py --preset real --hardware --i-am-present --resume <run id>
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import sys
+import time
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.config import Config, add_config_args, load_config
+from src.eval import protocol as P1
+from src.eval import protocol_v02 as P2
+from src.eval import real_grid as G
+from src.robot.camera import PolicyImagePipeline
+from src.robot.client import (
+    ConsoleOperator,
+    DeployConfig,
+    DeployLoop,
+    Operator,
+    PolicyClient,
+    ScriptedOperator,
+    TrialResult,
+    check_server,
+    latency_lines,
+    run_trials,
+    shutdown_session,
+    summarize,
+    trial_object,
+)
+from src.robot.driver import So101Driver
+from src.robot.safety import FkFn, load_sim_fk, make_safety
+from src.robot.serve import MockPolicy, PolicyServer, build_server
+from src.robot.servo_health import monitor_from_config
+from src.robot.units import UnitMap
+from src.runs import RUNS_DIR, Run, new_run_id
+
+JUDGING_RULE_VERSION = "real-judge-1"
+JUDGING_GENERAL = (
+    "Judge ONCE, after the trial has ended and the arm holds still (this prompt only appears "
+    "then), by eye, touching nothing. y only if ALL of the task's conditions hold NOW; a success "
+    "that was undone before the end is n. Doubt = n."
+)
+JUDGING_RULE: dict[str, str] = {  # mirrors src/env/success.py, read only
+    "PickPlace": "the object rests inside the bowl (over the bowl floor, below the rim), the bowl "
+    "is upright, and the object touches neither gripper jaw",
+    "Push": "the object's centre is inside the 5 cm target disc, the object is on the table, it "
+    "was never lifted off the table during the trial, and the gripper is not holding it",
+    "Stack": "the object rests on top of the blue cube (centred within ~1.5 cm, flat), the blue "
+    "cube is still on the table, and the object touches neither gripper jaw",
+}
+
+MOCK_LABEL = "MOCK: fake arm, fake camera, mock policy; exercises the eval loop only, NOT a result"
+HARDWARE_LABEL = "real arm, operator-scored, single session per checkpoint"
+
+HARDWARE_REFUSAL = """--hardware drives the real SO-101 and refuses to run without --i-am-present.
+
+Only the owner runs it, standing at the arm with a hand on the power switch, after WO-06
+(calibration, intrinsics, camera match), the WO-07 pilot, the placement grid printed and its
+10 cm scale bar measured, and with the policy server reachable through the tunnel."""
+
+HARDWARE_BANNER = """
+==========================================================================================
+ THIS WILL MOVE THE REAL ARM, up to 50 trials per cell.
+ Before every trial it drives to the home pose (deploy.home_qpos) through the safety filter,
+ then the policy moves it. Keep the workspace clear and a hand on the power switch.
+ A normal end (all trials, or q / Ctrl-C at a prompt) PARKS the arm at robot.park.qpos
+ (it moves), then torque goes off. Ctrl-C while the arm moves holds it; after ENTER
+ torque goes off and the arm drops: support it. A servo over-temperature / over-current
+ fault cuts torque AT ONCE: the arm drops, support it.
+==========================================================================================
+"""
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def protocol_fields() -> dict[str, Any]:
+    """Per-trial protocol citation: 0.2 composite hash, 0.1-draft as a reference, real-eval files."""
+    rule_text = json.dumps(
+        {"version": JUDGING_RULE_VERSION, "general": JUDGING_GENERAL, "tasks": JUDGING_RULE},
+        sort_keys=True,
+    )
+    return {
+        "protocol_version": P2.PROTOCOL_VERSION,
+        "protocol_hash": P2.protocol_hash(),
+        "protocol_ref": {"version": P1.PROTOCOL_VERSION, "hash": P1.protocol_hash()},
+        "real_eval": {
+            "judging_rule": JUDGING_RULE_VERSION,
+            "judging_rule_sha256": hashlib.sha256(rule_text.encode()).hexdigest(),
+            "grid_sha256": _sha256(REPO_ROOT / "src" / "eval" / "real_grid.py"),
+            "grid_pdf_sha256": _sha256(REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf"),
+        },
+    }
+
+
+class JudgeOperator(ConsoleOperator):
+    """The person at the arm, scoring under ``JUDGING_RULE``."""
+
+    def __init__(self, task: str, input_fn: Callable[[str], str] = input):
+        super().__init__(input_fn)
+        self.task = task
+
+    def outcome(self, result: TrialResult) -> str:
+        print(f"\ntrial ended ({result.stop_reason}, {result.steps} steps). {JUDGING_GENERAL}")
+        print(f"  {self.task} success = {JUDGING_RULE[self.task]}.")
+        return super().outcome(result)
+
+
+# ------------------------------------------------------------------------------------------------
+# Session state (resume)
+# ------------------------------------------------------------------------------------------------
+SCORED = ("success", "failure")
+
+
+def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """(session settings, every trial record so far) from an earlier run of the session. Trials
+    come from record.json, plus any metrics.jsonl trial rows it lacks (a run killed before exit)."""
+    rec_path = run_dir / "record.json"
+    if not rec_path.is_file():
+        sys.exit(f"--resume: no {rec_path}")
+    results = json.loads(rec_path.read_text()).get("results", {})
+    settings = results.get("session")
+    if not settings:
+        sys.exit(f"--resume: {rec_path} is not a wo07_real_eval session")
+    trials: list[dict[str, Any]] = list(results.get("trials") or [])
+    seen = {(t["cell"], t["trial_idx"], t["start_utc"]) for t in trials}
+    metrics = run_dir / "metrics.jsonl"
+    if metrics.is_file():
+        for line in metrics.read_text().splitlines():
+            row = json.loads(line)
+            if row.get("kind") != "trial":
+                continue
+            key = (row["cell"], row["trial_idx"], row["start_utc"])
+            if key not in seen:
+                seen.add(key)
+                trials.append({k: v for k, v in row.items() if k not in ("kind", "t", "step")})
+    return settings, trials
+
+
+def scored_indices(trials: Sequence[dict[str, Any]], cell: str) -> set[int]:
+    return {int(t["trial_idx"]) for t in trials if t["cell"] == cell and t["outcome"] in SCORED}
+
+
+def table(
+    trials: Sequence[dict[str, Any]], settings: dict[str, Any], cfg_deploy: DeployConfig
+) -> dict[str, Any]:
+    """client.summarize over the first scored record per (cell, trial_idx), plus completeness."""
+    first: dict[tuple[str, int], dict[str, Any]] = {}
+    aborted = []
+    for t in trials:
+        if t["outcome"] in SCORED:
+            first.setdefault((t["cell"], int(t["trial_idx"])), t)
+        else:
+            aborted.append(t)
+    scored = list(first.values())
+    s = summarize(scored + aborted, cfg_deploy.latency_target_ms, cfg_deploy.capture_offset_ms)
+    n = int(settings["trials_per_cell"])
+    for c in s["cells"].values():
+        c["target_n"] = n
+        c["complete"] = c["n"] == n
+    s["complete"] = all(
+        s["cells"].get(f"{settings['task']}/{cell}", {}).get("complete", False)
+        for cell in settings["cells"]
+    )
+    # a protocol table needs every protocol cell at REAL_TRIALS_PER_CELL scored trials
+    s["protocol_complete"] = (
+        s["complete"] and n == P1.REAL_TRIALS_PER_CELL and set(settings["cells"]) == set(P1.CELLS)
+    )
+    s.update(
+        protocol_version=P2.PROTOCOL_VERSION,
+        protocol_hash=settings["protocol"]["protocol_hash"],
+        protocol_ref=settings["protocol"]["protocol_ref"],
+        label=settings["label"],
+        judging_rule=JUDGING_RULE_VERSION,
+    )
+    return s
+
+
+def print_table(run_id: str, s: dict[str, Any], end: str) -> None:
+    print(f"\nrun {run_id}  (session end: {end})  label {s['label']}")
+    print("| cell | successes / n | rate | Wilson 95% | aborted | complete |")
+    print("|---|---|---|---|---|---|")
+    for name, c in s["cells"].items():
+        rate = "n/a" if c["success_rate"] is None else f"{100 * c['success_rate']:.1f}%"
+        lo, hi = c["wilson_95"]
+        print(
+            f"| {name} | {c['successes']} / {c['n']} (of {c['target_n']}) | {rate} | "
+            f"[{100 * lo:.1f}, {100 * hi:.1f}] | {c['aborted']} | {c['complete']} |"
+        )
+    for line in latency_lines(s):
+        print(line)
+    print(
+        f"  protocol {s['protocol_version']} {s['protocol_hash'][:12]} (ref "
+        f"{s['protocol_ref']['version']} {s['protocol_ref']['hash'][:12]}), judge {s['judging_rule']}"
+    )
+    if not s["protocol_complete"]:
+        print(
+            f"  NOT a protocol table: needs {P1.REAL_TRIALS_PER_CELL} scored trials in each of "
+            f"{', '.join(P1.CELLS)}"
+        )
+
+
+# ------------------------------------------------------------------------------------------------
+# Session
+# ------------------------------------------------------------------------------------------------
+def session(
+    cfg: Config,
+    loop: DeployLoop,
+    operator: Operator,
+    info: dict[str, Any],
+    *,
+    mode: str,
+    settings: dict[str, Any],
+    prior_trials: list[dict[str, Any]],
+    resumed_from: str | None,
+    max_steps: int | None,
+    camera_calibrated: bool,
+    runs_dir: Path,
+    on_trial_start: Callable[[int], None] | None = None,
+) -> Path:
+    task, n = str(settings["task"]), int(settings["trials_per_cell"])
+    trials: list[dict[str, Any]] = list(prior_trials)
+    end = "error"
+    extra = {
+        **settings["protocol"],
+        "session_id": settings["session_id"],
+        "label": settings["label"],
+        "mode": mode,
+    }
+    with Run(
+        work_order="WO-07",
+        script=__file__,
+        cfg=cfg,
+        device="cpu",
+        runs_dir=runs_dir,
+        run_id=new_run_id("WO-07", f"realeval-{mode}"),
+    ) as run:
+        if not settings.get("session_id"):
+            settings["session_id"] = extra["session_id"] = run.id
+        run.results.update(
+            mode=mode,
+            label=MOCK_LABEL if mode == "mock" else HARDWARE_LABEL,
+            session=settings,
+            resumed_from=resumed_from,
+            server_info=info,
+            judging_rule={
+                "version": JUDGING_RULE_VERSION,
+                "general": JUDGING_GENERAL,
+                "tasks": JUDGING_RULE,
+            },
+        )
+        print(f"{JUDGING_GENERAL}\n  {task} success = {JUDGING_RULE[task]}.")
+        try:
+            end = "completed"
+            for cell in settings["cells"]:
+                done = scored_indices(trials, cell)
+                todo = [k for k in range(n) if k not in done]
+                if not todo:
+                    continue
+                plan = G.sample_plan(task, cell, n, int(settings["slot_seed"]))
+
+                def place(
+                    k: int, cell: str = cell, plan: list[dict[str, Any]] = plan
+                ) -> tuple[str, dict[str, Any]]:
+                    obj = trial_object(task, cell, k)
+                    return G.placement_prompt(obj.label, plan[k]), plan[k]
+
+                _, end = run_trials(
+                    loop,
+                    operator,
+                    task=task,
+                    cell=cell,
+                    n_trials=n,
+                    info=info,
+                    camera_calibrated=camera_calibrated,
+                    log_row=run.log_metrics,
+                    max_steps=max_steps,
+                    trials=trials,
+                    on_trial_start=on_trial_start,
+                    indices=todo,
+                    placement_fn=place,
+                    record_extra=extra,
+                )
+                if end != "completed":
+                    break
+        except KeyboardInterrupt:
+            end = "operator_ctrl_c"
+        finally:
+            shutdown = shutdown_session(loop, operator, end)
+            summary = table(trials, settings, loop.dcfg)
+            run.results.update(session_end=end, shutdown=shutdown, trials=trials, summary=summary)
+        print_table(run.id, summary, end)
+        if not summary["complete"]:
+            print(f"  session incomplete: resume with --resume {run.id}")
+    return run.record_path
+
+
+def new_settings(args: argparse.Namespace, cfg: Config) -> dict[str, Any]:
+    ecfg = cfg.get("eval") or {}
+    n = int(
+        args.trials
+        if args.trials is not None
+        else ecfg.get("trials_per_cell", P1.REAL_TRIALS_PER_CELL)
+    )
+    return {
+        "session_id": None,  # the first run's id
+        "task": args.task,
+        "cells": list(args.cells or ecfg.get("cells") or P1.CELLS),
+        "trials_per_cell": n,
+        "protocol_trials_per_cell": P1.REAL_TRIALS_PER_CELL,
+        "slot_seed": int(
+            args.slot_seed if args.slot_seed is not None else ecfg.get("slot_seed", 0)
+        ),
+        "label": args.label,
+        "policy_id": None,  # from the server's Info
+        "protocol": protocol_fields(),
+    }
+
+
+def check_resume(settings: dict[str, Any], info: dict[str, Any]) -> None:
+    now = protocol_fields()
+    bad = [
+        f"{k}: session {settings['protocol'][k]!r} != now {now[k]!r}"
+        for k in ("protocol_hash", "protocol_ref", "real_eval")
+        if settings["protocol"][k] != now[k]
+    ]
+    if settings.get("policy_id") not in (None, info.get("policy_id")):
+        bad.append(
+            f"policy_id: session {settings['policy_id']!r} != server {info.get('policy_id')!r}"
+        )
+    if bad:
+        sys.exit("--resume refused, the session's evaluation changed:\n  " + "\n  ".join(bad))
+
+
+@contextmanager
+def mock_rig(
+    cfg: Config, args: argparse.Namespace, fk: FkFn | None
+) -> Iterator[tuple[DeployLoop, dict[str, Any], Callable[[int], None], bool]]:
+    sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from robot_fakes import FakeCam, FakeClock, FakeFollower
+
+    spec = importlib.util.spec_from_file_location(
+        "wo07_pilot", REPO_ROOT / "scripts" / "wo07_pilot.py"
+    )
+    assert spec is not None and spec.loader is not None
+    pilot = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pilot)
+    if args.fake_clock:
+        fake = FakeClock()
+        clock, sleep = fake, fake.sleep
+    else:
+        clock, sleep = time.perf_counter, time.sleep
+    dcfg = DeployConfig.from_config(cfg)
+    policy = MockPolicy(
+        pilot.mock_waypoints(dcfg.home_qpos), chunk_len=dcfg.chunk_len, infer_s=0.06, sleep=sleep
+    )
+    servicer = PolicyServer(
+        policy, image_size=dcfg.image_size, policy_id="mock:pickplace-waypoints", clock=clock
+    )
+    server, port = build_server(servicer, "127.0.0.1", 0)
+    try:
+        arm = So101Driver(
+            FakeFollower(),
+            UnitMap.from_config(cfg),
+            make_safety(cfg, fk or load_sim_fk(), clock=clock),
+            clock=clock,
+            monitor=monitor_from_config(cfg),
+            sleep=sleep,
+        )
+        pipe = PolicyImagePipeline.from_config(cfg)
+        with (
+            PolicyClient(
+                f"127.0.0.1:{port}",
+                timeout_s=dcfg.request_timeout_s,
+                chunk_len=dcfg.chunk_len,
+                action_dim=dcfg.action_dim,
+                clock=clock,
+            ) as client,
+            arm,
+        ):
+            info = client.info()
+            check_server(info, dcfg)
+            loop = DeployLoop(arm, FakeCam(clock), pipe, client, dcfg, clock=clock, sleep=sleep)
+            yield loop, info, lambda _k: policy.reset(), pipe.calibrated
+    finally:
+        policy.release.set()
+        server.stop(grace=0)
+
+
+def run(
+    cfg: Config,
+    args: argparse.Namespace,
+    *,
+    fk: FkFn | None = None,
+    operator: Operator | None = None,
+) -> Path:
+    if args.resume:
+        prior_dir = Path(args.resume) if Path(args.resume).is_dir() else args.runs_dir / args.resume
+        settings, prior = load_prior(prior_dir)
+        resumed_from: str | None = prior_dir.name
+    else:
+        if args.task is None:
+            sys.exit("--task is required for a new session")
+        settings, prior, resumed_from = new_settings(args, cfg), [], None
+    if args.hardware:
+        return run_hardware(cfg, args, settings, prior, resumed_from)
+    with mock_rig(cfg, args, fk) as (loop, info, on_start, calibrated):
+        if resumed_from:
+            check_resume(settings, info)
+        settings["policy_id"] = info.get("policy_id")
+        return session(
+            cfg,
+            loop,
+            operator or ScriptedOperator(),
+            info,
+            mode="mock",
+            settings=settings,
+            prior_trials=prior,
+            resumed_from=resumed_from,
+            max_steps=args.max_steps,
+            camera_calibrated=calibrated,
+            runs_dir=args.runs_dir,
+            on_trial_start=on_start,
+        )
+
+
+def run_hardware(
+    cfg: Config,
+    args: argparse.Namespace,
+    settings: dict[str, Any],
+    prior: list[dict[str, Any]],
+    resumed_from: str | None,
+) -> Path:
+    if not args.i_am_present:
+        print(HARDWARE_REFUSAL)
+        sys.exit(2)
+    print(HARDWARE_BANNER)
+    if input("type 'go' to continue: ").strip() != "go":
+        sys.exit("not confirmed; nothing was opened")
+    cam_cfg = cfg["cameras"]["front"]
+    if not cam_cfg.get("intrinsics"):
+        sys.exit("cameras.front.intrinsics is null: run scripts/wo06_camera_intrinsics.py first")
+    from src.robot.camera import OpenCVFrameSource
+
+    dcfg = DeployConfig.from_config(cfg)
+    fk = load_sim_fk()
+    pipe = PolicyImagePipeline.from_config(cfg)
+    target = f"{cfg['server']['host']}:{cfg['server']['port']}"
+    with PolicyClient(
+        target,
+        timeout_s=dcfg.request_timeout_s,
+        chunk_len=dcfg.chunk_len,
+        action_dim=dcfg.action_dim,
+    ) as client:
+        info = client.info()  # before the arm is connected: a wrong server never moves it
+        check_server(info, dcfg)
+        if resumed_from:
+            check_resume(settings, info)
+        settings["policy_id"] = info.get("policy_id")
+        print(f"policy server OK: {info['policy_id']} (server run {info.get('server_run')})")
+        if dcfg.policy_checkpoint is None:
+            print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
+        operator = JudgeOperator(str(settings["task"]))
+        with OpenCVFrameSource(cam_cfg) as cam, So101Driver.from_config(cfg, fk) as arm:
+            loop = DeployLoop(arm, cam, pipe, client, dcfg)
+            return session(
+                cfg,
+                loop,
+                operator,
+                info,
+                mode="hardware",
+                settings=settings,
+                prior_trials=prior,
+                resumed_from=resumed_from,
+                max_steps=args.max_steps,
+                camera_calibrated=pipe.calibrated,
+                runs_dir=args.runs_dir,
+            )
+
+
+def main(argv: Sequence[str] | None = None) -> Path:
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
+    add_config_args(parser)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--mock", action="store_true", help="in-process fakes (CPU, safe)")
+    mode.add_argument("--hardware", action="store_true", help="REAL ARM; owner only")
+    parser.add_argument("--i-am-present", action="store_true", help="owner at the arm")
+    parser.add_argument("--task", choices=P1.TASKS, default=None)
+    parser.add_argument("--cells", choices=P1.CELLS, nargs="+", default=None)
+    parser.add_argument(
+        "--trials", type=int, default=None, help="per cell; default eval.trials_per_cell (50)"
+    )
+    parser.add_argument(
+        "--slot-seed", type=int, default=None, help="placement plan; default eval.slot_seed"
+    )
+    parser.add_argument("--label", default="unlabelled", help="checkpoint label, e.g. sft / sft_rl")
+    parser.add_argument(
+        "--resume", default=None, help="run id (or run dir) of the session to continue"
+    )
+    parser.add_argument(
+        "--max-steps", type=int, default=None, help="default deploy.trial_max_steps"
+    )
+    parser.add_argument("--fake-clock", action="store_true", help="mock: instant, exact latency")
+    parser.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.preset != "real":
+        parser.error(
+            "WO-07 runs with --preset real (configs/real.yaml robot / deploy / eval blocks)"
+        )
+    if args.hardware and args.max_steps is not None:
+        parser.error("--max-steps is for mock runs; the real eval uses deploy.trial_max_steps")
+    cfg = load_config(args.preset, args.config)
+    return run(cfg, args)
+
+
+if __name__ == "__main__":
+    main()
