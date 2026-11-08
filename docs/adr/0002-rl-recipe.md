@@ -148,9 +148,10 @@ Applies to the next GRPO run only. No paid run has used it.
   the owner's +3 bar, but it now applies to sampled rollout success, a different quantity, so it
   needs the owner's confirmation. The flat gate's gain is a per-task least-squares trend over
   steps 1-38, i.e. the change from the SFT policy (the first proposal's baseline window, steps
-  1-10, had already taken 0-9 updates). Proposed with it, for the owner: `gate_flat_z` 0.5 (stop
+  1-10, had already taken 0-9 updates). With it, `gate_flat_z` 0.5, kept by the owner as the provisional default (2026-11-08) (stop
   only if gain + 0.5 x SE < 3 points), which in simulation stops 40-73% of flat runs and 6-9% of
-  runs where one task truly gains 5 points (`src/rl/gates.py`). `gate_max_drop` 0.04 and
+  runs where one task truly gains 5 points (`src/rl/gates.py`; its comparison row is the
+  older rollout-window rule, not the original 64-episode greedy gate). `gate_max_drop` 0.04 and
   `gate_entropy_min` 0.5 are the agent's judgment calls and have not been measured. The decline
   gate also needs the drop to exceed
   `gate_decline_z` (3) x its group-level SE on two consecutive non-overlapping windows, so

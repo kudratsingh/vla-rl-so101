@@ -141,10 +141,11 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   gate_min_gain: 0.03       # owner's +3 points (WO-04), now a gain from the SFT policy in SAMPLED
                             # success (owner to confirm: sampled success moved 7.9% -> 12.6% over
                             # 150 K=16 steps, i.e. ~+1.2 points by step 38 at that pace)
-  gate_flat_z: 0.5          # PROPOSAL (owner decides, PR #28): stop only if gain + 0.5 x SE < 3
-                            # points. Simulated P(stop): flat run 0.73 / 0.57 / 0.40 (p 0.08 / 0.13
-                            # / 0.20), one task truly +5: 0.06 / 0.08 / 0.09 (z 0: 0.17-0.23; the
-                            # old window rule 0.32-0.33). 0 = the plain +3 bar
+  gate_flat_z: 0.5          # PROVISIONAL default (owner 2026-11-08, PR #28; simulated only): stop
+                            # only if gain + 0.5 x SE < 3 points. Simulated P(stop): flat run 0.73 /
+                            # 0.57 / 0.40 (p 0.08 / 0.13 / 0.20), one task truly +5: 0.06 / 0.08 /
+                            # 0.09 (z 0: 0.17-0.23; the older rollout-window rule 0.32-0.33, not
+                            # the original 64-episode greedy gate). 0 = the plain +3 bar
   gate_rule: any_task       # owner 2026-10-28: pass if ANY trained task gained it
   gate_max_drop: 0.04       # decline: stop if the window is > 4 points below its best
                             # non-overlapping window (replaces the step-50/100 peak stop) ...

@@ -93,10 +93,11 @@ What changed:
   35/100 simulated flat runs; the SE is group-level: simulated 1.1-2.1 points for a 10-step
   window per task at p 0.08-0.20, 1.6-2.9 for a two-window difference). The flat gate (review
   L-baseline) fits a per-task least-squares trend over steps 1-38 and measures the gain from step
-  1, the SFT policy; the old baseline window 1-10 had already taken 0-9 updates. PROPOSAL for the
-  owner: stop only if gain + `gate_flat_z` (0.5) x SE < 3 points. Simulated P(stop): truly flat
-  0.40-0.73, one task truly +5 0.06-0.09 (plain +3 bar on the trend 0.17-0.23, the old window
-  rule 0.32-0.33); `gate_flat_z: 0` is the plain bar. Table in `src/rl/gates.py`. They
+  1, the SFT policy; the old baseline window 1-10 had already taken 0-9 updates. Provisional
+  default (owner 2026-11-08, simulated only): stop only if gain + `gate_flat_z` (0.5) x SE < 3
+  points. Simulated P(stop): truly flat 0.40-0.73, one task truly +5 0.06-0.09 (plain +3 bar on
+  the trend 0.17-0.23, the older rollout-window rule 0.32-0.33); `gate_flat_z: 0` is the plain
+  bar. Table in `src/rl/gates.py`; it does not reproduce the original 64-episode greedy gate. They
   decide spending only; the protocol eval decides improvement. Periodic greedy evals run on the
   trained tasks only and are sanity logs. The removed config keys raise an error naming their
   replacement.
@@ -170,7 +171,9 @@ the owner's go for the whole pass up front (pre-approval file, no A100 gate wait
 drops to `SPEND_CAP_SECONDS=10440` (2.9 h, $5.19) and the firm cap to $6.53. The margin: seed 0's
 RL stage took 26.8 h against its probe's 23.1 h projection (+16%, job log of pod
 `9d8p7vyfyv6ca4`); PickPlace-only 28.7 h vs 26.8 h (+7%). Each cap = planned x 1.25 + the full
-gate wait + the 20 min the job keeps between its soft deadline and the hard cap for the upload.
+gate wait + the 20 min the job keeps between its soft deadline and the hard cap for the upload
+(the hard-cap timer fires 180 s early, `CAP_PRESTART_S`, so billed time before the container starts
+stays inside the cap; the usable 201 / 87 min still cover 199 / 86 min).
 Timings below are from the WO-02/WO-04 job logs on the Hub (`KudratSingh22/vla-rl-so101-rl`
 `wo04/*/job.log`, `KudratSingh22/vla-rl-so101-sft` `wo02*/*/job.log`) unless marked estimated.
 
@@ -213,6 +216,53 @@ Timings below are from the WO-02/WO-04 job logs on the Hub (`KudratSingh22/vla-r
    estimated: A100-80GB x 41.3 h = $74 per 150-step seed, or 10.5 h = $18.72 if the flat gate stops
    it at step 38.
 
+**Pod deletion backstop** (2026-11-08, $0; checked against a hang-injection simulation, not on a
+pod). Every new pod uses `scripts/pod/pod_start_cmd.sh` as its start command: the whole file is
+the one string after the `["/bin/bash","-c"]` entrypoint, with no inline command. Its order is:
+- First it arms the hard-cap timer, before apt runs. The timer fires at first boot +
+  `SPEND_CAP_SECONDS` - `CAP_PRESTART_S`. `CAP_PRESTART_S` defaults to 180 s and covers billed
+  time before the container starts. That figure is an estimate.
+- The first-boot epoch is stored per pod id on `/workspace`, so a container restart re-arms the
+  timer with only the time left.
+- A cap that is not an integer deletes the pod at once.
+- At the cap, the timer runs `delete_self.sh`. It tries REST v2 DELETE, then GraphQL
+  `podTerminate`. Every curl has `--max-time 30`. A GraphQL reply counts only if the body holds
+  `podTerminate` and no `errors`. It reinstalls curl if it is missing and repeats every ~20-80 s
+  until the container dies.
+- Then apt runs under `timeout`, then a key check that writes `/root/backstop_status`
+  (`KEY_OK` / `KEY_BAD` / `KEY_UNVERIFIED` / `NO_CURL`, plus whether the timer is armed), then
+  sshd.
+
+The jobs (`diag_job.sh`, `demo_rebuild_job.sh`, `wo04_job.sh`) source `scripts/pod/job_lib.sh`:
+- The EXIT trap is installed before anything can fail.
+- Every stage runs under `timeout -k 120`, capped at the soft deadline (hard cap - 1200 s).
+- A watchdog sends TERM to the job 130 s after the soft deadline, which runs the trap.
+- The trap's upload is limited to 600 s (`uv run --no-sync`). Its delete loop is limited to
+  ~180 s, after which the timer keeps trying.
+- Worst case from the soft deadline: 130 + 630 + 270 s < 1200 s.
+
+Simulation: 47 cases at caps scaled to 120 s, with stub curl, uv and apt. They cover hangs in
+setup, uv sync, download, probe, gate, sweep/build and both uploads, children that ignore TERM, a
+step with no timeout, hung, failing or flaky deletes on either endpoint, a GraphQL error body, boot
+apt hanging, and an image without curl. Results:
+- 45 cases deleted the pod. The job deleted at or before the soft deadline + ~4 s scaled, or the
+  timer deleted at the cap + 0.2-4.3 s scaled. In real time, each failed delete attempt costs at
+  most ~80 s before the next one.
+- The 2 failures (one per job) are an API that fails every call for the whole window. The loop
+  kept trying (60-62 calls), but nothing inside the pod can fix that.
+
+`tests/test_pod_backstop.py` (CPU, ~7 s) pins the main cases: a hung REST DELETE falls back to
+GraphQL inside the cap, the restart re-arm works, and the start command's embedded copy of the
+delete script still matches `delete_self.sh`.
+
+Outside our control:
+- The pod cannot delete itself in four cases: RunPod's API is unreachable or refuses the
+  pod-scoped key for the whole window; the key or pod id is missing (`KEY_MISSING`/`KEY_BAD`); the
+  container restarts without a persistent `/workspace`; or apt cannot supply curl. In those
+  cases only a Mac-side check through the RunPod connector, or the owner in the console, stops
+  the pod.
+- RunPod's billing start and its teardown latency are not measured here.
+
 Proposed, not run: a rerun of the existing SFT `step_004000` and the two RL step-150 checkpoints
 under protocol 0.2. It is priced from the measured eval runtime of ~1.05 h per checkpoint on a
 4090, plus ~5% for the clip. estimated: RTX 4090 x 3.4-3.8 h = $3.0-3.4. Adding two-task step 50
@@ -220,7 +270,7 @@ and PickPlace-only step 100 brings it to $5.0-5.3.
 
 Unverified on GPU: gate behaviour and thresholds (`gate_min_gain` 0.03 now applies to sampled
 rollout success, as a gain from the SFT policy, and needs the owner's confirmation, as does
-`gate_flat_z` 0.5, simulated only; `gate_max_drop` 0.04, `gate_decline_z` 3 and
+`gate_flat_z` 0.5 (provisional default, simulated only); `gate_max_drop` 0.04, `gate_decline_z` 3 and
 `gate_entropy_min` 0.5 are not measured on GPU; z = 3 is from a CPU simulation only), diag/sweep forward cost, the throughput for the 16 x 8 / 2-epoch shape, the render
 hook timing on `physx_cuda`, the CUDA RNG restore (a GPU resume is not bit-identical), v2 oracle
 success on `physx_cuda`, recorder tail stepping on the GPU env, render-gap replay and 7B token

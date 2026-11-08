@@ -44,14 +44,18 @@ rollout policy's per-token entropy, src/rl/diagnostics.py). A window is the last
                         too: +4 points by step 10 then flat reads +2.6 (+6 reads +3.85).
                         Operating characteristic, P(stop at step 38), SIMULATED (noise model
                         above, 2 tasks, 4000 runs per cell, p0 0.08 / 0.13 / 0.20, linear gain):
-                          rule                    flat           one task +5    both tasks +5
-                          old window, z 0         .94/.85/.72    .32/.32/.33    .12/.14/.17
-                          trend, z 0              .89/.78/.65    .17/.20/.23    .04/.07/.10
-                          trend, z 0.5 (rl.yaml)  .73/.57/.40    .06/.08/.09    .01/.01/.02
-                          trend, z 1              .50/.33/.19    .02/.02/.03    .00/.00/.00
+                          rule                          flat         one task +5  both tasks +5
+                          older rollout-window rule     .94/.85/.72  .32/.32/.33  .12/.14/.17
+                          trend, z 0                    .89/.78/.65  .17/.20/.23  .04/.07/.10
+                          trend, z 0.5 (rl.yaml)        .73/.57/.40  .06/.08/.09  .01/.01/.02
+                          trend, z 1                    .50/.33/.19  .02/.02/.03  .00/.00/.00
+                        "older rollout-window rule" = window(29-38) - window(1-10) of sampled
+                        rollout success, z 0 (this PR's first version). The table does NOT
+                        reproduce the original 64-episode greedy gate (the WO-04 kill switch).
                         z 0.5 is the smallest of 0 / 0.3 / 0.4 / 0.5 / 1 with P(stop | one task
                         +5) <= 0.10 at every p0 (0.4: 0.101 / 0.106 at p0 0.13 / 0.20).
-                        tests/test_rl_gates.py pins the p0 0.13 cells. Owner's decision (PR #28).
+                        tests/test_rl_gates.py pins the p0 0.13 cells. Owner 2026-11-08: keep z 0.5 as the
+                        provisional default (simulated only; revisit after a GPU run).
   decline gate          the best window is tracked over ALIGNED windows only (ending at
                         first_step - 1 + k x window, so not the running max of overlapping
                         windows). Stop when, for BOTH the window ending at this step and the one

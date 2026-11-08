@@ -71,7 +71,7 @@ def test_flat_gate_any_task_and_mean_rules() -> None:
 
 def test_flat_gate_counts_learning_from_the_base_policy() -> None:
     """Review L-baseline: a learner that rises 10% -> 16% over steps 1-10 and then holds (window
-    10, check 38). The old window rule's baseline (steps 1-10) already holds half of that rise
+    10, check 38). The older rollout-window rule's baseline (steps 1-10) already holds half of that rise
     and reads +3.0; the trend from step 1 reads +3.85 and passes, also with z = 0.5 (SE ~0.15
     points: identical groups, only the misfit of a line). The front-loaded limit: +4 by step 10
     reads +2.6 and stops (documented in src/rl/gates.py)."""
@@ -113,7 +113,7 @@ def _refill_tallies(
 def test_flat_gate_operating_characteristic() -> None:
     """rl.yaml shape (check step 38, min_gain 0.03, any_task, gate_flat_z 0.5, 2 tasks), the
     test noise model and the trainer's refill group counts, p0 = 0.13, linear gain over steps
-    1-38. Pins the chosen setting: P(stop | flat) ~0.57 and P(stop | one task truly +5) ~0.08
+    1-38. Pins the provisional default (owner 2026-11-08): P(stop | flat) ~0.57 and P(stop | one task truly +5) ~0.08
     in the 4000-run simulation (src/rl/gates.py table); 200 seeded runs here: 104 / 20 / 1."""
 
     def stopped(seed: int, gain_a: float, gain_b: float) -> bool:
