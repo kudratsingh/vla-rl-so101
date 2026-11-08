@@ -17,7 +17,7 @@
 # Needs /root/runpod.env (RUNPOD_POD_ID, pod-scoped RUNPOD_API_KEY, SPEND_CAP_SECONDS,
 # POD_HARD_DEADLINE) and /root/pod_start_epoch, both written by scripts/pod/pod_start_cmd.sh (the
 # pod's start command, which also arms the hard self-delete timer: docs/STATUS.md "Next paid run",
-# SPEND_CAP_SECONDS 12240 = 3.4 h), and /root/.hf_token. Every stage is time-limited and a watchdog
+# SPEND_CAP_SECONDS 12420 = 3.45 h), and /root/.hf_token. Every stage is time-limited and a watchdog
 # stops the job at the soft deadline (scripts/pod/job_lib.sh).
 # NOT RUN YET: needs the owner's explicit go (CLAUDE.md rule 1).
 set -uo pipefail
