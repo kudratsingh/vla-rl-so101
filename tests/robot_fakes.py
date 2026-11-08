@@ -6,13 +6,14 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 from src.config import load_config
 from src.robot.camera import CameraFault, Frame
-from src.robot.units import JOINT_NAMES
+from src.robot.units import JOINT_NAMES, URDF_LIMITS_RAD
 
 
 def toy_fk(q: np.ndarray) -> np.ndarray:
@@ -32,23 +33,120 @@ def real_cfg() -> dict[str, Any]:
     return load_config("real")
 
 
+@dataclass(frozen=True)
+class FakeCal:
+    """lerobot's ``MotorCalibration`` fields (no lerobot import: CI installs no robot extra)."""
+
+    id: int
+    drive_mode: int
+    homing_offset: int
+    range_min: int
+    range_max: int
+
+
+MID_TICK = 2048
+GRIPPER_RANGE = (2000, 3500)  # raw ticks, closed .. open (arbitrary, like a real calibration)
+PORT_BUSY = "[TxRxResult] Port is in use!"  # scservo_sdk getTxRxResult(COMM_PORT_BUSY)
+CURRENT_MA_PER_COUNT = 6.5
+
+
+def full_sweep_calibration() -> dict[str, FakeCal]:
+    """A calibration whose sweep reached the URDF limits (src/robot/units.py's assumption):
+    arm joints mid = 2048 ticks, wrist_roll lerobot's fixed 0..4095, gripper GRIPPER_RANGE."""
+    cal: dict[str, FakeCal] = {}
+    for i, name in enumerate(JOINT_NAMES):
+        if name == "gripper":
+            lo, hi = GRIPPER_RANGE
+        elif name == "wrist_roll":
+            lo, hi = 0, 4095
+        else:
+            half = round(math.degrees(URDF_LIMITS_RAD[name][1]) * 4095 / 360)
+            lo, hi = MID_TICK - half, MID_TICK + half
+        cal[name] = FakeCal(i + 1, 0, 0, lo, hi)
+    return cal
+
+
+class FakeSerial:
+    def __init__(self) -> None:
+        self.input_resets = 0
+
+    def reset_input_buffer(self) -> None:
+        self.input_resets += 1
+
+
+class FakePortHandler:
+    """scservo_sdk ``PortHandler`` subset: ``is_using`` (the busy flag), ``clearPort``, ``ser``."""
+
+    def __init__(self) -> None:
+        self.is_using = False
+        self.ser = FakeSerial()
+        self.clears = 0
+
+    def clearPort(self) -> None:
+        self.clears += 1
+
+
 class FakeBus:
-    """Records torque/goal traffic like lerobot's FeetechMotorsBus (raw ticks = 2048 + deg*4095/360)."""
+    """Records torque/goal traffic like lerobot's FeetechMotorsBus. Raw position ticks: arm
+    2048 + int(deg*4095/360) (lerobot DEGREES with mid 2048), gripper range_min + pct% of the range.
+
+    Every transaction fails with scservo_sdk's "Port is in use!" while ``port_handler.is_using``
+    is set (a Ctrl-C that interrupted a transaction leaves it set). Temperature (deg C) and current
+    (mA, read back as 6.5 mA counts) per motor come from ``follower.temperature_c`` /
+    ``follower.current_ma``. ``eeprom``: the servos' Min/Max_Position_Limit (default = the file).
+    """
 
     def __init__(self, follower: FakeFollower):
         self.follower = follower
         self.torque_enabled = False
         self.calls: list[tuple[str, Any]] = []
         self.fail_disable = False
+        self.fail_health_read = False
+        self.port_handler = FakePortHandler()
+        self.calibration: dict[str, FakeCal] = full_sweep_calibration()
+        self.eeprom: dict[str, FakeCal] | None = None
+        self.max_temperature_limit = 70
+
+    def _check_port(self, what: str) -> None:
+        if self.port_handler.is_using:
+            raise ConnectionError(f"Failed to {what} {PORT_BUSY}")
+
+    def raw_positions(self) -> dict[str, int]:
+        out = {}
+        for m, v in self.follower.positions_lerobot().items():
+            if m == "gripper":
+                c = self.calibration[m]
+                out[m] = c.range_min + round(v / 100 * (c.range_max - c.range_min))
+            else:
+                out[m] = MID_TICK + int(v * 4095 / 360)
+        return out
 
     def sync_read(self, data_name: str, motors: Any = None, *, normalize: bool = True) -> Any:
+        self._check_port(f"sync read '{data_name}'")
         self.calls.append(("sync_read", data_name))
-        return {m: 2048 + int(v * 4095 / 360) for m, v in self.follower.positions_lerobot().items()}
+        if data_name == "Present_Temperature":
+            if self.fail_health_read:
+                raise ConnectionError("Failed to sync read 'Present_Temperature'")
+            return {m: int(v) for m, v in self.follower.temperature_c.items()}
+        if data_name == "Present_Current":
+            if self.fail_health_read:
+                raise ConnectionError("Failed to sync read 'Present_Current'")
+            return {m: round(v / CURRENT_MA_PER_COUNT) for m, v in self.follower.current_ma.items()}
+        if data_name == "Max_Temperature_Limit":
+            return {m: self.max_temperature_limit for m in JOINT_NAMES}
+        return self.raw_positions()
+
+    def read_calibration(self) -> dict[str, FakeCal]:
+        self._check_port("read calibration")
+        self.calls.append(("read_calibration", None))
+        return dict(self.calibration if self.eeprom is None else self.eeprom)
 
     def sync_write(self, data_name: str, values: Any, *, normalize: bool = True) -> None:
+        self._check_port(f"sync write '{data_name}'")
         self.calls.append(("sync_write", (data_name, dict(values))))
 
     def enable_torque(self, motors: Any = None, num_retry: int = 0) -> None:
+        self._check_port("write 'Torque_Enable'")
         self.calls.append(("enable_torque", None))
         self.torque_enabled = True
 
@@ -57,6 +155,7 @@ class FakeBus:
         self.follower.connected = False
 
     def disable_torque(self, motors: Any = None, num_retry: int = 0) -> None:
+        self._check_port("write 'Torque_Enable'")
         self.calls.append(("disable_torque", None))
         if self.fail_disable:
             raise ConnectionError("bus gone")
@@ -67,6 +166,9 @@ class FakeFollower:
     """Stands in for lerobot's SO101Follower. Positions in LeRobot units (deg, gripper 0-100).
 
     ``track``: the arm reaches every goal instantly (perfect servo).
+    ``interrupt_next``: "read" / "write" -> the next get_observation / send_action is interrupted
+    by a Ctrl-C mid-transaction: the port is left busy and KeyboardInterrupt is raised.
+    ``temperature_c`` / ``current_ma``: what the servo-health registers read (deg C, mA).
     """
 
     def __init__(self, start: dict[str, float] | None = None, track: bool = True):
@@ -76,13 +178,22 @@ class FakeFollower:
             self.pos.update(start)
         self.track = track
         self.bus = FakeBus(self)
-        self.calibration = {"shoulder_pan": object()}
+        self.calibration = self.bus.calibration  # lerobot: robot and bus share the file's dict
         self._calibrated = True
         self.connected = False
         self.sent: list[dict[str, float]] = []
         self.fail_read = False
         self.fail_write = False
         self.fail_connect = False
+        self.interrupt_next: str | None = None
+        self.temperature_c: dict[str, float] = {n: 35.0 for n in JOINT_NAMES}
+        self.current_ma: dict[str, float] = {n: 100.0 for n in JOINT_NAMES}
+
+    def _maybe_interrupt(self, kind: str) -> None:
+        if self.interrupt_next == kind:
+            self.interrupt_next = None
+            self.bus.port_handler.is_using = True  # txPacket set it; rxPacket never ran
+            raise KeyboardInterrupt
 
     def positions_lerobot(self) -> dict[str, float]:
         return {k.removesuffix(".pos"): v for k, v in self.pos.items()}
@@ -108,11 +219,15 @@ class FakeFollower:
         self.connected = False
 
     def get_observation(self) -> dict[str, Any]:
+        self._maybe_interrupt("read")
+        self.bus._check_port("sync read 'Present_Position'")
         if self.fail_read:
             raise ConnectionError("Failed to sync read 'Present_Position'")
         return dict(self.pos)
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        self._maybe_interrupt("write")
+        self.bus._check_port("sync write 'Goal_Position'")
         if self.fail_write:
             raise ConnectionError("Failed to sync write 'Goal_Position'")
         self.sent.append(dict(action))
