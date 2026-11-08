@@ -92,7 +92,7 @@ uv run scripts/wo06_calibrate.py --preset real find-port --write
   appears, the board needs the WCH CH34x macOS driver.
 - **Why 🟢:** `find_available_ports` only lists `/dev/tty*` and opens no port
   (`LR/scripts/lerobot_find_port.py:30-39`). The wrapper only compares the two lists and edits
-  the YAML (`scripts/wo06_calibrate.py:150-175`).
+  the YAML (`scripts/wo06_calibrate.py:153-178`).
 - **Report back:** the port name.
 
 ---
@@ -164,8 +164,8 @@ uv run scripts/wo06_calibrate.py --preset real calibrate --device follower
   An interrupted run (Ctrl-C) prints `... re-run calibrate`. The old file stays, but the motors no
   longer match it, and the driver will refuse to connect until you recalibrate.
 - **Why 🟡 (torque never enabled):** the wrapper opens only the bus (`bus.connect()`,
-  `scripts/wo06_calibrate.py:197`), disables torque (line 199), clears the cached file so
-  LeRobot takes the fresh path (lines 204-209), and disconnects with torque off (line 216). It no
+  `scripts/wo06_calibrate.py:200`), disables torque (line 202), clears the cached file so
+  LeRobot takes the fresh path (lines 207-212), and disconnects with torque off (line 219). It no
   longer calls `device.connect()`, whose `configure()` re-enables torque at the end of
   `torque_disabled()` (`LR/robots/so_follower/so_follower.py:105,156-158`;
   `LR/motors/motors_bus.py:663-678`). It never takes LeRobot's reuse branch, which wrote homing
@@ -189,7 +189,7 @@ uv run scripts/wo06_calibrate.py --preset real check --write-limits   # only whe
   `effective safety limits (deg):`, with the gripper at `[-5.0, 95.0]`.
 - **Pass/fail:** no `WARNING` lines. Recalibrate on any warning: the joint's zero would differ
   from the sim's (`src/robot/units.py:33-35`).
-- **Why 🟢:** reads the JSON file only and never opens the port (`scripts/wo06_calibrate.py:228-272`).
+- **Why 🟢:** reads the JSON file only and never opens the port (`scripts/wo06_calibrate.py:231-275`).
   Limits only ever narrow the URDF limits minus the margin (`src/robot/safety.py:152-174`).
 - **Rerun `--write-limits`** after any change to `robot.units` in step 5. The limits depend on
   `arm_sign`/`arm_offset_deg` (`src/robot/units.py:160-178`).
@@ -201,7 +201,9 @@ uv run scripts/wo06_calibrate.py --preset real check --write-limits   # only whe
 uv run scripts/wo06_calibrate.py --preset real verify     # Ctrl-C to stop
 ```
 
-A line prints every 0.2 s, for example
+It first prints the checks below and asks `Torque goes OFF now ... support the arm, then press
+ENTER`: torque can still be on after a crashed session, and the arm drops when it goes off. Hold
+the arm, press ENTER. Then a line prints every 0.2 s, for example
 `pan=    0.4  lift=   -1.2  elbow=    0.3  wflex=    2.0  wroll=    0.0  grip=   45.1  TCP=(0.385,-0.001,0.241) in`.
 The values are canonical degrees, and the TCP is in metres in the robot base frame. Support the arm
 throughout.
@@ -231,9 +233,10 @@ The expected directions come from the sim's FK (`src/env/kinematics.py`) evaluat
   starts, and read its TCP. `in` is ideal. Torque is enabled in this pose in step 9.
 - **Writes:** nothing.
 - **Pass/fail:** every row above as expected. `motors do not match the calibration file` → step 3.
-- **Why 🟡:** port only, with no `configure()` (`scripts/wo06_calibrate.py:288`). It explicitly
-  disables torque (line 290), only does `sync_read('Present_Position')` (line 294), and
-  disconnects with torque off (line 309). No Goal_Position write anywhere.
+- **Why 🟡:** asks you to support the arm first (`scripts/wo06_calibrate.py:293-294`), then port
+  only, with no `configure()` (line 295). It explicitly disables torque (line 297), only does
+  `sync_read('Present_Position')` (line 301), and disconnects with torque off (line 316). No
+  Goal_Position write anywhere.
 - **Report back:** one line at the middle pose, one line in the resting pose, and any sign or
   offset you changed.
 
@@ -297,12 +300,15 @@ uv run scripts/wo06_camera_match.py --preset real --with-arm --task PickPlace   
   real arm in the blend panel, wrist_roll included.
 - **Pass/fail:** the objects, base and table edge overlap within a few pixels. In 7b the arms
   overlap. On this branch a posing failure is an error, not a silent rest pose
-  (`scripts/wo06_camera_match.py:78-93`, `tests/test_camera_match.py`). Before this fix, the Mac
+  (`scripts/wo06_camera_match.py:89-104`, `tests/test_camera_match.py`). Before this fix, the Mac
   CPU `SerialVecEnv` had no `.agent`, and `--with-arm` showed the rest pose.
 - **Why 🟢 / 🟡:** without `--with-arm` no bus is opened. With it, `read_arm_joints` does
-  `bus.connect()`, one `sync_read('Present_Position')` and `bus.disconnect(disable_torque=False)`,
-  with no `configure()`, no torque enable and no goal write (`scripts/wo06_camera_match.py:62-75`).
-  You pose the limp arm by hand.
+  `bus.connect()`, `sync_read('Torque_Enable')`, one `sync_read('Present_Position')` and
+  `bus.disconnect(disable_torque=False)`, with no `configure()`, no torque change and no goal write
+  (`scripts/wo06_camera_match.py:62-86`). The script does not turn torque off (that could drop an
+  unsupported arm): if any servo is torqued it refuses with `follower torque is ON ...`. Then
+  run step 5's `verify` (it asks you to support the arm before torque goes off) or power-cycle the
+  servo supply, and retry. You pose the limp arm by hand.
 - **Decision for `docs/STATUS.md`** (WO-06 benchmark): from the blend and the colour stats,
   decide whether the WO-01 randomization retrain is needed (WO-06 deliverable 5).
 - **Report back:** the PNG and JSON paths, `mean_abs_diff`, a screenshot of one blend, and your
@@ -332,14 +338,14 @@ uv run scripts/wo06_calibrate.py --preset real verify --device leader
   in the same pose as the follower (verified in step 5) and every joint agrees within ~5°.
   Trigger closed ≈ −10°, open ≈ +100°.
 - **Pass/fail:** leader verify follows the same direction rules as step 5. Teleop applies the
-  follower's `robot.units` to the leader (`scripts/wo06_teleop_record.py:330`, `UnitMap.from_config`),
+  follower's `robot.units` to the leader (`scripts/wo06_teleop_record.py:414`, `UnitMap.from_config`),
   so a leader-only sign or offset difference can't be fixed in the config. Recalibrate whichever
   arm disagrees.
 - **Why 🟡:** the leader never receives a goal position: `get_action` is `sync_read` only
   (`LR/teleoperators/so_leader/so_leader.py:140-147`), and its `configure()` only disables torque
   (lines 128-132). The calibrate/verify paths are the same torque-off bus-only paths as steps 3 and 5
-  (`scripts/wo06_calibrate.py:178-217,275-309`). `_make_device` refuses the `YYYY` placeholder port
-  (`scripts/wo06_calibrate.py:125-147`).
+  (`scripts/wo06_calibrate.py:181-220,278-316`). `_make_device` refuses the `YYYY` placeholder port
+  (`scripts/wo06_calibrate.py:128-150`). Leader `verify` skips the support prompt.
 - **Report back:** one leader verify line next to the follower verify line for the same pose.
 
 ---
@@ -365,12 +371,15 @@ What happens and what you do:
    gripper above the table, every joint away from its stops, trigger mid-way. Press ENTER.
 3. **Sync (not recorded):** the follower eases onto the leader's pose, clipped to the safety limits,
    at ≤ 4°/step and 60°/s (`configs/real.yaml:28-29`). A fully closed or open trigger, or a leader
-   joint at its stop, no longer blocks this (`scripts/wo06_teleop_record.py:151-188`). If the
+   joint at its stop, does not block this, also when the follower starts outside a limit (gripper
+   resting closed, arm folded on its stops): like the safety filter, the sync then accepts the
+   joint where the filter holds it (`scripts/wo06_teleop_record.py:170-215`). If the
    script prints `safety rejects the leader pose (...)`, move the leader's gripper into
    `workspace_box_m`. If it prints `not in sync after 10 s ...`, it lists the joints that are lagging.
-   Either way the follower holds, and you get the prompt again.
+   Ctrl-C prints `sync aborted`. In every case the follower holds, and you get the prompt again.
 4. `recording (30 s max, Ctrl-C to end) ...`. Move slowly. **Bring the follower low over the table,
-   then press Ctrl-C once.** The follower then holds that pose (line 258).
+   then press Ctrl-C once.** The current control tick finishes, `episode ended` prints, and the
+   follower holds that pose (line 328).
 5. `keep this episode (N frames)? [Y]es / [n]o, redo / [q]uit:` → type `q`.
 6. `Ending the session ... Put a hand under the forearm ..., then press ENTER: torque goes OFF`.
    Support the arm, then press ENTER. The arm goes limp into your hand.
@@ -378,9 +387,12 @@ What happens and what you do:
 - **Writes:** `data/real_teleop/vla-rl-so101-real-teleop-rehearsal/` (git-ignored, replaced every
   rehearsal, never pushed). The real dataset is untouched.
 - **Expected:** possibly `NOTE <task>: recording the protocol instruction ...`. No
-  `WARNING camera config mismatch`. INFO `safety step_clip ...` lines during sync. A WARNING
-  `safety joint_limit gripper: -10.00 -> -5.00 deg` every tick while the trigger is fully closed is
-  expected: the follower stops at its safety floor. Finally
+  `WARNING camera config mismatch`. Log lines print as `<LEVEL> <logger>: <message>`, e.g.
+  `WARNING src.robot.driver: holding at measured pose (deg): [...]` after each sync abort and
+  episode. A `WARNING src.robot.safety: safety joint_limit gripper: -10.00 -> -5.00 deg (...)`
+  every tick while the trigger is fully closed is expected: the follower stops at its safety floor.
+  The per-tick `INFO src.robot.safety: safety step_clip ...` / `velocity_cap` lines (the rate
+  limiter at work during sync) print only with `--verbose`. Finally
   `saved 0 episodes to .../vla-rl-so101-real-teleop-rehearsal` (or 1 if you answered Y).
 - **Pass/fail:** no joint jumps at connect or at sync. The follower tracks the leader smoothly
   in the right directions. It stops when you stop. The session ends through step 6 above. Any
@@ -389,7 +401,7 @@ What happens and what you do:
 - **Why 🔴:** `So101Driver.connect` enables torque through LeRobot's `configure()`
   (`src/robot/driver.py:158`). Each tick, the safety filter runs and then the bus write follows
   (`src/robot/driver.py:268-271`). The sync and recording loops drive the follower
-  (`scripts/wo06_teleop_record.py:151-188,240-258`).
+  (`scripts/wo06_teleop_record.py:170-215,311-328`).
 - **Report back:** the full terminal log (or the `safety`/`STOPPED` lines), and whether
   anything moved unexpectedly.
 
@@ -406,12 +418,14 @@ uv run scripts/wo06_teleop_record.py --preset real              # 3 tasks x 5 ep
 
 For a private Hub copy, decide before you start: run `uv run hf auth login` once, then add `--push`
 to the command above. The upload runs after the session, only if at least one episode was saved,
-and always private (`scripts/wo06_teleop_record.py:380-382`). Never use `lerobot-record`, which
+and always private (`scripts/wo06_teleop_record.py:464-466`). Never use `lerobot-record`, which
 uploads publicly by default.
 
 For each episode: arrange the scene, then hold the leader mid-range (trigger mid-way) and press ENTER.
 Do the task, **finish with the follower low**, then press Ctrl-C (or wait 30 s) and answer `Y`, `n`
-(redo) or `q` (end the session). Between episodes the follower holds its last pose under
+(redo) or `q` (end the session). After `Y` the script prints `saving episode (encoding video, a few
+seconds; Ctrl-C is ignored) ...`: wait for the next prompt. If saving fails it prints
+`saving failed (...); episode discarded, redo it`, the follower keeps holding, and you redo it. Between episodes the follower holds its last pose under
 torque. It does not follow the leader at the prompts, so moving the leader then does nothing.
 Watch servo heat. If the servos feel hot, end the session with `q`, power off, and let them cool.
 
@@ -423,10 +437,10 @@ Watch servo heat. If the servos feel hot, end the session with `q`, power off, a
   strings, which differ for PickPlace and Push.
 - **Expected:** 15 × `[<Task> k/5] ...`, then `saved 15 episodes to .../data/real_teleop/vla-rl-so101-real-teleop`.
 - **Pass/fail:** 15 saved, with no unexpected motion. There is no resume: rerunning with `--overwrite`
-  deletes the saved episodes (`scripts/wo06_teleop_record.py:335-338`). Copy the folder aside
+  deletes the saved episodes (`scripts/wo06_teleop_record.py:419-422`). Copy the folder aside
   before any rerun.
 - **Why 🔴:** same path as step 9. The stored `action` is the safe command actually sent
-  (`scripts/wo06_teleop_record.py:251`).
+  (`scripts/wo06_teleop_record.py:321`).
 - **Report back:** the `saved N episodes` line, per-task notes (success by eye, any
   `STOPPED`/`REJECTED` lines), and the Hub URL if you pushed.
 
@@ -436,16 +450,20 @@ Watch servo heat. If the servos feel hot, end the session with `q`, power off, a
 
 - **Teleop (🔴):** end only through `q` or a single Ctrl-C at a prompt. The script then holds,
   asks you to support the arm, and turns torque off when you press ENTER
-  (`scripts/wo06_teleop_record.py:191-207`; normal exit of the driver's `with` block →
+  (`scripts/wo06_teleop_record.py:244-269`; normal exit of the driver's `with` block →
   `src/robot/driver.py:183`). Ctrl-C during the sync aborts it and holds. During recording it ends
-  the episode, not the session. A second Ctrl-C at the "support the arm" prompt counts as ENTER.
+  the episode, not the session. Outside a prompt Ctrl-C never interrupts a servo-bus or dataset
+  call: it is a flag checked between control ticks (`scripts/wo06_teleop_record.py:218-234`), and
+  it is ignored while an episode saves or the follower settles into its hold. Ctrl-C at the
+  "support the arm" prompt is ignored too (`Ctrl-C ignored: the follower still holds ...`): only
+  ENTER turns torque off, so support the arm first, or cut the servo supply.
 - **If anything looks wrong at any moment:** switch off the follower's servo supply. Torque goes
   off instantly and the arm drops, so keep it low.
 - **After each session:** the command has exited, the arm rests on the table, the servo supply
   is OFF (the switch), and then the USB comes out. Never leave the follower powered and torqued
   unattended.
 - **Torque-off steps (🟡):** Ctrl-C stops `verify`, and every path disconnects with torque off
-  (`scripts/wo06_calibrate.py:216,309`).
+  (`scripts/wo06_calibrate.py:219,316`).
 
 ## Reporting summary (send to the agent)
 
