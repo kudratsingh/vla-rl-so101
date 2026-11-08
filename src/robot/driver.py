@@ -10,6 +10,8 @@
   servos stop pushing; TORQUE_OFF: disable torque) and raises ``DeadmanTripped``: the loop stops.
   A caller may catch it, ask the operator, ``deadman.reset(...)`` and continue.
 * Any exception from the bus is a serial fault: deadman TORQUE_OFF, then ``SerialFault`` is raised.
+* ``check_frame`` (camera liveness without a write) and ``trip`` (any other failure, e.g. the
+  policy server) end the same way: response carried out, ``DeadmanTripped``.
 * Leaving the ``with`` block always disables torque (LeRobot's ``disable_torque_on_disconnect``;
   explicitly first if leaving on an exception). The arm then goes limp and drops onto the table:
   keep it low, or support it, when a session ends.
@@ -250,6 +252,23 @@ class So101Driver:
             except SerialFault:
                 pass  # already escalated to torque off
         return DeadmanTripped(f"deadman ({self.deadman.response}): {self.deadman.reason}")
+
+    def trip(self, reason: str, response: DeadmanResponse = DeadmanResponse.HOLD) -> DeadmanTripped:
+        """Latch the deadman for a failure outside the bus and camera (policy server, operator
+        Ctrl-C, client bug), carry out its response, and return the exception for the caller to
+        raise: ``raise arm.trip("server timeout")``."""
+        self.deadman.trip(reason, response)
+        return self._respond_to_deadman(None)
+
+    def check_frame(self, frame_time: float | None, now: float | None = None) -> None:
+        """The deadman's camera check without a write (e.g. before a policy query): on a missing,
+        stale or future frame, hold and raise DeadmanTripped."""
+        if not self._connected:
+            raise RuntimeError("driver not connected")
+        if self.deadman.tripped:
+            raise DeadmanTripped(f"deadman latched: {self.deadman.reason}")
+        if not self.deadman.check_frame(frame_time, self.clock() if now is None else now):
+            raise self._respond_to_deadman(None)
 
     # -- control --------------------------------------------------------------------------------
     def step(
