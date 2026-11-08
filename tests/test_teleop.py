@@ -251,3 +251,76 @@ def test_hot_servo_after_a_prompt_cuts_torque_before_any_motion(
         teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2, lambda im: im)
     assert "SUPPORT THE ARM NOW" in capsys.readouterr().out
     assert not fol.sent and not fol.bus.torque_enabled  # nothing moved, torque off at once
+
+
+def test_defaults_no_auto_park_and_a_bounded_torque_on_wait() -> None:
+    from src.robot.driver import park_from_config
+
+    cfg = real_cfg()
+    assert park_from_config(cfg) is None  # robot.park.enabled: false until the owner verifies
+    assert teleop.TorqueWait.from_config(cfg) == teleop.TorqueWait(60.0, 10.0)
+    cfg["teleop"]["prompt_torque_timeout_s"] = None
+    assert teleop.TorqueWait.from_config(cfg) is None
+
+
+def _health_reads(fol: FakeFollower) -> int:
+    return sum(
+        c == ("sync_read", r)
+        for c in fol.bus.calls
+        for r in ("Present_Temperature", "Present_Current")
+    )
+
+
+def test_prompt_timeout_under_torque_supports_then_torque_off(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
+    sess.arm.monitor = monitor_from_config(real_cfg())
+    sess.torque_wait = teleop.TorqueWait(timeout_s=60.0, grace_s=10.0)
+    waits: list[tuple[str, float, int]] = []
+
+    def no_answer(prompt: str, timeout_s: float) -> str | None:
+        waits.append((prompt, timeout_s, _health_reads(fol)))
+        return None  # nobody at the keyboard
+
+    monkeypatch.setattr(teleop, "timed_input", no_answer)
+    instr = teleop.protocol_instructions(["Push"])
+    saved = teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2, lambda im: im)
+    assert saved == 0
+    assert [w[1] for w in waits] == [60.0, 10.0]  # the scene prompt, then the support grace
+    assert waits[0][2] == 2  # temperature + current read BEFORE the wait, by this thread
+    out = capsys.readouterr().out
+    assert "SUPPORT THE ARM NOW" in out and "Torque goes OFF in 10 s" in out
+    assert not fol.sent and not fol.bus.torque_enabled  # nothing moved; torque released
+    assert sess.torque_released and sess.arm.deadman.response is not None
+
+
+def test_answered_prompt_reads_servos_before_and_after_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
+    sess.arm.monitor = monitor_from_config(real_cfg())
+    sess.torque_wait = teleop.TorqueWait(timeout_s=60.0, grace_s=0.0)
+    before: list[int] = []
+
+    def answer(prompt: str, timeout_s: float) -> str | None:
+        before.append(_health_reads(fol))
+        fol.temperature_c["elbow_flex"] = 58.0  # heated up while the operator thought
+        return ""
+
+    monkeypatch.setattr(teleop, "timed_input", answer)
+    with pytest.raises(ServoFault):
+        teleop.torque_on_ask(sess, "ENTER: ")
+    assert before == [2] and _health_reads(fol) == 3  # one read after: the trip
+    assert not fol.bus.torque_enabled
+
+
+def test_end_session_after_a_failed_torque_off_names_the_power_switch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
+    fol.bus.fail_disable = True
+    assert sess.arm.torque_off() is False
+    n = len(fol.sent)
+    teleop.end_session(sess.arm, sess)
+    assert "inline power switch" in capsys.readouterr().out and len(fol.sent) == n

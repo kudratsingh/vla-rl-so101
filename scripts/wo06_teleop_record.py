@@ -20,10 +20,25 @@ Torque is ON from connect until the session ends. Per episode: arrange the scene
 follower first eases onto the leader's pose clipped to the safety limits (rate-limited, not
 recorded), then recording runs for ``teleop.episode_time_s`` or until Ctrl-C, then the follower
 holds its pose; keep, redo or quit. ``q`` or Ctrl-C at any prompt (or the last episode) ends the
-session the healthy way: the follower PARKS at ``robot.park.qpos`` through the safety filter (it
-moves; Ctrl-C stops the park), then torque goes off. If the park cannot complete, or the session
-ends after a deadman stop (no ``resume``), it holds, asks the operator to support the arm, then
-torque off. A lost frame / stall holds the arm and asks you; a serial error cuts torque; a servo
+session: the follower holds, the operator supports the arm, ENTER turns torque off. With
+``robot.park.enabled: true`` (default false until the owner verifies the rest pose and the park
+path, WO-06 checklist step 5) a healthy end PARKS at ``robot.park.qpos`` through the safety filter
+first (it moves; Ctrl-C stops the park). If the park cannot complete, or the session ends after a
+deadman stop (no ``resume``), it holds, asks the operator to support the arm, then torque off.
+
+Bounded torque-on waits (``teleop.prompt_torque_timeout_s``, default 60 s; null = wait forever):
+every prompt answered while the follower holds under torque reads the servos' temperature and
+current first, waits at most that long, and reads them again after the answer. With no answer
+in time it tells the operator to support the arm, waits ``teleop.prompt_support_grace_s``
+(default 10 s; ENTER = now), turns torque off and ends the session (saved episodes are kept; an
+unsaved one is discarded). The wait is ``select()`` on stdin in this one thread: the servo bus
+keeps a single owner, and nothing reads it in the background.
+
+A failed torque-off write ("TORQUE OFF UNCONFIRMED", ``So101Driver.torque_off_unconfirmed``)
+blocks every further goal-position and torque-enable write; the script tells the operator to
+switch off the inline power switch and ends.
+
+A lost frame / stall holds the arm and asks you; a serial error cuts torque; a servo
 over-temperature / over-current (``robot.servo_monitor``) cuts torque AT ONCE and tells you to
 support the arm (no hold, no park). Outside the prompts Ctrl-C never interrupts a bus or dataset
 call: it is a flag checked between control ticks (ends the sync or the episode), and ignored
@@ -35,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import select
 import shutil
 import signal
 import sys
@@ -42,7 +58,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -65,12 +81,14 @@ from src.robot.camera import (
     sim_mismatches,
 )
 from src.robot.driver import (
+    TORQUE_OFF_UNCONFIRMED_MSG,
     DeadmanTripped,
     ParkSettings,
     SerialFault,
     ServoFault,
     So101Driver,
     StepResult,
+    park_from_config,
 )
 from src.robot.safety import DeadmanResponse, load_sim_fk
 from src.robot.units import JOINT_NAMES, UnitMap
@@ -124,6 +142,50 @@ def prompt_input(prompt: str) -> str:
         signal.signal(signal.SIGINT, prev)
 
 
+def timed_input(prompt: str, timeout_s: float) -> str | None:
+    """``prompt_input`` that gives up after ``timeout_s``: None. ``select()`` on stdin in this
+    thread (no reader thread; the servo bus is never touched here). EOF raises EOFError."""
+    prev = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        ready, _, _ = select.select([sys.stdin], [], [], max(0.0, timeout_s))
+        if not ready:
+            sys.stdout.write("\n")
+            return None
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError
+        return line.rstrip("\r\n")
+    finally:
+        signal.signal(signal.SIGINT, prev)
+
+
+class TorqueWait(NamedTuple):
+    """Bound on a prompt answered with the follower holding under torque (module doc). A
+    NamedTuple, not a dataclass: tests load this script without registering it in sys.modules."""
+
+    timeout_s: float  # teleop.prompt_torque_timeout_s
+    grace_s: float  # teleop.prompt_support_grace_s
+
+    @classmethod
+    def from_config(cls, cfg: dict[str, Any]) -> TorqueWait | None:
+        t = cfg.get("teleop") or {}
+        timeout = t.get("prompt_torque_timeout_s", 60.0)
+        if timeout is None:
+            return None
+        out = cls(float(timeout), float(t.get("prompt_support_grace_s", 10.0)))
+        if not (out.timeout_s > 0 and out.grace_s >= 0):
+            raise ValueError("teleop.prompt_torque_timeout_s must be > 0 and grace_s >= 0")
+        return out
+
+
+TORQUE_WAIT_EXPIRED = (
+    "\nNo answer for {timeout:.0f} s with torque ON. SUPPORT THE ARM NOW: put a hand under the "
+    "forearm. Torque goes OFF in {grace:.0f} s (ENTER = now) and the session ends."
+)
+
+
 def ask(prompt: str) -> str:
     """``input()``, lower-cased; Ctrl-C / EOF answer ``q`` (end the session the safe way)."""
     try:
@@ -160,9 +222,12 @@ class Session:
         cam: OpenCVFrameSource,
         units: UnitMap,
         park: ParkSettings | None = None,
+        torque_wait: TorqueWait | None = None,
     ):
         self.arm, self.leader, self.cam, self.units = arm, leader, cam, units
         self.park = park  # healthy-end park pose; None = hold + support prompt only
+        self.torque_wait = torque_wait  # None = prompts wait indefinitely under torque
+        self.torque_released = False  # torque turned off after a prompt timed out
         self.period = 1.0 / arm.safety.config.control_hz
         self.target: np.ndarray | None = None  # last leader pose, canonical rad
         self.stop = False  # Ctrl-C under ctrl_c_as_flag; the loops check it between ticks
@@ -260,6 +325,68 @@ def ctrl_c_as_flag(sess: Session) -> Iterator[None]:
         signal.signal(signal.SIGINT, prev)
 
 
+def _release_torque_after_wait(sess: Session) -> None:
+    """A prompt timed out under torque: support prompt, grace, torque off, deadman TORQUE_OFF
+    (so nothing after this holds, parks or moves)."""
+    tw = sess.torque_wait
+    assert tw is not None
+    print(TORQUE_WAIT_EXPIRED.format(timeout=tw.timeout_s, grace=tw.grace_s), flush=True)
+    if tw.grace_s > 0:
+        try:
+            timed_input("", tw.grace_s)
+        except (KeyboardInterrupt, EOFError):
+            pass
+    arm = sess.arm
+    arm.deadman.trip(
+        f"no answer for {tw.timeout_s:.0f} s at a prompt with torque on", DeadmanResponse.TORQUE_OFF
+    )
+    sess.torque_released = True
+    if arm.torque_off():
+        print("torque OFF: the follower is limp")
+
+
+def _torque_off_unconfirmed(arm: So101Driver) -> bool:
+    """Tell the operator to cut power if a torque-off write failed (driver latch). True if so."""
+    if arm.torque_off_unconfirmed is None:
+        return False
+    print(f"\n{TORQUE_OFF_UNCONFIRMED_MSG.format(detail=arm.torque_off_unconfirmed)}", flush=True)
+    return True
+
+
+def torque_on_ask(sess: Session, msg: str) -> str:
+    """``ask`` at a prompt where the follower holds under torque: servo health before and after
+    the wait, and the wait bounded by ``sess.torque_wait`` (module doc). A timeout releases
+    torque and answers ``q``. Raises ServoFault / SerialFault from the health reads."""
+    arm = sess.arm
+    if arm.torque_off_unconfirmed is not None or (
+        arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF
+    ):
+        return ask(msg)  # torque is off (or cannot be confirmed): nothing to bound or read
+    _checked_servos(arm)  # heat from the hold so far
+    if sess.torque_wait is None:
+        ans = ask(msg)
+    else:
+        try:
+            got = timed_input(msg, sess.torque_wait.timeout_s)
+        except (KeyboardInterrupt, EOFError):
+            print()
+            got = QUIT
+        if got is None:
+            _release_torque_after_wait(sess)
+            return QUIT
+        ans = got.strip().lower()
+    _checked_servos(arm)  # heat built up while the arm held at the prompt
+    return ans
+
+
+def _checked_servos(arm: So101Driver) -> None:
+    try:
+        arm.check_servos()
+    except ServoFault:
+        print("SUPPORT THE ARM NOW: torque is OFF (servo fault).")
+        raise
+
+
 def discard_episode(dataset: Any) -> None:
     try:
         dataset.clear_episode_buffer()
@@ -270,12 +397,16 @@ def discard_episode(dataset: Any) -> None:
 def end_session(arm: So101Driver, sess: Session | None = None) -> None:
     """End an operator-ended session (``q`` / Ctrl-C at a prompt, the last episode, no ``resume``).
 
-    Healthy (deadman clear) with ``sess.park`` set: park through the safety filter, then torque
-    off (``So101Driver.park``; Ctrl-C during the park stops it). Otherwise, or if the park does
-    not complete: hold at the measured pose, then let the operator support the arm before torque
-    goes off, when the driver's ``with`` block closes normally. Only ENTER (or a closed stdin)
-    gets there: Ctrl-C at this prompt is ignored, a panicked second press must not drop the arm.
+    Healthy (deadman clear) with ``sess.park`` set (``robot.park.enabled``): park through the
+    safety filter, then torque off (``So101Driver.park``; Ctrl-C during the park stops it).
+    Otherwise, or if the park does not complete: hold at the measured pose, then let the operator
+    support the arm before torque goes off, when the driver's ``with`` block closes normally.
+    Only ENTER (or a closed stdin, or the bounded torque-on wait running out) gets there: Ctrl-C
+    at this prompt is ignored, a panicked second press must not drop the arm. A failed torque-off
+    (driver latch) tells the operator to cut power at the inline switch.
     """
+    if _torque_off_unconfirmed(arm):
+        return
     if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
         return  # torque is already off
     if sess is not None and sess.park is not None and not arm.deadman.tripped:
@@ -284,16 +415,25 @@ def end_session(arm: So101Driver, sess: Session | None = None) -> None:
         if arm.park(sess.park, sess.frame_time, stop_fn=lambda: sess.stop):
             print("follower parked; torque OFF")
             return
+        if _torque_off_unconfirmed(arm):
+            return
         if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
             return  # a servo / serial fault during the park: torque is already off
         print("park did not complete: the follower holds")
     try:
         arm.hold()
     except SerialFault:
+        _torque_off_unconfirmed(arm)
         return  # escalated to torque off already
+    tw = sess.torque_wait if sess is not None else None
     while True:
         try:
-            prompt_input(SUPPORT_PROMPT)
+            if tw is None:
+                prompt_input(SUPPORT_PROMPT)
+            elif timed_input(SUPPORT_PROMPT, tw.timeout_s) is None:
+                assert sess is not None
+                _release_torque_after_wait(sess)
+                _torque_off_unconfirmed(arm)
             return
         except KeyboardInterrupt:
             print(
@@ -335,12 +475,11 @@ def _episodes(
         k = 0
         while k < n_eps:
             msg = f"[{task} {k + 1}/{n_eps}] arrange the scene, hold the leader, ENTER (q = end): "
-            if ask(msg) == QUIT:
+            if torque_on_ask(sess, msg) == QUIT:  # servo health before and after the wait
                 end_session(arm, sess)
                 return saved
             sess.stop = False  # drop a Ctrl-C pressed while saving / holding
             try:
-                arm.check_servos()  # heat built up while the arm held at the prompt
                 if not sess.sync_to_leader():
                     arm.hold()
                     print("follower holds; retry")
@@ -370,7 +509,9 @@ def _episodes(
                 dataset.clear_episode_buffer()
                 if arm.deadman.response is not DeadmanResponse.HOLD:
                     raise  # torque is off: end the session
-                ans = ask("arm is holding; type 'resume' to clear the deadman, else end: ")
+                ans = torque_on_ask(
+                    sess, "arm is holding; type 'resume' to clear the deadman, else end: "
+                )
                 if ans != "resume":
                     end_session(arm, sess)
                     return saved
@@ -378,7 +519,9 @@ def _episodes(
                 arm.safety.reset_reference()
                 continue
             n_frames = int(dataset.episode_buffer["size"])
-            keep = ask(f"keep this episode ({n_frames} frames)? [Y]es / [n]o, redo / [q]uit: ")
+            keep = torque_on_ask(
+                sess, f"keep this episode ({n_frames} frames)? [Y]es / [n]o, redo / [q]uit: "
+            )
             if keep == QUIT:
                 dataset.clear_episode_buffer()
                 end_session(arm, sess)
@@ -488,12 +631,23 @@ def main() -> None:
     try:
         if not leader.is_calibrated:
             sys.exit("leader motors do not match its calibration file; recalibrate the leader")
-        with (
-            OpenCVFrameSource(cfg["cameras"]["front"]) as cam,
-            So101Driver.from_config(cfg, fk) as arm,  # torque ON from here, holding the pose
-        ):
-            sess = Session(arm, leader, cam, units, park=ParkSettings.from_config(cfg))
-            record_session(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
+        arm = So101Driver.from_config(cfg, fk)
+        try:
+            with (
+                OpenCVFrameSource(cfg["cameras"]["front"]) as cam,
+                arm,  # torque ON from here, holding the pose
+            ):
+                sess = Session(
+                    arm,
+                    leader,
+                    cam,
+                    units,
+                    park=park_from_config(cfg),  # None unless robot.park.enabled
+                    torque_wait=TorqueWait.from_config(cfg),
+                )
+                record_session(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
+        finally:
+            _torque_off_unconfirmed(arm)  # also after the driver's own torque-off on exit
     finally:
         dataset.finalize()
         if leader.is_connected:
