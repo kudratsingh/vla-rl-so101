@@ -789,8 +789,14 @@ def run_trials(
     ``record_extra`` is merged into every record. ``settle_s``: after a trial that ran, the arm
     holds still this long (``loop.sleep``), the servos are read once, and only then is the
     operator asked to score it (real-eval judging rule); recorded per trial as ``settle``.
-    A failed torque-off (driver latch) ends the session: that trial is ``aborted`` (never
-    scored) and its record carries ``torque_off_unconfirmed``, stamped after every other field."""
+    A trial that ran and then faulted (servo / serial fault inside the trial or at the settle
+    read; torque off) skips the settle, the operator supports the arm (SERVO_FAULT_PROMPT), then
+    scores it: it is scored like any trial that ran, never redone. Ctrl-C (or a closed input) at
+    the score prompt or during the settle records that trial as a failure (doubt = n,
+    ``score_interrupted``) and ends the session (``operator_ctrl_c``; EOF re-raises).
+    Aborted (never scored, redone on a resume): the policy never ran (home failed / faulted /
+    Ctrl-C), a Ctrl-C during the trial, or a failed torque-off (driver latch), which ends the
+    session; its record carries ``torque_off_unconfirmed``, stamped after every other field."""
     if task not in protocol.TASKS or cell not in protocol.CELLS:
         raise ValueError(f"unknown task/cell {task}/{cell}")
     arm = loop.arm
@@ -820,6 +826,10 @@ def run_trials(
             arm.trip("operator Ctrl-C during the move home")
             home = {"reached": False, "error": "operator Ctrl-C"}
             result = TrialResult(stop_reason="operator_abort", stop_detail="Ctrl-C during home")
+        except Exception as e:  # a client bug while the arm moves: hold (deadman), then raise
+            log.exception("move home failed")
+            arm.trip(f"client error during the move home: {type(e).__name__}: {e}")
+            raise
         ran = False
         if result is None and home["reached"]:
             if not operator.confirm(f"{tag} {place_msg}; ENTER starts"):
@@ -834,30 +844,52 @@ def run_trials(
             result = TrialResult(stop_reason="home_failed", stop_detail=str(home))
             if not arm.deadman.tripped:
                 arm.hold()
+        # a trial that ran and ended in a servo / serial fault: torque is off, the arm may have
+        # dropped. No settling interval; the operator supports the arm BEFORE scoring it
+        fault = ran and (
+            result.stop_reason in ("servo_fault", "serial_fault")
+            or (arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF)
+        )
         settle: dict[str, Any] | None = None
         if settle_s is not None:
             settle = {"settle_s": float(settle_s), "measured_s": None}
-        if (
-            settle is not None
-            and ran
-            and result.stop_reason != "operator_abort"
-            and arm.torque_off_unconfirmed is None
-        ):
-            t_settle = loop.clock()
-            loop.sleep(float(settle["settle_s"]))  # hold still before scoring
-            settle["measured_s"] = round(loop.clock() - t_settle, 3)
-            try:
-                arm.check_servos()  # the arm held under torque while it settled
-            except (ServoFault, SerialFault) as e:  # torque now off: the scene may be disturbed
-                result.stop_reason = "servo_fault" if isinstance(e, ServoFault) else "serial_fault"
-                result.stop_detail = f"after the settling interval: {e}"
-                ran = False
-        aborted = (
-            not ran
-            or result.stop_reason == "operator_abort"
-            or arm.torque_off_unconfirmed is not None
-        )
-        outcome = "aborted" if aborted else operator.outcome(result)
+        score_interrupted: BaseException | None = None
+        try:
+            if fault:
+                if settle is not None:
+                    settle["skipped"] = "fault: torque off"
+                _support_after_fault(arm, operator)
+            elif (
+                settle is not None
+                and ran
+                and result.stop_reason != "operator_abort"
+                and arm.torque_off_unconfirmed is None
+            ):
+                t_settle = loop.clock()
+                loop.sleep(float(settle["settle_s"]))  # hold still before scoring
+                settle["measured_s"] = round(loop.clock() - t_settle, 3)
+                try:
+                    arm.check_servos()  # the arm held under torque while it settled
+                except (ServoFault, SerialFault) as e:  # torque now off: scored like a fault
+                    # inside the trial (the same physical event), never a free redo
+                    result.stop_reason = (
+                        "servo_fault" if isinstance(e, ServoFault) else "serial_fault"
+                    )
+                    result.stop_detail = f"after the settling interval: {e}"
+                    settle["fault"] = str(e)
+                    _support_after_fault(arm, operator)
+            aborted = (
+                not ran
+                or result.stop_reason == "operator_abort"
+                or arm.torque_off_unconfirmed is not None
+            )
+            outcome = "aborted" if aborted else operator.outcome(result)
+        except (KeyboardInterrupt, EOFError) as e:
+            # the session ended at the score prompt (or while the arm settled) after a trial that
+            # ran: doubt = n, so it is a failure, recorded, and never re-rolled on a resume
+            score_interrupted = e
+            scorable = ran and result.stop_reason != "operator_abort"
+            outcome = "failure" if scorable else "aborted"
         rec = trial_record(
             result,
             task=task,
@@ -877,6 +909,12 @@ def run_trials(
             rec["placement"] = placement
         if settle is not None:
             rec["settle"] = settle
+        if score_interrupted is not None:
+            rec["score_interrupted"] = (
+                "operator Ctrl-C"
+                if isinstance(score_interrupted, KeyboardInterrupt)
+                else "input closed (EOF)"
+            ) + " before the score: doubt = n"
         if record_extra:
             rec.update(record_extra)
         stamp_torque_off_unconfirmed(rec, arm)  # last: nothing after it overwrites the flag
@@ -884,6 +922,10 @@ def run_trials(
         if log_row is not None:
             log_row(kind="trial", **rec)
         log.info("%s %s: %s (%d steps)", tag, outcome, result.stop_reason, result.steps)
+        if isinstance(score_interrupted, EOFError):
+            raise score_interrupted  # not an operator choice: the session ends as an error
+        if score_interrupted is not None:
+            return trials, "operator_ctrl_c"
         if arm.torque_off_unconfirmed is not None:
             return trials, f"{TORQUE_OFF_UNCONFIRMED}: {arm.torque_off_unconfirmed}"
         if result.stop_reason == "operator_abort":
@@ -897,6 +939,23 @@ def run_trials(
             arm.deadman.reset(ack)
             arm.safety.reset_reference()
     return trials, "completed"
+
+
+def _support_after_fault(arm: So101Driver, operator: Operator) -> None:
+    """Torque went off during or right after a trial: the operator supports the arm before
+    anything else (scoring, shutdown). A latched torque-off failure is left to the latch path."""
+    if arm.torque_off_unconfirmed is not None:
+        return
+    if arm.servo_fault is not None:
+        msg = SERVO_FAULT_PROMPT.format(reason=arm.servo_fault)
+    else:
+        msg = (
+            f"SERIAL FAULT ({arm.deadman.reason}). Torque is OFF: the arm is limp and may have "
+            "dropped. Support it / lower it onto the table."
+        )
+    log.critical(msg)
+    print(f"\n{msg}", flush=True)
+    operator.wait("press ENTER once the arm rests safely (supported or on the table): ")
 
 
 def stamp_torque_off_unconfirmed(rec: dict[str, Any], arm: So101Driver) -> dict[str, Any]:

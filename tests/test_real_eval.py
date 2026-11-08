@@ -69,7 +69,9 @@ def test_sample_plan_is_seeded_balanced_and_feasible(task: str) -> None:
 
 
 def test_placement_pdf_is_committed_a3_and_current() -> None:
-    assert grid_pdf.main(["--check"]) == 0  # the committed PDF is what the script draws now
+    assert (
+        grid_pdf.main(["--preset", "real", "--check"]) == 0
+    )  # the committed PDF is what the script draws now
     data = (REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf").read_bytes()
     assert data.startswith(b"%PDF-1.4") and b"/MediaBox [0 0 841.89 1190.55]" in data  # A3 pt
     assert b"10 cm scale bar" in data
@@ -260,3 +262,179 @@ def test_hardware_refuses_a_slot_seed_other_than_the_config(
     argv = ["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"]
     with pytest.raises(SystemExit, match="must use the same placements"):
         ev.main([*argv, "--slot-seed", "7"])  # exits before any client, camera or port
+
+
+# -- PR 29 review fixes ----------------------------------------------------------------------------
+class EOFAtScore(ScriptedOperator):
+    def outcome(self, result: Any) -> str:
+        raise EOFError  # stdin closed at the score prompt
+
+
+def _records(tmp: Path) -> list[dict[str, Any]]:
+    return [json.loads(p.read_text())["results"] for p in sorted(tmp.glob("*/record.json"))]
+
+
+@pytest.mark.parametrize("where", ["score", "home"])
+def test_unexpected_error_is_never_a_healthy_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    from src.robot.client import DeployLoop
+    from src.robot.driver import So101Driver
+
+    _with_cfg(monkeypatch, lambda c: c["robot"]["park"].update(enabled=True))
+    parks: list[int] = []
+    monkeypatch.setattr(So101Driver, "park", lambda self, *a, **k: parks.append(1) or True)
+    if where == "score":
+        monkeypatch.setattr(ev, "ScriptedOperator", EOFAtScore)
+        err: type[BaseException] = EOFError
+    else:
+
+        def broken_home(self: Any) -> dict[str, Any]:
+            raise RuntimeError("client bug in go_home")
+
+        monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+        monkeypatch.setattr(DeployLoop, "go_home", broken_home)
+        err = RuntimeError
+    with pytest.raises(err):
+        ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen"))
+    (r,) = _records(tmp_path)
+    assert not parks and r["shutdown"] == "supported"  # hold + support, never a park
+    assert r["session_end"].startswith(f"error: {err.__name__}")
+    if where == "score":  # the trial ran: recorded as a failure (doubt = n), not lost
+        assert [(t["trial_idx"], t["outcome"]) for t in r["trials"]] == [(0, "failure")]
+        assert "EOF" in r["trials"][0]["score_interrupted"]
+
+
+def test_a_killed_run_resumes_from_its_own_record_and_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.runs import Run
+
+    flushes: list[int] = []
+    real_flush = Run.flush
+
+    def first_flush_only(self: Any) -> None:  # the session bind; then the process "dies"
+        if not flushes:
+            real_flush(self)
+        flushes.append(1)
+
+    monkeypatch.setattr(Run, "flush", first_flush_only)
+    monkeypatch.setattr(Run, "finish", lambda self, status="ok": self.record_path)  # no exit
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(4))  # 2 trials, then quit
+    killed = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "3", "--cells", "seen"))
+    on_disk = json.loads(killed.read_text())["results"]
+    assert on_disk["session"]["session_id"] == killed.parent.name and on_disk["trials"] == []
+    _, prior = ev.load_prior(killed.parent)
+    assert [t["trial_idx"] for t in prior] == [0, 1]  # from metrics.jsonl
+    monkeypatch.setattr(Run, "flush", real_flush)
+    monkeypatch.undo()
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    rec = ev.main(_args(tmp_path, "--resume", killed.parent.name))
+    r = json.loads(rec.read_text())["results"]
+    assert sorted(t["trial_idx"] for t in r["trials"]) == [0, 1, 2]  # only trial 2 ran again
+    assert r["summary"]["cells"]["PickPlace/seen"]["n"] == 3
+
+
+def test_resume_from_an_older_run_of_the_session_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(2))  # 1 trial per run
+    a = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "3", "--cells", "seen"))
+    b = ev.main(_args(tmp_path, "--resume", a.parent.name))
+    rb = json.loads(b.read_text())["results"]
+    assert rb["session_runs"] == [a.parent.name, b.parent.name]
+    with pytest.raises(SystemExit, match=f"continued session .* resume {b.parent.name}"):
+        ev.main(_args(tmp_path, "--resume", a.parent.name))
+    c = ev.main(_args(tmp_path, "--resume", b.parent.name))  # the newest run resumes
+    assert len(json.loads(c.read_text())["results"]["trials"]) == 3
+
+
+def test_resume_refuses_different_weights_under_the_same_policy_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.robot.serve import PolicyServer
+
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(2))
+    rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen"))
+    fp = json.loads(rec.read_text())["results"]["session"]["fingerprint"]
+    assert fp["values"]["policy"]["adapter_sha256"] == "mock:no-weights"
+    real_info = PolicyServer.info
+    monkeypatch.setattr(
+        PolicyServer, "info", lambda self: {**real_info(self), "adapter_sha256": "re-pushed"}
+    )
+    with pytest.raises(SystemExit, match="policy changed: adapter_sha256"):
+        ev.main(_args(tmp_path, "--resume", rec.parent.name))
+    trial = json.loads(rec.read_text())["results"]["trials"][0]
+    values = {**fp["values"], "policy": {**fp["values"]["policy"], "adapter_sha256": "re-pushed"}}
+    with pytest.raises(ev.PoolingRefused, match="differs in policy"):
+        ev.check_poolable([trial], ev.make_fingerprint(values))
+
+
+def test_resume_warns_about_a_torque_off_failure_at_the_last_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from src.robot.driver import So101Driver
+
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    real_torque_off = So101Driver.torque_off
+
+    def fail_at_shutdown(self: So101Driver) -> bool:  # every trial is clean; shutdown's fails
+        self.follower.bus.fail_disable = True
+        return real_torque_off(self)
+
+    monkeypatch.setattr(ev, "shutdown_session", _shutdown_with(fail_at_shutdown, monkeypatch))
+    rec = ev.main(_args(tmp_path, "--task", "Push", "--trials", "1", "--cells", "seen"))
+    r = json.loads(rec.read_text())["results"]
+    assert r["shutdown"] == "torque_off_unconfirmed"
+    assert not any(t["torque_off_unconfirmed"] for t in r["trials"])  # no trial carries it
+    monkeypatch.undo()
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    capsys.readouterr()
+    rec2 = ev.main(_args(tmp_path, "--resume", rec.parent.name, "--trials", "1"))
+    assert ev.PRIOR_TORQUE_OFF_UNCONFIRMED in capsys.readouterr().out
+    s2 = json.loads(rec2.read_text())["results"]["session"]
+    assert s2["prior_torque_off_unconfirmed"] is True  # carried to every later run
+    with pytest.raises(SystemExit, match="not acknowledged"):  # hardware: must type 'checked'
+        ev.bind_session(real_cfg_for_bind(), s2, [], "x", *_bind_rig(), acknowledge=lambda _m: "no")
+
+
+def _shutdown_with(torque_off: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    from src.robot.driver import So101Driver
+
+    real = ev.shutdown_session
+
+    def shutdown(loop: Any, operator: Any, end: str) -> str:
+        monkeypatch.setattr(So101Driver, "torque_off", torque_off)
+        return real(loop, operator, end)
+
+    return shutdown
+
+
+def real_cfg_for_bind() -> Any:
+    return ev.load_config("real")
+
+
+def _bind_rig() -> tuple[Any, ...]:
+    import sys as _sys
+
+    _sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from robot_fakes import FakeFollower, toy_fk
+
+    from src.robot.client import DeployConfig
+    from src.robot.driver import So101Driver
+    from src.robot.safety import make_safety
+    from src.robot.units import UnitMap
+
+    cfg = real_cfg_for_bind()
+    arm = So101Driver(FakeFollower(), UnitMap(), make_safety(cfg, toy_fk))
+    info = {"policy_id": "mock:pickplace-waypoints", "adapter_sha256": "mock:no-weights"}
+    return arm, info, DeployConfig.from_config(cfg), 16
+
+
+def test_placement_plan_is_prefix_stable_beyond_50_trials() -> None:
+    for task in P1.TASKS:
+        long = G.sample_plan(task, "seen", 80, 0)
+        assert long[:50] == G.sample_plan(task, "seen", 50, 0)
+        assert G.sample_plan(task, "seen", 65, 0) == long[:65]
+    assert ev.plan_sha256("Push", "seen", 0, 2) == ev.plan_sha256("Push", "seen", 0, 50)
+    assert ev.plan_sha256("Push", "seen", 0, 80) != ev.plan_sha256("Push", "seen", 0, 50)

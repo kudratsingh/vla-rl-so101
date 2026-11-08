@@ -24,12 +24,14 @@ Paired placements (owner 2026-11-08): the SFT and the SFT+RL sessions use the SA
 ``--hardware`` refuses a ``--slot-seed`` other than ``eval.slot_seed``, and the plan is
 prefix-stable in the trial count (``src/eval/real_grid.py``), so trial k of a cell gets the same
 placement in every session; every trial record carries ``placement_plan_sha256`` (the cell's
-50-trial plan) to check the pairing afterwards.
+plan over max(trials, 50), ``plan_sha256``) to check the pairing afterwards.
 
 Session fingerprint (owner 2026-11-08). A session is bound to the effective settings it ran with,
 in six components hashed separately (``fingerprint_values``): ``protocol`` (protocol 0.2 hash, the
 0.1-draft reference, judging rule and grid hashes), ``policy`` (the server's policy_id,
-``server.policy_checkpoint``), ``camera`` (the ``cameras`` block: index, resolution, fps,
+``server.policy_checkpoint`` and the served adapter's content hash ``adapter_sha256``, so a
+re-pushed or overwritten adapter under the same name is a different policy; ``--hardware``
+refuses a server that reports none), ``camera`` (the ``cameras`` block: index, resolution, fps,
 intrinsics, crop, fov, pose), ``calibration`` (the calibration the driver loaded: per motor id,
 drive mode, homing offset, range; the file's sha256; ``robot.units``), ``safety`` (the effective
 ``SafetyConfig``, ``robot.safety``, ``robot.servo_monitor``) and ``motion`` (control rate, the
@@ -40,9 +42,15 @@ changed keys, and the table refuses to pool trials whose fingerprints differ.
 
 Resumable: ``--resume <run id>`` continues a session (any earlier run of it). The task, cells,
 trials per cell, slot seed, label, policy id and fingerprint come from that run and must still
-match; trials without a y/n score (aborted: Ctrl-C, home failed, a fault, torque off unconfirmed)
-are redone with the same placement. Each invocation is its own run record, holding every trial
-of the session so far.
+match; trials without a y/n score (aborted: the policy never ran because the move home failed,
+faulted or was Ctrl-C'd; a Ctrl-C during the trial; torque off unconfirmed) are redone with the
+same placement. A trial that ran and then faulted is scored (judging rule), and a Ctrl-C at the
+score prompt scores it n: neither is ever re-rolled. Each invocation is its own run record,
+holding every trial of the session so far; record.json is written when the session is bound and
+after every trial, so a run killed without exiting (SIGHUP, power loss) can be resumed itself.
+``--resume`` refuses a run that a later run of its session continued (a resume of an older
+run would fork the session and drop the newer runs' scored trials), and warns (``--hardware``: asks for
+'checked') when an earlier run ended with TORQUE OFF UNCONFIRMED, in a trial or at shutdown.
 
 --mock      CPU, in-process, safe anywhere: MockPolicy behind gRPC on 127.0.0.1, the fake arm and
             camera from tests/robot_fakes.py, the real safety filter and sim FK. Scripted scores.
@@ -113,7 +121,10 @@ JUDGING_GENERAL = (
     "Judge ONCE, after the trial has ended and the arm has then held still for the settling "
     "interval of {settle_s:g} s (eval.settle_s; this prompt only appears then), by eye, touching "
     "nothing. y only if ALL of the task's conditions hold NOW; a success that was undone before "
-    "the end is n. Doubt = n."
+    "the end is n. Doubt = n. A trial that ran and ended in a servo or serial fault (torque cut, "
+    "inside the trial or at the settle read) is judged the same way once the arm is supported, "
+    "with no settling interval; it is never redone. Ending the session at this prompt (Ctrl-C, "
+    "closed input) scores the trial n."
 )
 JUDGING_RULE: dict[str, str] = {  # mirrors src/env/success.py, read only
     "PickPlace": "the object rests inside the bowl (over the bowl floor, below the rim), the bowl "
@@ -132,6 +143,11 @@ HARDWARE_REFUSAL = """--hardware drives the real SO-101 and refuses to run witho
 Only the owner runs it, standing at the arm with a hand on the power switch, after WO-06
 (calibration, intrinsics, camera match), the WO-07 pilot, the placement grid printed and its
 10 cm scale bar measured, and with the policy server reachable through the tunnel."""
+
+PRIOR_TORQUE_OFF_UNCONFIRMED = (
+    "WARNING: an earlier run of this session ended with TORQUE OFF UNCONFIRMED (in a trial or "
+    "at shutdown). Check the bus, the USB cable and every servo before powering the arm."
+)
 
 HARDWARE_BANNER = """
 ==========================================================================================
@@ -256,6 +272,8 @@ def fingerprint_values(
             "policy": {
                 "policy_id": info.get("policy_id"),
                 "policy_checkpoint": dcfg.policy_checkpoint,
+                "adapter_sha256": info.get("adapter_sha256"),  # the weights, not the name
+                "adapter_revision": info.get("adapter_revision"),
             },
             "camera": {"cameras": cfg["cameras"]},
             "calibration": calibration_values(arm, cfg),
@@ -339,9 +357,12 @@ class PoolingRefused(RuntimeError):
     """Trials from different effective settings would be pooled into one table."""
 
 
-def plan_sha256(task: str, cell: str, slot_seed: int) -> str:
-    """Hash of the cell's REAL_TRIALS_PER_CELL-trial placement plan (the paired slot sequence)."""
-    return _digest(_canon(G.sample_plan(task, cell, P1.REAL_TRIALS_PER_CELL, slot_seed)))
+def plan_sha256(task: str, cell: str, slot_seed: int, n: int = P1.REAL_TRIALS_PER_CELL) -> str:
+    """Hash of the cell's placement plan over max(n, REAL_TRIALS_PER_CELL) trials (the paired
+    slot sequence). The plan is prefix-stable, so a session of up to 50 trials carries the same
+    hash as a 50-trial one, and a longer session's hash covers every placement it used."""
+    n_hash = max(int(n), P1.REAL_TRIALS_PER_CELL)
+    return _digest(_canon(G.sample_plan(task, cell, n_hash, slot_seed)))
 
 
 # ------------------------------------------------------------------------------------------------
@@ -360,6 +381,8 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     settings = results.get("session")
     if not settings:
         sys.exit(f"--resume: {rec_path} is not a wo07_real_eval session")
+    if prior_run_torque_off_unconfirmed(results):  # carried by every later run of the session
+        settings["prior_torque_off_unconfirmed"] = True
     trials: list[dict[str, Any]] = list(results.get("trials") or [])
     seen = {(t["cell"], t["trial_idx"], t["start_utc"]) for t in trials}
     metrics = run_dir / "metrics.jsonl"
@@ -373,6 +396,55 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 seen.add(key)
                 trials.append({k: v for k, v in row.items() if k not in ("kind", "t", "step")})
     return settings, trials
+
+
+def prior_run_torque_off_unconfirmed(results: dict[str, Any]) -> bool:
+    """The run's own session end / shutdown shows the latch (it may have fired after the last
+    trial, in safe_shutdown, so no trial carries it), or an earlier run of the session did."""
+    return bool(
+        results.get("torque_off_unconfirmed")
+        or str(results.get("session_end") or "").startswith("torque_off_unconfirmed")
+        or str(results.get("shutdown") or "").startswith("torque_off_unconfirmed")
+        or (results.get("session") or {}).get("prior_torque_off_unconfirmed")
+    )
+
+
+def session_runs(runs_dir: Path, session_id: str) -> dict[str, str | None]:
+    """{run id: the run it resumed from} for every run whose record holds this session."""
+    out: dict[str, str | None] = {}
+    for rec in sorted(runs_dir.glob("*/record.json")):
+        try:
+            results = json.loads(rec.read_text()).get("results") or {}
+        except (OSError, ValueError):
+            continue
+        if (results.get("session") or {}).get("session_id") == session_id:
+            out[rec.parent.name] = results.get("resumed_from")
+    return out
+
+
+def check_newest(prior_dir: Path, settings: dict[str, Any]) -> list[str]:
+    """Refuse to resume from a run that a later run of the same session continued (a fork would
+    drop that run's scored trials and re-roll them). Returns the chain of runs up to the chosen
+    one, oldest first."""
+    sid = str(settings.get("session_id"))
+    runs = session_runs(prior_dir.parent, sid)
+    children: dict[str, list[str]] = {}
+    for rid, parent in runs.items():
+        if parent:
+            children.setdefault(parent, []).append(rid)
+    me = prior_dir.name
+    if me in children:
+        tip = me
+        while tip in children:
+            tip = max(children[tip])
+        sys.exit(
+            f"--resume refused: run {min(children[me])} continued session {sid} after {me}; "
+            f"resume {tip} (its newest run), or its scored trials would be dropped and re-run"
+        )
+    chain = [me]
+    while (parent := runs.get(chain[0])) and parent not in chain:
+        chain.insert(0, parent)
+    return chain
 
 
 def scored_indices(trials: Sequence[dict[str, Any]], cell: str) -> set[int]:
@@ -461,6 +533,7 @@ def session(
     camera_calibrated: bool,
     runs_dir: Path,
     on_trial_start: Callable[[int], None] | None = None,
+    prior_runs: Sequence[str] = (),
 ) -> Path:
     task, n = str(settings["task"]), int(settings["trials_per_cell"])
     settle_s = float(settings["settle_s"])
@@ -491,10 +564,18 @@ def session(
             resumed_from=resumed_from,
             server_info=info,
             judging_rule=judging_rule(settle_s),
+            session_runs=[*prior_runs, run.id],
+            trials=trials,  # the same list: every flush carries the trials so far
         )
+        run.flush()  # the session is on disk before the first motion: a killed run resumes
+
+        def log_row(**row: Any) -> None:
+            run.log_metrics(**row)
+            if row.get("kind") == "trial":
+                run.flush()
+
         print(f"{judging_rule(settle_s)['general']}\n  {task} success = {JUDGING_RULE[task]}.")
         try:
-            end = "completed"
             for cell in settings["cells"]:
                 done = scored_indices(trials, cell)
                 todo = [k for k in range(n) if k not in done]
@@ -508,7 +589,7 @@ def session(
                     obj = trial_object(task, cell, k)
                     return G.placement_prompt(obj.label, plan[k]), plan[k]
 
-                _, end = run_trials(
+                _, why = run_trials(
                     loop,
                     operator,
                     task=task,
@@ -516,7 +597,7 @@ def session(
                     n_trials=n,
                     info=info,
                     camera_calibrated=camera_calibrated,
-                    log_row=run.log_metrics,
+                    log_row=log_row,
                     max_steps=max_steps,
                     trials=trials,
                     on_trial_start=on_trial_start,
@@ -525,15 +606,21 @@ def session(
                     record_extra={
                         **extra,
                         "placement_plan_sha256": plan_sha256(
-                            task, cell, int(settings["slot_seed"])
+                            task, cell, int(settings["slot_seed"]), n
                         ),
                     },
                     settle_s=settle_s,
                 )
-                if end != "completed":
+                if why != "completed":
+                    end = why
                     break
+            else:
+                end = "completed"
         except KeyboardInterrupt:
             end = "operator_ctrl_c"
+        except Exception as e:  # never a healthy end: hold + support, no park
+            end = f"error: {type(e).__name__}: {e}"
+            raise
         finally:
             shutdown = shutdown_session(loop, operator, end)
             end = final_session_end(loop.arm, end)  # a failed torque-off wins over any end
@@ -609,9 +696,12 @@ def bind_session(
     info: dict[str, Any],
     dcfg: DeployConfig,
     max_steps: int | None,
+    acknowledge: Callable[[str], str] | None = None,
 ) -> None:
     """Fingerprint the effective settings; on a resume refuse any change, and refuse to pool
-    earlier trials with a different fingerprint. Runs before the arm is connected on hardware."""
+    earlier trials with a different fingerprint. Runs before the arm is connected on hardware.
+    An earlier TORQUE OFF UNCONFIRMED (any trial, or a run's session end / shutdown) is warned
+    about; with ``acknowledge`` (hardware) the operator must type 'checked'."""
     values = fingerprint_values(
         cfg, arm, info, dcfg, max_steps=max_steps, settle_s=settle_s_from_config(cfg)
     )
@@ -621,11 +711,18 @@ def bind_session(
             check_poolable(prior, settings["fingerprint"])
         except PoolingRefused as e:
             sys.exit(f"--resume refused: {e}")
-        if any(t.get("torque_off_unconfirmed") for t in prior):
-            print(
-                "WARNING: an earlier run of this session ended with TORQUE OFF UNCONFIRMED. "
-                "Check the bus, the USB cable and every servo before powering the arm."
-            )
+        if settings.get("prior_torque_off_unconfirmed") or any(
+            t.get("torque_off_unconfirmed") for t in prior
+        ):
+            print(PRIOR_TORQUE_OFF_UNCONFIRMED)
+            if (
+                acknowledge is not None
+                and acknowledge(
+                    "type 'checked' once the bus, the USB cable and every servo are checked: "
+                ).strip()
+                != "checked"
+            ):
+                sys.exit("not acknowledged; nothing was opened")
     else:
         settings["fingerprint"] = {**make_fingerprint(values), "values": values}
     settings["policy_id"] = info.get("policy_id")
@@ -654,7 +751,11 @@ def mock_rig(
         pilot.mock_waypoints(dcfg.home_qpos), chunk_len=dcfg.chunk_len, infer_s=0.06, sleep=sleep
     )
     servicer = PolicyServer(
-        policy, image_size=dcfg.image_size, policy_id="mock:pickplace-waypoints", clock=clock
+        policy,
+        image_size=dcfg.image_size,
+        policy_id="mock:pickplace-waypoints",
+        clock=clock,
+        adapter={"adapter_sha256": "mock:no-weights", "adapter_revision": None},
     )
     server, port = build_server(servicer, "127.0.0.1", 0)
     try:
@@ -696,13 +797,14 @@ def run(
     if args.resume:
         prior_dir = Path(args.resume) if Path(args.resume).is_dir() else args.runs_dir / args.resume
         settings, prior = load_prior(prior_dir)
+        prior_runs = check_newest(prior_dir, settings)
         resumed_from: str | None = prior_dir.name
     else:
         if args.task is None:
             sys.exit("--task is required for a new session")
-        settings, prior, resumed_from = new_settings(args, cfg), [], None
+        settings, prior, resumed_from, prior_runs = new_settings(args, cfg), [], None, []
     if args.hardware:
-        return run_hardware(cfg, args, settings, prior, resumed_from)
+        return run_hardware(cfg, args, settings, prior, resumed_from, prior_runs)
     with mock_rig(cfg, args, fk) as (loop, info, on_start, calibrated):
         bind_session(cfg, settings, prior, resumed_from, loop.arm, info, loop.dcfg, args.max_steps)
         return session(
@@ -718,6 +820,7 @@ def run(
             camera_calibrated=calibrated,
             runs_dir=args.runs_dir,
             on_trial_start=on_start,
+            prior_runs=prior_runs,
         )
 
 
@@ -727,6 +830,7 @@ def run_hardware(
     settings: dict[str, Any],
     prior: list[dict[str, Any]],
     resumed_from: str | None,
+    prior_runs: Sequence[str] = (),
 ) -> Path:
     if not args.i_am_present:
         print(HARDWARE_REFUSAL)
@@ -757,10 +861,15 @@ def run_hardware(
     ) as client:
         info = client.info()  # before the arm is connected: a wrong server never moves it
         check_server(info, dcfg)
+        if not info.get("adapter_sha256"):
+            sys.exit(
+                "policy server reports no adapter_sha256: the served weights cannot be bound to "
+                "the session (update the server to this branch); nothing was opened"
+            )
         # builds the follower (lerobot reads the calibration file; no port is opened) so the
         # fingerprint and the resume check run before anything can move
         arm = So101Driver.from_config(cfg, fk)
-        bind_session(cfg, settings, prior, resumed_from, arm, info, dcfg, None)
+        bind_session(cfg, settings, prior, resumed_from, arm, info, dcfg, None, acknowledge=input)
         print(f"policy server OK: {info['policy_id']} (server run {info.get('server_run')})")
         if dcfg.policy_checkpoint is None:
             print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
@@ -779,6 +888,7 @@ def run_hardware(
                 max_steps=args.max_steps,
                 camera_calibrated=pipe.calibrated,
                 runs_dir=args.runs_dir,
+                prior_runs=prior_runs,
             )
 
 

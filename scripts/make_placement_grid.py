@@ -14,8 +14,12 @@ Content, all derived from code (``src/eval/real_grid.py``, which reads ``src/eva
 * a 10 cm scale bar with 1 cm ticks: measure it after printing; if it is not 100 mm the print
   was scaled (print at 100% / "Actual size", never "Fit to page").
 
-    uv run scripts/make_placement_grid.py            # writes docs/assets/placement-grid-a3.pdf
-    uv run scripts/make_placement_grid.py --check    # exit 1 if the committed PDF is stale
+    uv run scripts/make_placement_grid.py --preset real          # writes the PDF
+    uv run scripts/make_placement_grid.py --preset real --check  # exit 1 if it is stale
+
+``--config`` / ``--preset`` are accepted for the project convention and only ``real`` is allowed;
+the grid reads no config: it is derived only from ``protocol.py`` and ``real_grid.py``, so
+``--check`` stays deterministic.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.config import add_config_args
 from src.eval import protocol as P
 from src.eval import real_grid as G
 
@@ -321,13 +326,16 @@ def draw() -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
+    add_config_args(parser)
     parser.add_argument("--out", type=Path, default=OUT)
     parser.add_argument("--check", action="store_true", help="exit 1 if the file is stale")
     args = parser.parse_args(argv)
+    if args.preset != "real":
+        parser.error("the placement grid is a real-arm artefact: --preset real")
     data = pdf_bytes(draw())
     if args.check:
         if not args.out.is_file() or args.out.read_bytes() != data:
-            print(f"{args.out} is stale: run scripts/make_placement_grid.py")
+            print(f"{args.out} is stale: run scripts/make_placement_grid.py --preset real")
             return 1
         print(f"{args.out} is up to date")
         return 0

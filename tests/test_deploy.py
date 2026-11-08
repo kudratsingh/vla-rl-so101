@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 import pytest
-from robot_fakes import FakeCam, FakeClock, FakeFollower, real_cfg, toy_fk
+from robot_fakes import LAST_TORQUE_OFF_CALL, FakeCam, FakeClock, FakeFollower, real_cfg, toy_fk
 
 from src.config import REPO_ROOT, load_config
 from src.eval import protocol
@@ -282,16 +282,19 @@ def test_serial_error_stops_the_loop_and_the_session(
         assert len(res["trials"]) == 1 and res["session_end"].startswith("torque_off")
         t = res["trials"][0]
         assert t["stop_reason"] == "serial_fault" and t["deadman_response"] == "torque_off"
+        assert t["outcome"] == "failure"  # it ran: scored (doubt = n), never a free redo
         assert not r.fol.bus.torque_enabled and r.policy.calls == 2
-        # torque already off: no HOLDING prompt, torque off retried
-        assert not op.prompts and "already OFF" in capsys.readouterr().out
-        assert r.fol.bus.calls[-1] == ("disable_torque", None)
+        # torque already off: the operator supports the arm before the score (one ack), no
+        # HOLDING prompt, torque off retried
+        assert op.prompts == ["press ENTER once the arm rests safely (supported or on the table): "]
+        assert "SERIAL FAULT" in (out := capsys.readouterr().out) and "already OFF" in out
+        assert r.fol.bus.calls[-1] == LAST_TORQUE_OFF_CALL
         # the bus answers again: still nothing is written while the latch is TORQUE_OFF
         r.fol.fail_write = False
         n = len(r.fol.sent)
         safe_shutdown(r.arm, op)
         r.arm.hold()
-        assert len(r.fol.sent) == n and not op.prompts and not r.fol.bus.torque_enabled
+        assert len(r.fol.sent) == n and len(op.prompts) == 1 and not r.fol.bus.torque_enabled
 
 
 @pytest.mark.parametrize("failure", ["error", "hang", "late", "bad_shape", "nan"])
@@ -645,3 +648,119 @@ def test_latency_is_never_labelled_end_to_end_without_a_measured_offset() -> Non
     assert s2["end_to_end_estimate_ms"]["median"] == 100.0
     assert s2["end_to_end_estimate_ms"]["capture_offset_ms"] == 40.0
     assert any("measured capture offset" in line for line in latency_lines(s2))
+
+
+# -- scoring after the trial: settle, faults, Ctrl-C at the score prompt (PR 29 review) -----------
+class EventOp(ScriptedOperator):
+    """Records prompts and scores in order, with the fake clock and the bus health reads."""
+
+    def __init__(self, r: Rig, interrupt_at_score: int | None = None) -> None:
+        self.r, self.events, self.scores = r, [], 0
+        self.interrupt_at_score = interrupt_at_score
+
+    def _reads(self) -> int:
+        regs = ("Present_Temperature", "Present_Current")
+        return sum(c[0] == "sync_read" and c[1] in regs for c in self.r.fol.bus.calls)
+
+    def wait(self, msg: str) -> None:
+        self.events.append(("wait", msg))
+
+    def outcome(self, result: Any) -> str:
+        self.scores += 1
+        if self.scores == self.interrupt_at_score:
+            raise KeyboardInterrupt
+        self.events.append(("outcome", result.stop_reason, self.r.clock(), self._reads()))
+        return super().outcome(result)
+
+
+def _trials(r: Rig, op: Any, n: int = 1, **kw: Any) -> tuple[list[dict[str, Any]], str]:
+    return run_trials(
+        r.loop,
+        op,
+        task="PickPlace",
+        cell="seen",
+        n_trials=n,
+        info=r.server_info,
+        camera_calibrated=False,
+        max_steps=16,
+        **kw,
+    )
+
+
+def _wrap_run_trial(r: Rig, after: Any) -> list[tuple[float, int]]:
+    """Calls ``after()`` when each trial returns; records (clock, health reads) at that moment."""
+    ends: list[tuple[float, int]] = []
+    real = r.loop.run_trial
+
+    def run_trial(*a: Any, **k: Any) -> Any:
+        res = real(*a, **k)
+        ends.append((r.clock(), EventOp(r)._reads()))
+        after()
+        return res
+
+    r.loop.run_trial = run_trial  # type: ignore[method-assign]
+    return ends
+
+
+def test_score_comes_after_the_settle_and_a_servo_read() -> None:
+    with rig() as r:
+        r.arm.monitor = monitor_from_config(real_cfg())
+        ends = _wrap_run_trial(r, lambda: None)
+        op = EventOp(r)
+        trials, end = _trials(r, op, settle_s=3.0)
+        assert end == "completed" and trials[0]["settle"] == {"settle_s": 3.0, "measured_s": 3.0}
+        (t_end, reads_end), (_, _, t_score, reads_score) = ends[0], op.events[-1]
+        assert t_score >= t_end + 3.0  # judged only after the arm held still for settle_s
+        assert reads_score == reads_end + 2  # temperature + current read in between
+
+
+def test_servo_fault_at_the_settle_read_is_scored_after_the_support_prompt() -> None:
+    with rig() as r:
+        r.arm.monitor = monitor_from_config(real_cfg())
+        _wrap_run_trial(r, lambda: r.fol.temperature_c.update(gripper=61.0))  # only after it
+        op = EventOp(r)
+        trials, end = _trials(r, op, n=2, settle_s=3.0)
+        t = trials[0]
+        assert len(trials) == 1 and end.startswith("torque_off: servo fault")
+        assert t["stop_reason"] == "servo_fault" and t["outcome"] == "failure"  # scored, not redone
+        assert t["stop_detail"].startswith("after the settling interval")
+        assert t["settle"]["measured_s"] == 3.0 and "over-temperature" in t["settle"]["fault"]
+        assert [e[0] for e in op.events] == ["wait", "outcome"]  # support the arm, then score
+        assert "rests safely" in op.events[0][1] and not r.fol.bus.torque_enabled
+
+
+def test_mid_trial_servo_fault_skips_the_settle_and_supports_before_scoring() -> None:
+    with rig() as r:
+        r.arm.monitor = monitor_from_config(real_cfg())
+
+        def overheat(k: int) -> None:
+            def on_decision(timing: dict[str, float]) -> None:
+                if timing["decision"] == 1:
+                    r.fol.temperature_c["gripper"] = 66.0
+
+            r.loop.on_decision = on_decision
+
+        sleeps: list[float] = []
+        real_sleep = r.loop.sleep
+        r.loop.sleep = lambda s: (sleeps.append(s), real_sleep(s))[1]  # type: ignore[assignment]
+        op = EventOp(r)
+        trials, end = _trials(r, op, settle_s=3.0, on_trial_start=overheat)
+        t = trials[0]
+        assert t["stop_reason"] == "servo_fault" and t["outcome"] == "failure"
+        assert t["settle"] == {"settle_s": 3.0, "measured_s": None, "skipped": "fault: torque off"}
+        assert 3.0 not in sleeps  # no settling interval with the arm limp
+        assert [e[0] for e in op.events] == ["wait", "outcome"]  # support first, then the score
+        assert end.startswith("torque_off: servo fault") and not r.fol.bus.torque_enabled
+
+
+def test_ctrl_c_at_the_score_prompt_records_a_failure_never_a_redo() -> None:
+    with rig() as r:
+        op = EventOp(r, interrupt_at_score=2)
+        trials, end = _trials(r, op, n=3, settle_s=0.0)
+        assert end == "operator_ctrl_c" and [t["trial_idx"] for t in trials] == [0, 1]
+        t = trials[1]
+        assert t["outcome"] == "failure" and "Ctrl-C" in t["score_interrupted"]
+        assert {int(x["trial_idx"]) for x in trials if x["outcome"] in ("success", "failure")} == {
+            0,
+            1,
+        }  # a resume (scored_indices) never re-rolls trial 1
