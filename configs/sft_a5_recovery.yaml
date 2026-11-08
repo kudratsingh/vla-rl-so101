@@ -1,0 +1,45 @@
+# Recovery SFT (owner request, 2026-11-07; docs/plans/recovery-sft.md). Fixed BEFORE any data is
+# collected or any number is seen:
+# - warm start from the current SFT checkpoint (WO-02 attempt 4 step_004000): the corrections are
+#   labels on THIS policy's own failure states (DAgger), and the GRPO diagnostic would start from
+#   the result; the matched control (sft_a5_control.yaml) gets the same start, steps and lr, so
+#   "recovery states" vs "more expert frames" is the only difference between the two arms.
+# - same recipe as attempt 4 otherwise: lr 5e-4 constant after 100 warmup steps, batch 8, the
+#   adapter's own norm bounds; 2000 steps (~2.2 passes over ~7.4k frames), a checkpoint every 500.
+# - mixing: the 25 demos/task + corrections capped at 60 episodes and 1650 frames per task (about
+#   the 25 demos' 1655 frames/task), frames sampled uniformly -> corrections <= ~50% of each task.
+# Checkpoint selection: scripts/wo02_eval.py --cells seen --seeds 7 (NOT protocol seeds 0-2).
+#   uv run scripts/wo02r_collect_corrections.py --preset sim --push               # data
+#   uv run scripts/wo02_sft.py --preset sim --config configs/sft_a5_recovery.yaml # train
+inherit: configs/sft_a4.yaml
+
+policy:
+  adapter: KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000
+
+data:
+  extra_datasets:
+    - hub_repo: KudratSingh22/vla-rl-so101-corrections-a4
+      kind: correction
+      max_episodes_per_task: 60
+      max_frames_per_task: 1650
+
+sft:
+  steps: 2000
+  checkpoint_every: 500
+
+recovery:                     # scripts/wo02r_collect_corrections.py
+  hub_repo: KudratSingh22/vla-rl-so101-corrections-a4
+  control_hub_repo: KudratSingh22/vla-rl-so101-control-a4
+  rollouts_per_task: 192      # 3 batches of 64 GPU envs; seen cell, recovery seeds only
+  rollout_max_steps: 150      # = the protocol horizon, so the failures are the eval's failures
+  cap_per_mode: 24            # branches tried per (task, failure mode), round-robin over modes
+  branch_back: 1              # branch one chunk boundary before the decisive event
+  oracle_max_steps: 150
+  control_episodes_per_task: 60   # fresh oracle demos on control seeds; the SFT loader matches frames
+  restore_tol: 1.0e-4
+
+cost:
+  gpu: RTX-4090
+  usd_per_hour: 0.89
+  est_s_per_step: 1.565       # measured: WO-02 4090 probes 1.547 / 1.575 s/step
+  setup_hours: 0.5

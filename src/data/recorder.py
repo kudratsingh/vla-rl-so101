@@ -54,6 +54,16 @@ _compat_lock = threading.Lock()
 _compat_installed = False
 
 
+def _datasets_skip_torchcodec() -> None:
+    """`datasets` 4.x imports torchcodec's AudioDecoder (torchcodec >= 0.4) when encoding rows
+    once torchcodec is in sys.modules; with our 0.2.1 pin every DemoRecorder write after a dataset
+    read in the same process then fails. LeRobot decodes video itself, so datasets' own torchcodec
+    Audio/Video features are unused: switch them off."""
+    import datasets.config
+
+    datasets.config.TORCHCODEC_AVAILABLE = False
+
+
 def install_torchcodec_compat() -> None:
     """Make lerobot 0.4.4's torchcodec decoder cache work with torchcodec 0.2.1 (idempotent).
 
@@ -64,6 +74,7 @@ def install_torchcodec_compat() -> None:
     with _compat_lock:
         if _compat_installed:
             return
+        _datasets_skip_torchcodec()
         try:
             import torchcodec.decoders  # noqa: F401  (loads the FFmpeg shared libs)
         except (ImportError, OSError, RuntimeError) as e:
@@ -150,6 +161,7 @@ class DemoRecorder:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
         datasets.disable_progress_bars()  # one "Map" bar per saved episode otherwise
+        _datasets_skip_torchcodec()
         os.environ.setdefault("SVT_LOG", "1")  # libsvtav1: errors only, not its config banner
         self.repo_id = repo_id
         self.root = Path(root)
