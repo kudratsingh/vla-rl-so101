@@ -411,8 +411,10 @@ What happens and what you do:
    the arm: after `teleop.prompt_support_grace_s` (10 s) torque goes off and the session ends
    (saved episodes are kept, an unsaved one is discarded). A Ctrl-C during those 10 s is ignored
    (the grace keeps running). The wait is a `select()` on the terminal in the same single
-   thread; nothing reads the servo bus in the background. `null` restores the old wait-forever
-   behaviour for teleop only (not recommended); the pilot and real eval refuse it.
+   thread; nothing reads the servo bus in the background. Anything typed before a prompt
+   appears is discarded, so press ENTER only once the prompt is on screen. `null` restores the
+   old wait-forever behaviour for teleop only (not recommended; a closed stdin still gets the
+   10 s grace); the pilot and real eval refuse it.
 3. **Sync (not recorded):** the follower eases onto the leader's pose, clipped to the safety limits,
    at ≤ 4°/step and 60°/s (`configs/real.yaml` keys `robot.safety.max_joint_step_deg` and
    `max_velocity_deg_s`). A fully closed or open trigger, or a leader
@@ -547,7 +549,9 @@ trips before the prompt waits.
   bounded wait keeps running, it is not restarted): only ENTER, the bounded wait running out
   (60 s with torque on, then the 10 s grace), or a closed stdin (`STDIN CLOSED ...`, then the
   10 s grace without the terminal) turns torque off, so support the arm first, or cut the servo
-  supply. Any other error (the dataset, the image pipeline, a bug) also holds the follower,
+  supply. Closing the Terminal window (or a dropped ssh session) is handled like a closed
+  stdin (`TERMINAL HUNG UP ...`): the loop stops, the 10 s grace runs, then torque goes off;
+  the process no longer dies with the arm held under torque. Any other error (the dataset, the image pipeline, a bug) also holds the follower,
   discards the episode and shows the same support prompt before the script exits with the error.
 - **Pilot and real eval (`scripts/wo07_pilot.py`, `scripts/wo07_real_eval.py`; owner decision
   2026-11-08):** every prompt answered while the arm holds under torque (move home, place the
@@ -558,16 +562,24 @@ trips before the prompt waits.
   (10 s, ENTER = now), torque off, and the session ends (`prompt_timeout: ...`, no park; the
   real eval resumes later). At the final support prompt only ENTER confirms: the run record
   says `shutdown: supported`, `support_confirmed: true`. Ctrl-C there is ignored (the arm keeps
-  holding); a closed stdin or the timeout releases torque after the grace and is recorded as
-  `shutdown: released_unconfirmed` with the cause (`timeout` / `eof`) and `support_confirmed:
-  false`. After a servo or serial fault torque is already off: the script tells you to support
+  holding, also if the press lands in the hold or the servo read before the wait); a closed
+  stdin, a closed Terminal window (SIGHUP) or the timeout releases torque after the grace and
+  is recorded as `shutdown: released_unconfirmed` with the cause (`timeout` / `eof` /
+  `hangup`) and `support_confirmed: false`. Outside a prompt Ctrl-C is a flag checked between
+  control ticks (like teleop): during motion it holds the arm at the next tick and the trial is
+  a failure (fault `operator_abort`); it never interrupts a servo transfer or the shutdown.
+  Anything typed before a prompt appears is discarded: an ENTER pressed during motion never
+  confirms support or starts the next trial. After a servo or serial fault torque is already off: the script tells you to support
   the arm and waits for ENTER (bounded); the run record keeps how you answered
   (`shutdown_detail.ack`: `enter` / `ctrl_c` / `eof` / `timeout`). Scoring: you are asked y/n
   only for a trial whose policy started and that ended without a fault; a fault after the
   policy started is a failure automatically (judging rule `real-judge-2`,
   `scripts/wo07_real_eval.py`), and a score prompt that ends without your answer (Ctrl-C,
-  closed input, timeout) is a failure too (doubt = n). Powered pilot / real-eval runs wait for
-  the revised PR #29 (with steps 9-10).
+  closed input, timeout) is a failure too (doubt = n). A trial whose policy started is never
+  re-run on a resume, even if the run was killed before its record was written (it is then a
+  failure, `session_lost`). Ending at the placement prompt after the arm went home is kept as
+  an unscored attempt and the slot is retried. Powered pilot / real-eval runs wait for the
+  revised PR #29 (with steps 9-10).
 - **If anything looks wrong at any moment, or the script prints `TORQUE OFF UNCONFIRMED`:**
   switch off the follower's servo supply at the inline power switch. Torque goes off instantly
   and the arm drops, so keep it low.

@@ -17,7 +17,11 @@
             only after ENTER (Ctrl-C there is ignored; a closed stdin or the timeout releases
             torque after the grace period and is recorded as released_unconfirmed, not
             supported); with robot.park.enabled (default false) it parks first. Ctrl-C during
-            motion holds it; a servo over-temperature / over-current fault cuts torque at once.
+            motion holds it (Ctrl-C is a flag outside prompts: it stops motion between ticks and
+            never interrupts a bus transfer or the shutdown); closing the Terminal (SIGHUP /
+            SIGTERM) takes the closed-stdin path (grace period, torque off,
+            released_unconfirmed, cause hangup). A servo over-temperature / over-current fault
+            cuts torque at once.
             A failed torque-off ("torque off unconfirmed") blocks all further motion and says to
             switch off the inline power switch; the trial records and the session end keep it.
 
@@ -60,12 +64,12 @@ from src.robot.client import (
     final_session_end,
     latency_lines,
     run_trials,
+    shutdown_or_record,
     shutdown_results,
-    shutdown_session,
     summarize,
 )
 from src.robot.driver import So101Driver
-from src.robot.prompts import TorqueGuard, TorqueWait
+from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
@@ -142,6 +146,7 @@ def session(
             label=MOCK_LABEL if mode == "mock" else HARDWARE_LABEL,
             server_info=info,
             torque_wait=None if torque_wait is None else torque_wait.record(),
+            trials=trials,  # the same list: a shutdown that raises still leaves the trials
         )
         try:
             _, end = run_trials(
@@ -160,15 +165,15 @@ def session(
         except KeyboardInterrupt:
             end = "operator_ctrl_c"
         finally:
-            shutdown = shutdown_session(loop, operator, end)
-            end = final_session_end(loop.arm, end)  # a failed torque-off wins over any end
             summary = summarize(trials, loop.dcfg.latency_target_ms, loop.dcfg.capture_offset_ms)
+            run.results.update(summary=summary)
+            shutdown = shutdown_or_record(run.results, loop, operator, end)
+            end = final_session_end(loop.arm, end)  # a failed torque-off wins over any end
             run.results.update(
                 session_end=end,
                 **shutdown_results(shutdown),
                 torque_off_unconfirmed=loop.arm.torque_off_unconfirmed,
                 trials=trials,
-                summary=summary,
             )
         print_summary(run.id, summary, end, shutdown.record())
     return run.record_path
@@ -306,8 +311,9 @@ def run_hardware(cfg: Config, args: argparse.Namespace) -> Path:
             print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
         arm = So101Driver.from_config(cfg, fk)  # builds the follower; no port is opened yet
         operator = ConsoleOperator(TorqueGuard(arm, torque_wait))
-        with OpenCVFrameSource(cam_cfg) as cam, arm:
-            loop = DeployLoop(arm, cam, pipe, client, dcfg)
+        # Ctrl-C a flag outside prompts, SIGHUP / SIGTERM the closed-stdin path (prompts.py)
+        with operator_signals() as interrupts, OpenCVFrameSource(cam_cfg) as cam, arm:
+            loop = DeployLoop(arm, cam, pipe, client, dcfg, interrupts=interrupts)
             return session(
                 cfg,
                 loop,

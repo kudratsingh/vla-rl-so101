@@ -37,4 +37,9 @@ logged (target <150 ms); video produced.
   The success rate excluding faulted trials is reported only as a labelled secondary diagnostic.
 - Prompts with torque on are bounded (`deploy.prompt_torque_timeout_s`, 60 s, then support,
   grace, torque off); "supported" is recorded only after an explicit ENTER
-  (`src/robot/prompts.py`).
+  (`src/robot/prompts.py`). Typed-ahead input is discarded before each prompt; Ctrl-C outside
+  a prompt is a flag checked between control ticks; closing the Terminal (SIGHUP) takes the
+  closed-stdin path (grace, torque off, `released_unconfirmed`).
+- A started trial is durable: a `trial_started` row is written the moment the policy starts,
+  and a resume scores a started trial without a record (the run was killed mid-trial) as a
+  failure (fault kind `session_lost`), never a redo.

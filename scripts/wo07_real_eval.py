@@ -66,9 +66,14 @@ Resumable: ``--resume <run id>`` continues a session (any earlier run of it). Th
 trials per cell, slot seed, label, policy id and fingerprint come from that run and must still
 match. A slot with any attempt whose policy started is done (``done_indices``) and never re-run;
 a slot whose attempts all ended before the policy started is retried with the same placement.
-Each invocation is its own run record,
-holding every trial of the session so far; record.json is written when the session is bound and
-after every trial, so a run killed without exiting (SIGHUP, power loss) can be resumed itself.
+The start is durable: the moment the policy starts, a ``trial_started`` row goes to
+metrics.jsonl, and a resume scores a started trial that has no record (the process was killed,
+crashed or lost power mid-trial) as a FAILURE with fault kind ``session_lost`` (``load_prior``).
+Each invocation is its own run record, holding every trial of the session so far; record.json is
+written when the session is bound and after every trial, so a run killed without exiting
+(SIGKILL, power loss) can be resumed itself. Closing the Terminal (SIGHUP / SIGTERM) is not a
+kill: the session takes the closed-stdin path (grace period, torque off, released_unconfirmed,
+cause hangup) and writes its record.
 ``--resume`` refuses a run that a later run of its session continued (a resume of an older
 run would fork the session and drop the newer runs' scored trials), and warns (``--hardware``: asks for
 'checked') when an earlier run ended with TORQUE OFF UNCONFIRMED, in a trial or at shutdown.
@@ -84,7 +89,8 @@ run would fork the session and drop the newer runs' scored trials), and warns (`
             holds the arm, asks for support, and turns torque off only after ENTER (Ctrl-C there
             is ignored; a closed stdin or the timeout is recorded as released_unconfirmed,
             support_confirmed false); robot.park.enabled (default false) parks first. Ctrl-C
-            during motion holds; a servo over-temperature / over-current fault cuts torque at
+            during motion holds (outside prompts Ctrl-C is a flag: motion stops between ticks,
+            never inside a bus transfer or the shutdown); a servo over-temperature / over-current fault cuts torque at
             once; a failed torque-off blocks all motion and says to switch off the inline power
             switch.
 
@@ -130,13 +136,13 @@ from src.robot.client import (
     final_session_end,
     latency_lines,
     run_trials,
+    shutdown_or_record,
     shutdown_results,
-    shutdown_session,
     summarize,
     trial_object,
 )
 from src.robot.driver import So101Driver
-from src.robot.prompts import TorqueGuard, TorqueWait
+from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
@@ -407,7 +413,11 @@ SCORED = ("success", "failure")
 
 def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """(session settings, every trial record so far) from an earlier run of the session. Trials
-    come from record.json, plus any metrics.jsonl trial rows it lacks (a run killed before exit)."""
+    come from record.json, plus any metrics.jsonl trial rows it lacks (a run killed before exit),
+    plus every ``trial_started`` row without its trial: the policy started and the process died
+    before the trial was recorded (killed, crashed, power lost). That row is the record as it
+    stood at the start, a FAILURE with fault kind ``session_lost``: the started slot is done and
+    is never re-run (real-judge-2)."""
     rec_path = run_dir / "record.json"
     if not rec_path.is_file():
         sys.exit(f"--resume: no {rec_path}")
@@ -420,15 +430,30 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     trials: list[dict[str, Any]] = list(results.get("trials") or [])
     seen = {(t["cell"], t["trial_idx"], t["start_utc"]) for t in trials}
     metrics = run_dir / "metrics.jsonl"
+    started: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
     if metrics.is_file():
         for line in metrics.read_text().splitlines():
-            row = json.loads(line)
-            if row.get("kind") != "trial":
+            try:
+                row = json.loads(line)
+            except ValueError:  # a line cut short by the kill
+                continue
+            if row.get("kind") not in ("trial", "trial_started"):
                 continue
             key = (row["cell"], row["trial_idx"], row["start_utc"])
-            if key not in seen:
+            rec = {k: v for k, v in row.items() if k not in ("kind", "t", "step")}
+            if row["kind"] == "trial_started":
+                started.setdefault(key, rec)
+            elif key not in seen:
                 seen.add(key)
-                trials.append({k: v for k, v in row.items() if k not in ("kind", "t", "step")})
+                trials.append(rec)
+    for key, rec in started.items():
+        if key not in seen:
+            seen.add(key)
+            print(
+                f"--resume: {key[0]} trial {key[1]} started at {rec.get('policy_started_utc')} and "
+                "has no record (the run ended mid-trial): scored a FAILURE (session_lost)"
+            )
+            trials.append(rec)
     return settings, trials
 
 
@@ -675,7 +700,7 @@ def session(
             end = f"error: {type(e).__name__}: {e}"
             raise
         finally:
-            shutdown = shutdown_session(loop, operator, end)
+            shutdown = shutdown_or_record(run.results, loop, operator, end)
             end = final_session_end(loop.arm, end)  # a failed torque-off wins over any end
             run.results.update(
                 session_end=end,
@@ -935,8 +960,9 @@ def run_hardware(
             print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
         guard = TorqueGuard(arm, torque_wait)
         operator = JudgeOperator(guard, str(settings["task"]), settle_s_from_config(cfg))
-        with OpenCVFrameSource(cam_cfg) as cam, arm:
-            loop = DeployLoop(arm, cam, pipe, client, dcfg)
+        # Ctrl-C a flag outside prompts, SIGHUP / SIGTERM the closed-stdin path (prompts.py)
+        with operator_signals() as interrupts, OpenCVFrameSource(cam_cfg) as cam, arm:
+            loop = DeployLoop(arm, cam, pipe, client, dcfg, interrupts=interrupts)
             return session(
                 cfg,
                 loop,

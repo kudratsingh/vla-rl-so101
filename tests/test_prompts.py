@@ -125,4 +125,149 @@ def test_from_config_refuses_an_unbounded_wait_on_the_real_arm() -> None:
         with pytest.raises(ValueError, match="prompt_torque_timeout_s"):
             P.TorqueWait.from_config(cfg, "deploy", allow_none=False)
     cfg["deploy"]["prompt_torque_timeout_s"] = None
-    assert P.TorqueWait.from_config(cfg, "deploy", allow_none=True) is None
+    cfg["deploy"]["prompt_support_grace_s"] = 7.0
+    # teleop's null = no bound, but the grace period is still read and kept (F5)
+    assert P.TorqueWait.from_config(cfg, "deploy", allow_none=True) == P.TorqueWait(None, 7.0)
+
+
+# -- review round 3: Ctrl-C outside a read, typed-ahead input, hang-up, the null-timeout grace ----
+def test_ctrl_c_during_the_closed_stdin_grace_does_not_drop_the_arm() -> None:
+    g, _reader, fol, said, clock = _guard([EOFError])
+    presses = {"n": 0}
+
+    def sleep(dt: float) -> None:  # the operator panics 3 s into the grace and presses Ctrl-C
+        if presses["n"] == 0:
+            presses["n"] += 1
+            clock.advance(3.0)
+            assert fol.bus.torque_enabled  # still holding when the press lands
+            raise KeyboardInterrupt
+        clock.advance(dt)
+
+    g.sleep = sleep
+    t0 = clock()
+    assert g.support("support it, ENTER: ") == P.EOF  # returns; nothing escapes
+    assert clock() - t0 == pytest.approx(10.0)  # the whole grace, not cut short by the press
+    assert P.CTRL_C_IGNORED_GRACE in said
+    assert g.released is not None and g.released["cause"] == P.EOF
+    assert not fol.bus.torque_enabled  # torque off only after the grace
+
+
+def test_ctrl_c_in_the_servo_read_before_the_support_wait_is_ignored() -> None:
+    g, reader, fol, said, _ = _guard([""])
+    real = g.arm.check_servos
+    calls = {"n": 0}
+
+    def check_servos() -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:  # lands mid-transfer: the port is left busy
+            fol.bus.port_handler.is_using = True
+            raise KeyboardInterrupt
+        real()
+
+    g.arm.check_servos = check_servos  # type: ignore[method-assign]
+    assert g.support("support it, ENTER: ") == P.ENTER  # still asked, still confirmed by ENTER
+    assert calls["n"] == 2 and not fol.bus.port_handler.is_using  # port released, read retried
+    assert P.CTRL_C_IGNORED in said and fol.bus.torque_enabled  # the caller turns torque off
+    assert reader.calls[0][1] == 60.0  # the bounded wait (its deadline set before the read)
+
+
+def test_null_timeout_keeps_the_grace_on_a_closed_stdin() -> None:
+    g, reader, fol, said, clock = _guard([EOFError], wait=P.TorqueWait(None, 10.0))
+    t0 = clock()
+    assert g.support("support it, ENTER: ") == P.EOF
+    assert reader.calls[0][1] is None  # no bound (teleop null) ...
+    assert clock() - t0 == pytest.approx(10.0)  # ... but the grace still runs before torque off
+    assert any("Torque goes OFF in 10 s" in m for m in said) and not fol.bus.torque_enabled
+    g2, _, _fol2, _, clock2 = _guard([EOFError], wait=None)  # no TorqueWait at all: the default
+    t0 = clock2()
+    assert g2.support("x") == P.EOF and clock2() - t0 == pytest.approx(P.DEFAULT_GRACE_S)
+
+
+def _stdin_from(monkeypatch: pytest.MonkeyPatch, fd: int) -> Any:
+    f = open(fd, "r", closefd=True)  # noqa: SIM115 - closed by the test
+    monkeypatch.setattr(P.sys, "stdin", f)
+    return f
+
+
+def test_timed_input_reads_times_out_and_sees_eof_on_a_real_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+
+    r, w = os.pipe()
+    f = _stdin_from(monkeypatch, r)
+    try:
+        os.write(w, b"abc\n")
+        assert P.timed_input("p? ", 1.0) == "abc"
+        assert P.timed_input("p? ", 0.01) is None  # nothing typed: the bound expires
+        os.close(w)
+        with pytest.raises(EOFError):
+            P.timed_input("p? ", 1.0)
+    finally:
+        f.close()
+
+
+def test_a_line_typed_before_the_prompt_never_answers_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+    import pty
+    import select
+    import threading
+
+    master, slave = pty.openpty()
+    f = _stdin_from(monkeypatch, slave)
+    try:
+        os.write(master, b"\n")  # ENTER pressed during the motion, before the prompt appeared
+        assert select.select([f], [], [], 2.0)[0]  # it is queued on the tty
+        assert P.timed_input("support? ", 0.2) is None  # discarded: no answer
+        threading.Timer(0.1, os.write, (master, b"y\n")).start()  # typed after the prompt
+        assert P.timed_input("score? ", 5.0) == "y"
+        # the support prompt: a queued ENTER does not confirm support
+        os.write(master, b"\n")
+        assert select.select([f], [], [], 2.0)[0]
+        fol = FakeFollower()
+        arm = So101Driver(fol, UnitMap(), make_safety(real_cfg(), toy_fk))
+        arm.connect()
+        g = P.TorqueGuard(arm, P.TorqueWait(0.2, 0.0), say=lambda _m: None)
+        assert g.support("support it, ENTER: ") == P.TIMEOUT  # not ENTER: released unconfirmed
+        assert g.released is not None and g.released["cause"] == P.TIMEOUT
+        assert not fol.bus.torque_enabled
+    finally:
+        f.close()
+        os.close(master)
+
+
+def test_operator_signals_make_ctrl_c_a_flag_and_a_hangup_the_closed_stdin_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import signal
+    import threading
+
+    monkeypatch.setattr(P, "_detach_stdio", lambda: None)  # keep pytest's capture
+    before = signal.getsignal(signal.SIGHUP)
+    r, w = os.pipe()
+    f = _stdin_from(monkeypatch, r)
+    try:
+        with P.operator_signals() as flags:
+            os.kill(os.getpid(), signal.SIGINT)  # outside a read: only a flag, nothing raised
+            assert flags.ctrl_c and flags.hangup is None
+            with pytest.raises(KeyboardInterrupt):  # inside a read Ctrl-C still answers
+                threading.Timer(0.1, os.kill, (os.getpid(), signal.SIGINT)).start()
+                P.timed_input("p? ", 5.0)
+            threading.Timer(0.1, os.kill, (os.getpid(), signal.SIGHUP)).start()
+            with pytest.raises(P.Hangup):  # the terminal closes during a wait
+                P.timed_input("p? ", 5.0)
+            assert flags.hangup == "SIGHUP"
+            with pytest.raises(P.Hangup):  # every later prompt: nobody can answer
+                P.timed_input("p? ", 5.0)
+            g, _, fol, said, clock = _guard([], wait=WAIT)
+            g.read_line = P.timed_input
+            t0 = clock()
+            assert g.support("support it, ENTER: ") == P.HANGUP
+            assert clock() - t0 == pytest.approx(10.0)  # the grace, without stdin
+            assert any("TERMINAL HUNG UP" in m for m in said) and not fol.bus.torque_enabled
+            assert g.released is not None and g.released["cause"] == P.HANGUP
+        assert signal.getsignal(signal.SIGHUP) == before  # restored
+    finally:
+        f.close()
+        os.close(w)

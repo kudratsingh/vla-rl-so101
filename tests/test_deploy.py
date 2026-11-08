@@ -10,6 +10,7 @@ import dataclasses
 import importlib.util
 import json
 import math
+import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -939,8 +940,21 @@ def test_pilot_torque_on_prompts_are_bounded_and_end_honestly(
         # every read while torque was on was bounded: nothing waits forever under torque
         assert all(t is not None for _, t, on in reader.calls if on)
         trials = res["trials"]
-        if prompt in ("home", "placement"):
-            assert trials == []  # the policy never started: nothing to score
+        if prompt == "home":
+            assert trials == []  # the arm never moved: no attempt
+        elif prompt == "placement":  # the arm went home, then the prompt ended: an attempt
+            (t,) = trials
+            assert (t["outcome"], t["outcome_source"]) == ("not_started", "not_scored")
+            assert not t["policy_started"] and t["home"]["reached"]
+            stop = {"timeout": "prompt_timeout", "ctrl_c": "operator_ctrl_c", "eof": "stdin_closed"}
+            assert t["stop_reason"] == stop[how]
+            assert t["stop_detail"].startswith("placement prompt")
+            if how == "timeout":
+                assert t["fault"]["kind"] == "prompt_timeout"
+                assert t["fault"]["where"] == "placement_prompt"
+            else:
+                assert t["fault"] is None
+            assert res["summary"]["cells"]["PickPlace/seen"]["not_started"] == 1
         else:
             (t,) = trials
             assert t["policy_started"]
@@ -1028,3 +1042,178 @@ def test_policy_started_is_the_first_action_handed_to_the_safety_filter() -> Non
         assert res.policy_started and res.policy_started_utc and res.steps == 16
         assert res.t_first_write is not None and res.policy_started_t is not None
         assert res.policy_started_t <= res.t_first_write  # stamped as the action was handed over
+
+
+# -- review round 3: signals as flags, hang-up, Ctrl-C outside a read, durable records -----------
+def _pilot_kw(tmp_path: Path, **extra: Any) -> dict[str, Any]:
+    return {
+        "mode": "mock",
+        "task": "PickPlace",
+        "cell": "seen",
+        "n_trials": 1,
+        "max_steps": 16,
+        "camera_calibrated": False,
+        "runs_dir": tmp_path,
+        "torque_wait": TorqueWait(60.0, 10.0),
+        **extra,
+    }
+
+
+def _record(tmp_path: Path) -> dict[str, Any]:
+    (rec,) = tmp_path.glob("*/record.json")
+    return dict(json.loads(rec.read_text())["results"])
+
+
+def _after_first_action(r: Rig, act: Any) -> Any:
+    def hook(k: int) -> None:
+        logged = r.loop.on_decision
+
+        def on_decision(timing: dict[str, float]) -> None:
+            if logged is not None:
+                logged(timing)
+            if timing["decision"] == 1:
+                act()
+
+        r.loop.on_decision = on_decision
+
+    return hook
+
+
+def test_ctrl_c_flag_during_motion_stops_between_ticks_and_the_trial_fails() -> None:
+    from src.robot.prompts import Interrupts
+
+    with rig() as r:
+        flags = Interrupts()
+        r.loop.interrupts = flags
+        op, _reader = _console(r, ["", "", ""])  # home, placement, support
+        hook = _after_first_action(r, lambda: setattr(flags, "ctrl_c", True))
+        trials, end = _trials(r, op, on_trial_start=hook)
+        (t,) = trials
+        assert end == "operator_abort" and t["stop_reason"] == "operator_abort"
+        assert t["policy_started"] and t["outcome"] == "failure"
+        assert t["fault"]["kind"] == "operator_abort"  # never a redo, never judged
+        assert r.arm.deadman.response is DeadmanResponse.HOLD and r.fol.bus.torque_enabled
+        assert not r.fol.bus.port_handler.is_using  # stopped between ticks, not mid-transfer
+        sd = shutdown_session(r.loop, op, end)
+        assert sd.end == "supported" and sd.support_confirmed is True
+
+
+def test_hangup_during_motion_takes_the_closed_stdin_path_and_records_it(tmp_path: Path) -> None:
+    from src.robot import prompts as P
+
+    with rig() as r:
+        r.arm.monitor = monitor_from_config(real_cfg())
+        r.loop.interrupts = P.INTERRUPTS
+        op, reader = _console(r, ["", ""])  # home, placement; then the terminal closes
+        fake = op.guard.read_line
+
+        def read(prompt: str, timeout_s: float | None) -> str | None:
+            if P.INTERRUPTS.hangup is not None:  # what timed_input does after a SIGHUP
+                reader.calls.append((prompt, timeout_s, r.fol.bus.torque_enabled))
+                raise P.Hangup("SIGHUP: the operator's terminal closed")
+            return fake(prompt, timeout_s)
+
+        op.guard.read_line = read
+        hook = _after_first_action(r, lambda: setattr(P.INTERRUPTS, "hangup", "SIGHUP"))
+        t0 = op.guard.clock()
+        pilot.session(
+            real_cfg(), r.loop, op, r.server_info, **_pilot_kw(tmp_path), on_trial_start=hook
+        )
+        res = _record(tmp_path)
+        (t,) = res["trials"]
+        assert t["policy_started"] and t["outcome"] == "failure"
+        assert t["stop_reason"] == "hangup" and t["fault"]["kind"] == "hangup"
+        assert res["session_end"].startswith("hangup: SIGHUP")
+        assert res["shutdown"] == "released_unconfirmed" and res["support_confirmed"] is False
+        assert res["shutdown_detail"]["cause"] == "hangup"
+        assert op.guard.clock() - t0 == pytest.approx(10.0)  # the grace period, then torque off
+        assert not r.fol.bus.torque_enabled
+        assert r.arm.deadman.response is DeadmanResponse.TORQUE_OFF
+
+
+@pytest.mark.parametrize("where", ["servo_read", "eof_grace"])
+def test_ctrl_c_in_the_shutdown_never_skips_it(tmp_path: Path, where: str) -> None:
+    """Without the flag handler (a fallback): a Ctrl-C at the home prompt ends the session, then
+    a second, panicked press lands in the shutdown's servo read or the closed-stdin grace. The
+    shutdown still finishes and the record still says how it ended."""
+    with rig() as r:
+        r.arm.monitor = monitor_from_config(real_cfg())
+        script: list[Any] = ["", "", "y", KeyboardInterrupt]  # trial 1 scored, Ctrl-C at home 2
+        script.append("" if where == "servo_read" else EOFError)
+        op, _reader = _console(r, script)
+        hit: list[str] = []
+        real = r.arm.check_servos
+
+        def check_servos() -> None:
+            stack = "".join(traceback.format_stack())
+            if where == "servo_read" and not hit and "safe_shutdown" in stack:
+                hit.append(stack)  # the shutdown's read, right before the support wait
+                raise KeyboardInterrupt
+            real()
+
+        r.arm.check_servos = check_servos  # type: ignore[method-assign]
+        if where == "eof_grace":
+            gsleep = op.guard.sleep
+            pressed = {"n": 0}
+
+            def sleep(dt: float) -> None:
+                if pressed["n"] == 0:
+                    pressed["n"] += 1
+                    raise KeyboardInterrupt
+                gsleep(dt)
+
+            op.guard.sleep = sleep
+        pilot.session(real_cfg(), r.loop, op, r.server_info, **_pilot_kw(tmp_path, n_trials=2))
+        res = _record(tmp_path)
+        assert [t["outcome"] for t in res["trials"]] == ["success"]  # the scored trial is kept
+        assert res["session_end"] == "operator_ctrl_c"
+        if where == "servo_read":
+            assert len(hit) == 1  # the press landed in the shutdown's servo read
+            assert res["shutdown"] == "supported" and res["support_confirmed"] is True
+        else:
+            assert res["shutdown"] == "released_unconfirmed" and res["support_confirmed"] is False
+            assert res["shutdown_detail"]["cause"] == "eof" and pressed["n"] == 1
+        assert not r.fol.bus.torque_enabled
+
+
+def test_a_shutdown_that_raises_still_leaves_the_trials_and_says_so(tmp_path: Path) -> None:
+    with rig() as r:
+        op, _reader = _console(r, ["", "", "y"])
+
+        def support(msg: str) -> str:
+            raise RuntimeError("bug in the shutdown")
+
+        op.support = support  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="bug in the shutdown"):
+            pilot.session(real_cfg(), r.loop, op, r.server_info, **_pilot_kw(tmp_path))
+        res = _record(tmp_path)
+        assert [t["outcome"] for t in res["trials"]] == ["success"]
+        assert res["shutdown"].startswith("error: RuntimeError")
+        assert res["support_confirmed"] is False and res["session_end"] == "completed"
+
+
+def test_a_started_trial_is_recorded_even_when_the_session_dies_before_its_record() -> None:
+    rows: list[dict[str, Any]] = []
+    with rig() as r:
+
+        def die() -> None:
+            raise SystemExit("killed mid-trial")
+
+        hook = _after_first_action(r, die)
+        trials: list[dict[str, Any]] = []
+        with pytest.raises(SystemExit):
+            _trials(
+                r,
+                ScriptedOperator(),
+                trials=trials,
+                on_trial_start=hook,
+                log_row=lambda **row: rows.append(row),
+            )
+        (t,) = trials
+        assert t["policy_started"] and t["outcome"] == "failure"
+        assert t["fault"]["kind"] == "session_lost" and "SystemExit" in t["fault"]["reason"]
+        kinds = [row["kind"] for row in rows]
+        assert kinds.index("trial_started") < kinds.index("decision") < kinds.index("trial")
+        started = next(row for row in rows if row["kind"] == "trial_started")
+        assert started["fault"]["kind"] == "session_lost" and started["policy_started"]
+        assert all(row["cell"] == "seen" for row in rows if row["kind"] == "decision")

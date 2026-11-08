@@ -383,7 +383,7 @@ def test_resume_warns_about_a_torque_off_failure_at_the_last_shutdown(
         self.follower.bus.fail_disable = True
         return real_torque_off(self)
 
-    monkeypatch.setattr(ev, "shutdown_session", _shutdown_with(fail_at_shutdown, monkeypatch))
+    monkeypatch.setattr(ev, "shutdown_or_record", _shutdown_with(fail_at_shutdown, monkeypatch))
     rec = ev.main(_args(tmp_path, "--task", "Push", "--trials", "1", "--cells", "seen"))
     r = json.loads(rec.read_text())["results"]
     assert r["shutdown"] == "torque_off_unconfirmed"
@@ -402,11 +402,11 @@ def test_resume_warns_about_a_torque_off_failure_at_the_last_shutdown(
 def _shutdown_with(torque_off: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     from src.robot.driver import So101Driver
 
-    real = ev.shutdown_session
+    real = ev.shutdown_or_record
 
-    def shutdown(loop: Any, operator: Any, end: str) -> str:
+    def shutdown(results: Any, loop: Any, operator: Any, end: str) -> Any:
         monkeypatch.setattr(So101Driver, "torque_off", torque_off)
-        return real(loop, operator, end)
+        return real(results, loop, operator, end)
 
     return shutdown
 
@@ -442,8 +442,12 @@ def test_placement_plan_is_prefix_stable_beyond_50_trials() -> None:
 
 
 # -- owner decisions 2026-11-08: bounded prompts, honest shutdown, fault scoring ------------------
-def _judge_with(monkeypatch: pytest.MonkeyPatch, script: list[Any]) -> Any:
-    """The real-eval JudgeOperator on a scripted stdin, bound to the mock rig's arm."""
+def _judge_with(
+    monkeypatch: pytest.MonkeyPatch, script: list[Any], lose_camera: bool = False
+) -> Any:
+    """The real-eval JudgeOperator on a scripted stdin, bound to the mock rig's arm.
+    ``lose_camera``: every frame after the first action of trial 0 is lost (a deadman HOLD after
+    the policy started, then the 'resume' prompt)."""
     from contextlib import contextmanager
 
     from robot_fakes import FakeClock, FakeReader
@@ -459,9 +463,23 @@ def _judge_with(monkeypatch: pytest.MonkeyPatch, script: list[Any]) -> Any:
     @contextmanager
     def rig(cfg: Any, args: Any, fk: Any) -> Any:
         with real_rig(cfg, args, fk) as out:
-            guard.arm = out[0].arm
-            reader.bus = out[0].arm.follower.bus
-            yield out
+            loop, info, on_start, calibrated = out
+            guard.arm = loop.arm
+            reader.bus = loop.arm.follower.bus
+
+            def start(k: int) -> None:
+                on_start(k)
+                logged = loop.on_decision
+
+                def on_decision(timing: dict[str, float]) -> None:
+                    if logged is not None:
+                        logged(timing)
+                    if lose_camera and k == 0:
+                        loop.cam.fail = True
+
+                loop.on_decision = on_decision
+
+            yield loop, info, start, calibrated
 
     monkeypatch.setattr(ev, "mock_rig", rig)
     monkeypatch.setattr(ev, "ScriptedOperator", lambda: op)
@@ -528,6 +546,82 @@ def test_real_eval_home_and_support_prompts_are_bounded(
     if how == "ctrl_c":  # Ctrl-C at the support prompt kept the arm holding (torque on)
         assert reader.calls[1][2] is True and reader.calls[2][2] is True
         assert reader.calls[2][1] == pytest.approx(55.0)  # the bounded wait kept running
+
+
+@pytest.mark.parametrize("how", ["timeout", "ctrl_c", "eof"])
+@pytest.mark.parametrize("prompt", ["placement", "resume"])
+def test_real_eval_placement_and_resume_prompts_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompt: str, how: str
+) -> None:
+    """Timeout, Ctrl-C and closed stdin at the placement ('ENTER starts') and the 'resume'
+    prompt (a deadman HOLD after the policy started), through wo07_real_eval's own session."""
+    answer = {"timeout": None, "ctrl_c": KeyboardInterrupt, "eof": EOFError}[how]
+    script: list[Any] = [""] + ([""] if prompt == "resume" else []) + [answer]
+    if how == "ctrl_c":
+        script.append("")  # ENTER at the support prompt
+    reader = _judge_with(monkeypatch, script, lose_camera=prompt == "resume")
+    argv = _args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen")
+    if how == "eof":
+        with pytest.raises(EOFError):
+            ev.main(argv)
+    else:
+        ev.main(argv)
+    (r,) = _records(tmp_path)
+    expected = {
+        "timeout": ("prompt_timeout", "released_unconfirmed", False),
+        "ctrl_c": ("operator_ctrl_c", "supported", True),
+        "eof": ("error: EOFError", "released_unconfirmed", False),
+    }[how]
+    assert r["session_end"].startswith(expected[0]), r["session_end"]
+    assert r["shutdown"] == expected[1] and r["support_confirmed"] is expected[2]
+    if expected[1] == "released_unconfirmed":
+        assert r["shutdown_detail"]["cause"] == how
+    on = [c for c in reader.calls if c[2]]
+    assert on and all(timeout is not None for _, timeout, _ in on)  # every torque-on wait bounded
+    (t,) = r["trials"]
+    c = r["summary"]["cells"]["PickPlace/seen"]
+    if prompt == "placement":  # home reached, then the prompt ended: an unscored attempt
+        assert (t["outcome"], t["outcome_source"]) == ("not_started", "not_scored")
+        assert not t["policy_started"] and t["placement"] and t["home"]["reached"]
+        assert t["stop_detail"].startswith("placement prompt")
+        assert (c["n"], c["not_started"]) == (0, 1)
+    else:  # a HOLD stop after the start: a failure, never judged; no 'resume' changes it
+        assert t["policy_started"] and t["outcome"] == "failure"
+        assert t["outcome_source"] == "fault" and t["fault"]["kind"] == "safety"
+        assert (c["n"], c["successes"], c["faulted"]) == (1, 0, 1)
+
+
+def test_a_run_killed_mid_trial_never_re_rolls_the_started_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The process dies after slot 1's policy started and before its trial was written (SIGKILL,
+    power loss: no record, only the durable ``trial_started`` row). A resume scores it a
+    failure (session_lost) and never re-runs it."""
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "3", "--cells", "seen"))
+    run_dir = rec.parent
+    # simulate the kill: slot 1's trial row and record never got written, nor anything after
+    data = json.loads(rec.read_text())
+    data["results"]["trials"] = [t for t in data["results"]["trials"] if t["trial_idx"] == 0]
+    rec.write_text(json.dumps(data))
+    rows = [json.loads(x) for x in (run_dir / "metrics.jsonl").read_text().splitlines()]
+    cut = next(
+        i for i, x in enumerate(rows) if x.get("kind") == "trial_started" and x["trial_idx"] == 1
+    )
+    kept = rows[: cut + 1]
+    (run_dir / "metrics.jsonl").write_text("".join(json.dumps(x) + "\n" for x in kept))
+    assert not any(x.get("kind") == "trial" and x["trial_idx"] == 1 for x in kept)
+    rec2 = ev.main(_args(tmp_path, "--resume", run_dir.name))
+    r2 = json.loads(rec2.read_text())["results"]
+    by_idx = {t["trial_idx"]: t for t in r2["trials"]}
+    assert sorted(by_idx) == [0, 1, 2]  # slot 1 was not re-run: slot 2 ran, slot 1 is a record
+    lost = by_idx[1]
+    assert lost["outcome"] == "failure" and lost["outcome_source"] == "fault"
+    assert lost["fault"]["kind"] == "session_lost" and lost["policy_started"]
+    assert [t["trial_idx"] for t in r2["trials"]].count(1) == 1
+    c = r2["summary"]["cells"]["PickPlace/seen"]
+    assert (c["n"], c["successes"], c["faults_by_kind"]) == (3, 2, {"session_lost": 1})
+    assert r2["summary"]["complete"]
 
 
 def test_faults_after_the_start_fail_and_unstarted_attempts_are_retried(

@@ -356,12 +356,40 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
     **Behaviour change to note:** a Ctrl-C during the trial after the policy started used to be
     an unscored redo; it is now a failure (fault kind `operator_abort`), per "slots with any
     started attempt are done".
+  - Review fixes on that round ($0, fakes only):
+    - Ctrl-C outside a prompt is a flag. The hardware pilot and real eval run under
+      `operator_signals` (`src/robot/prompts.py`; teleop's `ctrl_c_as_flag` uses it too):
+      SIGINT only sets a flag; `DeployLoop` checks it between ticks (trial and move home), so a
+      press never lands inside a bus transfer, a grace sleep, the hold or the servo read of the
+      shutdown. Prompt reads switch Ctrl-C back to KeyboardInterrupt for the read itself. As a
+      fallback (no handler), a Ctrl-C inside the shutdown's hold, servo read, torque-off or the
+      closed-stdin grace is ignored with a message (the port is released and the call retried),
+      so the shutdown always finishes and is recorded.
+    - Typed-ahead input is discarded (`termios.tcflush` on a tty before every prompt): an ENTER
+      pressed during motion or a double ENTER can no longer confirm support or start a trial.
+    - A closed Terminal / dropped ssh (SIGHUP, also SIGTERM) no longer kills the process with
+      the arm held under torque: motion stops at the next tick (trial fault kind `hangup`),
+      stdout/stderr are detached, every later prompt ends as `hangup` and takes the closed-stdin
+      path (grace without stdin, deadman TORQUE_OFF, torque off, `released_unconfirmed`, cause
+      `hangup`, record written). Teleop likewise.
+    - Durable start: the moment a trial's policy starts, a `trial_started` row goes to
+      metrics.jsonl. A resume turns one without its trial row (SIGKILL, crash, power loss) into
+      a failure, fault kind `session_lost`, so a started slot is never re-rolled; an exception
+      between the start and the record appends that failure before it propagates. Decision rows
+      carry the cell.
+    - Placement-prompt ends (q, timeout, Ctrl-C, EOF, a servo / serial fault from its health
+      reads) after the arm went home are kept as `not_started` attempts (stop reason and fault
+      recorded).
+    - The pilot keeps its trials in the record even if the shutdown raises; both scripts record
+      `shutdown: "error: ..."`, `support_confirmed: false` then.
+    - Teleop with `prompt_torque_timeout_s: null` keeps the grace period on a closed stdin
+      (`TorqueWait(None, grace)`); its provenance file records `support_release` (cause).
 Unverified on hardware: every item above. In particular: the thresholds, the read cost on the
 Mac's USB-serial link, whether the park pose rests safely with torque off, the refusal
 tolerances against a real calibration, the Homing_Offset read on the real servos, the
 behaviour of a real failed torque-off write, `select()` on the Mac terminal for the bounded
-waits (teleop, pilot, real eval; a line typed ahead of a prompt may sit in Python's stdin buffer
-where `select()` cannot see it), the port-busy recovery on a real interrupted packet, the capture offset, and the printed
+waits (teleop, pilot, real eval), `tcflush` of typed-ahead input on the Mac terminal, SIGHUP
+delivery to the Python child under `uv run` when the Terminal window closes, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
 grid's scale and alignment with the real base.
 
 ## Blockers and decisions pending the owner

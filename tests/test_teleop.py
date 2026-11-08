@@ -261,7 +261,8 @@ def test_defaults_no_auto_park_and_a_bounded_torque_on_wait() -> None:
     tw = teleop.TorqueWait.from_config(cfg, "teleop", allow_none=True)
     assert tw == teleop.TorqueWait(60.0, 10.0)
     cfg["teleop"]["prompt_torque_timeout_s"] = None
-    assert teleop.TorqueWait.from_config(cfg, "teleop", allow_none=True) is None  # teleop only
+    unbounded = teleop.TorqueWait.from_config(cfg, "teleop", allow_none=True)  # teleop only
+    assert unbounded == teleop.TorqueWait(None, 10.0)  # no bound; the grace period stays
 
 
 def _health_reads(fol: FakeFollower) -> int:

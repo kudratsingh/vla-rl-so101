@@ -41,8 +41,12 @@ A serial error ends everything: the driver has already cut torque, and nothing i
 it. A servo fault (over-temperature / over-current, ``src/robot/servo_health.py``) is the same:
 torque is already off, and the operator is told to support the arm. A HOLD trip ends the trial;
 resuming needs an operator acknowledgement (``Deadman.reset``). Ctrl-C during motion (a trial or
-the move home) holds (a deadman trip); the port is released first in case the Ctrl-C landed inside
-a bus transaction.
+the move home) holds (a deadman trip). On the real arm the session runs under
+``prompts.operator_signals``: Ctrl-C outside a prompt only sets a flag that ``DeployLoop`` checks
+between ticks (``SessionStop``), so it never lands inside a bus transaction; a hang-up (SIGHUP /
+SIGTERM: the Terminal closed) stops motion the same way (stop reason ``hangup``) and every later
+prompt takes the closed-stdin path. Without the handler (mock) a Ctrl-C mid-tick still holds; the
+port is released first in case it landed inside a bus transaction.
 
 Prompts with torque on (``ConsoleOperator`` through ``src/robot/prompts.py``'s ``TorqueGuard``,
 owner 2026-11-08): every prompt answered while the arm holds under torque (between trials, the
@@ -67,8 +71,8 @@ and park path): park at ``robot.park.qpos`` through the safety filter, then torq
 (parking off, any fault, an abort during motion, a declined resume): hold, the operator supports
 the arm and presses ENTER (``supported``, ``support_confirmed: true``), then torque off. Only an
 explicit ENTER confirms: Ctrl-C there is ignored (the arm keeps holding, the bounded wait keeps
-running); a closed stdin or the timeout releases torque after the grace period and the end is
-``released_unconfirmed`` with the cause (``support_confirmed: false``). After a serial or servo
+running); a closed stdin, a hang-up or the timeout releases torque after the grace period and
+the end is ``released_unconfirmed`` with the cause (``support_confirmed: false``). After a serial or servo
 fault torque is already off, nothing is written, and the acknowledgement is recorded with how it
 was given (``torque_was_off``).
 
@@ -97,6 +101,7 @@ adds an ``end_to_end_estimate_ms`` labelled with it, and never otherwise.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import time
@@ -125,7 +130,18 @@ from src.robot.driver import (
     So101Driver,
     park_from_config,
 )
-from src.robot.prompts import CTRL_C, ENTER, EOF, TIMEOUT, TorqueGuard, ack_record
+from src.robot.prompts import (
+    CTRL_C,
+    ENTER,
+    EOF,
+    HANGUP,
+    TIMEOUT,
+    Hangup,
+    Interrupts,
+    TorqueGuard,
+    ack_record,
+    ignoring_ctrl_c,
+)
 from src.robot.safety import DeadmanResponse
 from src.robot.serve import ACT_METHOD, INFO_METHOD, WIRE_VERSION, WireError, pack, unpack
 from src.robot.units import NUM_JOINTS
@@ -357,7 +373,8 @@ class FrameSource(Protocol):
 class TrialResult:
     stop_reason: str = ""  # max_steps | safety_reject | deadman | stale_chunk | serial_fault |
     # servo_fault | home_failed | torque_off_unconfirmed (set by run_trials, from the driver) |
-    # server_{timeout,unavailable,error,bad_reply} | operator_abort | client_error
+    # server_{timeout,unavailable,error,bad_reply} | operator_abort | hangup | client_error |
+    # session_lost | operator_quit / prompt_timeout / stdin_closed (placement-prompt attempts)
     stop_detail: str = ""
     deadman_response: str | None = None
     steps: int = 0
@@ -398,6 +415,21 @@ def _ms(a: float, b: float) -> float:
     return (b - a) * 1e3
 
 
+def _say(msg: str) -> None:
+    try:
+        print(msg, flush=True)
+    except OSError:
+        pass  # the terminal is gone (hang-up)
+
+
+class SessionStop(Exception):
+    """A Ctrl-C (flag) or a hang-up seen between ticks (``DeployLoop.stop_requested``)."""
+
+    def __init__(self, kind: str, reason: str):
+        super().__init__(reason)
+        self.kind, self.reason = kind, reason
+
+
 class DeployLoop:
     def __init__(
         self,
@@ -410,11 +442,39 @@ class DeployLoop:
         clock: Callable[[], float] = time.perf_counter,
         sleep: Callable[[float], None] = time.sleep,
         on_decision: Callable[[dict[str, float]], None] | None = None,
+        interrupts: Interrupts | None = None,
     ):
         self.arm, self.cam, self.pipe, self.client, self.dcfg = arm, cam, pipe, client, dcfg
         self.clock, self.sleep = clock, sleep
         self.on_decision = on_decision
+        # runs once per trial, right after its first action went to the safety filter (the
+        # durable "policy started" marker; run_trials)
+        self.on_policy_start: Callable[[TrialResult], None] | None = None
+        # the session's signal flags (src/robot/prompts.operator_signals; hardware only): a
+        # Ctrl-C or a hang-up stops motion between ticks, never inside a bus transaction
+        self.interrupts = interrupts
         self.period = 1.0 / dcfg.control_hz
+
+    def stop_requested(self) -> SessionStop | None:
+        """A Ctrl-C (flag) or a hang-up since the last prompt answer, as the stop to raise."""
+        i = self.interrupts
+        if i is None:
+            return None
+        if i.hangup is not None:
+            return SessionStop("hangup", f"{i.hangup}: the operator's terminal closed")
+        if i.ctrl_c:
+            return SessionStop("operator_abort", "operator Ctrl-C")
+        return None
+
+    def clear_ctrl_c(self) -> None:
+        """Drop a Ctrl-C pressed while nothing moved (a prompt was answered since)."""
+        if self.interrupts is not None:
+            self.interrupts.ctrl_c = False
+
+    def _check_stop(self) -> None:
+        stop = self.stop_requested()
+        if stop is not None:
+            raise stop
 
     def _read_frame(self) -> Frame | None:
         try:
@@ -440,6 +500,7 @@ class DeployLoop:
         t_end = self.clock() + self.dcfg.home_timeout_s
         steps, reached, rejected = 0, False, False
         while self.clock() < t_end:
+            self._check_stop()  # SessionStop: the caller holds the arm (between ticks)
             t0 = self.clock()
             frame = self._read_frame()
             out = self.arm.step(target, frame_time=None if frame is None else frame.capture_time)
@@ -479,9 +540,12 @@ class DeployLoop:
             res.stop_reason = res.stop_reason or "deadman"
         except SerialFault as e:
             res.stop_reason, res.stop_detail = "serial_fault", str(e)
-        except KeyboardInterrupt:
+        except SessionStop as e:  # a Ctrl-C / hang-up flag, seen between ticks: hold
+            res.stop_reason, res.stop_detail = e.kind, e.reason
+            ignoring_ctrl_c(functools.partial(self.arm.trip, e.reason), self.arm, _say)
+        except KeyboardInterrupt:  # no operator_signals handler (mock): the press landed mid-tick
             res.stop_reason = "operator_abort"
-            self.arm.trip("operator Ctrl-C")
+            ignoring_ctrl_c(functools.partial(self.arm.trip, "operator Ctrl-C"), self.arm, _say)
         except Exception as e:  # any client bug must still leave the arm holding
             log.exception("deploy loop failed")
             res.stop_reason = "client_error"
@@ -497,6 +561,7 @@ class DeployLoop:
         dcfg = self.dcfg
         t_tick: float | None = None  # start of the last write tick; the next starts a period later
         while res.steps < n_max:
+            self._check_stop()
             # -- decision tick: right after the last write, so the query counts against the next
             # write's period. Fresh frame, liveness check, query --------------------------------
             frame = self._read_frame()
@@ -527,6 +592,7 @@ class DeployLoop:
                     break
                 wait = 0.0 if t_tick is None else max(0.0, t_tick + self.period - self.clock())
                 self.sleep(wait)  # writes at least one period apart, the first of a chunk too
+                self._check_stop()
                 t0 = self.clock()
                 frame = self._read_frame()
                 # liveness first, on every tick: a lost frame on a stale-drop tick still trips
@@ -544,10 +610,15 @@ class DeployLoop:
                 frame_time = None if frame is None else frame.capture_time
                 if frame_time is not None:
                     res.max_frame_age_ms = max(res.max_frame_age_ms, _ms(frame_time, now))
-                if res.policy_started_t is None:  # the first policy action goes to the filter
+                first = res.policy_started_t is None
+                if first:  # the first policy action goes to the filter
                     res.policy_started_t, res.policy_started_utc = self.clock(), utc_now()
-                out = self.arm.step(action, frame_time=frame_time)
-                t_write = self.clock()
+                try:
+                    out = self.arm.step(action, frame_time=frame_time)
+                    t_write = self.clock()
+                finally:
+                    if first:  # after the write and its stamp: never delays or skews either
+                        self._policy_started(res)
                 t_tick = t0
                 res.steps += 1
                 self._record_safety(res, out.safety)
@@ -567,6 +638,14 @@ class DeployLoop:
                     res.stop_reason = "safety_reject"
                     res.stop_detail = "; ".join(iv.reason for iv in out.safety.interventions)
                     return
+
+    def _policy_started(self, res: TrialResult) -> None:
+        if self.on_policy_start is None:
+            return
+        try:
+            self.on_policy_start(res)
+        except Exception:  # a logging failure must not stop the trial
+            log.exception("recording the policy start failed")
 
     @staticmethod
     def _record_safety(res: TrialResult, safety: Any) -> None:
@@ -823,12 +902,15 @@ class ConsoleOperator:
         reply = self.guard.ask(prompt)
         if reply.how == CTRL_C:
             raise KeyboardInterrupt
+        if reply.how == HANGUP:
+            raise Hangup(f"terminal hung up at {prompt.strip()!r}")
         if reply.how == EOF:
             raise EOFError(f"stdin closed at {prompt.strip()!r}")
         if reply.how == TIMEOUT:
-            wait = self.guard.wait
-            limit = "" if wait is None else f" for {wait.timeout_s:.0f} s"
+            t = self.guard.wait.timeout_s
+            limit = "" if t is None else f" for {t:.0f} s"
             raise PromptTimeout(f"no answer{limit} at {prompt.strip()!r}")
+        assert reply.how == ENTER, reply.how
         return reply.answer
 
     def confirm(self, msg: str) -> bool:
@@ -895,6 +977,9 @@ FAULT_KIND = {
     "stale_chunk": "safety",  # the chunk's first action too old: HOLD
     "operator_abort": "operator_abort",  # Ctrl-C while the arm moved: HOLD
     "client_error": "client_error",  # a bug in the client: HOLD
+    "hangup": "hangup",  # SIGHUP / SIGTERM (the terminal closed) during motion: HOLD
+    "session_lost": "session_lost",  # the process ended before the trial was recorded
+    "prompt_timeout": "prompt_timeout",  # a torque-on prompt timed out (not-started attempts)
     TORQUE_OFF_UNCONFIRMED: TORQUE_OFF_UNCONFIRMED,
 }
 """``server_*`` (timeout, unavailable, error, bad reply: the deadman held) is kind ``server``."""
@@ -968,6 +1053,11 @@ def _score(
             t_settle = loop.clock()
             loop.sleep(float(settle["settle_s"]))  # hold still before scoring
             settle["measured_s"] = round(loop.clock() - t_settle, 3)
+            stop = loop.stop_requested()  # a Ctrl-C (flag) / hang-up during the settle
+            if stop is not None and stop.kind == "hangup":
+                raise Hangup(stop.reason)
+            if stop is not None:
+                raise KeyboardInterrupt
             try:
                 arm.check_servos()  # the arm held under torque while it settled
             except (ServoFault, SerialFault) as e:  # torque now off: the same physical event
@@ -979,8 +1069,11 @@ def _score(
         return "failure", "fault", _late_fault(result, e, "score_prompt"), None
     except KeyboardInterrupt:
         how, why = CTRL_C, f"operator Ctrl-C during {stage}"
-    except EOFError:
-        how, why = EOF, f"stdin closed (EOF) during {stage}"
+    except EOFError as e:
+        if isinstance(e, Hangup):
+            how, why = HANGUP, f"terminal hung up during {stage}"
+        else:
+            how, why = EOF, f"stdin closed (EOF) during {stage}"
     except PromptTimeout as e:
         how, why = TIMEOUT, f"{e}; torque released"
     return "failure", "unjudged", None, {"how": how, "reason": f"{why}: doubt = n (real-judge-2)"}
@@ -1025,20 +1118,29 @@ def run_trials(
     Scoring (``_score``, judging rule real-judge-2): ``policy_started`` (the trial's first action
     from the policy server was handed to the safety filter) decides whether an attempt counts.
     Not started (home failed / faulted / Ctrl-C, a server failure or a stale first chunk before
-    the first action, a failed torque-off before it): ``not_started``, never scored, the slot is
-    retried on a resume. Started: scored exactly once. A fault after the start (servo, serial,
-    safety-layer / deadman stop, server failure, operator Ctrl-C during motion, client error,
-    torque off unconfirmed; in the trial, at the settle read or around the score prompt) is a
-    failure with ``fault: {kind, stop_reason, reason, where}``, never judged by the operator, and
-    a later 'resume' does not change it. A score prompt that ends without a judgement (Ctrl-C,
-    EOF, timeout) is a failure with ``unjudged: {how, reason}``.
+    the first action, a failed torque-off before it, the placement prompt ended by q / timeout /
+    Ctrl-C / closed stdin / a servo read): ``not_started``, kept in the attempts log, never
+    scored, the slot is retried on a resume. Started: scored exactly once. A fault after the
+    start (servo, serial, safety-layer / deadman stop, server failure, operator Ctrl-C during
+    motion, a hang-up, client error, torque off unconfirmed; in the trial, at the settle read or
+    around the score prompt) is a failure with ``fault: {kind, stop_reason, reason, where}``,
+    never judged by the operator, and a later 'resume' does not change it. A score prompt that
+    ends without a judgement (Ctrl-C, EOF, timeout) is a failure with ``unjudged: {how, reason}``.
+
+    Durable start: the moment the policy starts, a ``trial_started`` row (the record as it would
+    stand if the process died there: a failure, fault kind ``session_lost``) goes to ``log_row``;
+    a resume (scripts/wo07_real_eval.load_prior) turns one without its ``trial`` row into that
+    failure, so a started slot is never re-rolled. An exception that ends the session between
+    the start and the record (a crash, a Ctrl-C without the flag handler) appends that record
+    before it propagates.
 
     The session ends on: q (``operator_quit``), a torque-on prompt timeout (``prompt_timeout``:
     torque released), a servo / serial fault (``torque_off: ...``), a failed torque-off, a
-    Ctrl-C during motion (``operator_abort``), Ctrl-C at the score prompt (``operator_ctrl_c``),
-    a declined resume after a HOLD stop. EOF at the score prompt raises EOFError after the trial
-    is recorded; Ctrl-C / EOF at the other prompts propagate. The operator supports the arm after
-    a fault in the shutdown (``safe_shutdown``) that follows every session end."""
+    Ctrl-C during motion (``operator_abort``), a hang-up (``hangup: ...``), Ctrl-C at the score
+    prompt (``operator_ctrl_c``), a declined resume after a HOLD stop. EOF at the score prompt
+    raises EOFError after the trial is recorded; Ctrl-C / EOF at the other prompts propagate. The
+    operator supports the arm after a fault in the shutdown (``safe_shutdown``) that follows
+    every session end."""
     if task not in protocol.TASKS or cell not in protocol.CELLS:
         raise ValueError(f"unknown task/cell {task}/{cell}")
     arm = loop.arm
@@ -1056,70 +1158,131 @@ def run_trials(
         end = _ready(operator, arm, f"{tag} clear the workspace; ENTER moves the arm HOME")
         if end is not None:
             return trials, end
+        loop.clear_ctrl_c()  # a press while nothing moved: the operator answered since
         start = utc_now()
-        result: TrialResult | None = None
-        try:
-            home: dict[str, Any] = loop.go_home()
-        except ServoFault as e:  # torque already off
-            home = {"reached": False, "error": str(e)}
-            result = TrialResult(stop_reason="servo_fault", stop_detail=str(e))
-        except (DeadmanTripped, SerialFault) as e:
-            home = {"reached": False, "error": str(e)}
-        except KeyboardInterrupt:  # arm in motion: hold, never park (port released by trip)
-            arm.trip("operator Ctrl-C during the move home")
-            home = {"reached": False, "error": "operator Ctrl-C"}
-            result = TrialResult(stop_reason="operator_abort", stop_detail="Ctrl-C during home")
-        except Exception as e:  # a client bug while the arm moves: hold (deadman), then raise
-            log.exception("move home failed")
-            arm.trip(f"client error during the move home: {type(e).__name__}: {e}")
-            raise
-        if result is None and home["reached"]:
-            end = _ready(operator, arm, f"{tag} {place_msg}; ENTER starts")
-            if end is not None:
-                return trials, end
+        slot: dict[str, Any] = {"pending": None, "recorded": False}
+        home: dict[str, Any] = {"reached": False}
+
+        def record(
+            result: TrialResult,
+            home: Mapping[str, Any] | None,
+            scored: Scored,
+            settle: Mapping[str, Any] | None = None,
+            *,
+            kind: str = "trial",
+            k: int = k,
+            instruction: str = instruction,
+            start: str = start,
+            placement: Mapping[str, Any] | None = placement,
+            slot: dict[str, Any] = slot,
+        ) -> dict[str, Any]:
+            outcome, source, fault, unjudged = scored
+            rec = trial_record(
+                result,
+                task=task,
+                cell=cell,
+                trial_idx=k,
+                instruction=instruction,
+                info=info,
+                start_utc=start,
+                end_utc=utc_now(),
+                outcome=outcome,
+                outcome_source=source,
+                home=home,
+                camera_calibrated=camera_calibrated,
+                servo_health=None if arm.monitor is None else arm.monitor.summary(),
+                fault=fault,
+                unjudged=unjudged,
+            )
+            if placement is not None:
+                rec["placement"] = dict(placement)
+            if settle is not None:
+                rec["settle"] = dict(settle)
+            if record_extra:
+                rec.update(record_extra)
+            stamp_torque_off_unconfirmed(rec, arm)  # last: nothing after it overwrites the flag
+            if kind == "trial":
+                trials.append(rec)
+                slot["recorded"] = True
             if log_row is not None:
-                loop.on_decision = lambda t, k=k: log_row(kind="decision", trial_idx=k, **t)
-            if on_trial_start is not None:
-                on_trial_start(k)
-            result = loop.run_trial(instruction, max_steps)
-        elif result is None:
-            result = TrialResult(stop_reason="home_failed", stop_detail=str(home))
-            if not arm.deadman.tripped:
-                arm.hold()
-        settle: dict[str, Any] | None = None
-        if settle_s is not None:
-            settle = {"settle_s": float(settle_s), "measured_s": None}
-        outcome, source, fault, unjudged = _score(loop, operator, result, settle)
-        rec = trial_record(
-            result,
-            task=task,
-            cell=cell,
-            trial_idx=k,
-            instruction=instruction,
-            info=info,
-            start_utc=start,
-            end_utc=utc_now(),
-            outcome=outcome,
-            outcome_source=source,
-            home=home,
-            camera_calibrated=camera_calibrated,
-            servo_health=None if arm.monitor is None else arm.monitor.summary(),
-            fault=fault,
-            unjudged=unjudged,
-        )
-        if placement is not None:
-            rec["placement"] = placement
-        if settle is not None:
-            rec["settle"] = settle
-        if record_extra:
-            rec.update(record_extra)
-        stamp_torque_off_unconfirmed(rec, arm)  # last: nothing after it overwrites the flag
-        trials.append(rec)
-        if log_row is not None:
-            log_row(kind="trial", **rec)
+                log_row(kind=kind, **rec)
+            return rec
+
+        def on_policy_start(
+            res: TrialResult,
+            home: dict[str, Any] = home,
+            slot: dict[str, Any] = slot,
+            record: RecordFn = record,
+        ) -> None:
+            slot["pending"] = record(
+                res, home, ("failure", "fault", dict(SESSION_LOST), None), kind="trial_started"
+            )
+
+        loop.on_policy_start = on_policy_start
+        try:
+            result: TrialResult | None = None
+            try:
+                home.update(loop.go_home())
+            except ServoFault as e:  # torque already off
+                home.update(reached=False, error=str(e))
+                result = TrialResult(stop_reason="servo_fault", stop_detail=str(e))
+            except (DeadmanTripped, SerialFault) as e:
+                home.update(reached=False, error=str(e))
+            except SessionStop as e:  # Ctrl-C / hang-up flag between ticks: hold, never park
+                why = f"{e.reason} during the move home"
+                ignoring_ctrl_c(functools.partial(arm.trip, why), arm, _say)
+                home.update(reached=False, error=e.reason)
+                result = TrialResult(stop_reason=e.kind, stop_detail=f"{e.reason} during home")
+            except KeyboardInterrupt:  # arm in motion: hold, never park (port released by trip)
+                arm.trip("operator Ctrl-C during the move home")
+                home.update(reached=False, error="operator Ctrl-C")
+                result = TrialResult(stop_reason="operator_abort", stop_detail="Ctrl-C during home")
+            except Exception as e:  # a client bug while the arm moves: hold (deadman), then raise
+                log.exception("move home failed")
+                arm.trip(f"client error during the move home: {type(e).__name__}: {e}")
+                raise
+            if result is None and home["reached"]:
+                end = _placement(operator, arm, f"{tag} {place_msg}; ENTER starts", home, record)
+                if end is not None:
+                    return trials, end
+                loop.clear_ctrl_c()
+                if log_row is not None:
+                    loop.on_decision = lambda t, k=k: log_row(
+                        kind="decision", cell=cell, trial_idx=k, **t
+                    )
+                if on_trial_start is not None:
+                    on_trial_start(k)
+                result = loop.run_trial(instruction, max_steps)
+            elif result is None:
+                result = TrialResult(stop_reason="home_failed", stop_detail=str(home))
+                if not arm.deadman.tripped:
+                    arm.hold()
+            settle: dict[str, Any] | None = None
+            if settle_s is not None:
+                settle = {"settle_s": float(settle_s), "measured_s": None}
+            scored = _score(loop, operator, result, settle)
+            rec = record(result, home, scored, settle)
+        except BaseException as e:
+            pending = slot["pending"]
+            if pending is not None and not slot["recorded"]:  # started, never recorded
+                pending["fault"] = {
+                    **SESSION_LOST,
+                    "reason": f"{type(e).__name__} after the policy started, before the trial "
+                    f"was recorded: {e}",
+                }
+                stamp_torque_off_unconfirmed(pending, arm)
+                trials.append(pending)
+                if log_row is not None:
+                    log_row(kind="trial", **pending)
+            raise
+        finally:
+            loop.on_policy_start = None
+        unjudged = scored[3]
         log.info("%s %s: %s (%d steps)", tag, rec["outcome"], rec["stop_reason"], result.steps)
         if unjudged is not None:
-            if unjudged["how"] == EOF:  # not an operator choice: the session ends as an error
+            if unjudged["how"] == HANGUP:  # not an operator choice: the session ends as an error
+                raise Hangup(unjudged["reason"])
+            if unjudged["how"] == EOF:
                 raise EOFError(unjudged["reason"])
             if unjudged["how"] == CTRL_C:
                 return trials, "operator_ctrl_c"
@@ -1129,6 +1292,8 @@ def run_trials(
             return trials, _torque_off_end(arm)
         if result.stop_reason == "operator_abort":
             return trials, "operator_abort"
+        if result.stop_reason == "hangup":
+            return trials, f"hangup: {result.stop_detail}"
         if arm.deadman.tripped:
             if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
                 return trials, _torque_off_end(arm)
@@ -1143,6 +1308,51 @@ def run_trials(
             arm.deadman.reset(ack)
             arm.safety.reset_reference()
     return trials, "completed"
+
+
+SESSION_LOST = {
+    "kind": "session_lost",
+    "stop_reason": "session_lost",
+    "reason": "the process ended after the policy started, before the trial was recorded",
+    "where": "trial",
+}
+"""The fault of a started trial whose record was never written (``trial_started`` marker)."""
+
+RecordFn = Callable[..., dict[str, Any]]
+
+
+def _placement(
+    operator: Operator, arm: So101Driver, msg: str, home: Mapping[str, Any], record: RecordFn
+) -> str | None:
+    """The placement prompt ("ENTER starts"), arm at home under torque. None = start the policy.
+    Any other end (q, a timeout, a servo / serial fault from the health reads, Ctrl-C, a closed
+    stdin, a hang-up) appends a ``not_started`` attempt first (``stop_reason`` says which, the
+    fault if any), then returns the session end or re-raises."""
+
+    def attempt(stop: str, detail: str, fault_kind: bool = False) -> None:
+        res = TrialResult(stop_reason=stop, stop_detail=f"placement prompt: {detail}")
+        fault = trial_fault(res, "placement_prompt") if fault_kind else None
+        record(res, home, ("not_started", "not_scored", fault, None))
+
+    try:
+        end = _ready(operator, arm, msg)
+    except KeyboardInterrupt:
+        attempt("operator_ctrl_c", "operator Ctrl-C")
+        raise
+    except EOFError as e:
+        attempt("hangup" if isinstance(e, Hangup) else "stdin_closed", str(e) or "EOF")
+        raise
+    if end is None:
+        return None
+    if end == "operator_quit":
+        attempt("operator_quit", end)
+    elif end.startswith("prompt_timeout"):
+        attempt("prompt_timeout", end, fault_kind=True)
+    elif end.startswith(TORQUE_OFF_UNCONFIRMED):
+        attempt(TORQUE_OFF_UNCONFIRMED, end, fault_kind=True)
+    else:  # torque_off: a servo / serial fault from the health reads around the wait
+        attempt("servo_fault" if arm.servo_fault is not None else "serial_fault", end, True)
+    return end
 
 
 def stamp_torque_off_unconfirmed(rec: dict[str, Any], arm: So101Driver) -> dict[str, Any]:
@@ -1199,9 +1409,11 @@ class Shutdown:
     ``end``: parked | supported | released_unconfirmed | torque_was_off | torque_off_unconfirmed.
     ``support_confirmed`` is True only after an explicit ENTER at a prompt that asked the operator
     to support the arm or check it rests safely (``supported``; ``torque_was_off`` acknowledged);
-    None after a completed park (the arm rests at the verified park pose; nobody was asked). ``released_unconfirmed``: torque went off after a torque-on prompt
-    timed out or stdin closed, with ``cause`` timeout | eof; nobody confirmed support. ``ack``:
-    the acknowledgement wait at the end, {prompt, given, how}."""
+    None after a completed park (the arm rests at the verified park pose; nobody was asked).
+    ``released_unconfirmed``: torque went off after a torque-on prompt timed out, stdin closed or
+    the terminal hung up, with ``cause`` timeout | eof | hangup; nobody confirmed support.
+    ``ack``: the acknowledgement wait at the end, {prompt, given, how}. A shutdown that raised
+    is recorded by the scripts as ``shutdown: "error: ..."`` with support_confirmed false."""
 
     end: str
     support_confirmed: bool | None  # None: parked, nobody was asked
@@ -1226,9 +1438,9 @@ def _torque_off_unconfirmed(arm: So101Driver, operator: Operator) -> Shutdown:
     arm.torque_off()  # retry: the latch stays set whatever it returns
     msg = TORQUE_OFF_UNCONFIRMED_MSG.format(detail=arm.torque_off_unconfirmed)
     log.critical(msg)
-    print(f"\n{msg}", flush=True)
+    _say(f"\n{msg}")
     if arm.servo_fault is not None:
-        print(SERVO_FAULT_PROMPT.format(reason=arm.servo_fault), flush=True)
+        _say(SERVO_FAULT_PROMPT.format(reason=arm.servo_fault))
     how = operator.acknowledge(POWER_OFF_PROMPT)
     return Shutdown(
         TORQUE_OFF_UNCONFIRMED,
@@ -1251,7 +1463,7 @@ def _support_after_fault(arm: So101Driver, operator: Operator, reason: str) -> d
         )
         prompt = REST_PROMPT
     log.critical(msg)
-    print(f"\n{msg}", flush=True)
+    _say(f"\n{msg}")
     return ack_record(prompt, operator.acknowledge(prompt))
 
 
@@ -1260,7 +1472,7 @@ def _torque_already_off(arm: So101Driver, reason: str, operator: Operator) -> Sh
     torque_off_unconfirmed if the retry (or an earlier write) failed."""
     if arm.torque_off_unconfirmed is not None or not arm.torque_off():  # retry, harmless
         return _torque_off_unconfirmed(arm, operator)
-    print(f"torque is already OFF ({reason}): the arm is limp; check it is resting safely")
+    _say(f"torque is already OFF ({reason}): the arm is limp; check it is resting safely")
     ack = _support_after_fault(arm, operator, reason)
     return Shutdown("torque_was_off", support_confirmed=bool(ack["given"]), ack=ack)
 
@@ -1276,7 +1488,7 @@ def _released(arm: So101Driver, operator: Operator, released: dict[str, Any]) ->
         "confirmed; check the arm rests safely"
     )
     log.critical(msg)
-    print(msg, flush=True)
+    _say(msg)
     return Shutdown("released_unconfirmed", support_confirmed=False, cause=cause, released=released)
 
 
@@ -1287,6 +1499,7 @@ def safe_shutdown(
     healthy: bool = False,
     park: ParkSettings | None = None,
     frame_time_fn: Callable[[], float | None] | None = None,
+    stop_fn: Callable[[], bool] | None = None,
 ) -> Shutdown:
     """End of a real-arm session (``Shutdown``).
 
@@ -1302,8 +1515,10 @@ def safe_shutdown(
     * Otherwise: hold the measured pose so the arm stays up, read servo health, and ask the
       operator to support it (``operator.support``). Only ENTER confirms (``supported``, then
       torque off). Ctrl-C there is ignored (the arm keeps holding; the bounded wait keeps
-      running); a closed stdin or the timeout releases torque after the grace period:
-      ``released_unconfirmed`` with the cause.
+      running), also when it lands in the hold or the servo read; a closed stdin, a hang-up or
+      the timeout releases torque after the grace period: ``released_unconfirmed`` with the
+      cause.
+    ``stop_fn`` (the Ctrl-C / hang-up flag) stops the park, like Ctrl-C.
     Any torque-off that fails on the way returns ``torque_off_unconfirmed``. Leaving the driver's
     ``with`` block disables torque again.
     """
@@ -1315,21 +1530,21 @@ def safe_shutdown(
     if arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF:
         return _torque_already_off(arm, arm.deadman.reason, operator)
     if healthy and park is not None and frame_time_fn is not None and not arm.deadman.tripped:
-        print("session ended normally: parking the arm (it moves), then torque off", flush=True)
-        if arm.park(park, frame_time_fn):
-            print("arm PARKED; torque OFF", flush=True)
+        _say("session ended normally: parking the arm (it moves), then torque off")
+        if arm.park(park, frame_time_fn, stop_fn=stop_fn):
+            _say("arm PARKED; torque OFF")
             return Shutdown("parked", support_confirmed=None)
         if arm.torque_off_unconfirmed is not None:
             return _torque_off_unconfirmed(arm, operator)
         if arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF:
             return _torque_already_off(arm, arm.deadman.reason, operator)
-        print("park did not complete: the arm holds; support it", flush=True)
+        _say("park did not complete: the arm holds; support it")
     try:
-        arm.hold()
+        ignoring_ctrl_c(arm.hold, arm, _say)  # a panicked Ctrl-C must not skip the hold
         how = operator.support(SUPPORT_PROMPT)  # servo health read before the wait
     except (ServoFault, SerialFault):  # torque is now off (or not confirmed off)
         return _torque_already_off(arm, arm.deadman.reason, operator)
-    if how != ENTER:  # eof / timeout: torque was released after the grace period
+    if how != ENTER:  # eof / hangup / timeout: torque was released after the grace period
         if arm.torque_off_unconfirmed is not None or not arm.torque_off():
             return _torque_off_unconfirmed(arm, operator)
         return Shutdown(
@@ -1339,7 +1554,7 @@ def safe_shutdown(
             ack=ack_record(SUPPORT_PROMPT, how),
             released=operator.released(),
         )
-    if not arm.torque_off():
+    if not ignoring_ctrl_c(arm.torque_off, arm, _say):
         return _torque_off_unconfirmed(arm, operator)
     return Shutdown("supported", support_confirmed=True, ack=ack_record(SUPPORT_PROMPT, how))
 
@@ -1348,13 +1563,33 @@ def shutdown_session(loop: DeployLoop, operator: Operator, end: str) -> Shutdown
     """``safe_shutdown`` for a session that ended with ``end``: park only on a healthy end
     (``HEALTHY_ENDS``, deadman clear), never on a fault or an abort during motion."""
     healthy = end in HEALTHY_ENDS and not loop.arm.deadman.tripped
+    loop.clear_ctrl_c()  # a press before the shutdown must not stop the park at once
     return safe_shutdown(
         loop.arm,
         operator,
         healthy=healthy,
         park=loop.dcfg.park,
         frame_time_fn=loop.frame_time,
+        stop_fn=lambda: loop.stop_requested() is not None,
     )
+
+
+def shutdown_or_record(
+    results: dict[str, Any], loop: DeployLoop, operator: Operator, end: str
+) -> Shutdown:
+    """``shutdown_session``; if it raises, the run record still says so (``shutdown: error``,
+    support not confirmed, the session end) before the exception propagates."""
+    try:
+        return shutdown_session(loop, operator, end)
+    except BaseException as e:
+        results.update(
+            session_end=final_session_end(loop.arm, end),
+            shutdown=f"error: {type(e).__name__}: {e}",
+            shutdown_detail=None,
+            support_confirmed=False,
+            torque_off_unconfirmed=loop.arm.torque_off_unconfirmed,
+        )
+        raise
 
 
 def shutdown_results(sd: Shutdown) -> dict[str, Any]:

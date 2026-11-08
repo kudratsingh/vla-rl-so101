@@ -23,7 +23,12 @@ def _real_yaml_placeholders(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     fakes = sys.modules.get("robot_fakes")
     if fakes is not None:  # robot_fakes.real_cfg() calls its module-level load_config
         monkeypatch.setattr(fakes, "load_config", load_config_placeholders)
+    prompts = sys.modules.get("src.robot.prompts")
+    if prompts is not None:  # process-wide signal flags: never leak between tests
+        prompts.INTERRUPTS.reset()
     yield
+    if prompts is not None:
+        prompts.INTERRUPTS.reset()
 
 
 @functools.cache

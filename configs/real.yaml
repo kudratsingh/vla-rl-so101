@@ -73,8 +73,10 @@ teleop:
   prompt_torque_timeout_s: 60        # s, max wait at a prompt with torque ON (servo health read
                                      # before and after it); then "support the arm", grace, torque
                                      # OFF, session ends. null = wait forever (teleop only; not
-                                     # recommended)
-  prompt_support_grace_s: 10         # s between "SUPPORT THE ARM NOW" and torque off (ENTER = now)
+                                     # recommended; the grace below still applies to a closed
+                                     # stdin / hung-up terminal)
+  prompt_support_grace_s: 10         # s between "SUPPORT THE ARM NOW" and torque off (ENTER = now;
+                                     # also after a closed stdin or a closed Terminal, SIGHUP)
   dataset_root: data/real_teleop     # local root; git-ignored
   hub_repo: KudratSingh22/vla-rl-so101-real-teleop
   instructions:                      # per-episode language task (keep in sync with the sim templates)
@@ -130,7 +132,8 @@ deploy:
                                      # support; servo health read before and after it); then
                                      # "support the arm", grace, torque OFF, session ends (no
                                      # park). The real arm refuses null or <= 0 (owner 2026-11-08)
-  prompt_support_grace_s: 10         # s between "SUPPORT THE ARM NOW" and torque off (ENTER = now)
+  prompt_support_grace_s: 10         # s between "SUPPORT THE ARM NOW" and torque off (ENTER = now;
+                                     # also after a closed stdin or a closed Terminal, SIGHUP)
   pilot:                             # scripts/wo07_pilot.py
     task: PickPlace
     cell: seen

@@ -59,7 +59,6 @@ import argparse
 import json
 import logging
 import shutil
-import signal
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -101,11 +100,12 @@ from src.robot.driver import (
 from src.robot.prompts import (
     CTRL_C,
     ENTER,
-    EOF,
+    STDIN_GONE,
     TIMEOUT,
     LineReader,
     TorqueGuard,
     TorqueWait,
+    operator_signals,
     prompt_input,
     timed_input,
 )
@@ -288,16 +288,16 @@ def ctrl_c_as_flag(sess: Session) -> Iterator[None]:
     A KeyboardInterrupt raised mid-tick can land inside scservo_sdk's pure-Python packet loop,
     which leaves the port marked busy (every later bus call fails, the hold too: the arm drops),
     or inside ``add_frame``, which leaves the episode buffer ragged (``save_episode`` raises).
+    SIGHUP / SIGTERM (the Terminal closed) also set ``sess.stop``, and every later prompt ends
+    as ``hangup``: the closed-stdin path (grace period, torque off, ``released_unconfirmed``)
+    instead of the process dying with the arm held under torque (``operator_signals``).
     """
 
-    def on_sigint(signum: int, frame: Any) -> None:
+    def on_signal() -> None:
         sess.stop = True
 
-    prev = signal.signal(signal.SIGINT, on_sigint)
-    try:
+    with operator_signals(on_signal):
         yield
-    finally:
-        signal.signal(signal.SIGINT, prev)
 
 
 def _torque_off_unconfirmed(arm: So101Driver) -> bool:
@@ -318,7 +318,7 @@ def torque_on_ask(sess: Session, msg: str) -> str:
     except ServoFault:
         print("SUPPORT THE ARM NOW: torque is OFF (servo fault).")
         raise
-    if reply.how in (CTRL_C, EOF):
+    if reply.how == CTRL_C or reply.how in STDIN_GONE:
         print()
         return QUIT
     if reply.how == TIMEOUT:
@@ -344,9 +344,11 @@ def end_session(arm: So101Driver, sess: Session | None = None) -> str:
     support the arm before torque goes off, when the driver's ``with`` block closes normally.
     The servos are read once after the hold, before the wait. Only ENTER confirms the support
     (``supported``): Ctrl-C at this prompt is ignored, a panicked second press must not drop the
-    arm, and the bounded wait keeps running. A closed stdin (loud message, the grace period
-    without stdin) or the bounded wait plus its grace running out turns torque off without a
-    confirmation: ``released_unconfirmed``, never "supported". A failed torque-off (driver latch)
+    arm, and the bounded wait keeps running. A closed stdin or a hung-up terminal (loud message,
+    the grace period without stdin; the grace applies with ``prompt_torque_timeout_s: null``
+    too) or the bounded wait plus its grace running out turns torque off without a
+    confirmation: ``released_unconfirmed`` (the cause in the provenance file's
+    ``support_release``), never "supported". A failed torque-off (driver latch)
     tells the operator to cut power at the inline switch.
     """
     end = _end_session(arm, sess)
@@ -373,7 +375,7 @@ def _end_session(arm: So101Driver, sess: Session | None) -> str:
         if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
             return "torque_was_off"  # a servo / serial fault during the park
         print("park did not complete: the follower holds")
-    guard = sess.guard if sess is not None else TorqueGuard(arm, None, read=timed_input)
+    guard = sess.guard if sess is not None else TorqueGuard(arm, TorqueWait(None), read=timed_input)
     try:
         arm.hold()
         how = guard.support(SUPPORT_PROMPT)  # servo health read before the wait
@@ -625,6 +627,7 @@ def main() -> None:
             provenance.update(
                 session_end=end,
                 support_confirmed=None if end in (None, "parked") else end == "supported",
+                support_release=None if sess is None else sess.guard.released,
                 torque_off_unconfirmed=arm.torque_off_unconfirmed,
             )
             (root / "meta" / "vla_rl_so101.json").write_text(
