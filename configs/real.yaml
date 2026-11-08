@@ -62,7 +62,8 @@ server:
   # an SSH tunnel: ssh -N -L 50051:127.0.0.1:50051 root@<pod-ip> -p <pod-ssh-port>
   host: 127.0.0.1
   port: 50051
-  policy_checkpoint: null             # HF id of SFT or SFT+RL LoRA
+  policy_checkpoint: null             # HF id of SFT or SFT+RL LoRA; when set, the server's
+                                      # policy_id (its --adapter string) must equal it exactly
 
 # WO-07 client (src/robot/client.py). Stop semantics are documented at the top of that file.
 deploy:
@@ -72,7 +73,9 @@ deploy:
   request_timeout_ms: 400            # ms, policy server deadline -> deadman (hold)
   max_chunk_age_ms: 800              # ms, source-frame capture -> write; older actions are dropped
                                      # and the policy re-queried (first action too old -> hold)
-  trial_max_steps: 150               # writes per trial = sim max_episode_steps (10 s at 15 Hz)
+  trial_max_steps: 150               # writes per trial = sim max_episode_steps. Wall time ~10 s
+                                     # at 15 Hz when a query beats the 66.7 ms period, else
+                                     # + 19 boundaries x (query - period); see write_hz per trial
   home_qpos: [0.0, -1.30, 0.60, 1.30, 0.0, 0.0]  # rad, sim REST_QPOS (src/env/robot.py)
   home_tol_deg: 3.0                  # deg, every joint; residual logged per trial
   home_timeout_s: 20

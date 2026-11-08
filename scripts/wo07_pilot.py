@@ -15,7 +15,9 @@
     uv run scripts/wo07_pilot.py --preset real --hardware --i-am-present  # owner at the arm
 
 Writes runs/<id>/record.json (every trial record + the summary with Wilson intervals) and
-runs/<id>/metrics.jsonl (one row per decision and per trial).
+runs/<id>/metrics.jsonl (one row per decision and per trial). This is the Mac process (device
+cpu, $0); the paid GPU side is the policy server's own run record (src/robot/serve.py), whose
+run id is stored here under results.server_info.server_run.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +77,8 @@ HARDWARE_BANNER = """
 def mock_waypoints(home: Sequence[float]) -> list[np.ndarray]:
     """A PickPlace-shaped joint path from home: hover, descend, close, lift, carry, open.
     Every TCP is inside workspace_box_m with the sim FK. "close" commands the sim's -0.17 rad,
-    which the real gripper floor (-5 deg) clips, so every pilot logs joint_limit interventions."""
+    which the real gripper floor (-5 deg) clips, so every full-length trial (the walk restarts
+    per trial) logs gripper joint_limit interventions."""
     h = np.asarray(home, dtype=np.float64)
     hover = np.array([0.3, -0.8, h[2], h[3], h[4], 0.6])
     descend = np.array([0.3, -0.55, h[2], h[3], h[4], 0.6])
@@ -99,6 +102,7 @@ def session(
     max_steps: int | None,
     camera_calibrated: bool,
     runs_dir: Path,
+    on_trial_start: Callable[[int], None] | None = None,
 ) -> Path:
     trials: list[dict[str, Any]] = []
     end = "error"
@@ -125,6 +129,7 @@ def session(
                 log_row=run.log_metrics,
                 max_steps=max_steps,
                 trials=trials,
+                on_trial_start=on_trial_start,
             )
         except KeyboardInterrupt:
             end = "operator_ctrl_c"
@@ -150,6 +155,7 @@ def print_summary(run_id: str, summary: dict[str, Any], end: str) -> None:
         f"  capture->first write ms: median {lat['median']}  p95 {lat['p95']}  (n {lat['n']}, "
         f"target < {summary['latency_target_ms']:.0f})"
     )
+    print(f"  realised write Hz per trial: median {summary['write_hz']['median']}")
     print(f"  protocol {summary['protocol_version']} {summary['protocol_hash'][:12]}")
 
 
@@ -212,6 +218,7 @@ def run_mock(
                 max_steps=args.max_steps,
                 camera_calibrated=pipe.calibrated,
                 runs_dir=args.runs_dir,
+                on_trial_start=lambda _k: policy.reset(),  # the waypoint walk restarts per trial
             )
     finally:
         policy.release.set()
@@ -245,7 +252,9 @@ def run_hardware(cfg: Config, args: argparse.Namespace) -> Path:
     ) as client:
         info = client.info()  # before the arm is connected: a wrong server never moves it
         check_server(info, dcfg)
-        print(f"policy server OK: {info['policy_id']}")
+        print(f"policy server OK: {info['policy_id']} (server run {info.get('server_run')})")
+        if dcfg.policy_checkpoint is None:
+            print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
         operator = ConsoleOperator()
         with OpenCVFrameSource(cam_cfg) as cam, So101Driver.from_config(cfg, fk) as arm:
             loop = DeployLoop(arm, cam, pipe, client, dcfg)
