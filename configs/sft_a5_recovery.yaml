@@ -5,7 +5,9 @@
 #   the result; the matched control (sft_a5_control.yaml) gets the same start, steps and lr, so
 #   "recovery states" vs "more expert frames" is the only difference between the two arms.
 # - same recipe as attempt 4 otherwise: lr 5e-4 constant after 100 warmup steps, batch 8, the
-#   adapter's own norm bounds; 2000 steps (~2.2 passes over ~7.4k frames), a checkpoint every 500.
+#   adapter's own norm bounds; 2000 steps, a checkpoint every 500. Fixed in steps, not passes:
+#   16k sampled frames = ~1.6 passes over ~9.9k frames when the 1650-frame cap binds (expected),
+#   up to ~3.2 over the 4964 demo frames alone if few corrections are kept.
 # - mixing: the 25 demos/task + corrections capped at 60 episodes and 1650 frames per task (about
 #   the 25 demos' 1655 frames/task), frames sampled uniformly -> corrections <= ~50% of each task.
 # Checkpoint selection: scripts/wo02_eval.py --cells seen --seeds 7 (NOT protocol seeds 0-2).

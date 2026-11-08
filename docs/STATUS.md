@@ -15,7 +15,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 06 | part 1 merged, kit arrived, physical bring-up pending | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
 | 04 | **benchmark not met; next step waits for the owner**, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
 | 05, 07, 08, 09 | not started | | |
-| Recovery SFT (owner request 4) | plan + local code, CPU tiny smoke passes; **no paid run approved** | `wo-recovery-sft` (draft PR) | `docs/plans/recovery-sft.md`: recovery + matched-control SFT ~$6.7 (4090), conditional GRPO diagnostic ~$8-29 (A100), conditional 3 seeds ~$85-161. Few-shot accounting of corrections is an owner decision. |
+| Recovery SFT (owner request 4) | plan + local code, CPU tiny smoke passes; **no paid run approved** | `wo-recovery-sft` (draft PR) | `docs/plans/recovery-sft.md`: recovery + matched-control SFT ~$7.1 (4090), conditional GRPO diagnostic as matched lr probes ~$3-5 then a separately approved continuation ~$9-30 (A100), conditional 3 seeds ~$89-169. Few-shot accounting of corrections is an owner decision. |
 
 ## Benchmarks met
 
@@ -161,7 +161,7 @@ probe gate.
 - 2026-10-27 WO-04 kill switch compares the trained-task mean (`eval/success_train`); Stack is
   evaluated and reported but cannot trip or pass it (owner confirmed on PR #11).
 - 2026-10-27 WO-04 K=16 keeps 128 trajectories per update (8 prompts), not 256 (owner confirmed).
-- 2026-11-07 Recovery SFT plan (docs/plans/recovery-sft.md), fixed before any data: warm start from `step_004000` for both arms (2000 steps, lr 5e-4); corrections capped at 60 episodes / 1650 frames per task; checkpoint selection on protocol seed 7 (never 0-2: the WO-02 sweep used protocol seed-0 seen episodes 0-49); new seed ranges recovery 3.0e9+ and control 3.1e9+, guarded by `src/eval/seed_ranges.py`.
+- 2026-11-07 Recovery SFT plan (docs/plans/recovery-sft.md), fixed before any data: warm start from `step_004000` for both arms (2000 steps, lr 5e-4); corrections capped at 60 episodes / 1650 frames per task; checkpoint selection on protocol seed 7 (never 0-2: the WO-02 sweep used protocol seed-0 seen episodes 0-49); new seed ranges recovery 3.0e9+ and control 3.1e9+, guarded by `src/eval/seed_ranges.py`. Gate precedence (fixed before data): "recovery improves" needs >= +3.0 points pooled seen over protocol seeds 0-2 with p < 0.05 AND recovery minus baseline > 0 on seeds 1-2 alone; anything else fails, and the owner approves spend, not the reading of the gate.
 - 2026-11-07 `datasets` 4.x + torchcodec 0.2.1: a dataset write after any dataset read in one process failed (AudioDecoder import); `src/data/recorder.py` turns off datasets' unused torchcodec features.
 
 ## WO-04 (PR #11, owner-approved 2026-10-27; seed runs from `wo-04-seeds`)

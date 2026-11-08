@@ -53,34 +53,41 @@ the protocol eval does (whole 8-action chunks, horizon 150, GPU sim). It uses 19
 per task (3 batches of 64). `run_batch_traced` (src/eval/sim_eval.py) is the protocol's episode
 loop plus a read-only trace. It records qpos, the privileged `obs["extra"]`, every `info` flag
 and the executed action at each step, and an env snapshot plus the last command at every chunk
-boundary. A test checks that its outcomes match `run_batch` exactly. At ~10-17% baseline success,
-about 160 failures per task are expected for PickPlace and Push, and more for Stack.
+boundary. A test checks that its outcomes match `run_batch` exactly. ManiSkill's reset runs no
+physics step, so its contact query returns the previous episode's last step. The trace therefore
+records `is_grasped = False` at step 0 (a fresh episode is never grasped; a test grasps, resets
+and checks it). At ~10-17% baseline success, about 160 failures per task are expected for
+PickPlace and Push, and more for Stack.
 
 `src/data/recovery.py classify` names each failure and the step of its decisive event:
 
 | Task | Mode | Rule (first that applies) | Event |
 |---|---|---|---|
-| PickPlace, Stack | dropped | grasped at some point, last grasp ends away from the goal | last grasped step |
+| PickPlace, Stack | held | still grasped at the final step, timed out without a release | final step |
+| | dropped | grasped at some point, last grasp ends away from the goal | last grasped step |
 | | misplaced | last grasp ends within 9 cm of the bowl / 4 cm of the base | release step |
 | | knocked | object moved > 2 cm without ever being grasped | first > 1 cm move |
-| | stalled | timed out, arm still (< 0.01 rad) over the last 16 steps | stall onset |
+| | stalled | timed out, arm still (< 0.01 rad) over the last 16 steps (checked before held, and after knocked when nothing was grasped) | stall onset |
 | | never_grasped | none of the above | closest TCP approach |
 | Push | lifted | the `ever_lifted` latch fired (success now impossible) | first lifted step |
 | | no_contact | object moved < 1 cm | closest TCP approach |
 | | missed | moved, not into the target | closest object-goal approach |
 
 The per-task counts of each mode are the failure taxonomy. They are logged in the run record
-(`failure_modes`, `unrecoverable`) and reported before any training.
+(`failure_modes`, `unrecoverable`, `reset_branch`) and reported before any training.
 
 ## 4. Branch states and oracle corrections
 
 `choose_branch` picks the chunk boundary one boundary (8 steps) before the event (`branch_back:
-1`), never earlier than the reset state, and moves earlier while the state is unrecoverable. A
-state is unrecoverable when the object is out of reach (> 0.31 m), the bowl is tipped, the Stack
-base is off the table or tipped, or the Push latch has already fired. Failures with no
-recoverable boundary are counted and dropped. `interleave` takes at most 24 branches per (task,
-mode), the first in seed order, and orders them round-robin across modes. Any prefix of the
-recorded corrections therefore keeps the mode mix, and that matters once the load-time cap binds.
+1`) and moves earlier while the state is unrecoverable. It never picks the reset state itself:
+an oracle run from reset is a fresh demo, i.e. the control arm's data, not a correction. A state
+is unrecoverable when the object is out of reach (> 0.31 m), the bowl is tipped, the Stack base
+is off the table or tipped, or the Push latch has already fired. Failures with no recoverable
+boundary (`unrecoverable`) and failures recoverable only from reset (`reset_branch`, e.g. an
+event in the first two chunks) are counted per mode and dropped. `interleave` takes at most 24
+branches per (task, mode), the first in seed order, and orders them round-robin across modes. Any
+prefix of the recorded corrections therefore keeps the mode mix, and that matters once the
+load-time cap binds.
 
 Each branch is restored (`src/env/state.py restore`): reset with the source episode's seed, which
 rebuilds the task bookkeeping, then `set_state_dict`, then restore the Push latch, then a fresh
@@ -123,8 +130,11 @@ run fails instead of clipping the labels.
 ## 6. Training: warm start, step budget (fixed now)
 
 Both arms **warm-start from `step_004000`**, with the same lr 5e-4 (constant after 100 warmup
-steps, fresh AdamW), batch 8, seed 0, the adapter's own norm bounds and **2,000 steps** (about 2.2
-passes over about 7.4k frames). A checkpoint is saved every 500 steps (`configs/sft_a5_recovery.yaml`).
+steps, fresh AdamW), batch 8, seed 0, the adapter's own norm bounds and **2,000 steps** (16,000
+sampled frames: about 1.6 passes over about 9.9k frames when the 1,650-frame cap binds, the
+expected case; up to about 3.2 passes over the 4,964 demo frames if few corrections are kept).
+The budget is fixed in steps, not passes, so both arms and the cost stay unchanged whatever the
+yield. A checkpoint is saved every 500 steps (`configs/sft_a5_recovery.yaml`).
 Why warm start, not from scratch:
 
 1. The corrections label this policy's own failure states. Fine-tuning it on them is the DAgger
@@ -173,8 +183,11 @@ Primary metric: pooled seen success over the 3 tasks (900 episodes per checkpoin
 one-sided two-proportion test as already used in results.md.
 
 - **Recovery improves**: recovery minus baseline (re-evaluated in step 9) is >= +3.0 points
-  pooled seen with p < 0.05. The same comparison is also reported on protocol seeds 1-2, which
-  excludes the leaked seed-0 episodes. If those disagree, the owner decides.
+  pooled seen over seeds 0-2 with p < 0.05 (primary; the seed-0 leak inflates the baseline, so
+  this readout is conservative), **and** on protocol seeds 1-2 alone (600 episodes, the part the
+  WO-02 selection never saw) recovery minus baseline is > 0 (no p requirement: 600 episodes is
+  underpowered). Anything else fails the gate. Both readouts go into results.md. This precedence
+  is fixed now; the owner approves spend, not the reading of the gate.
 - **Due to recovery states**: recovery minus control is >= +3.0 points with p < 0.05. Otherwise
   the gain is labelled "more expert data". It still counts as an improvement for the next gate,
   but the label goes into results.md.
@@ -190,33 +203,60 @@ per mode are reported. None of them gates.
 
 ## 11. Conditional: higher-LR GRPO diagnostic (allowance $60)
 
-Rollout settings match WO-04's PickPlace-only run (`configs/rl_pickplace.yaml`): K = 16, 8 prompts
-per update (128 trajectories), 32 envs, temperature 1.0, horizon 120, recompute old log-probs,
-ppo_mini_batch 64, refill cap 3, PickPlace trained, Push and Stack eval-only, 64-episode
-kill-switch evals and 32-episode periodic evals on rl_eval seeds. Only these change:
+Two stages, each its own owner go.
 
-- base = the recovery pick; RL seed 3 (passes `check_rl_seed`);
-- **lr 5e-4** (10x WO-04's 5e-5; it is the on-hold proposal in STATUS.md);
-- **75 steps**, checkpoints every 25.
+**Stage A: matched short probes (about $3-5).** From the recovery pick, `--probe-steps 3` on
+`configs/rl_pickplace_lr5e-5.yaml` (the WO-04 lr, reference) and `configs/rl_pickplace_lr.yaml`
+(lr 5e-4, the on-hold proposal in STATUS.md), plus `configs/rl_pickplace_lr1e-3.yaml` if rule 1
+fires. The three configs differ only in lr: same base, RL seed 3 (passes `check_rl_seed`), so the
+same prompts, and the same rollout settings. The probes compare `train/clip_frac`,
+`train/approx_kl`, the group drop rate and `rollout/success_rate`.
+
+**Stage B: continuation (about $9-30).** Proposed on the probe numbers: 75 steps at the lr rule 1
+picks, then the readout below.
+
+Every setting, as `scripts/wo03_rl.py --preset rl --estimate` validates it:
+
+- inherited unchanged from `configs/rl_pickplace.yaml` (WO-04's PickPlace-only run): K = 16, 8
+  prompts per update (128 trajectories), 32 envs, temperature 1.0, horizon 120, recompute old
+  log-probs, ppo_epochs 1, ppo_mini_batch 64 (two optimizer steps per update), refill cap 3,
+  PickPlace trained, Push and Stack eval-only, 64-episode kill-switch evals and 32-episode periodic
+  evals every 25 steps on rl_eval seeds, `early_stop_rule: any_task`, min improvement 0.03;
+- changed: base = the recovery pick (`--adapter`); `seed: 3`; `lr` 5e-5 / 5e-4 / 1e-3; `steps:
+  75`, `checkpoint_every: 25`;
+- `early_stop_check_at_frac: 0.26`, so the kill switch is at ceil(0.26 x 75) = ceil(19.5) = step
+  20 (the inherited 0.25 would give step 19; 0.2667 gives 21 in float arithmetic);
+- `peak_stop_step: 0` (off): the inherited ref 50 / stop 100 fails `GRPOConfig.validate` at 75
+  steps, and a peak stop at the last step stops nothing.
 
 The owner's diagnostic rules apply:
 
-1. Probe (3 steps). If the first-minibatch **clip fraction is 0.000**, use **lr 1e-3** for the run
-   (and re-probe once).
-2. **Kill switch at step 20**, any task: stop unless at least one trained task gains >= 3 points
-   over step 0 on the 64 kill-switch episodes (`early_stop_rule: any_task`).
-3. If the clip fraction moves but **sampled success is flat by step 20**, stop.
+1. **Rule 1 (stage A).** Escalate to lr 1e-3 (one more probe) if the lr 5e-4 probe's
+   `train/clip_frac`, averaged over its 3 steps, is **0.000**. That metric is the mean over the
+   update's two minibatches. The first minibatch runs before any optimizer step (ratio exactly 1
+   under recompute), so it contributes 0 by construction and the logged value is half the second
+   minibatch's. A reading of 0.000 therefore means the post-update minibatch was unclipped too.
+2. **Rule 2 (stage B). Kill switch at step 20**: stop unless at least one trained task gains >= 3
+   points over step 0 on the 64 kill-switch episodes (the trainer's kill switch, as configured).
+3. **Rule 3 (stage B).** If the clip fraction moves but **sampled success is flat by step 20**,
+   stop. Flat means `rollout/success_rate` averaged over steps 16-20 minus its average over steps
+   1-5 is < 0.03. The trainer does not implement this check (src/rl is outside this plan's code).
+   The stage B pod job reads it from `metrics.jsonl` at step 20 and stops the run. That job
+   script, with a tiny dry run of the check, must exist before stage B is proposed.
 
 The readout is the final checkpoint's protocol table on a 4090. PickPlace seen (300 episodes)
-versus its own base, from the same protocol run in section 9. The base changes together with
-the lr, so the diagnostic measures "GRPO gain from this base at this lr", not lr alone.
+versus its own base, from the same protocol run in section 9. Stage A isolates lr from the same
+base. Stage B measures "GRPO gain from this base at this lr" over 75 steps.
 
 ## 12. Conditional: three confirmatory seeds (allowance $210)
 
 These run only if the diagnostic's PickPlace seen is **>= +10 points over its base** (the owner's
 +10 bar of 2026-10-28) with p < 0.05 and it passed its step-20 checks. Seeds 0, 1 and 2 use the
 diagnostic's exact settings and step budget, run sequentially. Seeds 1-2 start only after seed 0
-passes its step-20 kill switch, as in WO-04. Each seed gets a full protocol eval. Between +3 and
+passes its step-20 kill switch, as in WO-04. At 75 steps that is the stage B config with only
+`seed` changed. At 150 steps the kill switch needs `early_stop_check_at_frac: 0.133`
+(ceil(19.95) = step 20; the inherited 0.25 would put it at step 38), and the inherited peak stop
+(ref 50, stop 100) applies. Each seed gets a full protocol eval. Between +3 and
 +10 points, the result is reported and the owner decides. Nothing runs automatically.
 
 ## 13. Cost, from measured numbers
@@ -225,43 +265,48 @@ Rates: RTX 4090 $0.89/h, A100 80 GB $1.79/h (STATUS.md, 2026-11-07). Measured in
 
 - a full protocol eval of one checkpoint (2,700 episodes) costs $0.93-0.94 on a 4090, about 1.05 h, or about 0.39 h per 1,000 episodes (results.md);
 - 4090 SFT runs at 1.547-1.575 s/step (attempt 2/3 probes);
-- pod setup plus probe takes 0.58 h (the two gate-expired pods);
-- WO-04 PickPlace-only took 30.5 h for probe + 150 steps + eval, so about 0.19 h per step on an A100 including its evals (pod `s2ljj3drwg0ov0`);
+- pod setup + probe + one 30-min approval-gate timeout takes 0.58 h (the two gate-expired pods, about 0.08 h active; `APPROVAL_WAIT_S=1800`, scripts/pod/wo02_job.sh);
+- WO-04 PickPlace-only took 30.5 h for probe + 150 steps + eval, so (30.5 - 0.85) / 150 = about 0.20 h per step on an A100 including its evals (pod `s2ljj3drwg0ov0`);
 - the WO-04 probes took 0.80-0.86 h.
 
 Recovery SFT + matched evaluations (one RTX 4090 pod, with gates after the probe and after collection):
 
 | Step | Basis | h |
 |---|---|---|
-| Setup + probe: restore round trip on GPU, 1 rollout batch, 20 SFT steps | 0.58 h measured | 0.6 |
+| Setup + probe: restore round trip on GPU, 1 rollout batch, 20 SFT steps; first gate wait | 0.58 h measured (incl. a 30-min gate timeout) | 0.6 |
 | SFT rollouts, 3 x 192 recovery seeds | 576 eps x 0.39 h / 1,000 | 0.23 |
 | Oracle branches (<= 3 x ~120) + control demos (3 x 60) + AV1 recording | estimate; the probe measures it | 0.5 |
+| Second approval gate (after collection), up to its timeout | 30-min `APPROVAL_WAIT_S`; less if the owner answers sooner | 0.5 |
 | Recovery SFT, 2,000 steps | 2,000 x 1.565 s | 0.87 |
 | Control SFT, 2,000 steps | 2,000 x 1.565 s | 0.87 |
 | Selection sweep, 8 checkpoints x 300 seen episodes (seed 7) | 2,400 x 0.39 h / 1,000 | 0.94 |
 | Full protocol x 3 (baseline, recovery, control) | 3 x 1.05 h | 3.15 |
 | Uploads and slack | estimate | 0.3 |
-| **Total** | | **~7.5 h = ~$6.7** (pod cap $12 with 75% contingency) |
+| **Total** | | **~8.0 h = ~$7.1** (pod cap $12, ~70% contingency) |
 
-estimated: RTX-4090 x 7.5 h = $6.7, within the **$30** allowance.
+estimated: RTX-4090 x 8.0 h = $7.1, within the **$30** allowance.
 
 GRPO diagnostic (A100 run + 4090 protocol eval):
 
-| Exit | A100 h | $ |
-|---|---|---|
-| Probe only (clip / drop-rate gate), each probe | 0.85 | 1.5 |
-| Kill switch at step 20 | 0.85 + 20 x 0.19 = 4.65 | 8.3 |
-| Full 75 steps + 4090 protocol eval ($0.93 + setup) | 0.85 + 75 x 0.19 = 15.1 | 27.0 + 1.2 = 28.2 |
-| Worst case: second probe at lr 1e-3 + full run | | ~30 |
+| Stage | Exit | A100 h | $ |
+|---|---|---|---|
+| A (own go) | each probe (separate setup, worst case) | 0.85 | 1.5 |
+| A | lr 5e-5 + 5e-4 probes; + lr 1e-3 if rule 1 fires | 1.7; 2.55 | 3.0; 4.6 |
+| B (own go) | kill switch at step 20 | 0.85 + 20 x 0.20 = 4.85 | 8.7 |
+| B | full 75 steps + 4090 protocol eval ($0.93 + setup) | 0.85 + 75 x 0.20 = 15.85 | 28.4 + 1.2 = 29.6 |
+| A + B | worst case: three probes + full run | 18.4 | ~34 |
 
-estimated: A100-80GB x 15.1 h + RTX-4090 x 1.4 h = ~$29, within the **$60** allowance (pod cap
-$40).
+estimated: stage A A100-80GB x 2.55 h = $4.6; stage B A100-80GB x 15.85 h + RTX-4090 x 1.4 h =
+$29.6. Together ~$34 worst case, within the **$60** allowance (pod cap $40).
+`scripts/wo03_rl.py --estimate` gives 16.6 h / $29.7 for the 75-step run (worst-case refill), in
+line with the measured rate.
 
-Confirmatory seeds: 3 x $28.2 = **~$85** at 75 steps, within **$210**. If the owner wants 150 steps
-per seed: 0.85 + 150 x 0.19 = 29.4 h = $52.6 + $1.2 = ~$54 per seed, **~$161** for three, still
-within $210. A seed stopped at step 20 costs about $8.3.
+Confirmatory seeds: 3 x $29.6 = **~$89** at 75 steps, within **$210**. If the owner wants 150 steps
+per seed: 0.85 + 150 x 0.20 = 30.85 h = $55.2 + $1.2 = ~$56 per seed, **~$169** for three, still
+within $210. A seed stopped at step 20 costs about $8.7.
 
-All stages together: worst case about $6.7 + $30 + $161 = **~$198** of the $300 total allowance.
+All stages together, worst case from the caps: $12 + $40 + $169 = **~$221** of the $300 total
+allowance.
 Most likely, the plan stops at one of the gates well before that.
 
 ## 14. Owner decisions needed
@@ -277,10 +322,12 @@ Most likely, the plan stops at one of the gates well before that.
    table would carry the label. The control arm exceeds 25 demos/task under any reading, so it
    stays diagnostic only.
 2. Go / no-go on the recovery pod (about $7, cap $12) after its probe numbers.
-3. After section 10: whether to run the diagnostic (about $8-29, cap $40).
+3. After section 10, two separate decisions: whether to run the stage A probes (about $3-5),
+   then, on the probe numbers, whether to run the stage B continuation (about $9-30). Both stages
+   share the $40 pod cap.
 4. After section 11: whether to run the confirmatory seeds, at 75 or 150 steps. Whether WO-04's
    2-of-3-task benchmark needs a two-task (PickPlace + Push) confirmatory run instead. It would
-   cost about the same, at 0.17 h/step measured.
+   cost about the same, at about 0.18 h/step (A100 ledger, pod `9d8p7vyfyv6ca4`: (28.4 - 0.85) / 150).
 
 ## 15. Run sequence (after approval)
 
@@ -309,11 +356,16 @@ The pod job script (probe stage, approval gate, upload, self-delete) follows the
   about 23 s on an M3 Pro. `--mode control`: 2 control demos, about 6 s.
 - `scripts/wo02_sft.py --preset tiny` on demos + corrections: 151 + 74 frames, per-dataset
   coverage 0.0 clipped, 4 steps.
+- `scripts/wo03_rl.py --preset rl --estimate` on the three section 11 configs: `GRPOConfig`
+  validates, RL seed 3 passes `check_rl_seed`, kill switch at step 20, evals at steps 0, 20, 25,
+  50, 75; 16.6 h / $29.7 for 75 steps. `scripts/wo03_rl.py --preset tiny` (toy env, CPU): the GRPO
+  loop runs end to end.
 - Tests:
   - restore of swapped rows, the Push latch and a re-rendered frame;
   - traced versus untraced outcomes, on a fake env and on the CPU sim;
   - in-hand oracle takeover;
-  - the taxonomy and branch rules;
+  - the taxonomy and branch rules (incl. held and the reset-state exclusion);
+  - no stale `is_grasped` at a traced reset after a held grasp;
   - the seed guard;
   - capped and frame-matched loading;
   - a script smoke run.
