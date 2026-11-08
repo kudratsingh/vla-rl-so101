@@ -474,6 +474,11 @@ def test_serve_main_names_its_adapter_and_keeps_a_run_record(
         return Server(), bound
 
     monkeypatch.setattr(serve, "load_oft", fake_oft)
+    monkeypatch.setattr(  # no Hub access in tests: adapter_identity is tested on a local dir
+        serve,
+        "served_adapter_identity",
+        lambda a: {"adapter_sha256": f"sha-of:{a}", "adapter_revision": None},
+    )
     monkeypatch.setattr(serve, "build_server", build)
     monkeypatch.setattr(serve.signal, "signal", lambda *a: None)
     rec_path = serve.main(["--preset", "rl", "--device", "cpu", "--runs-dir", str(tmp_path)])
@@ -484,6 +489,28 @@ def test_serve_main_names_its_adapter_and_keeps_a_run_record(
     assert rec["results"]["policy_id"] == adapter and rec["results"]["requests"] == 0
     assert seen["server_run"]["run_id"] == rec["run_id"]
     assert seen["server_run"]["device"] == "cpu"
+    assert seen["adapter_sha256"] == rec["results"]["adapter_sha256"] == f"sha-of:{adapter}"
+
+
+def test_adapter_identity_hashes_the_weights_not_the_name(tmp_path: Path) -> None:
+    from src.robot import serve
+
+    snap = tmp_path / "models--u--r" / "snapshots" / "abc123" / "ckpt"
+    snap.mkdir(parents=True)
+    (snap / "adapter_config.json").write_text('{"r": 8}')
+    (snap / "adapter_model.safetensors").write_bytes(b"weights-v1")
+    (snap / "optimizer.pt").write_bytes(b"not hashed")
+    a = serve.adapter_identity(snap)
+    assert a["adapter_revision"] == "abc123"
+    assert a["adapter_files"] == ["adapter_config.json", "adapter_model.safetensors"]
+    (snap / "optimizer.pt").write_bytes(b"changed")
+    assert serve.adapter_identity(snap)["adapter_sha256"] == a["adapter_sha256"]
+    (snap / "adapter_model.safetensors").write_bytes(b"weights-v2")  # re-pushed, same name
+    assert serve.adapter_identity(snap)["adapter_sha256"] != a["adapter_sha256"]
+    local = tmp_path / "local"
+    local.mkdir()
+    with pytest.raises(FileNotFoundError):
+        serve.adapter_identity(local)
 
 
 def test_healthy_end_parks_then_torque_off_a_motion_abort_does_not() -> None:

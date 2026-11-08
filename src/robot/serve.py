@@ -259,6 +259,19 @@ def adapter_identity(adapter_dir: Path) -> dict[str, Any]:
     return {"adapter_sha256": h.hexdigest(), "adapter_revision": rev, "adapter_files": found}
 
 
+def served_adapter_identity(adapter: str | None) -> dict[str, Any]:
+    """``adapter_identity`` of what ``load_oft`` loaded (a Hub spec resolves to the snapshot the
+    load just cached); a fixed marker for the tiny-random policy (no adapter)."""
+    if adapter is None:
+        return {"adapter_sha256": "tiny-random:no-adapter", "adapter_revision": None}
+    from src.policy.openvla_oft import resolve_adapter
+
+    adapter_dir = resolve_adapter(adapter)
+    if adapter_dir is None:
+        raise FileNotFoundError(f"adapter {adapter!r} did not resolve to a directory")
+    return adapter_identity(adapter_dir)
+
+
 def load_oft(cfg: Config, device: str, adapter: str | None) -> OFTServed:
     """GPU box only (not exercised by the CPU tests): base + LoRA adapter, as the sim eval runs it.
     ``make_policy`` does not switch to eval mode, so it is done here."""
@@ -414,14 +427,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
             k: dev.get(k) for k in ("device", "name", "runpod_pod_id")
         }
         policy = load_oft(cfg, args.device, adapter)
-        if adapter is None:
-            identity: dict[str, Any] = {"adapter_sha256": "tiny-random:no-adapter"}
-        else:
-            from src.policy.openvla_oft import resolve_adapter
-
-            adapter_dir = resolve_adapter(adapter)  # cached by the load above
-            assert adapter_dir is not None
-            identity = adapter_identity(adapter_dir)
+        identity = served_adapter_identity(adapter)
         run.results.update(policy_id=policy_id, adapter=adapter, host=args.host, **identity)
         image_size = int((cfg.get("env") or {}).get("image_size", 224))
         servicer = PolicyServer(
