@@ -10,7 +10,10 @@
         [--sweep-adam-steps 8] [--sweep-batch <run>/sweep_batch.pt]
     uv run scripts/wo03_rl.py --preset rl --adapter <sft> --probe-temperatures 0.7,1.0,1.3 \\
         [--probe-groups 64]
-    # add --estimate to either probe command for its projected hours / $ without running it
+    uv run scripts/wo03_rl.py --preset rl --adapter <sft> --probe-clip [--probe-groups 32]
+    # add --estimate to any probe command for its projected hours / $ without running it
+Every probe uses the preset's rl.rollout_action_clip_deg (configs/rl.yaml: 4.0, owner 2026-11-08)
+for its rollouts and prints it; --probe-clip compares that clip against none on paired rollouts.
 
 `rl.env: toy` selects the synthetic env (src/rl/toy_env.py); anything else uses src.env.make_env
 (GPU-parallel sim when `device` is cuda, serial CPU envs on cpu). The policy comes from the
@@ -195,6 +198,7 @@ def estimate_probes(
     stored_batch: bool,
     temperatures: list[float] | None,
     groups: int,
+    clip_groups: int | None = None,
 ) -> dict[str, float]:
     """Projected GPU time of the Track B probes from cost.throughput (not included: setup, and
     the 7B load + GPU env build of each separate invocation).
@@ -204,7 +208,9 @@ def estimate_probes(
     log-probs and diag reference), then per lr `adam_steps` mini-batch forward+backward passes
     and 2 no-grad forwards of the whole batch (post scores + greedy tokens).
     Temperature probe drivers: env stepping + rendering + sampling forwards of
-    ceil(groups / groups-per-env-batch) env batches per temperature (no update)."""
+    ceil(groups / groups-per-env-batch) env batches per temperature (no update).
+    Clip probe (`clip_groups`): the same per env batch, ceil(clip_groups / groups-per-env-batch)
+    env batches per arm, 2 arms (the clip itself is a per-step clamp of 6 joints: not costed)."""
     rl = GRPOConfig.from_config(cfg)
     sh = _shape(cfg)
     out: dict[str, float] = {}
@@ -241,6 +247,17 @@ def estimate_probes(
                 "temp_probe_s_per_t": per_t,
                 "temp_probe_h": total / 3600.0,
                 "temp_probe_dollars": total / 3600.0 * usd,
+            }
+        )
+    if clip_groups:
+        batches = math.ceil(clip_groups / gpb)
+        total = 2 * batches * batch_actions / sh["actions_per_s"]
+        out.update(
+            {
+                "clip_probe_env_batches_per_arm": float(batches),
+                "clip_probe_s": total,
+                "clip_probe_h": total / 3600.0,
+                "clip_probe_dollars": total / 3600.0 * usd,
             }
         )
     if out:
@@ -335,7 +352,8 @@ def print_probe(cfg: Config, probe: dict[str, Any], proj: dict[str, Any], gpu: s
         f"{probe['first_minibatch_mean_abs_log_ratio']:.5f} (max > 0.05 -> consider "
         "rl.recompute_old_log_probs: true), group-reset diff frac "
         f"{probe['group_reset_diff_frac']:.5f}, groups dropped {probe['frac_groups_dropped']:.0%} "
-        f"(refill cap hit on {probe['refill_cap_hit_frac']:.0%} of steps); {diag}"
+        f"(refill cap hit on {probe['refill_cap_hit_frac']:.0%} of steps); "
+        f"{_clip_text(rl.rollout_action_clip_deg, probe.get('action_clip_frac'))}; {diag}"
     )
     flat_stop = (
         "flat-gate stop" if rl.gate_stop else "flat-gate check (logged only, gate_stop false)"
@@ -355,12 +373,35 @@ def print_probe(cfg: Config, probe: dict[str, Any], proj: dict[str, Any], gpu: s
         print("[wo03_rl] PROBE WARNING sampler/update log-probs disagree", flush=True)
 
 
+def _clip_text(deg: float | None, frac: float | None = None, verb: str = "changed") -> str:
+    """The rollout action clip as the probe lines print it."""
+    if deg is None:
+        return "action clip off (rl.rollout_action_clip_deg null)"
+    txt = f"action clip {deg:g} deg/step"
+    return txt if frac is None else f"{txt} ({verb} {frac:.1%} of env steps)"
+
+
+def _clip_detail(row: dict[str, Any], prefix: str, verb: str) -> str:
+    return (
+        f"clip {verb} {row[f'{prefix}_frac']:.1%} of env steps / "
+        f"{row[f'{prefix}_joint_frac']:.1%} of joint-steps (mean |delta| "
+        f"{row[f'{prefix}_mean_abs_delta_deg']:.2f} deg, max {row[f'{prefix}_max_abs_delta_deg']:.1f})"
+    )
+
+
 def print_lr_sweep(out: dict[str, Any]) -> None:
     b = out["batch"]
+    clip = out.get("rollout_action_clip_deg")
+    clipped = (
+        f"; {_clip_detail(b, 'rollout/action_clip', 'changed')}"
+        if "rollout/action_clip_frac" in b
+        else ""
+    )
     print(
         f"[wo03_rl] LR-SWEEP batch: {b['trajectories']} trajectories ({b['groups']} groups, "
         f"{b['decisions']} decisions, tasks {b['tasks']}); {out['adam_steps']} Adam steps per lr; "
-        "on-batch movement after the update (all tokens of the batch):",
+        f"rollouts with {_clip_text(clip)}{clipped}; on-batch movement after the update (all "
+        "tokens of the batch):",
         flush=True,
     )
     for r in out["rows"]:
@@ -378,20 +419,60 @@ def print_lr_sweep(out: dict[str, Any]) -> None:
 def print_temperature_probe(out: dict[str, Any]) -> None:
     print(
         f"[wo03_rl] TEMP-PROBE {out['groups']} groups per temperature (same prompts each time), "
-        "rollouts only:",
+        f"rollouts only, {_clip_text(out.get('rollout_action_clip_deg'))}:",
         flush=True,
     )
     for r in out["rows"]:
+        clip = (
+            f", {_clip_detail(r, 'probe/action_clip', 'changed')}"
+            if "probe/action_clip_frac" in r
+            else ""
+        )
         print(
             f"[wo03_rl] TEMP-PROBE T {r['temperature']:.2f}: sampled success "
             f"{r['probe/success_rate']:.3f} (SE {r['probe/success_rate_se']:.3f}), groups dropped "
             f"{r['probe/frac_groups_dropped']:.3f} (all-0 {r['probe/frac_groups_all_zero']:.3f}, "
             f"all-1 {r['probe/frac_groups_all_one']:.3f}), entropy {r['probe/entropy']:.3f} "
             f"nats/token, {r['probe/env_batches_per_update']:.1f} env batches per update"
-            f"{' (refill cap binds)' if r['probe/refill_cap_binds'] else ''}, "
+            f"{' (refill cap binds)' if r['probe/refill_cap_binds'] else ''}{clip}, "
             f"{r['probe/s_per_env_batch']:.1f} s per env batch",
             flush=True,
         )
+
+
+def print_clip_probe(out: dict[str, Any]) -> None:
+    """4 lines prefixed `[wo03_rl] CLIP-PROBE` (scripts/pod/diag_job.sh shows the last 4)."""
+    print(
+        f"[wo03_rl] CLIP-PROBE {out['groups']} groups x K={out['samples_per_prompt']} per arm, "
+        f"T {out['temperature']:.2f}, clip {out['rollout_action_clip_deg']:g} deg/step vs off; "
+        "same prompts and the same sampling seeds per env batch in both arms; rollouts only:",
+        flush=True,
+    )
+    for r in out["rows"]:
+        verb = "changed" if r["clip_applied"] else "WOULD have changed"
+        print(
+            f"[wo03_rl] CLIP-PROBE arm {r['arm']}: sampled success {r['probe/success_rate']:.3f} "
+            f"(SE {r['probe/success_rate_se']:.3f}), groups dropped "
+            f"{r['probe/frac_groups_dropped']:.3f} (all-0 {r['probe/frac_groups_all_zero']:.3f}, "
+            f"all-1 {r['probe/frac_groups_all_one']:.3f}), entropy {r['probe/entropy']:.3f}, mean "
+            f"episode {r['probe/mean_episode_len']:.1f} steps, "
+            f"{_clip_detail(r, 'probe/action_clip', verb)}, "
+            f"{r['probe/s_per_env_batch']:.1f} s per env batch",
+            flush=True,
+        )
+    p = out["paired"]
+    print(
+        f"[wo03_rl] CLIP-PROBE paired: success on - off {p['success_diff_on_minus_off']:+.3f} (SE "
+        f"{p['success_diff_se']:.3f} over {p['groups']:.0f} groups); episodes both "
+        f"{p['episodes_both_success']:.0f} / off only {p['episodes_off_only']:.0f} / on only "
+        f"{p['episodes_on_only']:.0f} / neither {p['episodes_neither']:.0f} (exact McNemar p "
+        f"{p['episodes_mcnemar_exact_p']:.3f}, episodes in a group are not independent); groups "
+        f"dropped both {p['groups_dropped_both']:.0f} / off only "
+        f"{p['groups_dropped_off_only']:.0f} / on only {p['groups_dropped_on_only']:.0f} / kept "
+        f"both {p['groups_kept_both']:.0f}; first-decision tokens identical "
+        f"{p['first_decision_token_match']:.3f} (pairing check)",
+        flush=True,
+    )
 
 
 # --- wiring --------------------------------------------------------------------------------
@@ -471,14 +552,26 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         metavar="T1,T2,...",
         help="rollouts only: group-drop rate and sampled success per temperature",
     )
+    mode.add_argument(
+        "--probe-clip",
+        action="store_true",
+        help="rollouts only, paired: the preset's rl.rollout_action_clip_deg vs no clip on the "
+        "same prompts and sampling seeds; success, group-drop rate, clip intervention per arm",
+    )
     parser.add_argument("--sweep-adam-steps", type=int, default=8)
     parser.add_argument(
         "--sweep-batch", type=Path, default=None, help="replay a stored sweep_batch.pt"
     )
     parser.add_argument(
-        "--probe-groups", type=int, default=64, help="groups (prompts) per probed temperature"
+        "--probe-groups",
+        type=int,
+        default=None,
+        help="groups (prompts) per probed temperature (default 64) or per clip-probe arm "
+        "(default 32)",
     )
     args = parser.parse_args(argv)
+    if args.probe_groups is None:
+        args.probe_groups = 32 if args.probe_clip else 64
     if args.probe_steps is not None and args.probe_steps < 1:
         parser.error("--probe-steps must be >= 1 (0 would start the full run)")
     if args.sweep_adam_steps < 1 or args.probe_groups < 1:
@@ -501,9 +594,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     bad_tasks = sorted(set(rl.train_tasks) - set(cfg["env"]["tasks"]))
     if bad_tasks:  # GRPOTrainer checks this too, but only after the 7B load
         parser.error(f"rl.train_tasks {bad_tasks} not in env.tasks {list(cfg['env']['tasks'])}")
+    if args.probe_clip and rl.rollout_action_clip_deg is None:
+        parser.error("--probe-clip needs rl.rollout_action_clip_deg set in the preset (it is null)")
     if args.estimate:
         gpu = cfg["cost"]["gpu"]
-        if args.lr_sweep or args.probe_temperatures:
+        if args.lr_sweep or args.probe_temperatures or args.probe_clip:
             est = estimate_probes(
                 cfg,
                 lrs=args.lr_sweep,
@@ -511,10 +606,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                 stored_batch=args.sweep_batch is not None,
                 temperatures=args.probe_temperatures,
                 groups=args.probe_groups,
+                clip_groups=args.probe_groups if args.probe_clip else None,
             )
             for key, value in est.items():
                 print(f"{key:>28}: {value:,.2f}")
-            hours = est.get("lr_sweep_h", 0.0) + est.get("temp_probe_h", 0.0)
+            print(f"{'rollout_action_clip_deg':>28}: {rl.rollout_action_clip_deg}")
+            hours = sum(est.get(f"{k}_h", 0.0) for k in ("lr_sweep", "temp_probe", "clip_probe"))
             print(
                 f"estimated: {gpu} x {hours:.2f} h = ${hours * float(cfg['cost']['usd_per_hour']):.2f}"
                 f" + setup {est['setup_h']:.1f} h per pod (config {config_hash(cfg)[:12]})"
@@ -558,6 +655,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         kind += "lrsweep"
     elif args.probe_temperatures:
         kind += "tempprobe"
+    elif args.probe_clip:
+        kind += "clipprobe"
     run_id = f"{stamp}-{kind}-{cfg['preset']}-s{seed}-{uuid.uuid4().hex[:6]}"
     run_dir = REPO_ROOT / "runs" / run_id
     record = _new_run_record(cfg, run_id, device)
@@ -615,6 +714,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             record["temperature_probe"] = temps
             print_temperature_probe(temps)
             return {**temps, "run_dir": str(run_dir)}
+        if args.probe_clip:
+            clip_out = trainer.probe_clip(args.probe_groups)
+            record["status"] = "probe"
+            record["clip_probe"] = clip_out
+            print_clip_probe(clip_out)
+            return {**clip_out, "run_dir": str(run_dir)}
         summary = trainer.run()
         reason = summary["stop_reason"]
         record["status"] = STATUS_BY_STOP[reason] if reason else "finished"
@@ -628,7 +733,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         raise
     finally:
         if trainer is not None and not (
-            args.probe_steps or args.lr_sweep or args.probe_temperatures
+            args.probe_steps or args.lr_sweep or args.probe_temperatures or args.probe_clip
         ):
             # when each spend gate would have stopped the run (also with rl.gate_stop false, and
             # for an interrupted run): first step per gate, the flat-gate decision at its check
