@@ -57,7 +57,7 @@ from src.robot.units import (
 )
 from src.robot.yamlio import update_yaml_file
 
-SHORT_NAMES = ("pan", "lift", "elbow", "wflex", "wroll", "grip")  # verify columns, JOINT_NAMES order
+SHORT_NAMES = ("pan", "lift", "elbow", "wflex", "wroll", "grip")  # verify columns
 
 FOLLOWER_STEPS = """
 WHAT YOU DO PHYSICALLY (follower):
