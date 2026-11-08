@@ -130,3 +130,33 @@ class SerialVecEnv(gym.Env):
     def elapsed_steps(self) -> torch.Tensor:
         bases: list[Any] = [env.unwrapped for env in self.envs]
         return torch.cat([b.elapsed_steps for b in bases])
+
+    # ------------------------------------------------------------------ state (src/env/state.py)
+    def get_state_dict(self) -> dict[str, Any]:
+        """ManiSkill state dict of every sub-env, rows stacked: same layout as a GPU env's."""
+        bases: list[Any] = [env.unwrapped for env in self.envs]
+        out: dict[str, Any] = _stack([b.get_state_dict() for b in bases])
+        return out
+
+    def set_state_dict(self, state: dict[str, Any], env_idx: list[int] | None = None) -> None:
+        """Write row i of `state` into sub-env i (all rows, or the sub-envs in `env_idx` with one
+        row each, in that order). Call `get_obs()` afterwards: cached observations are stale."""
+        idx = list(range(self.num_envs)) if env_idx is None else [int(i) for i in env_idx]
+        for row, i in enumerate(idx):
+            base: Any = self.envs[i].unwrapped
+            base.set_state_dict(_rows(state, row))
+
+    def get_obs(self) -> Any:
+        """Fresh batched observation of the current sim state (re-rendered), cached for resets."""
+        bases: list[Any] = [env.unwrapped for env in self.envs]
+        self._obs = _stack([b.get_obs() for b in bases])
+        return self._obs
+
+
+def _rows(tree: Any, row: int) -> Any:
+    """Row `row` of every tensor in a batched tree, keeping a batch dim of 1."""
+    if isinstance(tree, dict):
+        return {k: _rows(v, row) for k, v in tree.items()}
+    if isinstance(tree, torch.Tensor) and tree.ndim > 0:
+        return tree[row : row + 1]
+    return tree
