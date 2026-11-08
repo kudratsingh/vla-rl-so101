@@ -22,7 +22,9 @@
 #                                                        action-slot logits; NOT concurrent with the update
 #   ManiSkill GPU envs, 3 tasks x 32 @ 224^2     6       ~2 GiB per env instance (PhysX GPU buffers
 #                                                        + Vulkan renderer + targets); one per task
-#                                                        (WO-03 sized this at 128^2; sim.yaml renders 224)
+#                                                        (WO-03 sized this at 128^2; sim.yaml renders 224;
+#                                                        since 2026-11-08 only the trained tasks' envs
+#                                                        are built: 2 x 2 = 4 GiB)
 #   rollout buffer (obs, tokens, log-probs)      0       kept in host RAM: <= 12 env batches x 32
 #                                                        x 19 decisions x 150 KB image = ~1.1 GB CPU
 #   CUDA context + allocator slack               2.5

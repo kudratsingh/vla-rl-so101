@@ -9,8 +9,8 @@
 # The step-50 vs step-100 peak stop (owner 2026-10-28) compared two 32-episode greedy evals and
 # produced one wrong "peak" at step 50; it is replaced by rl.yaml's decline gate (windowed rollout
 # success > gate_max_drop below its best window) and every eval step keeps a checkpoint.
-#   estimated: A100-80GB x 41.3 h = $74 (worst case, refill cap every step; same arithmetic as
-#   rl.yaml with 1 trained task in the evals: --estimate prints it)
+#   estimated: A100-80GB x 41.2 h = $74 (worst case, refill cap every step; same arithmetic as
+#   rl.yaml with 1 trained task in the evals: --estimate prints it); flat-gate stop 10.4 h = $19
 inherit: configs/rl.yaml
 
 rl:
