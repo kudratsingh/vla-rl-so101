@@ -142,3 +142,62 @@ def test_synthetic_frames_feed_the_policy() -> None:
     assert torch.isfinite(loss) and 0.0 <= metrics["token_acc"] <= 1.0
     with pytest.raises(ValueError, match="delta_timestamps"):
         ChunkedDemoDataset(frames, chunk_len=4)[0]
+
+
+def _record(root: Path, repo: str, episodes: list[tuple[int, str, bool]]) -> None:
+    """A real WO-01-recorder dataset: (frames, sidecar kind, oracle_success) per episode."""
+    from src.data.recorder import DemoRecorder
+
+    rec = DemoRecorder(repo, root / repo.split("/")[-1], image_hw=(32, 32))
+    for ep, (n, kind, ok) in enumerate(episodes):
+        for t in range(n):
+            img = torch.full((32, 32, 3), 20 * t, dtype=torch.uint8).numpy()
+            act = torch.full((6,), 0.01 * t + 0.1 * ep)
+            rec.add_frame(img, torch.zeros(6), act, TASKS["PickPlace"])
+        rec.save_episode(
+            {"task_family": "PickPlace", "seed": ep, "cell": "seen", "oracle_success": ok}
+            | ({} if kind == "demo" else {"kind": kind})
+        )
+    rec.finalize()
+
+
+def test_extra_datasets_capped_and_frame_matched(tmp_path: Path) -> None:
+    """Demos + capped corrections (recovery arm), and demos + frame-matched control demos."""
+    from src.data.oft_dataset import ConcatFrames, select_budget
+
+    _record(tmp_path, "local/d", [(5, "demo", True), (6, "demo", True)])
+    corr = [(4, "correction", True), (2, "correction", False), (3, "correction", True)]
+    _record(tmp_path, "local/c", [*corr, (5, "correction", True)])
+    _record(tmp_path, "local/k", [(3, "control_demo", True)] * 4)
+    base = (
+        f"inherit: configs/sft_tiny.yaml\ndata:\n  dataset_root: {tmp_path}\n  hub_repo: local/d\n"
+    )
+    recovery = tmp_path / "recovery.yaml"
+    recovery.write_text(
+        base + "  extra_datasets:\n    - {hub_repo: local/c, kind: correction, "
+        "max_episodes_per_task: 5, max_frames_per_task: 8}\n"
+    )
+    control = tmp_path / "control.yaml"
+    control.write_text(
+        base + "  extra_datasets:\n    - {hub_repo: local/k, kind: control_demo, "
+        f"match_frames_of: {recovery}}}\n"
+    )
+
+    ds, info = load_sft_frames(load_config("tiny", recovery), chunk_len=4)
+    assert isinstance(ds.frames, ConcatFrames) and ds.frames.names == ["demo", "correction"]
+    extra = info["extra_datasets"][0]
+    # failed branch skipped; 4 + 3 = 7 frames, the next (5) would pass the 8-frame cap
+    assert extra["episodes_per_task"] == {"PickPlace": [0, 2]} and extra["num_frames"] == 7
+    assert info["demo_frames"] == 11 and len(ds) == 18 and info["episodes_per_task"]["PickPlace"]
+    assert all_actions(ds.frames).shape == (18, 6)
+    assert torch.allclose(ds[11]["actions"][:, 0], torch.tensor([0.0, 0.01, 0.02, 0.03]))
+
+    ds, info = load_sft_frames(load_config("tiny", control), chunk_len=4)
+    extra = info["extra_datasets"][0]
+    assert extra["kind"] == "control_demo" and extra["frames_per_task"] == {"PickPlace": 6}
+    assert len(ds) == 11 + 6
+
+    rows = [{"task_family": "PickPlace", "cell": "seen", "oracle_success": True,
+             "episode_index": i, "num_frames": 10} for i in range(3)]  # fmt: skip
+    assert select_budget(rows, "PickPlace", kind="demo", max_episodes=2) == ([0, 1], 20)
+    assert select_budget(rows, "PickPlace", kind="correction") == ([], 0)

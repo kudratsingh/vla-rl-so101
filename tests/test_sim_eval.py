@@ -178,3 +178,32 @@ def test_wo02_eval_tiny_end_to_end(wo01_standins: Path) -> None:
         ("PickPlace", "seen", 3)
     ]
     assert (wo01_standins / "eval.md").read_text().startswith("Policy `tiny-random`")
+
+
+@pytest.mark.parametrize("exec_steps", [None, 3])
+def test_traced_rollout_matches_run_batch(exec_steps: int | None) -> None:
+    from src.eval.sim_eval import run_batch_traced
+
+    seeds = [0, 1, 2, 3, 4, 5]
+    s, ln = run_batch(zero_act, FakeEnv("Push", 6), lambda o: o, seeds, 150, exec_steps)
+    calls: list[int] = []
+    st, lt, trace = run_batch_traced(
+        zero_act,
+        FakeEnv("Push", 6),
+        lambda o: o,
+        seeds,
+        150,
+        exec_steps,
+        snapshot_fn=lambda env: calls.append(env.steps) or env.steps,
+    )
+    assert torch.equal(s, st) and torch.equal(ln, lt)
+    stride = 8 if exec_steps is None else exec_steps
+    want = list(range(0, 10, stride))
+    assert [b.step for b in trace.boundaries] == want and [
+        b.state for b in trace.boundaries
+    ] == want
+    assert calls == want and trace.boundaries[0].active.all()
+    assert len(trace.steps) == 11 and "action" not in trace.steps[0]
+    assert "success" not in trace.steps[0]  # the fake's reset info is empty
+    assert torch.stack([x["success"] for x in trace.steps[1:]]).shape == (10, 6)
+    assert torch.equal(trace.boundaries[-1].last_action, trace.steps[want[-1]]["action"])

@@ -1,0 +1,6 @@
+# docs/plans/recovery-sft.md section 11, stage A: configs/rl_pickplace_lr.yaml at the WO-04 lr,
+# the matched reference probe (never continued). Same base, RL seed, prompts and rollouts.
+inherit: configs/rl_pickplace_lr.yaml
+
+rl:
+  lr: 5e-5

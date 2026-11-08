@@ -120,3 +120,27 @@ def test_wo02_sft_probe_saves_nothing(fake_runs: type[FakeRun]) -> None:
     assert not (run.dir / "checkpoints").exists()
     # hours are rounded to 3 decimals: a fast CPU makes tiny's 20-step extrapolation round to 0
     assert out["s_per_step_median"] > 0 and out["extrapolated"]["s_per_step"] > 0
+
+
+def test_recovery_configs_and_per_dataset_coverage() -> None:
+    import wo02_sft
+
+    from src.data.oft_dataset import ACTION_KEY, ConcatFrames
+    from src.policy.oft.actions import NormBounds
+
+    rec = load_config("sim", "configs/sft_a5_recovery.yaml")
+    ctl = load_config("sim", "configs/sft_a5_control.yaml")
+    a4 = load_config("sim", "configs/sft_a4.yaml")
+    # the two arms differ only in their extra dataset; both warm-start from the RL base
+    same = {k: v for k, v in rec.items() if k != "data"}
+    assert same == {k: v for k, v in ctl.items() if k != "data"}
+    assert rec["policy"]["adapter"] == load_config("rl")["policy"]["adapter"]
+    assert rec["sft"]["lr"] == a4["sft"]["lr"] and rec["sft"]["steps"] == 2000
+    assert rec["data"]["demos_per_task"] == ctl["data"]["demos_per_task"] == 25
+    assert ctl["data"]["extra_datasets"][0]["match_frames_of"] == "configs/sft_a5_recovery.yaml"
+    bounds = NormBounds(low=(-1.0,) * 6, high=(1.0,) * 6)
+    inside = [{ACTION_KEY: torch.zeros(8, 6)}] * 3
+    outside = [{ACTION_KEY: torch.full((8, 6), 2.0)}]
+    cov = wo02_sft.coverage_by_part(bounds, ConcatFrames([inside, outside], ["demo", "correction"]))
+    assert cov["demo"]["frac_outside"] == 0.0 and cov["correction"]["frac_outside"] == 1.0
+    assert set(wo02_sft.coverage_by_part(bounds, inside)) == {"demo"}

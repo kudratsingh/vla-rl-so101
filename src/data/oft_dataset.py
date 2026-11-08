@@ -13,6 +13,7 @@ imported lazily here.
 
 from __future__ import annotations
 
+import bisect
 import importlib
 from collections.abc import Sequence
 from pathlib import Path
@@ -85,8 +86,31 @@ def collate_sft(items: Sequence[dict[str, Any]]) -> SFTBatch:
     )
 
 
+class ConcatFrames:
+    """Several frame sources (the demos + extra datasets) behind one index, in order."""
+
+    def __init__(self, parts: Sequence[FrameSource], names: Sequence[str]) -> None:
+        if len(parts) != len(names) or not parts:
+            raise ValueError("need one name per part and at least one part")
+        self.parts, self.names = list(parts), list(names)
+        self.offsets = [0]
+        for p in self.parts:
+            self.offsets.append(self.offsets[-1] + len(p))
+
+    def __len__(self) -> int:
+        return self.offsets[-1]
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        if not 0 <= idx < len(self):
+            raise IndexError(idx)
+        part = bisect.bisect_right(self.offsets, idx) - 1
+        return self.parts[part][idx - self.offsets[part]]
+
+
 def all_actions(frames: FrameSource, action_key: str = ACTION_KEY) -> Tensor:
     """Every per-frame action (N, D) -- for the normalisation-bounds coverage check."""
+    if isinstance(frames, ConcatFrames):
+        return torch.cat([all_actions(p, action_key) for p in frames.parts])
     hf = getattr(frames, "hf_dataset", None)
     if hf is not None:
         return torch.stack([torch.as_tensor(a) for a in hf[action_key]]).float()
@@ -143,8 +167,82 @@ def _ensure_local(repo_id: str, root: Path) -> None:
     snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=str(root))
 
 
+def select_budget(
+    rows: Sequence[dict[str, Any]],
+    task: str,
+    *,
+    kind: str,
+    cell: str = "seen",
+    max_episodes: int | None = None,
+    max_frames: int | None = None,
+) -> tuple[list[int], int]:
+    """Episodes of `task` / `kind` (sidecar "kind", default "demo") in recording order: the
+    longest prefix with <= max_episodes episodes and <= max_frames frames. Only oracle-successful
+    episodes count. Returns (episode indices, frames)."""
+    out: list[int] = []
+    frames = 0
+    for r in rows:
+        if r["task_family"] != task or r["cell"] != cell or not r["oracle_success"]:
+            continue
+        if str(r.get("kind", "demo")) != kind:
+            continue
+        if max_episodes is not None and len(out) >= max_episodes:
+            break
+        n = int(r["num_frames"])
+        if max_frames is not None and frames + n > max_frames:
+            break
+        out.append(int(r["episode_index"]))
+        frames += n
+    return out, frames
+
+
+def _cap(a: int | None, b: int | None) -> int | None:
+    return b if a is None else a if b is None else min(a, b)
+
+
+def _extra_selection(
+    cfg: Config, rec: Any, spec: dict[str, Any], tasks: Sequence[str], cell: str
+) -> tuple[str, Path, dict[str, list[int]], dict[str, int]]:
+    """(repo_id, root, episodes per task, frames per task) of one `data.extra_datasets` entry.
+
+    `match_frames_of: <config>` caps each task's frames at what that config's extra dataset of
+    kind `match_kind` (default "correction") selects: the matched control."""
+    repo_id, root = rec.dataset_location(
+        {**cfg, "data": {**cfg["data"], "hub_repo": str(spec["hub_repo"])}}
+    )
+    root = Path(root)
+    _ensure_local(str(repo_id), root)
+    rows = rec.read_sidecar(root)
+    max_eps = spec.get("max_episodes_per_task")
+    max_frames = spec.get("max_frames_per_task")
+    target: dict[str, int] = {}
+    if spec.get("match_frames_of"):
+        from src.config import REPO_ROOT, load_config
+
+        other = load_config(str(cfg["preset"]), REPO_ROOT / str(spec["match_frames_of"]))
+        want = str(spec.get("match_kind", "correction"))
+        refs = [e for e in other["data"].get("extra_datasets") or [] if e.get("kind") == want]
+        if len(refs) != 1:
+            raise ValueError(f"{spec['match_frames_of']}: need exactly one {want!r} extra dataset")
+        _, _, _, target = _extra_selection(other, rec, refs[0], tasks, cell)
+    eps: dict[str, list[int]] = {}
+    frames: dict[str, int] = {}
+    for task in tasks:
+        eps[task], frames[task] = select_budget(
+            rows,
+            task,
+            kind=str(spec.get("kind", "correction")),
+            cell=cell,
+            max_episodes=None if max_eps is None else int(max_eps),
+            max_frames=_cap(None if max_frames is None else int(max_frames), target.get(task)),
+        )
+    return str(repo_id), root, eps, frames
+
+
 def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, dict[str, Any]]:
-    """The few-shot SFT set: the first `data.demos_per_task` successful `data.cell` demos per task."""
+    """The few-shot SFT set: the first `data.demos_per_task` successful `data.cell` demos per task,
+    plus any `data.extra_datasets` (recovery corrections, matched-control demos), each capped per
+    task. Frames are sampled uniformly, so each part's share of the mix is its frame share."""
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
     rec: Any = importlib.import_module("src.data.recorder")  # WO-01
@@ -153,17 +251,47 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
     _ensure_local(repo_id, Path(root))
     n = int(cfg["data"]["demos_per_task"])
     cell = str(cfg["data"].get("cell", "seen"))
+    tasks = list(cfg["env"]["tasks"])
     episodes: list[int] = []
     per_task: dict[str, list[int]] = {}
-    for task in cfg["env"]["tasks"]:
+    for task in tasks:
         eps = rec.select_episodes(root, task, n, cell=cell)
         if len(eps) < n:
             raise ValueError(f"{repo_id}: {len(eps)} {cell!r} demos for {task}, need {n}")
         per_task[task] = eps
         episodes.extend(eps)
-    fps = int(LeRobotDatasetMetadata(repo_id, root=root).fps)
-    delta = {rec.ACTION_KEY: [k / fps for k in range(chunk_len)]}
-    frames = rec.load_demo_dataset(repo_id, root, episodes=sorted(episodes), delta_timestamps=delta)
+    parts: list[tuple[str, str, Path, list[int]]] = [("demo", repo_id, Path(root), episodes)]
+    extra_info: list[dict[str, Any]] = []
+    for spec in cfg["data"].get("extra_datasets") or []:
+        kind = str(spec.get("kind", "correction"))
+        x_repo, x_root, x_eps, x_frames = _extra_selection(cfg, rec, spec, tasks, cell)
+        flat = [e for t in tasks for e in x_eps[t]]
+        if not flat:
+            raise ValueError(f"{x_repo}: no {kind!r} episodes selected")
+        parts.append((kind, x_repo, x_root, flat))
+        extra_info.append(
+            {
+                "kind": kind,
+                "repo_id": x_repo,
+                "episodes_per_task": x_eps,
+                "frames_per_task": x_frames,
+                "num_frames": sum(x_frames.values()),
+            }
+        )
+    sources: list[FrameSource] = []
+    fps_all: set[int] = set()
+    for _, p_repo, p_root, p_eps in parts:
+        fps = int(LeRobotDatasetMetadata(p_repo, root=p_root).fps)
+        fps_all.add(fps)
+        delta = {rec.ACTION_KEY: [k / fps for k in range(chunk_len)]}
+        sources.append(
+            rec.load_demo_dataset(p_repo, p_root, episodes=sorted(p_eps), delta_timestamps=delta)
+        )
+    if len(fps_all) != 1:
+        raise ValueError(f"datasets disagree on fps: {sorted(fps_all)}")
+    frames: FrameSource = (
+        sources[0] if len(sources) == 1 else ConcatFrames(sources, [p[0] for p in parts])
+    )
     ds = ChunkedDemoDataset(
         frames,
         chunk_len=chunk_len,
@@ -171,12 +299,15 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
         state_key=rec.STATE_KEY,
         action_key=rec.ACTION_KEY,
     )
-    info = {
+    info: dict[str, Any] = {
         "repo_id": repo_id,
         "root": str(root),
-        "fps": fps,
+        "fps": fps_all.pop(),
         "cell": cell,
         "episodes_per_task": per_task,
         "num_frames": len(ds),
     }
+    if extra_info:
+        info["demo_frames"] = len(sources[0])
+        info["extra_datasets"] = extra_info
     return ds, info

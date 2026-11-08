@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import REPO_ROOT, Config, add_config_args, config_hash, load_config
 from src.eval import protocol
+from src.eval.seed_ranges import check_rl_seed
 from src.rl.policy_api import build_policy
 from src.rl.rollout import ObsFn
 from src.rl.trainer import (
@@ -279,6 +280,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         cfg["policy"]["adapter"] = args.adapter
     device, seed = str(cfg["device"]), int(cfg["seed"])
     rl = GRPOConfig.from_config(cfg)  # validate before touching envs or weights
+    if cfg["rl"].get("env") != "toy":  # ManiSkill prompts must not reuse held-out episode seeds
+        check_rl_seed(seed)
     if args.estimate:
         est = estimate_cost(cfg)
         gpu = cfg["cost"]["gpu"]
