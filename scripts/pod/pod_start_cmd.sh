@@ -116,7 +116,8 @@ if ! command -v curl > /dev/null; then
 elif [ -z "${RUNPOD_POD_ID:-}" ] || [ -z "${RUNPOD_API_KEY:-}" ]; then
   st=KEY_MISSING
 else
-  code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 20 \
+  # timeout(1) so a curl that ignores --max-time cannot block sshd (and the job) for the whole cap
+  code=$(timeout -k 5 30 curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 20 \
     "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID" -H "Authorization: Bearer $RUNPOD_API_KEY")
   case "$code" in 2??) st=KEY_OK ;; 401) st=KEY_BAD ;; *) st=KEY_UNVERIFIED ;; esac
   st="$st http=$code"
