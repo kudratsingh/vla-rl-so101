@@ -63,3 +63,10 @@ def test_two_episodes_roundtrip_with_torchcodec(tmp_path: Path) -> None:
     }
     assert select_episodes(root, "Push", 1) == [1]
     assert not (root / "images").exists()
+
+    # writing again after torchcodec decoded a dataset in this process (render-gap codec floor)
+    rec2 = DemoRecorder("local/test-demos-2", tmp_path / "demos2", image_hw=(32, 32))
+    rec2.add_frame(np.zeros((32, 32, 3), np.uint8), np.zeros(6), np.zeros(6), "again")
+    rec2.save_episode({"task_family": "Push", "seed": 7, "cell": "seen", "oracle_success": True})
+    rec2.finalize()
+    assert load_demo_dataset("local/test-demos-2", tmp_path / "demos2").num_frames == 1
