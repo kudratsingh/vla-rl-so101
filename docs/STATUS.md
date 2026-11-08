@@ -143,11 +143,15 @@ What changed:
   `configs/demos_v2.yaml`): it rebuilds 25 demos per task on the GPU renderer into a new Hub repo
   (`KudratSingh22/vla-rl-so101-demos-25-v2`); it does not write to the 0.1 repos. It also has a
   render-gap mode that compares stored and fresh frames and greedy tokens against a codec floor.
+  Its headline is t = 0 (the first frame of each episode, before any replay physics); pooled
+  all-frame numbers are reported separately because replay physics drift contributes to them.
   Preliminary single run on the Mac CPU (run 20261108T083504Z-wo01r-sim-c025, dirty tree at
   2af16f6, first 3 of 25 episodes per task (223/163/209 frames), pixels and joints only, token
-  comparison skipped): the pixel gap is within 0.03 mean-abs (<= 1.4%) of the codec floor on all 3
-  tasks (e.g. PickPlace 2.070 vs 2.042) and joint drift is 0. The full 25-episode check with
-  tokens on the 4090 is still pending (see Next).
+  comparison skipped). **This is a same-renderer pipeline check:** the stored 0.1 frames and the
+  fresh frames were both rendered on the Mac CPU renderer. It is not a Mac-vs-GPU renderer gap
+  measurement. Its pooled all-frame pixel gap is within 0.03 mean-abs (<= 1.4%) of the codec floor
+  on all 3 tasks (e.g. PickPlace 2.070 vs 2.042), and joint drift is 0. The Mac-vs-GPU check (full
+  25 episodes, with tokens, on the 4090) is still pending (see Next).
 - Protocol 0.2 (`src/eval/protocol_v02.py`, new; `scripts/wo02_eval.py --protocol 0.2`). Its hash
   combines the file bytes of the protocol, the eval loop (`src/eval/sim_eval.py`: episode seeds,
   clip, success latch, episode end), env, success, camera and robot model with the canonical
@@ -167,7 +171,8 @@ diagnostics.
 caps: RTX 4090 render-gap pod `SPEND_CAP_SECONDS=5400` (1.5 h, $1.34 at $0.89/h) and A100-80GB
 diagnostics pod `SPEND_CAP_SECONDS=12240` (3.4 h, $6.09 at $1.79/h). Expected $4.00 as planned,
 $5.00 with a +25% estimate-error margin, $6.34 if both approval gates wait their full 30 min. With
-the owner's go for the whole pass up front (pre-approval file, no A100 gate wait), the A100 cap
+the owner's go for the whole pass up front (pre-approval file written before launch, no A100 gate
+wait), the A100 cap
 drops to `SPEND_CAP_SECONDS=10440` (2.9 h, $5.19) and the firm cap to $6.53. The margin: seed 0's
 RL stage took 26.8 h against its probe's 23.1 h projection (+16%, job log of pod
 `9d8p7vyfyv6ca4`); PickPlace-only 28.7 h vs 26.8 h (+7%). Each cap = planned x 1.25 + the full
@@ -213,8 +218,20 @@ Timings below are from the WO-02/WO-04 job logs on the Hub (`KudratSingh22/vla-r
    `--estimate` fell from 1.20 h to 1.15 h.
 3. Only after 1-2, and after the recovery-SFT base clears rule 3: a GRPO run with the measured lr and
    temperature written into `configs/rl.yaml`, starting with `--probe-steps 3`. The worst case is
-   estimated: A100-80GB x 41.3 h = $74 per 150-step seed, or 10.5 h = $18.72 if the flat gate stops
-   it at step 38.
+   estimated: A100-80GB x 41.3 h = $74 per 150-step seed. `rl.gate_stop` is false for this first
+   run (owner 2026-11-08), so the flat gate logs at step 38 and does not stop it. Budget the full
+   run. (A stop at step 38 would have been 10.5 h = $18.72.)
+
+**Approving a gate** (CLAUDE.md rule 1, all pod jobs, `scripts/pod/approval_lib.sh`): the gate
+passes only on `/workspace/APPROVED.<RUNPOD_POD_ID>` written after the pod's first boot
+(`/root/pod_start_epoch`). A file from an earlier pod on a reused volume, or the old unscoped
+`/workspace/APPROVED`, is ignored, and the job log lists it with the reason. On the owner's
+explicit go, the agent runs this over SSH on the pod, from the repo root:
+
+    bash -c '. /root/runpod.env; . scripts/pod/approval_lib.sh; approval_write "owner go <date>: <what>"'
+
+For a pre-approved pass, run the same command before the job reaches its gate (for example right
+after launch).
 
 **Pod deletion backstop** (2026-11-08, $0; checked against a hang-injection simulation, not on a
 pod). Every new pod uses `scripts/pod/pod_start_cmd.sh` as its start command: the whole file is
@@ -233,7 +250,8 @@ the one string after the `["/bin/bash","-c"]` entrypoint, with no inline command
   (`KEY_OK` / `KEY_BAD` / `KEY_UNVERIFIED` / `NO_CURL`, plus whether the timer is armed), then
   sshd.
 
-The jobs (`diag_job.sh`, `demo_rebuild_job.sh`, `wo04_job.sh`) source `scripts/pod/job_lib.sh`:
+The jobs (`diag_job.sh`, `demo_rebuild_job.sh`, `wo04_job.sh`) source `scripts/pod/job_lib.sh`
+(and `approval_lib.sh` for the approval gate, above):
 - The EXIT trap is installed before anything can fail.
 - Every stage runs under `timeout -k 120`, capped at the soft deadline (hard cap - 1200 s).
 - A watchdog sends TERM to the job 130 s after the soft deadline, which runs the trap.
@@ -276,12 +294,79 @@ hook timing on `physx_cuda`, the CUDA RNG restore (a GPU resume is not bit-ident
 success on `physx_cuda`, recorder tail stepping on the GPU env, render-gap replay and 7B token
 comparison, and the 0.2 clip and end-flag capture on CUDA.
 
-Deferred: the 4 deg/step clip inside RL rollouts (review Track B item 4), so RL rollouts and 0.2
-eval do not yet see the same action limits; `src.eval.sim_eval.clip_joint_step` is ready to reuse.
+RL rollout action clip: see "Owner instructions 2026-11-08, round 2" below. Current RL rollouts do
+not apply protocol 0.2's 4 deg/step clip. `rl.rollout_action_clip_deg` (null = off) now makes the
+setting explicit.
 The robot items (servo temperature/current fault response, `park()` on healthy shutdown, camera
 timestamp, placement grid, `wo07_real_eval.py`) belong to PR 2, on PR #23's branch. The plan
 revision for PR #25 is on `wo-recovery-sft`. PR #25's `configs/rl_pickplace_lr*.yaml` use the
 removed `early_stop_*` / `peak_stop_step` keys and need renaming when it merges, or they fail fast.
+
+### Owner instructions 2026-11-08, round 2 (blocking before any paid run; $0, CPU only)
+
+On PR #28 (`fix/pre-run-hardening`). Nothing ran on a GPU. Protocol `0.1-draft` (`e9ce5bb47a88`),
+`src/env/success.py` and every reported number are unchanged.
+
+- **PPO mini-batches** (`src/rl/trainer.py` `ppo_minibatches`). Each epoch splits the kept
+  groups into ceil(groups / (`ppo_mini_batch` / K)) equal whole-group mini-batches. Sizes differ
+  by at most one group and no group is split. Trajectories are contiguous per group
+  (e = g x K + k) and are gathered by group index. A full batch of 16 groups splits as before
+  (8 + 8), so its gradients are unchanged. A refill-capped batch no longer gives a short tail its
+  own full Adam step: 11 groups now split 6 + 5, where they used to split 8 + 3. Every consumer
+  of the old count is unchanged, because the count is the same: ceil(trajectories /
+  `ppo_mini_batch`) per epoch for the lr sweep's Adam-step count and epochs, the LambdaLR steps
+  and the resume state. Only the sizes change. The new log key is `train/minibatch_groups`. The
+  sweep `--estimate` uses the largest equal mini-batch, which gives the same number for a full
+  batch. `tests/test_rl_minibatch.py` covers 1/7/8/9/11/16/17 groups and checks the trajectories
+  each Adam step sees. ADR-0002 and `configs/rl.yaml` describe the rule.
+- **Approval gates** (`scripts/pod/approval_lib.sh`, all five pod jobs): see "Approving a gate"
+  above. `tests/test_pod_approval.py` checks that stale, unscoped and other-pod files are ignored
+  and that a fresh scoped file passes. `job_lib.sh` is unchanged.
+- **Spend gates observed, not trusted.** `rl.gate_stop: false` in `configs/rl.yaml` and
+  `configs/rl_pickplace.yaml` for the first RL training run. `gate_flat_z` stays at 0.5,
+  provisional. Every step logs `gate/would_stop` (0/1), `gate/would_stop_reason` (every gate that
+  fired) and `gate/first_would_stop_step` (0 = none yet). `record.json` `gate_decisions` (also
+  written for an interrupted run), the run summary and the console `GATE SUMMARY` line give the
+  first step each gate would have stopped the run. They also give the flat gate's numbers at its
+  check step and say whether it would have stopped the run there (step 38, where WO-04 seeds 1-2
+  stopped under the older rule). The gate log is checkpointed, so a resumed run keeps it.
+- **Render-gap reporting** (`scripts/wo01r_rebuild_demos.py`). The headline is t = 0, the first
+  frame of each episode, rendered from the reset state before any replay physics. It reports
+  `pixels_t0`, `tokens_stored_vs_fresh_t0` (every episode's first frame) and
+  `state_max_abs_diff_t0_rad`, next to the codec floor's t0 numbers. Pooled all-frame numbers
+  (`pixels_all`, `tokens_stored_vs_fresh_all`) go in a separate table and JSON block. They are
+  labelled because open-loop replay physics drift contributes to them. Each run carries a
+  `comparison` label. The Mac result above is a **same-renderer pipeline check**, and its run
+  record now carries that note.
+- **RL rollout action clip (stated explicitly).** The current RL rollouts do **not** apply the
+  4 deg/step joint clip that protocol 0.2 sim eval applies. I checked `src/rl/rollout.py`
+  `collect_rollouts`: it passes the policy's actions to `env.step` unchanged. The same function
+  runs the in-training greedy evals and the temperature probe, so they do not clip either. The
+  WO-04 runs and every 0.1 protocol eval ran unclipped too. Only `scripts/wo02_eval.py
+  --protocol 0.2` clips (`src/eval/sim_eval.py` `clip_joint_step`, bound from
+  `configs/real.yaml`). The new key `rl.rollout_action_clip_deg` makes this explicit. It is null
+  (off) in `configs/rl.yaml`, which is the setting for the next run, and it keeps the current
+  behaviour bit for bit. Setting it to 4.0 applies protocol 0.2's `clip_joint_step` to every
+  executed rollout and in-training-eval action and logs `rollout/action_clip_frac`; the sampled
+  tokens and log-probs are unchanged. **Owner choice:** off keeps the run comparable with WO-04
+  and the 0.1 numbers; 4.0 matches protocol 0.2 and the real arm. **Recommendation: off for the
+  next run.** That run already changes the shape, lr, epochs and gate logging, and adding the clip
+  would confound the comparison with WO-04. Evaluate its checkpoints under both 0.1 and 0.2: the
+  difference prices the train/eval mismatch. Switch to 4.0 for runs whose headline number is
+  protocol 0.2 or real-arm.
+- **Follow-ups.** `push_dataset` (every demo push, wo01r included) refuses the two 0.1 repos
+  unless `allow_protected` (`wo01_build_env.py --overwrite-hub` only); wo01r `--push` to one stops
+  before the build. With `data.require_tail_finished` (on in `demos_v2*.yaml`), the build drops a
+  successful demo whose release/retreat did not finish (oracle still running at the tail cap, or a
+  grasp task ending off the release target). It reports the demo per seed and records the next
+  seed instead, so one bad episode no longer blocks pushing the valid ones. A shortfall below
+  `demos_per_task` still blocks the push. `load_sft_frames` refuses a v2 demo set (v2 oracle or a
+  recorded tail) unless `data.chunk_pad: drop`.
+- **Mac test note.** `.venv/bin/pytest` starts with `#!/bin/sh`, and macOS strips
+  `DYLD_FALLBACK_LIBRARY_PATH` from it, so torchcodec cannot find FFmpeg 7 and the recorder tests
+  fail. Run `uv run python -m pytest` on the Mac instead.
+  `tests/test_pod_backstop.py::test_cap_timer_retries_and_survives_restart` is timing-sensitive.
+  It failed once while a `uv sync` was running alongside and passed 3 of 3 times on its own.
 
 ## Blockers and decisions pending the owner
 

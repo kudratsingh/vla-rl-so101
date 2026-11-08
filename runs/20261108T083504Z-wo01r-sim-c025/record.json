@@ -127,6 +127,9 @@
   "estimated_usd": 0.0,
   "actual_usd": 0.0,
   "status": "ok",
+  "notes": [
+    "2026-11-08 (label added afterwards, no number changed): SAME-RENDERER PIPELINE CHECK. The stored 0.1 frames and the fresh frames were both rendered on the Mac CPU renderer (MoltenVK); this is NOT a Mac-vs-GPU renderer gap measurement. The Mac-vs-GPU gap is the pending render-gap probe on the GPU pod (scripts/pod/demo_rebuild_job.sh)."
+  ],
   "results": {
     "mode": "render-gap",
     "render_gap": {
