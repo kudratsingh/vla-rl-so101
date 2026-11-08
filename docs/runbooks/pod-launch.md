@@ -90,8 +90,9 @@ against a mistyped id on the shared account.
 
    If the create call returns no id, list pods by name and treat any match as created.
 3. **Start both watchdogs at once**, before anything else (`CAP` is 5940 for the 4090 pod, 13800 or
-   12000 for the A100 pod with the paired clip probe (12660 / 10860 without it, `CLIP_GROUPS=0`);
-   docs/STATUS.md):
+   12000 for the A100 pod with the paired clip probe (12660 / 10860 without it, `CLIP_GROUPS=0`;
+   a pod launched at those smaller caps skips the clip probe in-pod so the lr sweep keeps its
+   time; docs/STATUS.md):
    ```zsh
    gh workflow run pod-watchdog.yml --repo kudratsingh/vla-rl-so101 \
      -f pod_id=<id> -f deadline_epoch=$DEADLINE -f cap_s=$CAP

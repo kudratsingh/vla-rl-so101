@@ -105,6 +105,23 @@ def test_probe_clip_pairs_prompts_and_sampling_seeds(tmp_path: Path) -> None:
     assert again["paired"] == p
 
 
+def test_probe_clip_builds_envs_before_seeding(tmp_path: Path) -> None:
+    # review R3-3: an env factory that draws from the global torch RNG while building must not
+    # shift arm "off"'s first-batch draws (envs are built before any reseed or timer)
+    envs: list[JointEnv] = []
+    tr = _trainer(_cfg(), tmp_path, envs)
+    build = tr.env_factory
+
+    def rng_factory(task: str, n: int) -> JointEnv:
+        torch.rand(1000)
+        return build(task, n)
+
+    tr.env_factory = rng_factory
+    out = tr.probe_clip(groups=20)
+    assert out["paired"]["first_decision_token_match"] == 1.0
+    assert all(r["probe/s_per_env_batch_after_first"] > 0 for r in out["rows"])
+
+
 def test_probe_clip_needs_the_clip_set(tmp_path: Path) -> None:
     cfg = _cfg()
     cfg["rl"]["rollout_action_clip_deg"] = None

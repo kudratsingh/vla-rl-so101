@@ -102,6 +102,65 @@ def test_measure_only_counts_what_the_clip_would_have_changed() -> None:
     )
 
 
+class SmallStepPolicy:
+    """Moves every joint by a random step strictly inside the bound from the current reading, on
+    a 1e-3 rad target grid (like de-tokenized bins: targets not built as `ref + step`)."""
+
+    def __init__(self, n: int) -> None:
+        self.gen = torch.Generator().manual_seed(0)
+        self.n = n
+
+    def sample(self, obs: PolicyObs, instructions: Sequence[str], temperature: float) -> Any:
+        step = (torch.rand(self.n, 1, 6, generator=self.gen) * 2 - 1) * 0.95 * BOUND
+        target = torch.round((obs["state"].unsqueeze(1) + step) * 1000) / 1000
+        return RolloutStep(
+            actions=target,
+            tokens=torch.zeros(self.n, 1, 6, dtype=torch.long),
+            log_probs=torch.zeros(self.n, 1, 6),
+        )
+
+    def eval(self) -> object:
+        return self
+
+
+class OffsetJointEnv(JointEnv):
+    """JointEnv whose reset pose is `pose` rad on every joint (float32 rounding bites at != 0)."""
+
+    def __init__(self, num_envs: int, max_steps: int, pose: float) -> None:
+        super().__init__(num_envs, max_steps=max_steps, goal_rad=math.inf)
+        self.pose = pose
+
+    def reset(self, *, seed: Any = None, options: Any = None) -> tuple[Any, dict[str, Any]]:
+        out = super().reset(seed=seed, options=options)
+        self.q = torch.full((self.n, 6), self.pose)
+        return self._obs(), out[1]
+
+
+@pytest.mark.parametrize("pose", [0.01, 0.1, 1.0, 3.0])
+@pytest.mark.parametrize("apply", [True, False])
+def test_steps_inside_the_bound_count_as_no_intervention(pose: float, apply: bool) -> None:
+    # `ref + (a - ref).clamp()` is not bit-exact when the clamp does not bind; the stats must not
+    # count that 1-ulp rounding as clip activity (review R3-1)
+    n = 32
+    stats = ClipStats()
+    collect_rollouts(
+        SmallStepPolicy(n),  # type: ignore[arg-type]
+        OffsetJointEnv(n, max_steps=20, pose=pose),
+        joint_obs,
+        prompt_seeds=list(range(8)),
+        group_size=4,
+        temperature=1.0,
+        max_episode_steps=20,
+        task="t",
+        action_clip=BOUND,
+        clip_stats=stats,
+        clip_apply=apply,
+    )
+    assert stats.env_steps == 20 * n
+    assert stats.clipped_steps == stats.clipped_joint_steps == 0
+    assert stats.delta_sum_rad == stats.delta_max_rad == 0.0
+
+
 def test_clip_changes_the_env_action_only_ppo_keeps_the_sampled_tokens(tmp_path: Path) -> None:
     """Owner 2026-11-08: the clip applies ONLY to the action sent to the env; the stored tokens,
     their log-probs, PPO's old log-probs and ratios all refer to the SAMPLED tokens."""

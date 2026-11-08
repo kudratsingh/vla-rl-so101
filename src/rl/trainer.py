@@ -1313,7 +1313,11 @@ class GRPOTrainer:
         return out
 
     def lr_sweep(
-        self, lrs: Sequence[float], adam_steps: int, batch: RolloutBatch | None = None
+        self,
+        lrs: Sequence[float],
+        adam_steps: int,
+        batch: RolloutBatch | None = None,
+        batch_clip_deg: float | str | None = "unknown",
     ) -> dict[str, Any]:
         """Offline replay lr sweep (review 8, Track B): ONE rollout batch (collected here, or a
         stored one), then for each lr: restore the adapter + optimizer state, run `adam_steps`
@@ -1323,14 +1327,23 @@ class GRPOTrainer:
         policy and optimizer as they were. Costs one rollout collection + 2 forwards of the batch
         before the first lr (greedy tokens; log-probs, reused as every lr's old log-probs and
         diag reference) + per lr: adam_steps x a mini-batch forward/backward + 2 forwards of the
-        batch (post scores, post greedy)."""
+        batch (post scores, post greedy).
+
+        The rollout action clip recorded is the batch's own: this preset's when collected here
+        (also logged to metrics.jsonl as a `lr_sweep_batch` row with its clip intervention stats
+        and written next to the batch as sweep_batch.json), else `batch_clip_deg` (the stored
+        batch's sweep_batch.json; "unknown" without one), never the current preset's."""
         if not lrs or adam_steps < 1:
             raise ValueError("need >= 1 lr and adam_steps >= 1")
         rows: list[dict[str, Any]] = []
         out: dict[str, Any] = {
             "adam_steps": adam_steps,
             "lrs": list(lrs),
-            "rollout_action_clip_deg": self.rl.rollout_action_clip_deg,  # of the batch's rollouts
+            # of the batch's rollouts: a stored batch may come from another clip setting
+            "rollout_action_clip_deg": (
+                batch_clip_deg if batch is not None else (self.rl.rollout_action_clip_deg)
+            ),
+            "batch_source": "stored" if batch is not None else "collected",
         }
         try:
             stats: dict[str, float] = {}
@@ -1338,7 +1351,10 @@ class GRPOTrainer:
                 batch, stats = self.collect()
                 if batch is None:
                     raise RuntimeError("every collected group was all-equal: nothing to replay")
+                self._log({"kind": "lr_sweep_batch", "step": 0, **stats})
             batch.save(self.run_dir / "sweep_batch.pt")
+            meta = {"rollout_action_clip_deg": out["rollout_action_clip_deg"]}
+            (self.run_dir / "sweep_batch.json").write_text(json.dumps(meta) + "\n")
             out["batch"] = {
                 "trajectories": batch.num_trajectories,
                 "groups": batch.num_groups,
@@ -1520,8 +1536,14 @@ class GRPOTrainer:
         clip_stats = {a: ClipStats() for a in arms}
         timers = {a: RolloutTimer() for a in arms}
         elapsed = {a: 0.0 for a in arms}
+        batch_s: dict[str, list[float]] = {a: [] for a in arms}
         sampling_seeds: list[int] = []
         try:
+            # build every env this probe visits BEFORE any seeding or timing: the lazy build would
+            # otherwise land inside arm "off"'s time (it runs first) and run after the reseed
+            first_task = self._next_task
+            for i in range(min(n_batches, len(self.train_tasks))):
+                self._env(self.train_tasks[(first_task + i) % len(self.train_tasks)])
             for b in range(n_batches):
                 task = self.train_tasks[self._next_task % len(self.train_tasks)]
                 self._next_task += 1
@@ -1529,12 +1551,13 @@ class GRPOTrainer:
                 self._next_prompt += gpb
                 sampling_seed = CLIP_PROBE_SAMPLING_SEED + self.seed * TRAIN_SEED_STRIDE + b
                 sampling_seeds.append(sampling_seed)
+                env = self._env(task)  # built above: no RNG use, no build time from here on
                 for arm, apply in arms.items():
                     torch.manual_seed(sampling_seed)  # CPU and every CUDA device: same draws
                     t0 = time.perf_counter()
                     batch, _ = collect_rollouts(
                         self.policy,
-                        self._env(task),
+                        env,
                         self.obs_fn,
                         prompt_seeds=seeds,
                         group_size=k,
@@ -1547,7 +1570,8 @@ class GRPOTrainer:
                         clip_stats=clip_stats[arm],
                         clip_apply=apply,
                     )
-                    elapsed[arm] += time.perf_counter() - t0
+                    batch_s[arm].append(time.perf_counter() - t0)
+                    elapsed[arm] += batch_s[arm][-1]
                     rewards[arm].append(batch.group_rewards)
                     by_task[arm][task].append(batch.group_rewards)
                     first_tokens[arm].append(batch.tokens[:, 0])
@@ -1578,6 +1602,12 @@ class GRPOTrainer:
             row.update(clip_stats[arm].summary("probe/action_clip"))
             row["probe/time_s"] = elapsed[arm]
             row["probe/s_per_env_batch"] = elapsed[arm] / n_batches
+            # batch 0 of arm "off" carries the process's first forwards (CUDA warm-up): compare
+            # the arms' speed on the later batches
+            later = batch_s[arm][1:]
+            row["probe/s_per_env_batch_after_first"] = (
+                sum(later) / len(later) if later else elapsed[arm]
+            )
             for key, value in timers[arm].totals(elapsed[arm]).items():
                 row[f"probe/time/{key}_s"] = value
             self._log(row)

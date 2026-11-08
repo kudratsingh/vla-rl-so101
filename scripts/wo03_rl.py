@@ -373,8 +373,20 @@ def print_probe(cfg: Config, probe: dict[str, Any], proj: dict[str, Any], gpu: s
         print("[wo03_rl] PROBE WARNING sampler/update log-probs disagree", flush=True)
 
 
-def _clip_text(deg: float | None, frac: float | None = None, verb: str = "changed") -> str:
+def stored_clip_deg(batch_path: Path) -> float | str | None:
+    """The action clip a stored sweep_batch.pt was collected with (its sweep_batch.json, written
+    by GRPOTrainer.lr_sweep), or "unknown" when that file is absent (batches saved before it)."""
+    meta = batch_path.with_suffix(".json")
+    if not meta.is_file():
+        return "unknown"
+    value = json.loads(meta.read_text()).get("rollout_action_clip_deg", "unknown")
+    return value if value is None or isinstance(value, str) else float(value)
+
+
+def _clip_text(deg: float | str | None, frac: float | None = None, verb: str = "changed") -> str:
     """The rollout action clip as the probe lines print it."""
+    if isinstance(deg, str):
+        return f"action clip {deg} (stored batch without sweep_batch.json)"
     if deg is None:
         return "action clip off (rl.rollout_action_clip_deg null)"
     txt = f"action clip {deg:g} deg/step"
@@ -457,7 +469,8 @@ def print_clip_probe(out: dict[str, Any]) -> None:
             f"all-1 {r['probe/frac_groups_all_one']:.3f}), entropy {r['probe/entropy']:.3f}, mean "
             f"episode {r['probe/mean_episode_len']:.1f} steps, "
             f"{_clip_detail(r, 'probe/action_clip', verb)}, "
-            f"{r['probe/s_per_env_batch']:.1f} s per env batch",
+            f"{r['probe/s_per_env_batch']:.1f} s per env batch "
+            f"({r['probe/s_per_env_batch_after_first']:.1f} after the first: warm-up excluded)",
             flush=True,
         )
     p = out["paired"]
@@ -703,7 +716,12 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             return {**probe, "projection": proj, "run_dir": str(run_dir)}
         if args.lr_sweep:
             stored = RolloutBatch.load(args.sweep_batch) if args.sweep_batch else None
-            sweep = trainer.lr_sweep(args.lr_sweep, args.sweep_adam_steps, stored)
+            sweep = trainer.lr_sweep(
+                args.lr_sweep,
+                args.sweep_adam_steps,
+                stored,
+                stored_clip_deg(args.sweep_batch) if args.sweep_batch else "unknown",
+            )
             record["status"] = "probe"
             record["lr_sweep"] = sweep
             print_lr_sweep(sweep)

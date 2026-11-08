@@ -11,7 +11,9 @@
 #   nohup bash scripts/pod/diag_job.sh > /workspace/job.log 2>&1 &
 # Optional: SEED (3; RL seeds 0-2 are the WO-04 runs, check_rl_seed allows 0-9), SFT_ADAPTER (WO-02
 #   a4 step_004000), RL_CFG (configs/rl.yaml), TEMPS (0.7,1.0,1.3), PROBE_GROUPS (64),
-#   CLIP_GROUPS (32 prompts x the preset's K per arm; 0 skips the clip probe),
+#   CLIP_GROUPS (32 prompts x the preset's K per arm; 0 skips the clip probe; it is also skipped
+#   when the pod's cap leaves no room for it AND the lr sweep, and a clip-probe failure other than
+#   a timeout continues to the gate: the lr sweep keeps priority),
 #   LRS (5e-5,2e-4,5e-4,1e-3), SWEEP_ADAM_STEPS (8), APPROVAL_WAIT_S (1800), HUB_REPO.
 # Approval gate (CLAUDE.md rule 1): the lr sweep starts only once THIS pod's approval file
 #   (/workspace/APPROVED.<RUNPOD_POD_ID>, written after the pod's first boot: scripts/pod/
@@ -105,15 +107,21 @@ run_capped 300 uv run python -c "import torch; assert torch.cuda.is_available();
 # (`set -o pipefail`: a failing --estimate fails the pipe; it prints the preset's clip setting)
 run_capped 300 uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
   --probe-temperatures "$TEMPS" --probe-groups "$PROBE_GROUPS" | tail -2 || exit 13
+CLIP_S=0
 if [ "$CLIP_GROUPS" != 0 ]; then
   # refuses a preset whose rl.rollout_action_clip_deg is null: nothing to compare
-  run_capped 300 uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
-    --probe-clip --probe-groups "$CLIP_GROUPS" | tail -1 || exit 13
+  # (the estimate prints thousands separators: stripped before awk reads the number)
+  CLIP_S=$(run_capped 300 uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
+    --probe-clip --probe-groups "$CLIP_GROUPS" | awk '/clip_probe_s:/ {gsub(",", "", $2); printf "%d", $2}')
+  is_int "$CLIP_S" && [ "$CLIP_S" -gt 0 ] || exit 13
+  echo "[job] clip probe estimate ${CLIP_S} s (cost.throughput)"
 fi
 SWEEP_H=$(run_capped 300 uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
-  --lr-sweep "$LRS" --sweep-adam-steps "$SWEEP_ADAM_STEPS" | awk '/lr_sweep_h:/ {print $2}')
+  --lr-sweep "$LRS" --sweep-adam-steps "$SWEEP_ADAM_STEPS" | awk '/lr_sweep_h:/ {gsub(",", "", $2); print $2}')
 [ -n "$SWEEP_H" ] || exit 13
 echo "[job] lr sweep estimate ${SWEEP_H} h (cost.throughput)"
+# the sweep must finish before the soft deadline, with the 25% estimate-error margin
+NEED_S=$(awk -v h="$SWEEP_H" 'BEGIN { printf "%d", h * 3600 * 1.25 + 120 }')
 
 stage download
 # the SFT adapter (fails fast on a wrong path); the 15 GB base downloads in the first probe
@@ -131,22 +139,33 @@ run_until_deadline uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed 
   --adapter "$SFT_ADAPTER" --probe-temperatures "$TEMPS" --probe-groups "$PROBE_GROUPS" || exit 20
 upload "temperature probe"
 
-if [ "$CLIP_GROUPS" != 0 ]; then
+# the clip probe runs only if the lr sweep still fits after it: clip x 1.25 + 2 min, the sweep's
+# NEED_S, and the full approval wait unless the pass is pre-approved (a pod launched at the
+# round-2 caps, 12660 / 10860 s, skips it here instead of losing the sweep at the gate)
+CLIP_NEED_S=$(( CLIP_S * 5 / 4 + 120 + NEED_S ))
+approval_valid || CLIP_NEED_S=$(( CLIP_NEED_S + ${APPROVAL_WAIT_S:-1800} ))
+if [ "$CLIP_GROUPS" != 0 ] && [ "$(left)" -lt "$CLIP_NEED_S" ]; then
+  echo "[job] clip probe skipped: $(( $(left) / 60 )) min to the soft deadline < $(( CLIP_NEED_S / 60 ))" \
+    "min for it + the lr sweep (+ approval wait); the lr sweep keeps priority"
+elif [ "$CLIP_GROUPS" != 0 ]; then
   stage probe-clip
   # paired, rollouts only: the same prompts and sampling seeds with the preset's clip and without;
   # per arm sampled success, group-drop rate, clip intervention (arm off: would have intervened).
   # Before the gate: its numbers inform the owner's go on the lr sweep, and a gate of its own
   # would idle the A100 for up to APPROVAL_WAIT_S (30 min = $0.90) to save a ~14 min ($0.43) stage
+  # Optional: a timeout (no time left) ends the job; any other failure continues to the gate,
+  # whose NEED_S check still guards the cap; the gate output then shows no CLIP-PROBE lines
   run_until_deadline uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" \
-    --adapter "$SFT_ADAPTER" --probe-clip --probe-groups "$CLIP_GROUPS" || exit 22
-  upload "clip probe"
+    --adapter "$SFT_ADAPTER" --probe-clip --probe-groups "$CLIP_GROUPS"
+  rc=$?
+  [ "$rc" = 124 ] && exit 22
+  [ "$rc" = 0 ] || echo "[job] clip probe failed (rc=$rc); continuing to the lr-sweep gate"
+  upload "clip probe (rc=$rc)"
 fi
 
 stage await-approval
 grep "\[wo03_rl\] TEMP-PROBE" /workspace/job.log | tail -4
-grep "\[wo03_rl\] CLIP-PROBE" /workspace/job.log | tail -4
-# the sweep must finish before the soft deadline, with the 25% estimate-error margin
-NEED_S=$(awk -v h="$SWEEP_H" 'BEGIN { printf "%d", h * 3600 * 1.25 + 120 }')
+grep "\[wo03_rl\] CLIP-PROBE" /workspace/job.log | tail -4 || echo "[job] no CLIP-PROBE lines (skipped or failed)"
 echo "[job] pod up $(pod_minutes) min so far (setup + checks + temperature + clip probes); next: lr sweep" \
   "$LRS x $SWEEP_ADAM_STEPS Adam steps, est. ${SWEEP_H} h (+25% = $(( NEED_S / 60 )) min);" \
   "soft deadline in $(( $(left) / 60 )) min"

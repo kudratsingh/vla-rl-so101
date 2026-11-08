@@ -190,15 +190,17 @@ def _timed(original: Callable[..., Any], holder: dict[str, RolloutTimer | None])
 @dataclass
 class ClipStats:
     """Action-clip intervention counts over env steps of RUNNING episodes (finished envs that
-    still receive ignored actions are not counted). "Changed" = the clip moved the action
-    (`clip_joint_step(a, ref, bound) != a`), whether or not it was applied (`clip_apply`)."""
+    still receive ignored actions are not counted). "Changed" = the commanded step exceeded the
+    bound (`|a - ref| > bound`, so `clip_joint_step` binds), whether or not the clip was applied
+    (`clip_apply`); delta = `|a - ref| - bound` on those entries. Counted from the bound, not from
+    `clip_joint_step(a) != a`, which flags 1-ulp float rounding where the clamp does not bind."""
 
     env_steps: int = 0  # running-episode env steps seen
     clipped_steps: int = 0  # ... on which the clip changed at least one joint
     joint_steps: int = 0  # env_steps x joints
     clipped_joint_steps: int = 0
     clipped_by_joint: list[int] = field(default_factory=list)  # per joint
-    delta_sum_rad: float = 0.0  # sum of |a - clip(a)| over the changed entries
+    delta_sum_rad: float = 0.0  # sum of |a - ref| - bound over the changed entries
     delta_max_rad: float = 0.0
 
     def add(self, changed: Tensor, delta: Tensor, active: Tensor) -> None:
@@ -464,9 +466,12 @@ def _collect(
                 ref = ref.to(action.device, action.dtype)
                 safe = clip_joint_step(action, ref, action_clip)  # protocol 0.2's function
                 if clip_stats is not None:
-                    changed = (safe != action) & active.to(action.device).unsqueeze(-1)
+                    # counted from the bound, not from `safe != action`: ref + (a - ref).clamp()
+                    # is not bit-exact when the clamp does not bind (1-ulp float32 "changes")
+                    over = (action - ref).abs() - action_clip
+                    changed = (over > 0) & active.to(action.device).unsqueeze(-1)
                     clip_changed.append(changed)
-                    clip_delta.append((action - safe).abs() * changed)
+                    clip_delta.append(over.clamp(min=0) * changed)
                     clip_active.append(active.clone())
                 if clip_apply:  # env action only: the stored tokens / log-probs stay the sampled
                     action = safe

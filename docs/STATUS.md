@@ -529,9 +529,11 @@ and every reported number are unchanged.
   print it (`TEMP-PROBE ... action clip 4 deg/step`, `LR-SWEEP batch ... rollouts with action clip
   4 deg/step`, `--estimate` prints `rollout_action_clip_deg`).
 - **Intervention logging:** per RL step in `metrics.jsonl` (`rollout/action_clip_frac` env steps,
-  `_joint_frac`, `_frac_by_joint` (6), `_mean_abs_delta_deg` / `_max_abs_delta_deg` = |a -
-  clip(a)| over the changed entries, `_env_steps`); per temperature (`probe/action_clip_*`), in the
-  lr sweep's batch stats, and in both clip-probe arms. Counted over running episodes only.
+  `_joint_frac`, `_frac_by_joint` (6), `_mean_abs_delta_deg` / `_max_abs_delta_deg` = |a - ref| -
+  bound over the changed entries, `_env_steps`); per temperature (`probe/action_clip_*`), in the
+  lr sweep's batch stats (record.json and a `lr_sweep_batch` row in metrics.jsonl), and in both
+  clip-probe arms. Counted over running episodes only, from the bound (`|a - ref| > bound`), not
+  from `clip_joint_step(a) != a`, which is not bit-exact when the clamp does not bind.
 - **Paired probe** (`scripts/wo03_rl.py --probe-clip [--probe-groups 32]`,
   `GRPOTrainer.probe_clip`): rollouts only, no update. Both arms play the same prompts (reset
   seeds, tasks round-robin) with the same sampling seeds (torch RNG reseeded per env batch),
@@ -551,13 +553,39 @@ and every reported number are unchanged.
   its own gate would idle the A100 up to 30 min ($0.90) to guard a ~14 min ($0.43) stage. It
   uploads its record, and the gate prints the last 4 `CLIP-PROBE` lines next to `TEMP-PROBE`.
   `CLIP_GROUPS=0` skips it; the gpu-check stage `--estimate`s it first, which refuses a preset
-  with a null clip. Caps: above (13800 / 12000 s).
+  with a null clip. Caps: above (13800 / 12000 s). The sweep keeps priority: the job runs the clip
+  probe only if, at that point, the time to the soft deadline covers the clip estimate x 1.25 +
+  2 min + the sweep's need (estimate x 1.25 + 2 min) + the full 30 min approval wait unless the
+  pass is pre-approved; otherwise it prints "clip probe skipped" and goes to the gate (a pod
+  launched at the round-2 caps 12660 / 10860 s skips it rather than losing the sweep). A clip-probe
+  failure other than a timeout continues to the gate (the gate then shows no `CLIP-PROBE` lines).
 - **Gates unchanged:** `rl.gate_stop: false` for the first training run in both presets, and
   the gate-decision logging (`gate/would_stop*`, `record.gate_decisions`) is in place (checked).
 - **Unverified on GPU:** the clip-probe pairing on CUDA (multinomial on the CUDA generator after
   `torch.manual_seed`; GPU kernel nondeterminism may lower the first-decision token match below
   1.0), the per-step intervention tensors' overhead on `physx_cuda` (one host copy per env batch),
   and how the clip changes the episode length, success and group-drop rate of the a4 SFT policy.
+
+#### Round 3 review fixes ($0, CPU only)
+
+- `src/rl/rollout.py`: clip intervention counted from the bound (`|a - ref| > bound`; delta =
+  `|a - ref| - bound`), not from `clip_joint_step(a) != a`. That float comparison flagged 1-ulp
+  rounding as clipping (measured: 10-19% of within-bound entries near 0.01-0.1 rad on a 1e-3 rad
+  target grid) and pulled the mean |delta| toward 0. The executed action is unchanged
+  (`clip_joint_step`); `src/eval/` untouched. Test: within-bound steps at poses 0.01-3 rad count 0.
+- `scripts/pod/diag_job.sh`: the clip-probe time check above (sweep priority) and a non-fatal
+  clip-probe failure (timeout still exits 22). With today's estimates (clip 714 s, sweep 1.15 h)
+  the check needs 1012 + 5295 + 1800 s = 135.1 min left (105.1 min pre-approved). At the 13800 s
+  cap (soft deadline 202 min after creation) the probe runs if it is reached by 66.9 min; it is
+  planned at ~48 min (~59 min with the 25% margin). At 12660 s (soft deadline 183 min) only an
+  on-plan pod (<= 47.9 min) runs it; later, it is skipped and the sweep still fits.
+- `src/rl/trainer.py` `lr_sweep`: records the BATCH's clip (collected: the preset's; stored: its
+  `sweep_batch.json`, written next to `sweep_batch.pt`, else "unknown"), `batch_source`, and a
+  `lr_sweep_batch` metrics row with the batch's clip stats. `probe_clip`: builds every env it
+  visits before any reseed or timer (an RNG-using env build no longer shifts arm off's first
+  draws; build time no longer lands in arm off) and reports `probe/s_per_env_batch_after_first`
+  (CUDA warm-up excluded).
+- No cost change: the planned stages, caps (5940 / 13800 / 12000 s) and $ above are unchanged.
 
 ## Blockers and decisions pending the owner
 
