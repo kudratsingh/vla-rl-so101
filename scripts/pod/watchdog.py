@@ -14,18 +14,29 @@ and adds SPEND_CAP_SECONDS, so the cap counts from creation, not boot. With --ca
 createdAt (REST v2) tightens it to min(deadline, createdAt + cap). Fire time = deadline - lead.
 
 Behaviour:
-  - before the fire time: read the pod every --poll-s; exit 0 once it is verified gone (it deleted
-    itself), provided this key has seen it exist (a 404 can also mean "not visible to this key");
+  - at start: confirm this key sees the pod under a name with --expect-name-prefix, re-reading for
+    up to --confirm-s (120 s). No source shows a pod -> alert, exit 3 at once (wrong id, or not
+    visible to this key); 401/403 from both REST APIs -> exit 5; still unreadable -> alert and go
+    on, but never delete a pod that was not confirmed (the RunPod account is shared). The launchers
+    wait for the "confirmed" event; --confirm-only stops after this step (exit 0 = confirmed);
+  - before the fire time: read the pod every --poll-s; exit 0 early only if it deleted itself:
+    every read over >= --gone-confirm-s (120 s) shows it gone;
+  - a read is GONE only when two sources agree (404, status TERMINATED, or GraphQL pod null): a
+    REST 404 also means "not accessible to the caller" (v2 OpenAPI), so one source alone is
+    UNKNOWN; PRESENT from any source wins;
   - at the fire time (at once if started after it): terminate with REST v2 DELETE
     (api.runpod.io/v2/pods/{id}), then REST v1 DELETE (rest.runpod.io/v1/pods/{id}), then GraphQL
-    podTerminate (counted only with no "errors"); every request has a connect and a total timeout;
-  - verified gone = two consecutive reads >= --verify-gap-s apart that show no pod (404, status
-    TERMINATED, or GraphQL pod null), not an accepted delete; otherwise the delete is sent again;
+    podTerminate (counted only with no "errors"); a DELETE 404 is not an acceptance; after an
+    accepted delete that did not remove the pod, every retry sends all three; every request has a
+    connect and a total timeout;
+  - verified gone = two consecutive reads >= --verify-gap-s apart that show no pod, not an
+    accepted delete; otherwise the delete is sent again;
   - not verified gone by the deadline: alert (macOS notification + bell; GitHub ::error::) and keep
-    trying until deadline + --overrun-s, then exit 2.
-Exit codes: 0 verified gone; 2 not verified by deadline + overrun; 3 gone but this key never saw
-the pod (check the console); 4 pod name does not match --expect-name-prefix (nothing deleted);
-5 bad input or no key.
+    trying until max(deadline, fire-phase entry) + --overrun-s, at least one full attempt (also
+    after a clock jump, e.g. a laptop waking), then exit 2.
+Exit codes: 0 verified gone (--confirm-only: confirmed); 2 not verified by the end of the overrun;
+3 this key never saw the pod; 4 pod name does not match --expect-name-prefix (nothing deleted);
+5 bad input, no key, or key refused; 6 --confirm-only: pod not confirmed (API errors).
 
 The key comes only from the environment (RUNPOD_API_KEY), never argv, and is redacted from every
 line this script writes. Every attempt is logged as one JSONL line to --log.
@@ -84,6 +95,7 @@ class Read:
     detail: str = ""
     created: float | None = None
     name: str | None = None
+    auth: bool = False  # 401/403: the key was refused
 
 
 @dataclass
@@ -101,6 +113,10 @@ class Cfg:
     timeout_s: float = 8.0
     delete_timeout_s: float = 15.0
     late_warn_s: float = 180.0
+    confirm_s: float = 120.0
+    confirm_every_s: float = 15.0
+    gone_confirm_s: float = 120.0
+    jump_s: float = 30.0
     expect_name_prefix: str = ""
     api_v2: str = API_V2
     api_v1: str = API_V1
@@ -144,7 +160,10 @@ class Watchdog:
         self.clock = clock or Clock()
         self._out = out or (lambda s: print(s, flush=True))
         self._notify = notify or _notify
-        self.seen = False
+        self.seen = False  # some source showed the pod
+        self.name_verified = False  # ... under a name with the expected prefix (may delete)
+        self.bad_name: Read | None = None
+        self.woke_late = False
         self.created: float | None = None
         self.deadline = cfg.deadline
         self.attempts = 0
@@ -240,6 +259,8 @@ class Watchdog:
         self.log("read", source=src, http=r.status, err=r.error, s=round(r.elapsed, 2))
         if r.status == 404:
             return Read(GONE, src, "404")
+        if r.status in (401, 403):
+            return Read(UNKNOWN, src, f"http {r.status}", auth=True)
         if r.status == 200:
             try:
                 j = json.loads(r.body)
@@ -262,8 +283,10 @@ class Watchdog:
         r, j = self._gql(q)
         self.log("read", source="graphql", http=r.status, err=r.error, s=round(r.elapsed, 2))
         if j is None:
-            return Read(UNKNOWN, "graphql", f"http {r.status}" if r.status else r.error)
+            auth = r.status in (401, 403)
+            return Read(UNKNOWN, "graphql", f"http {r.status}" if r.status else r.error, auth=auth)
         if j.get("errors"):
+            # also how an unauthenticated call answers (errors + pod null): never counted as gone
             return Read(UNKNOWN, "graphql", "errors in body")
         data = j.get("data")
         if not isinstance(data, dict) or "pod" not in data:
@@ -279,19 +302,50 @@ class Watchdog:
         return Read(UNKNOWN, "graphql", "unexpected data.pod")
 
     def read(self) -> Read:
-        """First decisive answer from REST v2, then REST v1, then GraphQL."""
+        """One combined read over REST v2, REST v1 and GraphQL, in that order.
+
+        PRESENT from any source wins (the pod exists). GONE needs two sources that agree: a REST
+        404 also means "not accessible to the caller" (v2 OpenAPI), and one API can glitch, so a
+        single source saying "no pod" while the others cannot answer stays UNKNOWN.
+        """
         pid = self.cfg.pod_id
-        rd = Read(UNKNOWN, "none")
-        for fn in (
+        res: list[Read] = []
+        sources: list[Callable[[], Read]] = [
             lambda: self._read_rest(self.cfg.api_v2, f"/v2/pods/{pid}", "rest_v2"),
             lambda: self._read_rest(self.cfg.api_v1, f"/pods/{pid}", "rest_v1"),
             self._read_gql,
-        ):
-            rd = fn()
-            if rd.state != UNKNOWN:
+        ]
+        for fn in sources:
+            res.append(fn())
+            if res[-1].state == PRESENT or sum(x.state == GONE for x in res) >= 2:
                 break
+        gone = [x for x in res if x.state == GONE]
+        present = [x for x in res if x.state == PRESENT]
+        created = next((x.created for x in res if x.created is not None), None)
+        detail = "; ".join(f"{x.source}: {x.detail}" for x in res)
+        if present:
+            rd = present[0]
+            rd.created = rd.created if rd.created is not None else created
+            if gone:
+                self.log("sources_disagree", detail=detail)
+            rd.detail = detail
+        elif len(gone) >= 2:
+            rd = Read(GONE, "+".join(x.source for x in gone), detail, created, gone[0].name)
+        else:
+            # auth: both REST reads refused the key (GraphQL cannot tell; it answers 200 + errors)
+            auth = sum(x.auth for x in res if x.source.startswith("rest")) == 2
+            src = gone[0].source if gone else "none"
+            rd = Read(UNKNOWN, src, ("only one source says gone; " if gone else "") + detail)
+            rd.auth = auth
         if rd.state == PRESENT:
             self.seen = True
+            if rd.name is not None and not self.name_ok(rd):
+                self.bad_name = rd
+            elif not self.name_verified and (
+                not self.cfg.expect_name_prefix or rd.name is not None
+            ):
+                self.name_verified = True
+                self.log("confirmed", name=rd.name, source=rd.source, status=rd.detail)
         if rd.created is not None and self.created is None:
             self.created = rd.created
             self._tighten()
@@ -321,26 +375,58 @@ class Watchdog:
         p = self.cfg.expect_name_prefix
         return not p or rd.name is None or rd.name.startswith(p)
 
+    def may_delete(self) -> bool:
+        """Only a pod this key has seen, under a name with the expected prefix: the RunPod account
+        is shared, so an unverified (possibly mistyped) id is never deleted. An empty
+        --expect-name-prefix disables the check explicitly."""
+        return self.name_verified or not self.cfg.expect_name_prefix
+
+    def _sleep(self, s: float) -> None:
+        """Sleep, and notice a wall-clock jump (laptop sleep, a stalled runner)."""
+        if s <= 0:
+            return
+        t0 = self.clock.now()
+        self.clock.sleep(s)
+        el = self.clock.now() - t0
+        if el > s + self.cfg.jump_s:
+            self.woke_late = True
+            self.log("woke_late", expected_s=round(s, 1), slept_s=round(el, 1))
+
     # ---- terminate -----------------------------------------------------------------------
-    def terminate(self) -> bool:
-        """One attempt over all three endpoints; True if any of them accepted."""
+    def terminate(self, every_endpoint: bool) -> bool:
+        """One attempt; True if any endpoint accepted (2xx; GraphQL only with no "errors").
+
+        First attempt: stop at the first acceptance. Later attempts (an accepted delete did not
+        remove the pod) send all three. A DELETE 404 is not an acceptance: it may mean "not
+        visible to this endpoint", so the next endpoint is tried; only verify_gone() decides.
+        """
         self.attempts += 1
         n, pid = self.attempts, self.cfg.pod_id
+        accepted = False
         for src, base, path in (
             ("rest_v2", self.cfg.api_v2, f"/v2/pods/{pid}"),
             ("rest_v1", self.cfg.api_v1, f"/pods/{pid}"),
         ):
             r = self.request("DELETE", f"{base}{path}", total=self.cfg.delete_timeout_s)
-            ok = r.status is not None and (200 <= r.status < 300 or r.status == 404)
+            ok = r.status is not None and 200 <= r.status < 300
             self.log(
-                "delete", attempt=n, source=src, http=r.status, err=r.error, s=round(r.elapsed, 2)
+                "delete",
+                attempt=n,
+                source=src,
+                http=r.status,
+                err=r.error,
+                accepted=ok,
+                s=round(r.elapsed, 2),
             )
-            if ok:
+            accepted = accepted or ok
+            if ok and not every_endpoint:
                 return True
         r, j = self._gql(
             'mutation { podTerminate(input: {podId: "' + pid + '"}) }', self.cfg.delete_timeout_s
         )
-        ok = j is not None and not j.get("errors") and "podTerminate" in (j.get("data") or {})
+        data = j.get("data") if j is not None else None
+        ok = j is not None and not j.get("errors") and isinstance(data, dict)
+        ok = ok and "podTerminate" in (data or {})
         self.log(
             "delete",
             attempt=n,
@@ -351,21 +437,72 @@ class Watchdog:
             body=r.body.replace("\n", " ")[:200],
             s=round(r.elapsed, 2),
         )
-        return ok
+        return accepted or ok
 
     def verify_gone(self) -> bool:
-        """Two consecutive reads, >= verify_gap_s apart, that both show no pod."""
+        """Two consecutive combined reads, >= verify_gap_s apart, that both show no pod."""
         a = self.read()
         self.log("verify", read=1, state=a.state, source=a.source, detail=a.detail)
         if a.state != GONE:
             return False
-        self.clock.sleep(self.cfg.verify_gap_s)
+        self._sleep(self.cfg.verify_gap_s)
         b = self.read()
         self.log("verify", read=2, state=b.state, source=b.source, detail=b.detail)
         return b.state == GONE
 
     # ---- main loop -----------------------------------------------------------------------
-    def run(self) -> int:
+    def _confirm(self) -> int | None:
+        """Startup check that this key sees the pod under the expected name.
+
+        Re-reads for up to --confirm-s. Returns an exit code to stop with: 3 = no source shows a
+        pod (wrong id, or not visible to this key), 4 = name mismatch, 5 = key refused by both REST
+        APIs, 6 = still unreadable (API errors); or None once confirmed.
+        """
+        c = self.cfg
+        end = self.clock.now() + c.confirm_s
+        n = 0
+        while True:
+            rd = self.read()
+            n += 1
+            self.log(
+                "first_read" if n == 1 else "confirm_read",
+                state=rd.state,
+                source=rd.source,
+                detail=rd.detail,
+                name=rd.name,
+            )
+            if self.bad_name is not None:
+                return self._refuse_name(self.bad_name)
+            if self.name_verified:
+                return None
+            if rd.auth:
+                self.alert(
+                    "pod watchdog: KEY REFUSED",
+                    f"{c.pod_id}: REST v2 and v1 answer {rd.detail}; this watchdog can never"
+                    " delete the pod. Fix the key, or delete the pod via the connector.",
+                )
+                self.log("exit", rc=5, requests=self.requests)
+                return 5
+            if self.clock.now() >= end:
+                break
+            self._sleep(min(c.confirm_every_s, max(0.0, end - self.clock.now())))
+        if rd.state == GONE:
+            self.alert(
+                "pod watchdog: pod never seen",
+                f"{c.pod_id}: no source shows this pod after {c.confirm_s:.0f} s (wrong id, or"
+                " not visible to this key). It watches nothing; check the id and the console.",
+            )
+            self.log("exit", rc=3, requests=self.requests)
+            return 3
+        self.alert(
+            "pod watchdog: cannot confirm the pod",
+            f"{c.pod_id}: not confirmed after {c.confirm_s:.0f} s ({rd.detail})."
+            " It keeps trying, but will not delete an unconfirmed pod.",
+        )
+        self.log("unconfirmed", state=rd.state, detail=rd.detail)
+        return 6
+
+    def run(self, confirm_only: bool = False) -> int:
         c = self.cfg
         now = self.clock.now()
         self.log(
@@ -375,6 +512,7 @@ class Watchdog:
             lead_s=c.lead_s,
             cap_s=c.cap_s,
             fire_in_s=round(self.fire - now, 1),
+            confirm_only=confirm_only,
         )
         if c.cap_s is not None:
             late = now - (c.deadline - c.cap_s)
@@ -382,50 +520,63 @@ class Watchdog:
                 c.extra["warned_late"] = True
                 self.log("warn_started_late", seconds_after_create=round(late, 1), source="cap")
                 _gh("warning", f"watchdog started {late:.0f} s after the create call")
-        rd = self.read()
-        self.log("first_read", state=rd.state, source=rd.source, detail=rd.detail, name=rd.name)
-        if not self.name_ok(rd):
-            return self._refuse_name(rd)
-        if rd.state == UNKNOWN:
-            self.alert("pod watchdog: cannot read the pod", f"{c.pod_id}: {rd.detail}")
+        rc = self._confirm()
+        if confirm_only:
+            rc = 0 if rc is None else rc
+            self.log("exit", rc=rc, phase="confirm", requests=self.requests)
+            return rc
+        if rc is not None and rc != 6:
+            return rc
         if self.clock.now() >= self.fire:
             self.log("started_after_fire_time", late_s=round(self.clock.now() - self.fire, 1))
-        # phase 1: watch until the fire time; exit early if the pod deleted itself
+        rd = Read(UNKNOWN, "none")
+        # phase 1: watch until the fire time; exit early only if the pod deleted itself: two
+        # sources agree it is gone, on every read over at least --gone-confirm-s
         streak_t: float | None = None
         while self.clock.now() < self.fire:
             if rd.state == GONE and self.seen:
-                if streak_t is not None and self.clock.now() - streak_t >= c.verify_gap_s:
-                    self.log("verified_gone", phase="watch", requests=self.requests)
-                    return 0
                 if streak_t is None:
                     streak_t = self.clock.now()
-                self.clock.sleep(min(c.verify_gap_s, max(0.0, self.fire - self.clock.now())))
+                elif self.clock.now() - streak_t >= c.gone_confirm_s:
+                    self.log("verified_gone", phase="watch", requests=self.requests)
+                    self.log("exit", rc=0, phase="watch", requests=self.requests)
+                    return 0
+                step = c.gone_confirm_s / 4
             else:
                 streak_t = None
-                self.clock.sleep(min(c.poll_s, max(0.0, self.fire - self.clock.now())))
+                step = c.poll_s
+            self._sleep(min(step, max(0.0, self.fire - self.clock.now())))
             if self.clock.now() >= self.fire:
                 break
             rd = self.read()
-            if not self.name_ok(rd):
-                return self._refuse_name(rd)
+            if self.bad_name is not None:
+                return self._refuse_name(self.bad_name)
             if rd.state != GONE:
                 streak_t = None
         return self._terminate_phase()
 
     def _terminate_phase(self) -> int:
         c = self.cfg
-        end = self.deadline + c.overrun_s
-        self.log("fire", deadline_in_s=round(self.deadline - self.clock.now(), 1))
+        # the overrun window counts from the later of the deadline and now: a watchdog that starts
+        # (or wakes) late still gets a full window, and always makes at least one attempt
+        end = max(self.deadline, self.clock.now()) + c.overrun_s
+        self.log(
+            "fire",
+            deadline_in_s=round(self.deadline - self.clock.now(), 1),
+            give_up_in_s=round(end - self.clock.now(), 1),
+        )
         alerted = False
+        must_cycle = True
         while True:
-            if not alerted and self.clock.now() >= self.deadline:
+            now = self.clock.now()
+            if not alerted and now >= self.deadline:
                 alerted = True
                 self.alert(
                     "pod watchdog: DEADLINE PASSED",
-                    f"pod {c.pod_id} not verified gone; still trying for {c.overrun_s:.0f} s."
-                    " Delete it in the RunPod console now.",
+                    f"pod {c.pod_id} not verified gone; still trying for"
+                    f" {max(0.0, end - now):.0f} s. Delete it in the RunPod console now.",
                 )
-            if self.clock.now() >= end:
+            if now >= end and not must_cycle:
                 self.alert(
                     "pod watchdog: GAVE UP",
                     f"pod {c.pod_id} not verified gone after {self.attempts} attempts."
@@ -433,10 +584,18 @@ class Watchdog:
                 )
                 self.log("exit", rc=2, attempts=self.attempts, requests=self.requests)
                 return 2
-            accepted = self.terminate()
-            if accepted:
-                self.clock.sleep(min(c.verify_gap_s, max(0.0, end - self.clock.now())))
-            if self.verify_gone():
+            self.woke_late = False
+            accepted = False
+            if self.may_delete():
+                accepted = self.terminate(every_endpoint=self.attempts > 0)
+                if accepted:
+                    self._sleep(min(c.verify_gap_s, max(0.0, end - self.clock.now())))
+            else:
+                self.log("delete_withheld", reason="pod not yet seen under the expected name")
+            gone = self.verify_gone()
+            if self.bad_name is not None:
+                return self._refuse_name(self.bad_name)
+            if gone:
                 if not self.seen:
                     self.alert(
                         "pod watchdog: gone, but never seen",
@@ -449,7 +608,9 @@ class Watchdog:
                 self.log("exit", rc=0, attempts=self.attempts, requests=self.requests)
                 return 0
             self.log("still_present_or_unknown", attempt=self.attempts, accepted=accepted)
-            self.clock.sleep(min(c.retry_pause_s, max(0.0, end - self.clock.now())))
+            self._sleep(min(c.retry_pause_s, max(0.0, end - self.clock.now())))
+            # a cycle ran; after a clock jump (laptop sleep) run one more before giving up
+            must_cycle = self.woke_late
 
     def _refuse_name(self, rd: Read) -> int:
         self.alert(
@@ -517,6 +678,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--timeout-s", type=float, default=8.0, help="total, per read request")
     p.add_argument("--delete-timeout-s", type=float, default=15.0, help="total, per delete")
     p.add_argument("--expect-name-prefix", default="")
+    p.add_argument("--confirm-s", type=float, default=120.0, help="startup confirm window")
+    p.add_argument(
+        "--gone-confirm-s", type=float, default=120.0, help="self-deleted: gone this long"
+    )
+    p.add_argument("--confirm-only", action="store_true", help="exit after the startup confirm")
     p.add_argument("--no-alerts", action="store_true")
     p.add_argument("--api-v2", default=API_V2, help=argparse.SUPPRESS)
     p.add_argument("--api-v1", default=API_V1, help=argparse.SUPPRESS)
@@ -540,7 +706,10 @@ def main(
         bad.append("--pod-id must be 4-64 of [A-Za-z0-9_-]")
     if a.deadline_epoch < 1.6e9 or a.deadline_epoch > 4.1e9:
         bad.append("--deadline-epoch is not a plausible epoch")
-    if min(a.lead_s, a.verify_gap_s, a.overrun_s) < 0 or min(a.timeout_s, a.delete_timeout_s) <= 0:
+    if (
+        min(a.lead_s, a.verify_gap_s, a.overrun_s, a.confirm_s, a.gone_confirm_s) < 0
+        or min(a.timeout_s, a.delete_timeout_s) <= 0
+    ):
         bad.append("negative lead / gap / overrun or non-positive timeout")
     if a.cap_s is not None and a.cap_s <= 0:
         bad.append("--cap-s must be positive")
@@ -562,6 +731,8 @@ def main(
         timeout_s=a.timeout_s,
         delete_timeout_s=a.delete_timeout_s,
         expect_name_prefix=a.expect_name_prefix,
+        confirm_s=a.confirm_s,
+        gone_confirm_s=a.gone_confirm_s,
         api_v2=a.api_v2.rstrip("/"),
         api_v1=a.api_v1.rstrip("/"),
         graphql=a.graphql,
@@ -573,7 +744,7 @@ def main(
         wd.log("exit", rc=5)
         return 5
     try:
-        return wd.run()
+        return wd.run(confirm_only=a.confirm_only)
     except KeyboardInterrupt:
         wd.alert("pod watchdog stopped by hand", f"pod {cfg.pod_id} is no longer watched")
         wd.log("exit", rc=130)

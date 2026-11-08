@@ -6,6 +6,10 @@
 # THE REPO IS PUBLIC, so this log is public: the watchdog prints no key (GitHub also masks secrets)
 # and logs only the pod id, timestamps, HTTP codes and truncated API error bodies.
 # workflow_dispatch works only once this file is on the default branch.
+# The key is an ENVIRONMENT secret of the `pod-watchdog` environment, whose deployment branches are
+# limited to main (runbook, one-time setup): a workflow on any other branch cannot read it.
+# Armed = the "Confirm pod visible" step succeeded (the key sees the pod under the expected name);
+# the agent checks that step with `gh run view --json jobs` before going on (runbook step 3).
 name: pod-watchdog
 
 on:
@@ -40,6 +44,7 @@ concurrency:
 jobs:
   watchdog:
     runs-on: ubuntu-latest
+    environment: pod-watchdog
     # GitHub's maximum for a hosted-runner job; deadlines beyond ~5.5 h are refused below
     timeout-minutes: 360
     steps:
@@ -49,6 +54,7 @@ jobs:
           sparse-checkout-cone-mode: false
       # inputs go through env, never into the script text (no expression injection)
       - name: Validate inputs
+        id: validate
         env:
           POD_ID: ${{ inputs.pod_id }}
           DEADLINE: ${{ inputs.deadline_epoch }}
@@ -57,9 +63,9 @@ jobs:
         run: |
           set -eu
           echo "$POD_ID" | grep -Eq '^[A-Za-z0-9_-]{4,64}$' || { echo "::error::bad pod_id"; exit 1; }
-          echo "$DEADLINE" | grep -Eq '^[0-9]{10}$' || { echo "::error::deadline_epoch must be epoch seconds"; exit 1; }
-          echo "$LEAD_S" | grep -Eq '^[0-9]{1,5}$' || { echo "::error::bad lead_s"; exit 1; }
-          [ -z "$CAP_S" ] || echo "$CAP_S" | grep -Eq '^[0-9]{1,6}$' || { echo "::error::bad cap_s"; exit 1; }
+          echo "$DEADLINE" | grep -Eq '^[1-9][0-9]{9}$' || { echo "::error::deadline_epoch must be epoch seconds"; exit 1; }
+          echo "$LEAD_S" | grep -Eq '^(0|[1-9][0-9]{0,4})$' || { echo "::error::bad lead_s"; exit 1; }
+          [ -z "$CAP_S" ] || echo "$CAP_S" | grep -Eq '^[1-9][0-9]{0,5}$' || { echo "::error::bad cap_s"; exit 1; }
           now=$(date +%s)
           # job limit 360 min from job start; keep room for the lead, the overrun window (900 s) and slack
           if [ $((DEADLINE - now)) -gt 19800 ]; then
@@ -67,7 +73,22 @@ jobs:
             exit 1
           fi
           echo "pod $POD_ID, deadline $(date -u -d "@$DEADLINE" +%FT%TZ) (in $((DEADLINE - now)) s), lead $LEAD_S s"
+      - name: Confirm pod visible
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          POD_ID: ${{ inputs.pod_id }}
+          DEADLINE: ${{ inputs.deadline_epoch }}
+          LEAD_S: ${{ inputs.lead_s }}
+        run: |
+          set -u
+          if [ -z "$RUNPOD_API_KEY" ]; then echo "::error::environment secret RUNPOD_API_KEY (pod-watchdog) is not set"; exit 1; fi
+          python3 -I scripts/pod/watchdog.py --confirm-only --pod-id "$POD_ID" \
+            --deadline-epoch "$DEADLINE" --lead-s "$LEAD_S" --log "$RUNNER_TEMP/confirm.jsonl" \
+            --expect-name-prefix vla-rl-so101
+      # runs even when the confirm step failed: an API that cannot answer yet may recover (the
+      # watchdog still never deletes a pod it has not confirmed); a wrong id or key exits at once
       - name: Watchdog
+        if: ${{ !cancelled() && steps.validate.outcome == 'success' }}
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           POD_ID: ${{ inputs.pod_id }}
@@ -76,7 +97,7 @@ jobs:
           LEAD_S: ${{ inputs.lead_s }}
         run: |
           set -u
-          if [ -z "$RUNPOD_API_KEY" ]; then echo "::error::repo secret RUNPOD_API_KEY is not set"; exit 1; fi
+          if [ -z "$RUNPOD_API_KEY" ]; then echo "::error::environment secret RUNPOD_API_KEY (pod-watchdog) is not set"; exit 1; fi
           set -- --pod-id "$POD_ID" --deadline-epoch "$DEADLINE" --lead-s "$LEAD_S" \
             --log "$RUNNER_TEMP/watchdog.jsonl" --expect-name-prefix vla-rl-so101
           [ -z "$CAP_S" ] || set -- "$@" --cap-s "$CAP_S"

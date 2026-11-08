@@ -22,7 +22,8 @@ KILL_AFTER_S=${KILL_AFTER_S:-120}
 WATCHDOG=""
 export DEBIAN_FRONTEND=noninteractive
 
-is_int() { case "${1:-}" in '' | *[!0-9]*) return 1 ;; esac; }
+# decimal only: a leading zero would be read as octal by $((...)) ("08" aborts the arithmetic)
+is_int() { case "${1:-}" in '' | *[!0-9]* | 0?*) return 1 ;; esac; }
 
 # source /root/runpod.env and set DEADLINE (the soft deadline); non-zero = do not start
 pod_env() {
