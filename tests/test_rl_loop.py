@@ -468,7 +468,6 @@ def test_gate_stop_false_logs_every_decision_and_when_it_would_have_stopped(
     assert state["gate_decisions"]["flat_check"]["step"] == 10
 
 
-
 def test_gate_summary_after_resuming_a_checkpoint_without_a_gate_log(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -504,6 +503,7 @@ def test_gate_summary_after_resuming_a_checkpoint_without_a_gate_log(
         (tmp_path / "c" / "checkpoints" / "step_000040" / "trainer_state.json").read_text()
     )
     assert later["gate_decisions"]["log_from"] == 21
+
 
 def test_config_validation() -> None:
     rl = GRPOConfig.from_config(load_config("rl"))  # the next-run preset must parse

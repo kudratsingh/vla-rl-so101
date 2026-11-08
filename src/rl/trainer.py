@@ -1164,10 +1164,12 @@ class GRPOTrainer:
             "first step per gate: %s",
             str(self.rl.gate_stop).lower(),
             flat,
-            (first if first is not None else "none")
-            if g["gate_log_complete"]
-            else f"unknown (log starts at step {g['gate_log_from_step']}; first logged "
-            f"{g['first_logged_would_stop_step'] or 'none'})",
+            (
+                (first if first is not None else "none")
+                if g["gate_log_complete"]
+                else f"unknown (log starts at step {g['gate_log_from_step']}; first logged "
+                f"{g['first_logged_would_stop_step'] or 'none'})"
+            ),
             g["first_would_stop_reasons"] or "",
             firsts,
         )
