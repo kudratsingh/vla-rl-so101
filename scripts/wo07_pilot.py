@@ -8,12 +8,18 @@
 --hardware  OWNER ONLY, never run by tests or agents: real arm, real camera, the policy server
             through an SSH tunnel (configs/real.yaml server). Refuses without --i-am-present, then
             needs 'go' typed. Moves the arm to the home pose before every trial; the operator
-            scores every trial y/n. A normal end holds the arm, asks the operator to support
-            it, then turns torque off (with robot.park.enabled, default false, it parks first);
-            Ctrl-C during motion holds it, then torque goes off after ENTER; a servo
-            over-temperature / over-current fault cuts torque at once. A failed torque-off
-            ("torque off unconfirmed") blocks all further motion and says to switch off the
-            inline power switch; the trial records and the session end keep that flag.
+            scores every trial whose policy started and ended cleanly y/n (a fault after the
+            policy started is a failure, recorded with its kind; an attempt whose policy never
+            started is not scored). Every prompt answered with torque on reads servo health
+            before and after and waits at most deploy.prompt_torque_timeout_s (60 s; then
+            "support the arm now", deploy.prompt_support_grace_s, torque off, the session ends).
+            A normal end holds the arm, asks the operator to support it, and turns torque off
+            only after ENTER (Ctrl-C there is ignored; a closed stdin or the timeout releases
+            torque after the grace period and is recorded as released_unconfirmed, not
+            supported); with robot.park.enabled (default false) it parks first. Ctrl-C during
+            motion holds it; a servo over-temperature / over-current fault cuts torque at once.
+            A failed torque-off ("torque off unconfirmed") blocks all further motion and says to
+            switch off the inline power switch; the trial records and the session end keep it.
 
     uv run scripts/wo07_pilot.py --preset real --mock                     # real-time, ~1 min
     uv run scripts/wo07_pilot.py --preset real --mock --fake-clock --trials 3
@@ -54,10 +60,12 @@ from src.robot.client import (
     final_session_end,
     latency_lines,
     run_trials,
+    shutdown_results,
     shutdown_session,
     summarize,
 )
 from src.robot.driver import So101Driver
+from src.robot.prompts import TorqueGuard, TorqueWait
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
@@ -81,6 +89,8 @@ HARDWARE_BANNER = """
  ENTER, torque goes off (robot.park.enabled true: it PARKS first, it moves). Ctrl-C while
  the arm moves holds it; after ENTER torque goes off and the arm drops: support it. A servo
  over-temperature / over-current fault cuts torque AT ONCE: the arm drops, support it.
+ No answer within deploy.prompt_torque_timeout_s at any prompt with torque on: SUPPORT THE
+ ARM, torque goes OFF after the grace period and the session ends.
  TORQUE OFF UNCONFIRMED: switch off the servo supply at the inline power switch.
 ==========================================================================================
 """
@@ -115,6 +125,7 @@ def session(
     camera_calibrated: bool,
     runs_dir: Path,
     on_trial_start: Callable[[int], None] | None = None,
+    torque_wait: TorqueWait | None = None,
 ) -> Path:
     trials: list[dict[str, Any]] = []
     end = "error"
@@ -127,7 +138,10 @@ def session(
         run_id=new_run_id("WO-07", f"pilot-{mode}"),
     ) as run:
         run.results.update(
-            mode=mode, label=MOCK_LABEL if mode == "mock" else HARDWARE_LABEL, server_info=info
+            mode=mode,
+            label=MOCK_LABEL if mode == "mock" else HARDWARE_LABEL,
+            server_info=info,
+            torque_wait=None if torque_wait is None else torque_wait.record(),
         )
         try:
             _, end = run_trials(
@@ -151,24 +165,36 @@ def session(
             summary = summarize(trials, loop.dcfg.latency_target_ms, loop.dcfg.capture_offset_ms)
             run.results.update(
                 session_end=end,
-                shutdown=shutdown,
+                **shutdown_results(shutdown),
                 torque_off_unconfirmed=loop.arm.torque_off_unconfirmed,
                 trials=trials,
                 summary=summary,
             )
-        print_summary(run.id, summary, end)
+        print_summary(run.id, summary, end, shutdown.record())
     return run.record_path
 
 
-def print_summary(run_id: str, summary: dict[str, Any], end: str) -> None:
+def print_summary(
+    run_id: str, summary: dict[str, Any], end: str, shutdown: dict[str, Any] | None = None
+) -> None:
     print(f"\nrun {run_id}  (session end: {end})")
+    if shutdown is not None:
+        cause = f" ({shutdown['cause']})" if shutdown.get("cause") else ""
+        print(
+            f"  shutdown: {shutdown['end']}{cause}  support confirmed: "
+            f"{shutdown['support_confirmed']}"
+        )
     for name, c in summary["cells"].items():
         rate = "n/a" if c["success_rate"] is None else f"{100 * c['success_rate']:.0f}%"
         lo, hi = c["wilson_95"]
         print(
-            f"  {name}: {c['successes']}/{c['n']} = {rate}  Wilson95 [{100 * lo:.0f}, {100 * hi:.0f}]"
-            f"  aborted {c['aborted']}  stops {c['stop_reasons']}"
+            f"  {name}: {c['successes']}/{c['n']} started = {rate}  Wilson95 "
+            f"[{100 * lo:.0f}, {100 * hi:.0f}]  faulted {c['faulted']} {c['faults_by_kind']}  "
+            f"unjudged {c['unjudged']}  not started {c['not_started']}  stops {c['stop_reasons']}"
         )
+        d = c["diagnostic_excluding_faulted"]
+        d_rate = "n/a" if d["success_rate"] is None else f"{100 * d['success_rate']:.0f}%"
+        print(f"    secondary diagnostic, excluding faulted: {d['successes']}/{d['n']} = {d_rate}")
     for line in latency_lines(summary):
         print(line)
     print(f"  realised write Hz per trial: median {summary['write_hz']['median']}")
@@ -193,6 +219,7 @@ def run_mock(
     else:
         clock, sleep = time.perf_counter, time.sleep
     dcfg = DeployConfig.from_config(cfg)
+    torque_wait = TorqueWait.from_config(cfg, "deploy", allow_none=True)  # validated, unused
     policy = MockPolicy(
         mock_waypoints(dcfg.home_qpos),
         chunk_len=dcfg.chunk_len,
@@ -239,6 +266,7 @@ def run_mock(
                 camera_calibrated=pipe.calibrated,
                 runs_dir=args.runs_dir,
                 on_trial_start=lambda _k: policy.reset(),  # the waypoint walk restarts per trial
+                torque_wait=torque_wait,
             )
     finally:
         policy.release.set()
@@ -249,6 +277,7 @@ def run_hardware(cfg: Config, args: argparse.Namespace) -> Path:
     if not args.i_am_present:
         print(HARDWARE_REFUSAL)
         sys.exit(2)
+    torque_wait = hardware_torque_wait(cfg)
     print(HARDWARE_BANNER)
     if input("type 'go' to continue: ").strip() != "go":
         sys.exit("not confirmed; nothing was opened")
@@ -275,8 +304,9 @@ def run_hardware(cfg: Config, args: argparse.Namespace) -> Path:
         print(f"policy server OK: {info['policy_id']} (server run {info.get('server_run')})")
         if dcfg.policy_checkpoint is None:
             print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
-        operator = ConsoleOperator()
-        with OpenCVFrameSource(cam_cfg) as cam, So101Driver.from_config(cfg, fk) as arm:
+        arm = So101Driver.from_config(cfg, fk)  # builds the follower; no port is opened yet
+        operator = ConsoleOperator(TorqueGuard(arm, torque_wait))
+        with OpenCVFrameSource(cam_cfg) as cam, arm:
             loop = DeployLoop(arm, cam, pipe, client, dcfg)
             return session(
                 cfg,
@@ -290,7 +320,19 @@ def run_hardware(cfg: Config, args: argparse.Namespace) -> Path:
                 max_steps=args.max_steps,
                 camera_calibrated=pipe.calibrated,
                 runs_dir=args.runs_dir,
+                torque_wait=torque_wait,
             )
+
+
+def hardware_torque_wait(cfg: Config) -> TorqueWait:
+    """``deploy.prompt_torque_timeout_s`` / ``prompt_support_grace_s`` for the real arm: a null or
+    non-positive timeout is refused before anything is opened (owner 2026-11-08)."""
+    try:
+        tw = TorqueWait.from_config(cfg, "deploy", allow_none=False)
+    except ValueError as e:
+        sys.exit(f"{e}; nothing was opened")
+    assert tw is not None
+    return tw
 
 
 def main(argv: Sequence[str] | None = None) -> Path:

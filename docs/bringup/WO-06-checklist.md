@@ -401,16 +401,18 @@ What happens and what you do:
    `Max_Temperature_Limit` next to the monitor's trip temperature. Unverified on hardware.
 2. `[Push 1/1] arrange the scene, hold the leader, ENTER (q = end):`. Hold the leader mid-workspace:
    gripper above the table, every joint away from its stops, trigger mid-way. Press ENTER.
-   **Bounded torque-on wait (proposal, on by default):** every prompt answered while the
-   follower holds under torque (this one, `keep this episode ...`, `type 'resume' ...`) reads
-   the servos' temperature and current before it waits and again after you answer; the final
-   support prompt reads them once before it waits (torque goes off right after it). If you do not answer within `teleop.prompt_torque_timeout_s` (60 s), it
-   prints `No answer for 60 s with torque ON. SUPPORT THE ARM NOW ... Torque goes OFF in 10 s
-   (ENTER = now) and the session ends.` Support the arm: after `teleop.prompt_support_grace_s`
-   (10 s) torque goes off and the session ends (saved episodes are kept, an unsaved one is
-   discarded). The wait is a `select()` on the terminal in the same single thread; nothing
-   reads the servo bus in the background. `null` restores the old wait-forever behaviour (not
-   recommended).
+   **Bounded torque-on wait (on by default; shared with the WO-07 pilot and real eval,
+   `src/robot/prompts.py`):** every prompt answered while the follower holds under torque
+   (this one, `keep this episode ...`, `type 'resume' ...`) reads the servos' temperature and
+   current before it waits and again after you answer; the final support prompt reads them once
+   before it waits (torque goes off right after it). If you do not answer within
+   `teleop.prompt_torque_timeout_s` (60 s), it prints `No answer for 60 s with torque ON.
+   SUPPORT THE ARM NOW ... Torque goes OFF in 10 s (ENTER = now) and the session ends.` Support
+   the arm: after `teleop.prompt_support_grace_s` (10 s) torque goes off and the session ends
+   (saved episodes are kept, an unsaved one is discarded). A Ctrl-C during those 10 s is ignored
+   (the grace keeps running). The wait is a `select()` on the terminal in the same single
+   thread; nothing reads the servo bus in the background. `null` restores the old wait-forever
+   behaviour for teleop only (not recommended); the pilot and real eval refuse it.
 3. **Sync (not recorded):** the follower eases onto the leader's pose, clipped to the safety limits,
    at ≤ 4°/step and 60°/s (`configs/real.yaml` keys `robot.safety.max_joint_step_deg` and
    `max_velocity_deg_s`). A fully closed or open trigger, or a leader
@@ -528,7 +530,10 @@ trips before the prompt waits.
 
 - **Teleop (🔴):** end only through `q` or a single Ctrl-C at a prompt. The script then holds,
   asks you to support the arm, and turns torque off when you press ENTER (`end_session` in
-  `scripts/wo06_teleop_record.py`; normal exit of the driver's `with` block). With
+  `scripts/wo06_teleop_record.py`; normal exit of the driver's `with` block). Only that ENTER
+  counts as a confirmed support: `meta/vla_rl_so101.json` records `session_end` and
+  `support_confirmed`, and a closed stdin or the timeout is `released_unconfirmed`, never
+  `supported`. With
   `robot.park.enabled: true` (only after step 5's checks) it parks first (step 9, item 6); a
   park that cannot finish, or a deadman stop, falls back to the hold and support prompt. If no
   one answers a prompt for 60 s with torque on, it asks you to support the arm and turns torque
@@ -538,16 +543,31 @@ trips before the prompt waits.
   call: it is a flag checked between control ticks (`ctrl_c_as_flag` in
   `scripts/wo06_teleop_record.py`), and
   it is ignored while an episode saves or the follower settles into its hold. Ctrl-C at the
-  "support the arm" prompt is ignored too (`Ctrl-C ignored: the follower still holds ...`): only
-  ENTER, or the bounded wait running out (60 s with torque on, then the 10 s grace), turns
-  torque off, so support the arm first, or cut the servo supply. Any other error (the dataset,
-  the image pipeline, a bug) also holds the follower, discards the episode and shows the same
-  support prompt before the script exits with the error.
-- **Pilot and real eval (`scripts/wo07_pilot.py`, `scripts/wo07_real_eval.py`):** their prompts
-  (move home, place the objects, score the trial, support the arm at the end) wait **without a
-  time limit and without servo reads** while the arm holds under torque (accepted gap,
-  `docs/STATUS.md`). Never leave the arm at one of those prompts: stay at the arm with a hand
-  on the inline switch, and switch the supply off if you must step away.
+  "support the arm" prompt is ignored too (`Ctrl-C ignored: the arm still holds ...`; the
+  bounded wait keeps running, it is not restarted): only ENTER, the bounded wait running out
+  (60 s with torque on, then the 10 s grace), or a closed stdin (`STDIN CLOSED ...`, then the
+  10 s grace without the terminal) turns torque off, so support the arm first, or cut the servo
+  supply. Any other error (the dataset, the image pipeline, a bug) also holds the follower,
+  discards the episode and shows the same support prompt before the script exits with the error.
+- **Pilot and real eval (`scripts/wo07_pilot.py`, `scripts/wo07_real_eval.py`; owner decision
+  2026-11-08):** every prompt answered while the arm holds under torque (move home, place the
+  objects, score the trial, `type 'resume'` after a HOLD stop, support the arm at the end) reads
+  the servos before the wait and after your answer, and waits at most
+  `deploy.prompt_torque_timeout_s` (60 s; `--hardware` refuses `null` or a value <= 0 before
+  anything opens). With no answer: `SUPPORT THE ARM NOW`, `deploy.prompt_support_grace_s`
+  (10 s, ENTER = now), torque off, and the session ends (`prompt_timeout: ...`, no park; the
+  real eval resumes later). At the final support prompt only ENTER confirms: the run record
+  says `shutdown: supported`, `support_confirmed: true`. Ctrl-C there is ignored (the arm keeps
+  holding); a closed stdin or the timeout releases torque after the grace and is recorded as
+  `shutdown: released_unconfirmed` with the cause (`timeout` / `eof`) and `support_confirmed:
+  false`. After a servo or serial fault torque is already off: the script tells you to support
+  the arm and waits for ENTER (bounded); the run record keeps how you answered
+  (`shutdown_detail.ack`: `enter` / `ctrl_c` / `eof` / `timeout`). Scoring: you are asked y/n
+  only for a trial whose policy started and that ended without a fault; a fault after the
+  policy started is a failure automatically (judging rule `real-judge-2`,
+  `scripts/wo07_real_eval.py`), and a score prompt that ends without your answer (Ctrl-C,
+  closed input, timeout) is a failure too (doubt = n). Powered pilot / real-eval runs wait for
+  the revised PR #29 (with steps 9-10).
 - **If anything looks wrong at any moment, or the script prints `TORQUE OFF UNCONFIRMED`:**
   switch off the follower's servo supply at the inline power switch. Torque goes off instantly
   and the arm drops, so keep it low.

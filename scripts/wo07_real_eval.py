@@ -12,13 +12,35 @@ composite hash (``src/eval/protocol_v02.py``) with the 0.1-draft version and has
 the placement and the placement plan's hash, the judging-rule version, the settling interval, the
 real-eval file hashes and the session fingerprint. ``record.json`` holds the Wilson table.
 
-Judging rule ``real-judge-1`` (``judging_rule()``; project review 2026-11-07 section 3.2: a real
-judge must be defined before WO-07; approved by the owner 2026-11-08): after the trial has ended,
-the arm holds still for ``eval.settle_s`` seconds (the settling interval: objects stop rolling or
+Judging rule ``real-judge-2`` (``judging_rule()``; project review 2026-11-07 section 3.2: a real
+judge must be defined before WO-07; real-judge-1 approved by the owner 2026-11-08, real-judge-2
+implements the owner's trial-scoring decision of 2026-11-08): after the trial has ended, the arm
+holds still for ``eval.settle_s`` seconds (the settling interval: objects stop rolling or
 tipping), then it is judged ONCE (the prompt only appears then), by eye, without touching
 anything. Real trials have no success latch: the sim stops at its first success step, the arm
 keeps acting until ``trial_max_steps`` or a stop, so a success undone before the end is a failure
 (stricter than sim). Doubt counts as a failure.
+
+What real-judge-2 changes against real-judge-1 (which had the operator score faulted trials after
+supporting the arm, and left trials with a failed torque-off unscored): a trial counts once its
+policy STARTED (``policy_started``: the trial's first action from the policy server was handed to
+the safety filter; recorded with its UTC time). Every started trial is scored exactly once and is
+never redone. A fault after the start is a FAILURE in the primary metric without a judgement, the
+fault recorded separately (``fault: {kind, stop_reason, reason, where}``; kinds: servo, serial,
+safety = a safety-layer or deadman stop (joint / workspace violation, lost frame, stall, stale
+chunk), server, operator_abort (Ctrl-C during motion), client_error, torque_off_unconfirmed),
+also when torque off is unconfirmed; a later operator 'resume' does not change it. The operator
+still gets the support prompt (at the shutdown that follows: a torque-off fault ends the session).
+A score prompt that ends without a judgement (Ctrl-C, closed stdin, no answer in
+``deploy.prompt_torque_timeout_s``) is a failure, ``outcome_source: unjudged`` with the reason
+(doubt = n applied to a missing judgement; owner check). An attempt whose policy never started
+(the move home failed / faulted / was Ctrl-C'd, a server failure or a stale first chunk before the
+first action, a quit) is ``not_started``: kept in the attempts log, never scored, and retried with
+the same placement on a resume. Primary metric: successes / started trials, per cell, with the
+Wilson interval; ``diagnostic_excluding_faulted`` (success rate over started trials without a
+fault) and ``faults_by_kind`` are a clearly labelled SECONDARY diagnostic. The rule's version and
+text hash are in the session fingerprint, so a session scored under real-judge-1 can be neither
+resumed nor pooled with real-judge-2 records.
 
 Paired placements (owner 2026-11-08): the SFT and the SFT+RL sessions use the SAME slot sequence.
 ``--hardware`` refuses a ``--slot-seed`` other than ``eval.slot_seed``, and the plan is
@@ -42,10 +64,9 @@ changed keys, and the table refuses to pool trials whose fingerprints differ.
 
 Resumable: ``--resume <run id>`` continues a session (any earlier run of it). The task, cells,
 trials per cell, slot seed, label, policy id and fingerprint come from that run and must still
-match; trials without a y/n score (aborted: the policy never ran because the move home failed,
-faulted or was Ctrl-C'd; a Ctrl-C during the trial; torque off unconfirmed) are redone with the
-same placement. A trial that ran and then faulted is scored (judging rule), and a Ctrl-C at the
-score prompt scores it n: neither is ever re-rolled. Each invocation is its own run record,
+match. A slot with any attempt whose policy started is done (``done_indices``) and never re-run;
+a slot whose attempts all ended before the policy started is retried with the same placement.
+Each invocation is its own run record,
 holding every trial of the session so far; record.json is written when the session is bound and
 after every trial, so a run killed without exiting (SIGHUP, power loss) can be resumed itself.
 ``--resume`` refuses a run that a later run of its session continued (a resume of an older
@@ -56,11 +77,16 @@ run would fork the session and drop the newer runs' scored trials), and warns (`
             camera from tests/robot_fakes.py, the real safety filter and sim FK. Scripted scores.
             NOT a result.
 --hardware  OWNER ONLY, never run by tests or agents: gated exactly like scripts/wo07_pilot.py
-            (refuses without --i-am-present, then needs 'go' typed). A normal end holds the arm,
-            asks for support, then torque off (robot.park.enabled, default false: parks first);
-            Ctrl-C during motion holds, then torque off after ENTER; a servo over-temperature /
-            over-current fault cuts torque at once; a failed torque-off blocks all motion and
-            says to switch off the inline power switch.
+            (refuses without --i-am-present, or a null / non-positive
+            deploy.prompt_torque_timeout_s, then needs 'go' typed). Every prompt answered with
+            torque on reads servo health before and after and waits at most that timeout (then
+            "support the arm now", the grace period, torque off, the session ends). A normal end
+            holds the arm, asks for support, and turns torque off only after ENTER (Ctrl-C there
+            is ignored; a closed stdin or the timeout is recorded as released_unconfirmed,
+            support_confirmed false); robot.park.enabled (default false) parks first. Ctrl-C
+            during motion holds; a servo over-temperature / over-current fault cuts torque at
+            once; a failed torque-off blocks all motion and says to switch off the inline power
+            switch.
 
     uv run scripts/wo07_real_eval.py --preset real --mock --fake-clock --trials 2 --max-steps 16
     uv run scripts/wo07_real_eval.py --preset real --hardware --i-am-present --task PickPlace \\
@@ -104,27 +130,34 @@ from src.robot.client import (
     final_session_end,
     latency_lines,
     run_trials,
+    shutdown_results,
     shutdown_session,
     summarize,
     trial_object,
 )
 from src.robot.driver import So101Driver
+from src.robot.prompts import TorqueGuard, TorqueWait
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
 from src.robot.units import UnitMap
 from src.runs import RUNS_DIR, Run, new_run_id
 
-JUDGING_RULE_VERSION = "real-judge-1"
+JUDGING_RULE_VERSION = "real-judge-2"
 DEFAULT_SETTLE_S = 3.0  # eval.settle_s
 JUDGING_GENERAL = (
     "Judge ONCE, after the trial has ended and the arm has then held still for the settling "
     "interval of {settle_s:g} s (eval.settle_s; this prompt only appears then), by eye, touching "
     "nothing. y only if ALL of the task's conditions hold NOW; a success that was undone before "
-    "the end is n. Doubt = n. A trial that ran and ended in a servo or serial fault (torque cut, "
-    "inside the trial or at the settle read) is judged the same way once the arm is supported, "
-    "with no settling interval; it is never redone. Ending the session at this prompt (Ctrl-C, "
-    "closed input) scores the trial n."
+    "the end is n. Doubt = n. A trial counts once its policy started (its first action from the "
+    "policy server reached the safety filter) and is then scored exactly once, never redone. A "
+    "fault after the start (servo, serial, a safety-layer or deadman stop: joint / workspace "
+    "violation, lost frame, stall, stale chunk; a policy-server failure; Ctrl-C during motion; a "
+    "client error; torque off unconfirmed; inside the trial, at the settle read or while this "
+    "prompt waits) makes it a failure without a judgement (the fault is recorded; a later "
+    "'resume' does not change it). A score prompt that ends without a judgement (Ctrl-C, closed "
+    "input, no answer in deploy.prompt_torque_timeout_s) scores it n. An attempt whose policy "
+    "never started is not scored and is redone with the same placement."
 )
 JUDGING_RULE: dict[str, str] = {  # mirrors src/env/success.py, read only
     "PickPlace": "the object rests inside the bowl (over the bowl floor, below the rim), the bowl "
@@ -155,6 +188,9 @@ HARDWARE_BANNER = """
  Before every trial it drives to the home pose (deploy.home_qpos) through the safety filter,
  then the policy moves it. Keep the workspace clear and a hand on the power switch.
  After each trial the arm holds still for eval.settle_s, then you score it (doubt = n).
+ A fault after the policy started is a failure (no score asked); support the arm.
+ No answer within deploy.prompt_torque_timeout_s at a prompt with torque on: SUPPORT THE
+ ARM, torque goes OFF after the grace period, the session ends (resume later).
  A normal end (all trials, or q / Ctrl-C at a prompt) holds the arm: support it, press
  ENTER, torque goes off (robot.park.enabled true: it PARKS first, it moves). Ctrl-C while
  the arm moves holds it; after ENTER torque goes off and the arm drops: support it. A servo
@@ -176,7 +212,7 @@ def settle_s_from_config(cfg: Config) -> float:
 
 
 def judging_rule(settle_s: float) -> dict[str, Any]:
-    """The judging rule real-judge-1, with its settling interval."""
+    """The judging rule (``JUDGING_RULE_VERSION``), with its settling interval."""
     return {
         "version": JUDGING_RULE_VERSION,
         "general": JUDGING_GENERAL.format(settle_s=settle_s),
@@ -205,10 +241,8 @@ def protocol_fields(settle_s: float = DEFAULT_SETTLE_S) -> dict[str, Any]:
 class JudgeOperator(ConsoleOperator):
     """The person at the arm, scoring under ``judging_rule(settle_s)``."""
 
-    def __init__(
-        self, task: str, settle_s: float = DEFAULT_SETTLE_S, input_fn: Callable[[str], str] = input
-    ):
-        super().__init__(input_fn)
+    def __init__(self, guard: TorqueGuard, task: str, settle_s: float = DEFAULT_SETTLE_S):
+        super().__init__(guard)
         self.task = task
         self.settle_s = settle_s
 
@@ -447,26 +481,28 @@ def check_newest(prior_dir: Path, settings: dict[str, Any]) -> list[str]:
     return chain
 
 
-def scored_indices(trials: Sequence[dict[str, Any]], cell: str) -> set[int]:
-    return {int(t["trial_idx"]) for t in trials if t["cell"] == cell and t["outcome"] in SCORED}
+def done_indices(trials: Sequence[dict[str, Any]], cell: str) -> set[int]:
+    """Slots of ``cell`` with an attempt whose policy started: scored once, never re-run."""
+    return {int(t["trial_idx"]) for t in trials if t["cell"] == cell and t.get("policy_started")}
 
 
 def table(
     trials: Sequence[dict[str, Any]], settings: dict[str, Any], cfg_deploy: DeployConfig
 ) -> dict[str, Any]:
-    """client.summarize over the first scored record per (cell, trial_idx), plus completeness.
-    Raises PoolingRefused when a trial's session fingerprint differs from the session's."""
+    """client.summarize over the first started record per (cell, trial_idx) (a started slot is
+    never re-run, so there is one) plus every not-started attempt, and completeness. Raises
+    PoolingRefused when a trial's session fingerprint differs from the session's."""
     if settings.get("fingerprint"):
         check_poolable(trials, settings["fingerprint"])
     first: dict[tuple[str, int], dict[str, Any]] = {}
-    aborted = []
+    attempts = []
     for t in trials:
-        if t["outcome"] in SCORED:
+        if t.get("policy_started") and t["outcome"] in SCORED:
             first.setdefault((t["cell"], int(t["trial_idx"])), t)
         else:
-            aborted.append(t)
+            attempts.append(t)
     scored = list(first.values())
-    s = summarize(scored + aborted, cfg_deploy.latency_target_ms, cfg_deploy.capture_offset_ms)
+    s = summarize(scored + attempts, cfg_deploy.latency_target_ms, cfg_deploy.capture_offset_ms)
     n = int(settings["trials_per_cell"])
     for c in s["cells"].values():
         c["target_n"] = n
@@ -490,17 +526,32 @@ def table(
     return s
 
 
-def print_table(run_id: str, s: dict[str, Any], end: str) -> None:
+def print_table(
+    run_id: str, s: dict[str, Any], end: str, shutdown: dict[str, Any] | None = None
+) -> None:
     print(f"\nrun {run_id}  (session end: {end})  label {s['label']}")
-    print("| cell | successes / n | rate | Wilson 95% | aborted | complete |")
-    print("|---|---|---|---|---|---|")
+    if shutdown is not None:
+        cause = f" ({shutdown['cause']})" if shutdown.get("cause") else ""
+        print(
+            f"shutdown: {shutdown['end']}{cause}  support confirmed: {shutdown['support_confirmed']}"
+        )
+    print("PRIMARY: successes / started trials (a fault after the start is a failure)")
+    print("| cell | successes / started | rate | Wilson 95% | faulted | unjudged | not started |")
+    print("|---|---|---|---|---|---|---|")
     for name, c in s["cells"].items():
         rate = "n/a" if c["success_rate"] is None else f"{100 * c['success_rate']:.1f}%"
         lo, hi = c["wilson_95"]
+        kinds = ", ".join(f"{k} {v}" for k, v in sorted(c["faults_by_kind"].items()))
         print(
             f"| {name} | {c['successes']} / {c['n']} (of {c['target_n']}) | {rate} | "
-            f"[{100 * lo:.1f}, {100 * hi:.1f}] | {c['aborted']} | {c['complete']} |"
+            f"[{100 * lo:.1f}, {100 * hi:.1f}] | {c['faulted']}{f' ({kinds})' if kinds else ''} "
+            f"| {c['unjudged']} | {c['not_started']} |"
         )
+    print("SECONDARY diagnostic (NOT the result): success rate excluding faulted trials")
+    for name, c in s["cells"].items():
+        d = c["diagnostic_excluding_faulted"]
+        d_rate = "n/a" if d["success_rate"] is None else f"{100 * d['success_rate']:.1f}%"
+        print(f"  {name}: {d['successes']} / {d['n']} = {d_rate}")
     for line in latency_lines(s):
         print(line)
     print(
@@ -534,6 +585,7 @@ def session(
     runs_dir: Path,
     on_trial_start: Callable[[int], None] | None = None,
     prior_runs: Sequence[str] = (),
+    torque_wait: TorqueWait | None = None,
 ) -> Path:
     task, n = str(settings["task"]), int(settings["trials_per_cell"])
     settle_s = float(settings["settle_s"])
@@ -565,6 +617,7 @@ def session(
             server_info=info,
             judging_rule=judging_rule(settle_s),
             session_runs=[*prior_runs, run.id],
+            torque_wait=None if torque_wait is None else torque_wait.record(),
             trials=trials,  # the same list: every flush carries the trials so far
         )
         run.flush()  # the session is on disk before the first motion: a killed run resumes
@@ -577,7 +630,7 @@ def session(
         print(f"{judging_rule(settle_s)['general']}\n  {task} success = {JUDGING_RULE[task]}.")
         try:
             for cell in settings["cells"]:
-                done = scored_indices(trials, cell)
+                done = done_indices(trials, cell)
                 todo = [k for k in range(n) if k not in done]
                 if not todo:
                     continue
@@ -626,13 +679,13 @@ def session(
             end = final_session_end(loop.arm, end)  # a failed torque-off wins over any end
             run.results.update(
                 session_end=end,
-                shutdown=shutdown,
+                **shutdown_results(shutdown),
                 torque_off_unconfirmed=loop.arm.torque_off_unconfirmed,
                 trials=trials,
             )
             summary = table(trials, settings, loop.dcfg)
             run.results.update(summary=summary)
-        print_table(run.id, summary, end)
+        print_table(run.id, summary, end, shutdown.record())
         if not summary["complete"]:
             print(f"  session incomplete: resume with --resume {run.id}")
     return run.record_path
@@ -805,6 +858,7 @@ def run(
         settings, prior, resumed_from, prior_runs = new_settings(args, cfg), [], None, []
     if args.hardware:
         return run_hardware(cfg, args, settings, prior, resumed_from, prior_runs)
+    torque_wait = TorqueWait.from_config(cfg, "deploy", allow_none=True)  # validated; mock: unused
     with mock_rig(cfg, args, fk) as (loop, info, on_start, calibrated):
         bind_session(cfg, settings, prior, resumed_from, loop.arm, info, loop.dcfg, args.max_steps)
         return session(
@@ -821,6 +875,7 @@ def run(
             runs_dir=args.runs_dir,
             on_trial_start=on_start,
             prior_runs=prior_runs,
+            torque_wait=torque_wait,
         )
 
 
@@ -835,6 +890,11 @@ def run_hardware(
     if not args.i_am_present:
         print(HARDWARE_REFUSAL)
         sys.exit(2)
+    try:  # a null or non-positive torque-on bound is refused before anything is opened
+        torque_wait = TorqueWait.from_config(cfg, "deploy", allow_none=False)
+    except ValueError as e:
+        sys.exit(f"{e}; nothing was opened")
+    assert torque_wait is not None
     print(HARDWARE_BANNER)
     if input("type 'go' to continue: ").strip() != "go":
         sys.exit("not confirmed; nothing was opened")
@@ -873,7 +933,8 @@ def run_hardware(
         print(f"policy server OK: {info['policy_id']} (server run {info.get('server_run')})")
         if dcfg.policy_checkpoint is None:
             print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
-        operator = JudgeOperator(str(settings["task"]), settle_s_from_config(cfg))
+        guard = TorqueGuard(arm, torque_wait)
+        operator = JudgeOperator(guard, str(settings["task"]), settle_s_from_config(cfg))
         with OpenCVFrameSource(cam_cfg) as cam, arm:
             loop = DeployLoop(arm, cam, pipe, client, dcfg)
             return session(
@@ -889,6 +950,7 @@ def run_hardware(
                 camera_calibrated=pipe.calibrated,
                 runs_dir=args.runs_dir,
                 prior_runs=prior_runs,
+                torque_wait=torque_wait,
             )
 
 

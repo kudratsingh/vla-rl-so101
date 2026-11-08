@@ -72,7 +72,8 @@ teleop:
   episode_time_s: 30                 # s, max per episode (Ctrl-C ends one early)
   prompt_torque_timeout_s: 60        # s, max wait at a prompt with torque ON (servo health read
                                      # before and after it); then "support the arm", grace, torque
-                                     # OFF, session ends. null = wait forever (not recommended)
+                                     # OFF, session ends. null = wait forever (teleop only; not
+                                     # recommended)
   prompt_support_grace_s: 10         # s between "SUPPORT THE ARM NOW" and torque off (ENTER = now)
   dataset_root: data/real_teleop     # local root; git-ignored
   hub_repo: KudratSingh22/vla-rl-so101-real-teleop
@@ -124,6 +125,12 @@ deploy:
                                      # docs/bringup/latency-measurement.md; null = not measured, and
                                      # no end-to-end latency is reported
   stop_on_reject: true               # a workspace / invalid-action rejection ends the trial
+  prompt_torque_timeout_s: 60        # s, max wait at every pilot / real-eval prompt answered with
+                                     # torque ON (between trials, placement, score, resume, final
+                                     # support; servo health read before and after it); then
+                                     # "support the arm", grace, torque OFF, session ends (no
+                                     # park). The real arm refuses null or <= 0 (owner 2026-11-08)
+  prompt_support_grace_s: 10         # s between "SUPPORT THE ARM NOW" and torque off (ENTER = now)
   pilot:                             # scripts/wo07_pilot.py
     task: PickPlace
     cell: seen
@@ -137,4 +144,4 @@ eval:                                # scripts/wo07_real_eval.py
                                      # sessions MUST use the same slot sequence (owner 2026-11-08):
                                      # --hardware refuses any other --slot-seed
   settle_s: 3.0                      # s the arm holds still after a trial before it is scored
-                                     # (judging rule real-judge-1; recorded per trial)
+                                     # (judging rule real-judge-2; recorded per trial)

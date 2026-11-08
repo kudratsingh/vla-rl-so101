@@ -395,3 +395,45 @@ class FakeCam:
         self.last = Frame(self.image, self.clock())
         self.last_fresh_time = self.last.capture_time
         return self.last
+
+
+class FakeReader:
+    """Scripted stdin for ``src.robot.prompts.TorqueGuard`` (its ``LineReader``). Each script item
+    is a line (the operator typed it and pressed ENTER), ``None`` (no answer: the wait times out),
+    ``KeyboardInterrupt`` (Ctrl-C) or ``EOFError`` (stdin closed; every later read is EOF too, as
+    with a real closed stdin). An exhausted script times out. ``calls``: (prompt, timeout_s,
+    torque on at the moment of the read). With ``clock`` a timeout advances it by the whole wait
+    and a Ctrl-C by ``ctrl_c_s`` (the operator pressed it a little into the wait)."""
+
+    def __init__(
+        self,
+        script: list[Any],
+        clock: FakeClock | None = None,
+        bus: FakeBus | None = None,
+        ctrl_c_s: float = 5.0,
+    ):
+        self.script = list(script)
+        self.clock, self.bus, self.ctrl_c_s = clock, bus, ctrl_c_s
+        self.calls: list[tuple[str, float | None, bool | None]] = []
+        self.closed = False
+
+    def __call__(self, prompt: str, timeout_s: float | None) -> str | None:
+        self.calls.append(
+            (prompt, timeout_s, None if self.bus is None else self.bus.torque_enabled)
+        )
+        if self.closed:
+            raise EOFError
+        item = self.script.pop(0) if self.script else None
+        if item is EOFError:
+            self.closed = True
+            raise EOFError
+        if item is KeyboardInterrupt:
+            if self.clock is not None:
+                self.clock.advance(self.ctrl_c_s)
+            raise KeyboardInterrupt
+        if item is None and self.clock is not None and timeout_s is not None:
+            self.clock.advance(timeout_s)
+        return None if item is None else str(item)
+
+    def prompts(self) -> list[str]:
+        return [c[0] for c in self.calls]

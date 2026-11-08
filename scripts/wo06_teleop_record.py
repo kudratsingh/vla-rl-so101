@@ -26,14 +26,18 @@ path, WO-06 checklist step 5) a healthy end PARKS at ``robot.park.qpos`` through
 first (it moves; Ctrl-C stops the park). If the park cannot complete, or the session ends after a
 deadman stop (no ``resume``), it holds, asks the operator to support the arm, then torque off.
 
-Bounded torque-on waits (``teleop.prompt_torque_timeout_s``, default 60 s; null = wait forever):
-every prompt answered while the follower holds under torque (scene, keep, resume) reads the
-servos' temperature and current first, waits at most that long, and reads them again after the
-answer; the final support prompt reads them once before its wait. With no answer
-in time it tells the operator to support the arm, waits ``teleop.prompt_support_grace_s``
-(default 10 s; ENTER = now), turns torque off and ends the session (saved episodes are kept; an
-unsaved one is discarded). The wait is ``select()`` on stdin in this one thread: the servo bus
-keeps a single owner, and nothing reads it in the background.
+Bounded torque-on waits (``teleop.prompt_torque_timeout_s``, default 60 s; null = wait forever),
+shared with the WO-07 pilot and real eval (``src/robot/prompts.py``): every prompt answered while
+the follower holds under torque (scene, keep, resume) reads the servos' temperature and current
+first, waits at most that long, and reads them again after the answer; the final support prompt
+reads them once before its wait. With no answer in time it tells the operator to support the arm,
+waits ``teleop.prompt_support_grace_s`` (default 10 s; ENTER = now), turns torque off and ends the
+session (saved episodes are kept; an unsaved one is discarded). At the final support prompt only
+ENTER confirms: Ctrl-C is ignored (the follower keeps holding, the bounded wait keeps running); a
+closed stdin prints a loud warning, waits the grace period without stdin, then turns torque off.
+Those ends are recorded as ``released_unconfirmed`` (``session_end`` and ``support_confirmed:
+false`` in ``meta/vla_rl_so101.json``), never as supported. The wait is ``select()`` on stdin in
+this one thread: the servo bus keeps a single owner, and nothing reads it in the background.
 
 A failed torque-off write ("TORQUE OFF UNCONFIRMED", ``So101Driver.torque_off_unconfirmed``)
 blocks every further goal-position and torque-enable write; the script tells the operator to
@@ -54,7 +58,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import select
 import shutil
 import signal
 import sys
@@ -62,7 +65,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import numpy as np
 
@@ -85,6 +88,7 @@ from src.robot.camera import (
     sim_mismatches,
 )
 from src.robot.driver import (
+    TORQUE_OFF_UNCONFIRMED,
     TORQUE_OFF_UNCONFIRMED_MSG,
     DeadmanTripped,
     ParkSettings,
@@ -93,6 +97,17 @@ from src.robot.driver import (
     So101Driver,
     StepResult,
     park_from_config,
+)
+from src.robot.prompts import (
+    CTRL_C,
+    ENTER,
+    EOF,
+    TIMEOUT,
+    LineReader,
+    TorqueGuard,
+    TorqueWait,
+    prompt_input,
+    timed_input,
 )
 from src.robot.safety import DeadmanResponse, load_sim_fk
 from src.robot.units import JOINT_NAMES, UnitMap
@@ -139,59 +154,6 @@ def protocol_instructions(tasks: Sequence[str]) -> dict[str, str]:
     return {t: instruction(t, RED_CUBE) for t in tasks}
 
 
-def prompt_input(prompt: str) -> str:
-    """``input()`` with Ctrl-C raising KeyboardInterrupt, also inside ``ctrl_c_as_flag``."""
-    prev = signal.signal(signal.SIGINT, signal.default_int_handler)
-    try:
-        return input(prompt)
-    finally:
-        signal.signal(signal.SIGINT, prev)
-
-
-def timed_input(prompt: str, timeout_s: float) -> str | None:
-    """``prompt_input`` that gives up after ``timeout_s``: None. ``select()`` on stdin in this
-    thread (no reader thread; the servo bus is never touched here). EOF raises EOFError."""
-    prev = signal.signal(signal.SIGINT, signal.default_int_handler)
-    try:
-        sys.stdout.write(prompt)
-        sys.stdout.flush()
-        ready, _, _ = select.select([sys.stdin], [], [], max(0.0, timeout_s))
-        if not ready:
-            sys.stdout.write("\n")
-            return None
-        line = sys.stdin.readline()
-        if not line:
-            raise EOFError
-        return line.rstrip("\r\n")
-    finally:
-        signal.signal(signal.SIGINT, prev)
-
-
-class TorqueWait(NamedTuple):
-    """Bound on a prompt answered with the follower holding under torque (module doc). A
-    NamedTuple, not a dataclass: tests load this script without registering it in sys.modules."""
-
-    timeout_s: float  # teleop.prompt_torque_timeout_s
-    grace_s: float  # teleop.prompt_support_grace_s
-
-    @classmethod
-    def from_config(cls, cfg: dict[str, Any]) -> TorqueWait | None:
-        t = cfg.get("teleop") or {}
-        timeout = t.get("prompt_torque_timeout_s", 60.0)
-        if timeout is None:
-            return None
-        out = cls(float(timeout), float(t.get("prompt_support_grace_s", 10.0)))
-        if not (out.timeout_s > 0 and out.grace_s >= 0):
-            raise ValueError("teleop.prompt_torque_timeout_s must be > 0 and grace_s >= 0")
-        return out
-
-
-TORQUE_WAIT_EXPIRED = (
-    "\nNo answer for {timeout:.0f} s with torque ON. SUPPORT THE ARM NOW: put a hand under the "
-    "forearm. Torque goes OFF in {grace:.0f} s (ENTER = now) and the session ends."
-)
-
-
 def ask(prompt: str) -> str:
     """``input()``, lower-cased; Ctrl-C / EOF answer ``q`` (end the session the safe way)."""
     try:
@@ -229,14 +191,21 @@ class Session:
         units: UnitMap,
         park: ParkSettings | None = None,
         torque_wait: TorqueWait | None = None,
+        read: LineReader = timed_input,
     ):
         self.arm, self.leader, self.cam, self.units = arm, leader, cam, units
         self.park = park  # healthy-end park pose; None = hold + support prompt only
-        self.torque_wait = torque_wait  # None = prompts wait indefinitely under torque
-        self.torque_released = False  # torque turned off after a prompt timed out
+        # bounded torque-on prompts (src/robot/prompts.py); torque_wait None = wait forever
+        self.guard = TorqueGuard(arm, torque_wait, read=read)
+        self.session_end: str | None = None  # end_session's result (provenance file)
         self.period = 1.0 / arm.safety.config.control_hz
         self.target: np.ndarray | None = None  # last leader pose, canonical rad
         self.stop = False  # Ctrl-C under ctrl_c_as_flag; the loops check it between ticks
+
+    @property
+    def torque_released(self) -> bool:
+        """Torque was turned off after a prompt timed out or stdin closed (support unconfirmed)."""
+        return self.guard.released is not None
 
     def frame_time(self) -> float | None:
         try:
@@ -331,26 +300,6 @@ def ctrl_c_as_flag(sess: Session) -> Iterator[None]:
         signal.signal(signal.SIGINT, prev)
 
 
-def _release_torque_after_wait(sess: Session) -> None:
-    """A prompt timed out under torque: support prompt, grace, torque off, deadman TORQUE_OFF
-    (so nothing after this holds, parks or moves)."""
-    tw = sess.torque_wait
-    assert tw is not None
-    print(TORQUE_WAIT_EXPIRED.format(timeout=tw.timeout_s, grace=tw.grace_s), flush=True)
-    if tw.grace_s > 0:
-        try:
-            timed_input("", tw.grace_s)
-        except (KeyboardInterrupt, EOFError):
-            pass
-    arm = sess.arm
-    arm.deadman.trip(
-        f"no answer for {tw.timeout_s:.0f} s at a prompt with torque on", DeadmanResponse.TORQUE_OFF
-    )
-    sess.torque_released = True
-    if arm.torque_off():
-        print("torque OFF: the follower is limp")
-
-
 def _torque_off_unconfirmed(arm: So101Driver) -> bool:
     """Tell the operator to cut power if a torque-off write failed (driver latch). True if so."""
     if arm.torque_off_unconfirmed is None:
@@ -360,37 +309,21 @@ def _torque_off_unconfirmed(arm: So101Driver) -> bool:
 
 
 def torque_on_ask(sess: Session, msg: str) -> str:
-    """``ask`` at a prompt where the follower holds under torque: servo health before and after
-    the wait, and the wait bounded by ``sess.torque_wait`` (module doc). A timeout releases
-    torque and answers ``q``. Raises ServoFault / SerialFault from the health reads."""
-    arm = sess.arm
-    if arm.torque_off_unconfirmed is not None or (
-        arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF
-    ):
-        return ask(msg)  # torque is off (or cannot be confirmed): nothing to bound or read
-    _checked_servos(arm)  # heat from the hold so far
-    if sess.torque_wait is None:
-        ans = ask(msg)
-    else:
-        try:
-            got = timed_input(msg, sess.torque_wait.timeout_s)
-        except (KeyboardInterrupt, EOFError):
-            print()
-            got = QUIT
-        if got is None:
-            _release_torque_after_wait(sess)
-            return QUIT
-        ans = got.strip().lower()
-    _checked_servos(arm)  # heat built up while the arm held at the prompt
-    return ans
-
-
-def _checked_servos(arm: So101Driver) -> None:
+    """``ask`` at a prompt where the follower holds under torque (``TorqueGuard.ask``): servo
+    health before and after the wait, and the wait bounded by ``teleop.prompt_torque_timeout_s``
+    (module doc). A timeout releases torque and answers ``q``; Ctrl-C / EOF answer ``q``. Raises
+    ServoFault / SerialFault from the health reads."""
     try:
-        arm.check_servos()
+        reply = sess.guard.ask(msg)
     except ServoFault:
         print("SUPPORT THE ARM NOW: torque is OFF (servo fault).")
         raise
+    if reply.how in (CTRL_C, EOF):
+        print()
+        return QUIT
+    if reply.how == TIMEOUT:
+        return QUIT  # torque already released (support message, grace, torque off)
+    return reply.answer
 
 
 def discard_episode(dataset: Any) -> None:
@@ -400,57 +333,58 @@ def discard_episode(dataset: Any) -> None:
         dataset.episode_buffer = dataset.create_episode_buffer()
 
 
-def end_session(arm: So101Driver, sess: Session | None = None) -> None:
+def end_session(arm: So101Driver, sess: Session | None = None) -> str:
     """End an operator-ended session (``q`` / Ctrl-C at a prompt, the last episode, no ``resume``).
+    Returns how it ended (also ``sess.session_end``, written to the provenance file): parked |
+    supported | released_unconfirmed | torque_was_off | torque_off_unconfirmed.
 
     Healthy (deadman clear) with ``sess.park`` set (``robot.park.enabled``): park through the
     safety filter, then torque off (``So101Driver.park``; Ctrl-C during the park stops it).
     Otherwise, or if the park does not complete: hold at the measured pose, then let the operator
     support the arm before torque goes off, when the driver's ``with`` block closes normally.
-    The servos are read once after the hold, before the wait. Only ENTER (or a closed stdin, or
-    the bounded torque-on wait plus its grace running out) gets there: Ctrl-C
-    at this prompt is ignored, a panicked second press must not drop the arm. A failed torque-off
-    (driver latch) tells the operator to cut power at the inline switch.
+    The servos are read once after the hold, before the wait. Only ENTER confirms the support
+    (``supported``): Ctrl-C at this prompt is ignored, a panicked second press must not drop the
+    arm, and the bounded wait keeps running. A closed stdin (loud message, the grace period
+    without stdin) or the bounded wait plus its grace running out turns torque off without a
+    confirmation: ``released_unconfirmed``, never "supported". A failed torque-off (driver latch)
+    tells the operator to cut power at the inline switch.
     """
+    end = _end_session(arm, sess)
+    if sess is not None:
+        sess.session_end = end
+    return end
+
+
+def _end_session(arm: So101Driver, sess: Session | None) -> str:
     if _torque_off_unconfirmed(arm):
-        return
+        return TORQUE_OFF_UNCONFIRMED
+    if sess is not None and sess.torque_released:
+        return "released_unconfirmed"  # a prompt timed out / stdin closed: torque is off
     if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
-        return  # torque is already off
+        return "torque_was_off"
     if sess is not None and sess.park is not None and not arm.deadman.tripped:
         print("ending the session: the follower PARKS (it moves; Ctrl-C stops it), then torque off")
         sess.stop = False
         if arm.park(sess.park, sess.frame_time, stop_fn=lambda: sess.stop):
             print("follower parked; torque OFF")
-            return
+            return "parked"
         if _torque_off_unconfirmed(arm):
-            return
+            return TORQUE_OFF_UNCONFIRMED
         if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
-            return  # a servo / serial fault during the park: torque is already off
+            return "torque_was_off"  # a servo / serial fault during the park
         print("park did not complete: the follower holds")
+    guard = sess.guard if sess is not None else TorqueGuard(arm, None, read=timed_input)
     try:
         arm.hold()
-        _checked_servos(arm)  # heat from the hold so far, before the support wait
-    except (ServoFault, SerialFault):
-        _torque_off_unconfirmed(arm)
-        return  # torque is already off (escalated, or the servo fault's response)
-    tw = sess.torque_wait if sess is not None else None
-    while True:
-        try:
-            if tw is None:
-                prompt_input(SUPPORT_PROMPT)
-            elif timed_input(SUPPORT_PROMPT, tw.timeout_s) is None:
-                assert sess is not None
-                _release_torque_after_wait(sess)
-                _torque_off_unconfirmed(arm)
-            return
-        except KeyboardInterrupt:
-            print(
-                "\nCtrl-C ignored: the follower still holds. Support the arm, then press ENTER "
-                "(or switch off the servo supply)."
-            )
-        except EOFError:
-            print("\nWARNING stdin closed: torque goes OFF without confirmation, the arm drops")
-            return
+        how = guard.support(SUPPORT_PROMPT)  # servo health read before the wait
+    except (ServoFault, SerialFault) as e:
+        if isinstance(e, ServoFault):
+            print("SUPPORT THE ARM NOW: torque is OFF (servo fault).")
+        return TORQUE_OFF_UNCONFIRMED if _torque_off_unconfirmed(arm) else "torque_was_off"
+    if how == ENTER:
+        return "supported"  # torque goes off when the driver's `with` block closes
+    _torque_off_unconfirmed(arm)
+    return TORQUE_OFF_UNCONFIRMED if arm.torque_off_unconfirmed else "released_unconfirmed"
 
 
 def record_session(
@@ -655,7 +589,7 @@ def main() -> None:
         video_backend="torchcodec",
         vcodec="libsvtav1",
     )
-    provenance = {
+    provenance: dict[str, Any] = {
         "source": "scripts/wo06_teleop_record.py",
         "protocol_version": PROTOCOL_VERSION,
         "protocol_hash": protocol_hash(),
@@ -670,6 +604,7 @@ def main() -> None:
         if not leader.is_calibrated:
             sys.exit("leader motors do not match its calibration file; recalibrate the leader")
         arm = So101Driver.from_config(cfg, fk)
+        sess: Session | None = None
         try:
             with (
                 OpenCVFrameSource(cfg["cameras"]["front"]) as cam,
@@ -681,11 +616,20 @@ def main() -> None:
                     cam,
                     units,
                     park=park_from_config(cfg),  # None unless robot.park.enabled
-                    torque_wait=TorqueWait.from_config(cfg),
+                    torque_wait=TorqueWait.from_config(cfg, "teleop", allow_none=True),
                 )
                 record_session(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
         finally:
             _torque_off_unconfirmed(arm)  # also after the driver's own torque-off on exit
+            end = None if sess is None else sess.session_end
+            provenance.update(
+                session_end=end,
+                support_confirmed=None if end in (None, "parked") else end == "supported",
+                torque_off_unconfirmed=arm.torque_off_unconfirmed,
+            )
+            (root / "meta" / "vla_rl_so101.json").write_text(
+                json.dumps(provenance, indent=2) + "\n"
+            )
     finally:
         dataset.finalize()
         if leader.is_connected:

@@ -302,7 +302,8 @@ def test_unexpected_error_is_never_a_healthy_end(
     assert r["session_end"].startswith(f"error: {err.__name__}")
     if where == "score":  # the trial ran: recorded as a failure (doubt = n), not lost
         assert [(t["trial_idx"], t["outcome"]) for t in r["trials"]] == [(0, "failure")]
-        assert "EOF" in r["trials"][0]["score_interrupted"]
+        assert r["trials"][0]["unjudged"]["how"] == "eof"
+        assert r["trials"][0]["outcome_source"] == "unjudged"
 
 
 def test_a_killed_run_resumes_from_its_own_record_and_metrics(
@@ -438,3 +439,191 @@ def test_placement_plan_is_prefix_stable_beyond_50_trials() -> None:
         assert G.sample_plan(task, "seen", 65, 0) == long[:65]
     assert ev.plan_sha256("Push", "seen", 0, 2) == ev.plan_sha256("Push", "seen", 0, 50)
     assert ev.plan_sha256("Push", "seen", 0, 80) != ev.plan_sha256("Push", "seen", 0, 50)
+
+
+# -- owner decisions 2026-11-08: bounded prompts, honest shutdown, fault scoring ------------------
+def _judge_with(monkeypatch: pytest.MonkeyPatch, script: list[Any]) -> Any:
+    """The real-eval JudgeOperator on a scripted stdin, bound to the mock rig's arm."""
+    from contextlib import contextmanager
+
+    from robot_fakes import FakeClock, FakeReader
+
+    from src.robot.prompts import TorqueGuard, TorqueWait
+
+    gclock = FakeClock()
+    reader = FakeReader(script, gclock)
+    guard = TorqueGuard(None, TorqueWait(60.0, 10.0), read=reader, clock=gclock, sleep=gclock.sleep)  # type: ignore[arg-type]
+    op = ev.JudgeOperator(guard, "PickPlace", 3.0)
+    real_rig = ev.mock_rig
+
+    @contextmanager
+    def rig(cfg: Any, args: Any, fk: Any) -> Any:
+        with real_rig(cfg, args, fk) as out:
+            guard.arm = out[0].arm
+            reader.bus = out[0].arm.follower.bus
+            yield out
+
+    monkeypatch.setattr(ev, "mock_rig", rig)
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: op)
+    return reader
+
+
+@pytest.mark.parametrize("how", ["timeout", "ctrl_c", "eof"])
+def test_real_eval_score_prompt_without_a_judgement_is_a_failure_never_redone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    answer = {"timeout": None, "ctrl_c": KeyboardInterrupt, "eof": EOFError}[how]
+    script: list[Any] = ["", "", answer] + ([""] if how == "ctrl_c" else [])
+    reader = _judge_with(monkeypatch, script)
+    argv = _args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen")
+    if how == "eof":
+        with pytest.raises(EOFError):
+            ev.main(argv)
+    else:
+        ev.main(argv)
+    (r,) = _records(tmp_path)
+    (t,) = r["trials"]
+    assert t["policy_started"] and t["outcome"] == "failure"
+    assert t["outcome_source"] == "unjudged" and t["unjudged"]["how"] == how
+    assert t["settle"]["measured_s"] == 3.0  # judged (or not) only after the settling interval
+    assert all(timeout is not None for _, timeout, on in reader.calls if on)  # all bounded
+    expected = {
+        "timeout": ("prompt_timeout", "released_unconfirmed", False),
+        "ctrl_c": ("operator_ctrl_c", "supported", True),
+        "eof": ("error: EOFError", "released_unconfirmed", False),
+    }[how]
+    assert r["session_end"].startswith(expected[0]) and r["shutdown"] == expected[1]
+    assert r["support_confirmed"] is expected[2]
+    c = r["summary"]["cells"]["PickPlace/seen"]
+    assert (c["n"], c["successes"], c["unjudged"]) == (1, 0, 1)
+    # a resume never re-runs the started slot: only trial 1 runs
+    monkeypatch.undo()
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    rec2 = ev.main(_args(tmp_path, "--resume", (tmp_path / r["session"]["session_id"]).name))
+    r2 = json.loads(rec2.read_text())["results"]
+    assert [x["trial_idx"] for x in r2["trials"]] == [0, 1]
+    assert r2["summary"]["cells"]["PickPlace/seen"]["n"] == 2
+
+
+@pytest.mark.parametrize("how", ["timeout", "ctrl_c", "eof"])
+def test_real_eval_home_and_support_prompts_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    answer = {"timeout": None, "ctrl_c": KeyboardInterrupt, "eof": EOFError}[how]
+    # the first home prompt, then (Ctrl-C) the support prompt: Ctrl-C there too, then silence
+    script: list[Any] = [answer] + ([KeyboardInterrupt, None] if how == "ctrl_c" else [])
+    reader = _judge_with(monkeypatch, script)
+    argv = _args(tmp_path, "--task", "PickPlace", "--trials", "1", "--cells", "seen")
+    if how == "eof":
+        with pytest.raises(EOFError):
+            ev.main(argv)
+    else:
+        ev.main(argv)
+    (r,) = _records(tmp_path)
+    assert r["trials"] == []  # the policy never started
+    assert r["shutdown"] == "released_unconfirmed" and r["support_confirmed"] is False
+    assert r["shutdown_detail"]["cause"] == ("timeout" if how == "ctrl_c" else how)
+    on = [c for c in reader.calls if c[2]]
+    assert on and all(timeout is not None for _, timeout, _ in on)
+    if how == "ctrl_c":  # Ctrl-C at the support prompt kept the arm holding (torque on)
+        assert reader.calls[1][2] is True and reader.calls[2][2] is True
+        assert reader.calls[2][1] == pytest.approx(55.0)  # the bounded wait kept running
+
+
+def test_faults_after_the_start_fail_and_unstarted_attempts_are_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Attempt 1 (slot 0): the server fails on the first query, before any action: not started,
+    unscored, retried with the same placement. Attempt 2 (slot 1): the server fails on the second
+    query, after the start: a failure (fault kind server), not judged, a later 'resume' does not
+    change it. Slot 2 runs clean."""
+    from src.robot.serve import MockPolicy
+
+    state = {"attempt": 0}
+    fail_at = {1: 1, 2: 2}  # attempt -> the call that fails
+    real_reset, real_act = MockPolicy.reset, MockPolicy.act
+
+    def reset(self: Any) -> None:
+        state["attempt"] += 1
+        real_reset(self)
+
+    def act(self: Any, obs: Any, instruction: str) -> Any:
+        if fail_at.get(state["attempt"]) == self.calls + 1:
+            self.calls += 1
+            raise RuntimeError("mock server failure")
+        return real_act(self, obs, instruction)
+
+    monkeypatch.setattr(MockPolicy, "reset", reset)
+    monkeypatch.setattr(MockPolicy, "act", act)
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)  # resumes after HOLD stops
+    rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "3", "--cells", "seen"))
+    r = json.loads(rec.read_text())["results"]
+    t0, t1, t2 = r["trials"]
+    assert (t0["trial_idx"], t0["outcome"], t0["policy_started"]) == (0, "not_started", False)
+    assert t0["stop_reason"] == "server_error" and t0["fault"] is None
+    assert (t1["trial_idx"], t1["outcome"], t1["outcome_source"]) == (1, "failure", "fault")
+    assert t1["policy_started"] and t1["policy_started_utc"]
+    assert t1["fault"]["kind"] == "server" and t1["fault"]["stop_reason"] == "server_error"
+    assert (t2["trial_idx"], t2["outcome"]) == (2, "success")
+    c = r["summary"]["cells"]["PickPlace/seen"]
+    assert (c["n"], c["successes"], c["not_started"], c["faulted"]) == (2, 1, 1, 1)
+    assert c["success_rate"] == 0.5 and c["faults_by_kind"] == {"server": 1}
+    assert c["diagnostic_excluding_faulted"] == {
+        "n": 1,
+        "successes": 1,
+        "success_rate": 1.0,
+        "note": c["diagnostic_excluding_faulted"]["note"],
+    }
+    assert "SECONDARY" in c["diagnostic_excluding_faulted"]["note"]
+    assert not r["summary"]["complete"]  # slot 0 still has no started attempt
+    rec2 = ev.main(_args(tmp_path, "--resume", rec.parent.name))
+    r2 = json.loads(rec2.read_text())["results"]
+    assert [(t["trial_idx"], t["outcome"]) for t in r2["trials"][3:]] == [(0, "success")]
+    assert r2["trials"][3]["placement"] == t0["placement"]  # the same placement
+    c2 = r2["summary"]["cells"]["PickPlace/seen"]
+    assert (c2["n"], c2["successes"], c2["not_started"]) == (3, 2, 1) and r2["summary"]["complete"]
+
+
+def test_judging_rule_bump_refuses_a_real_judge_1_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert ev.JUDGING_RULE_VERSION == "real-judge-2"
+    assert "policy started" in ev.judging_rule(3.0)["general"]
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(2))
+    rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen"))
+    data = json.loads(rec.read_text())
+    session = data["results"]["session"]
+    for holder in (session["protocol"], session["fingerprint"]["values"]["protocol"]):
+        holder["real_eval"]["judging_rule"] = "real-judge-1"  # recorded under the old rule
+    rec.write_text(json.dumps(data))
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    with pytest.raises(SystemExit, match="resume refused(.|\n)*real_eval"):
+        ev.main(_args(tmp_path, "--resume", rec.parent.name))
+
+
+@pytest.mark.parametrize("bad", [None, 0, -1])
+def test_hardware_refuses_an_unbounded_torque_on_wait(
+    monkeypatch: pytest.MonkeyPatch, bad: Any
+) -> None:
+    pilot = _load("wo07_pilot")
+    asked: list[str] = []
+    monkeypatch.setattr("builtins.input", lambda msg="": asked.append(msg) or "go")
+    for mod, argv in (
+        (ev, ["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"]),
+        (pilot, ["--preset", "real", "--hardware", "--i-am-present"]),
+    ):
+        _with_cfg_in(mod, monkeypatch, lambda c: c["deploy"].update(prompt_torque_timeout_s=bad))
+        with pytest.raises(SystemExit, match="prompt_torque_timeout_s(.|\n)*nothing was opened"):
+            mod.main(argv)
+    assert asked == []  # refused before the 'go' prompt: nothing was opened
+
+
+def _with_cfg_in(mod: ModuleType, monkeypatch: pytest.MonkeyPatch, edit: Any) -> None:
+    real_load = mod.load_config
+
+    def load(preset: str, path: Any = None) -> Any:
+        cfg = real_load(preset, path)
+        edit(cfg)
+        return cfg
+
+    monkeypatch.setattr(mod, "load_config", load)

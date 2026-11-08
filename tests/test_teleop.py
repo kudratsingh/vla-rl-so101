@@ -258,9 +258,10 @@ def test_defaults_no_auto_park_and_a_bounded_torque_on_wait() -> None:
 
     cfg = real_cfg()
     assert park_from_config(cfg) is None  # robot.park.enabled: false until the owner verifies
-    assert teleop.TorqueWait.from_config(cfg) == teleop.TorqueWait(60.0, 10.0)
+    tw = teleop.TorqueWait.from_config(cfg, "teleop", allow_none=True)
+    assert tw == teleop.TorqueWait(60.0, 10.0)
     cfg["teleop"]["prompt_torque_timeout_s"] = None
-    assert teleop.TorqueWait.from_config(cfg) is None
+    assert teleop.TorqueWait.from_config(cfg, "teleop", allow_none=True) is None  # teleop only
 
 
 def _health_reads(fol: FakeFollower) -> int:
@@ -276,23 +277,25 @@ def test_prompt_timeout_under_torque_supports_then_torque_off(
 ) -> None:
     sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
     sess.arm.monitor = monitor_from_config(real_cfg())
-    sess.torque_wait = teleop.TorqueWait(timeout_s=60.0, grace_s=10.0)
+    sess.guard.wait = teleop.TorqueWait(timeout_s=60.0, grace_s=10.0)
     waits: list[tuple[str, float, int]] = []
 
     def no_answer(prompt: str, timeout_s: float) -> str | None:
         waits.append((prompt, timeout_s, _health_reads(fol)))
         return None  # nobody at the keyboard
 
-    monkeypatch.setattr(teleop, "timed_input", no_answer)
+    sess.guard.read_line = no_answer
     instr = teleop.protocol_instructions(["Push"])
     saved = teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2, lambda im: im)
     assert saved == 0
-    assert [w[1] for w in waits] == [60.0, 10.0]  # the scene prompt, then the support grace
+    # the scene prompt, then the support grace
+    assert [w[1] for w in waits] == [60.0, pytest.approx(10.0, abs=0.5)]
     assert waits[0][2] == 2  # temperature + current read BEFORE the wait, by this thread
     out = capsys.readouterr().out
     assert "SUPPORT THE ARM NOW" in out and "Torque goes OFF in 10 s" in out
     assert not fol.sent and not fol.bus.torque_enabled  # nothing moved; torque released
     assert sess.torque_released and sess.arm.deadman.response is not None
+    assert sess.session_end == "released_unconfirmed"  # never "supported"
 
 
 def test_answered_prompt_reads_servos_before_and_after_the_wait(
@@ -300,7 +303,7 @@ def test_answered_prompt_reads_servos_before_and_after_the_wait(
 ) -> None:
     sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
     sess.arm.monitor = monitor_from_config(real_cfg())
-    sess.torque_wait = teleop.TorqueWait(timeout_s=60.0, grace_s=0.0)
+    sess.guard.wait = teleop.TorqueWait(timeout_s=60.0, grace_s=0.0)
     before: list[int] = []
 
     def answer(prompt: str, timeout_s: float) -> str | None:
@@ -308,7 +311,7 @@ def test_answered_prompt_reads_servos_before_and_after_the_wait(
         fol.temperature_c["elbow_flex"] = 58.0  # heated up while the operator thought
         return ""
 
-    monkeypatch.setattr(teleop, "timed_input", answer)
+    sess.guard.read_line = answer
     with pytest.raises(ServoFault):
         teleop.torque_on_ask(sess, "ENTER: ")
     assert before == [2] and _health_reads(fol) == 3  # one read after: the trip
@@ -367,3 +370,39 @@ def test_unexpected_error_holds_and_asks_for_support_before_torque_off(
         and "teleop error: ValueError" in sess.arm.deadman.reason
     )
     assert not fol.bus.torque_enabled  # torque off only after the prompt
+
+
+@pytest.mark.parametrize(
+    ("script", "end", "torque_on_after"),
+    [
+        ([""], "supported", True),  # torque goes off when the driver's `with` block closes
+        ([KeyboardInterrupt, ""], "supported", True),  # Ctrl-C ignored, then ENTER
+        ([KeyboardInterrupt, None], "released_unconfirmed", False),  # Ctrl-C never confirms
+        ([EOFError], "released_unconfirmed", False),  # stdin closed: grace, torque off
+        ([None], "released_unconfirmed", False),
+    ],
+)
+def test_end_session_claims_support_only_after_enter(
+    capsys: pytest.CaptureFixture[str], script: list[Any], end: str, torque_on_after: bool
+) -> None:
+    from robot_fakes import FakeClock, FakeReader
+
+    sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
+    clock = FakeClock()
+    reader = FakeReader(script, clock, fol.bus)
+    sess.guard = teleop.TorqueGuard(
+        sess.arm,
+        teleop.TorqueWait(timeout_s=60.0, grace_s=10.0),
+        read=reader,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    t0 = clock()
+    assert teleop.end_session(sess.arm, sess) == end and sess.session_end == end
+    assert fol.bus.torque_enabled is torque_on_after
+    assert all(c[2] for c in reader.calls[: len(script)])  # the arm held during every wait
+    out = capsys.readouterr().out
+    if EOFError in script:
+        assert "STDIN CLOSED" in out and clock() - t0 == pytest.approx(10.0)
+    if end == "released_unconfirmed":
+        assert sess.torque_released and "support was NOT confirmed" in out

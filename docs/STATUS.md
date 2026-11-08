@@ -237,11 +237,11 @@ Review 3.3 and section 9's robot item. The branch is PR #23's branch (`wo-07-pil
   `end_to_end_estimate_ms`.
 - `scripts/wo07_real_eval.py`: protocol cells × `eval.trials_per_cell` (50), placement-grid slots
   from `src/eval/real_grid.py` (seeded by `eval.slot_seed`, so SFT and SFT+RL sessions are paired
-  trial by trial), and the judging rule `real-judge-1`: judged once after the arm stops, no success
-  latch, doubt = n. Every trial record carries the protocol 0.2 hash, the 0.1-draft reference, and
+  trial by trial), and the judging rule `real-judge-2` (was `real-judge-1`; see the owner
+  decisions below): judged once after the arm stops, no success latch, doubt = n. Every trial record carries the protocol 0.2 hash, the 0.1-draft reference, and
   the hashes of the rule, the grid and the PDF. The run record holds the Wilson table.
-  `--resume <run id>` redoes unscored trials with the same placement and refuses if the
-  evaluation changed. `--hardware` is gated like the pilot. `--mock` runs on the fakes.
+  `--resume <run id>` retries slots whose policy never started, with the same placement, and
+  refuses if the evaluation changed. `--hardware` is gated like the pilot. `--mock` runs on the fakes.
 - `docs/assets/placement-grid-a3.pdf` (`scripts/make_placement_grid.py`, vector PDF written
   directly, no new dependency): a 6 × 6 lattice of SHIFTED_REGION whose inner 4 × 4 is exactly
   SEEN_REGION, slot ids A1-F6, the robot base outline from the URDF meshes, axes, and a 10 cm scale
@@ -261,7 +261,8 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
   torque enable is refused. The operator message says to switch off the servo supply at the
   inline power switch. Trial records get `torque_off_unconfirmed: true` and stop reason
   `torque_off_unconfirmed` (the trial's own reason is kept as `stop_reason_before`). They are
-  stamped after every other field and never scored. The shutdown result, `session_end` and the
+  stamped after every other field (since `real-judge-2`: a started trial is then a failure,
+  fault kind `torque_off_unconfirmed`; an unstarted attempt stays unscored). The shutdown result, `session_end` and the
   summary keep the flag (`scripts/wo07_pilot.py`, `scripts/wo07_real_eval.py`). Tested with a
   fake bus whose torque-off write raises.
 - Real-eval session fingerprint. Six components are hashed separately: protocol (0.2 hash, 0.1
@@ -284,7 +285,7 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
     since the review fixes). Every
     record carries `placement_plan_sha256`.
   - Settling interval: `eval.settle_s` = 3 s. The arm holds still, the servos are read once,
-    then the operator scores the trial. The interval is part of judging rule `real-judge-1`
+    then the operator scores the trial. The interval is part of judging rule `real-judge-1` (now `real-judge-2`)
     (its text and hash) and of each trial's `settle` field.
 - PR #29 review fixes (2026-11-08, $0, fakes only):
   - Torque off reaches every motor. `So101Driver.torque_off` no longer calls lerobot's
@@ -307,32 +308,60 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
     `adapter_sha256` (content of the adapter files) and Hub revision; `--hardware` refuses a
     server without it. The placement plan is prefix-stable for any n (independent RNG streams;
     the plan, and so `grid_sha256`, changed: no session has run yet).
-  - Scoring (judging rule `real-judge-1` text, so its hash, changed): a trial that ran and
+  - Scoring (superseded by `real-judge-2`, below; judging rule `real-judge-1` text, so its hash, changed): a trial that ran and
     then faulted (servo / serial fault in the trial or at the settle read) skips the settle,
     the operator supports the arm first, then scores it; it is never a free redo. Ctrl-C (or
     EOF) at the score prompt records the trial as a failure (`score_interrupted`), so a resume
     cannot re-roll it. **Owner check:** this applies "doubt counts as fail" to both cases; the
     alternative (abort and redo) was rejected because it turns policy-caused faults into redos.
   - `scripts/make_placement_grid.py` takes `--config/--preset` (only `real`).
-- **Accepted gap (owner decision pending):** the real-eval and pilot prompts in
-  `src/robot/client.py` (`run_trials` home and placement confirms, the score prompt, the
-  `safe_shutdown` support wait) wait without a time limit and without servo reads while the arm
-  holds under torque. The firmware's 70 C cut-out is the backstop. Procedural rule until the
-  owner decides: the operator stays at the arm with a hand on the inline switch and never
-  leaves it at a prompt. Moving `TorqueWait` into `src/robot` and bounding these prompts is
-  the follow-up.
-- Proposal, implemented behind config: a bounded torque-on wait at teleop prompts
-  (`teleop.prompt_torque_timeout_s` = 60 s, `prompt_support_grace_s` = 10 s; `null` = old
-  behaviour). Each torque-on prompt reads servo health before and after the wait. With no
-  answer in time, the script says "SUPPORT THE ARM NOW", waits through the grace period, turns
-  torque off and ends the session. The wait is `select()` on stdin in the single control
-  thread; there is no background reader, so the bus keeps one owner.
-
+- Owner decisions of 2026-11-08 (second review round, same PR, $0, fakes only). **Powered
+  bring-up steps 9-10 stay on hold until this revision of #29 lands.**
+  - Bounded torque-on waits in the pilot and the real eval (the former accepted gap is closed).
+    Teleop's helpers moved into `src/robot/prompts.py` (`TorqueWait`, `TorqueGuard`,
+    `timed_input`; mypy-strict) and teleop imports them. Every pilot / real-eval prompt answered
+    while the arm holds under torque (home, placement, score, `resume` after a HOLD stop, the
+    final support prompt) reads servo health before the wait and after the answer and waits at
+    most `deploy.prompt_torque_timeout_s` (60 s). No answer: "SUPPORT THE ARM NOW",
+    `deploy.prompt_support_grace_s` (10 s, ENTER = now), deadman TORQUE_OFF, torque off, the
+    session ends (`prompt_timeout: ...`, no park). `--hardware` refuses a null or non-positive
+    timeout before anything opens; mock runs keep the instant `ScriptedOperator`. Prompts with
+    torque off (before connect, `type 'go'`) are not bounded.
+  - Shutdown honesty. `safe_shutdown` returns a `Shutdown` (end, `support_confirmed`, cause,
+    ack). `supported` only after an explicit ENTER at the support prompt. Ctrl-C there is
+    ignored with a message (the arm keeps holding, the bounded wait keeps running, its deadline
+    not reset); a closed stdin prints a loud warning, waits the grace without stdin, then torque
+    off; a timeout releases as above. Those ends are `released_unconfirmed` with the cause
+    (`timeout` / `eof`) and `support_confirmed: false`. The acknowledgement waits after a fault
+    (`_support_after_fault`, `_torque_already_off`, `_torque_off_unconfirmed`) record whether
+    it was given and how (`enter` / `ctrl_c` / `eof` / `timeout`; bounded by the same timeout so
+    the record is always written). Teleop's `end_session` now returns its end and writes
+    `session_end` and `support_confirmed` into `meta/vla_rl_so101.json`; it never claimed
+    support before either (it printed only), but a closed stdin used to drop torque at once
+    without the grace.
+  - Trial scoring (judging rule bumped to `real-judge-2`, so a `real-judge-1` session cannot be
+    resumed or pooled). `policy_started` (+ UTC time) = the trial's first action from the
+    policy server was handed to `So101Driver.step` (the safety filter). A fault after that is
+    a failure in the primary metric, recorded separately as `fault: {kind, stop_reason, reason,
+    where}` (kinds: servo, serial, safety = joint/workspace stop, lost frame, stall, stale
+    chunk; server; operator_abort = Ctrl-C during motion; client_error; torque_off_unconfirmed,
+    also when torque off is unconfirmed). The operator is not asked to judge it; the support
+    prompt comes with the shutdown that follows (a torque-off fault always ends the session). A
+    later `resume` does not change it. A score prompt ending without a judgement (Ctrl-C, EOF,
+    timeout) is a failure with `outcome_source: unjudged` (doubt = n; **owner check: flagged
+    choice**). Attempts whose policy never started are `not_started`: kept in the log, never
+    scored, retried with the same placement on a resume; a slot with a started attempt is never
+    re-run. Primary metric = successes / started trials (Wilson); a labelled secondary
+    diagnostic gives the rate excluding faulted trials and the fault counts by kind.
+    **Behaviour change to note:** a Ctrl-C during the trial after the policy started used to be
+    an unscored redo; it is now a failure (fault kind `operator_abort`), per "slots with any
+    started attempt are done".
 Unverified on hardware: every item above. In particular: the thresholds, the read cost on the
 Mac's USB-serial link, whether the park pose rests safely with torque off, the refusal
 tolerances against a real calibration, the Homing_Offset read on the real servos, the
 behaviour of a real failed torque-off write, `select()` on the Mac terminal for the bounded
-wait, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
+waits (teleop, pilot, real eval; a line typed ahead of a prompt may sit in Python's stdin buffer
+where `select()` cannot see it), the port-busy recovery on a real interrupted packet, the capture offset, and the printed
 grid's scale and alignment with the real base.
 
 ## Blockers and decisions pending the owner
@@ -380,6 +409,10 @@ grid's scale and alignment with the real base.
   rest pose and a clear park path are verified after WO-06 step 5; single owner of the serial
   bus (no background reader); fixed placement grid and doubt = fail approved; the same slot
   sequence for SFT and SFT+RL; a settling interval before scoring.
+- 2026-11-08 Robot safety (second round): bound the pilot / real-eval torque-on prompts (60 s +
+  10 s grace, servo reads around each wait; real arm refuses null); "supported" only after an
+  explicit ENTER; faults after the policy started count as failures with the fault recorded,
+  unstarted attempts retried on resume; powered steps 9-10 on hold until the revised #29 lands.
 
 - 2026-10-28 WO-04 follow-up (ADR-0002 amendment 2): no per-task advantage normalization; kill
   switch passes if ANY trained task is +3 at step 38; PickPlace-only run, success = final protocol
@@ -391,6 +424,7 @@ grid's scale and alignment with the real base.
 - 2026-11-08 Servo fault thresholds 55 C / 1500 mA for 1 s, read every 4th tick (firmware Max_Temperature_Limit 70 C; lerobot sets the gripper's Protection_Current to 250 counts = 1625 mA); kept by the owner as provisional, to confirm with rehearsal temperatures.
 - 2026-11-08 Settling interval 3 s (`eval.settle_s`) before a real trial is scored; bounded torque-on teleop prompt wait 60 s + 10 s grace (`teleop.prompt_torque_timeout_s`, `prompt_support_grace_s`), the owner's proposal implemented on by default.
 - 2026-11-08 Real judging rule `real-judge-1`: judged once after the arm stops, all success conditions true at that moment, doubt = n (stricter than the sim's latched success).
+- 2026-11-08 Real judging rule `real-judge-2` (owner's trial-scoring decision): a trial counts once its policy started; a fault after the start is a failure (fault recorded); an unjudged score prompt is a failure (doubt = n, agent's reading, flagged to the owner); unstarted attempts are retried, never scored. Faulted-trial support moved from a trial-level prompt to the shutdown that always follows such a fault (one acknowledgement, recorded with how it was given).
 - 2026-11-08 Real placement: a stratified 6 x 6 slot lattice of SHIFTED_REGION (seen = inner 4 x 4) instead of continuous positions, so an operator can place objects by hand; one slot seed pairs the SFT and SFT+RL sessions.
 - 2026-10-26 Python 3.11 kept; LeRobot pinned to 0.4.4, the last release supporting 3.11 (0.5+ needs ≥3.12).
 - 2026-10-26 PyTorch 2.6.0 instead of 2.5.x: every LeRobot ≥0.3 needs torchcodec ≥0.2.1, which pairs with torch 2.6.
