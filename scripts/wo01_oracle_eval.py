@@ -7,6 +7,13 @@
 Episodes run in batches of `--num-envs` sub-envs; batch b is reset with seed `--seed + b`
 (per-env seeds derived as ManiSkill does). An episode succeeds if the env's success check fires
 before the time limit (ManiSkill terminates on success).
+
+Besides success, each cell reports how many policy decisions (`--chunk`-step action chunks, 8 for
+OpenVLA-OFT) an episode takes: `decisions_success` = mean ceil(steps / chunk) over successful
+episodes, and `near_decisions` = mean chunks spent with the TCP within NEAR_RADIUS of the object
+before the first contact phase (close / push), the part of the approach that sets the grasp;
+`near_tcp_cm_per_step` is the mean TCP speed over those steps. `--oracle-profile v1` reproduces
+the 0.1-era oracle (src/data/oracle.py ORACLE_PROFILES).
 """
 
 from __future__ import annotations
@@ -25,18 +32,36 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import add_config_args, config_hash, load_config
-from src.data.oracle import make_oracle
+from src.data.oracle import DEFAULT_PROFILE, ORACLE_PROFILES, make_oracle
 from src.env import CELLS, TASKS, make_env
 from src.eval.protocol import PROTOCOL_VERSION, protocol_hash, wilson_interval
 
+NEAR_RADIUS = 0.10  # m, TCP-object distance that counts as "near the object"
+
+
+def _mean(xs: list[float]) -> float | None:
+    return round(sum(xs) / len(xs), 2) if xs else None
+
 
 def run_cell(
-    cfg: dict[str, Any], task: str, cell: str, episodes: int, num_envs: int, seed: int
+    cfg: dict[str, Any],
+    task: str,
+    cell: str,
+    episodes: int,
+    num_envs: int,
+    seed: int,
+    *,
+    profile: str = DEFAULT_PROFILE,
+    chunk: int = 8,
 ) -> dict[str, Any]:
     env = make_env(cfg, task, num_envs=num_envs, cell=cell, render=False)
-    oracle = make_oracle(task, env)
+    oracle = make_oracle(task, env, profile)
+    contact = oracle.contact_phase()
     max_steps = int(cfg["env"]["max_episode_steps"])
-    successes, lengths = [], []
+    successes: list[bool] = []
+    lengths: list[int] = []
+    near_steps: list[float] = []
+    near_speed: list[float] = []
     t0 = time.time()
     for b in range(math.ceil(episodes / num_envs)):
         obs, _ = env.reset(seed=seed + b)
@@ -44,8 +69,18 @@ def run_cell(
         done = torch.zeros(num_envs, dtype=torch.bool)
         success = torch.zeros(num_envs, dtype=torch.bool)
         length = torch.full((num_envs,), max_steps)
+        near = torch.zeros(num_envs)  # steps near the object before the first contact phase
+        near_path = torch.zeros(num_envs)  # TCP path length over those steps (m)
+        reached = torch.zeros(num_envs, dtype=torch.bool)  # first contact phase entered
         for t in range(max_steps):
+            tcp0 = obs["extra"]["tcp_pose"][:, :3].cpu().float()
+            dist = (obs["extra"]["obj_pose"][:, :3].cpu().float() - tcp0).norm(dim=-1)
             obs, _, term, trunc, info = env.step(oracle.act(obs))
+            reached |= oracle.phase.cpu() >= contact
+            counting = (~done & ~reached & (dist < NEAR_RADIUS)).float()
+            tcp1 = obs["extra"]["tcp_pose"][:, :3].cpu().float()
+            near += counting
+            near_path += counting * (tcp1 - tcp0).norm(dim=-1)
             term, trunc = term.cpu().bool(), trunc.cpu().bool()
             newly = (term | trunc) & ~done
             success |= newly & info["success"].cpu().bool()
@@ -56,16 +91,22 @@ def run_cell(
         take = min(num_envs, episodes - b * num_envs)
         successes += success[:take].tolist()
         lengths += length[:take].tolist()
+        near_steps += near[:take].tolist()
+        near_speed += (near_path / near.clamp(min=1))[:take].tolist()
     env.close()
     k, n = int(sum(successes)), len(successes)
     lo, hi = wilson_interval(k, n)
-    ok_len = [ln for ln, s in zip(lengths, successes, strict=True) if s]
+    ok = [i for i in range(n) if successes[i]]
     return {
         "successes": k,
         "episodes": n,
         "rate": k / n,
         "ci95": [round(lo, 4), round(hi, 4)],
-        "mean_steps_success": round(sum(ok_len) / len(ok_len), 1) if ok_len else None,
+        "mean_steps_success": _mean([lengths[i] for i in ok]),
+        "decisions_success": _mean([math.ceil(lengths[i] / chunk) for i in ok]),
+        "near_steps": _mean([near_steps[i] for i in ok]),
+        "near_decisions": _mean([near_steps[i] / chunk for i in ok]),
+        "near_tcp_cm_per_step": _mean([100 * near_speed[i] for i in ok]),
         "seconds": round(time.time() - t0, 1),
     }
 
@@ -81,6 +122,13 @@ def main() -> None:
     parser.add_argument("--tasks", default=",".join(TASKS))
     parser.add_argument("--cells", default="seen,shifted")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--oracle-profile",
+        choices=sorted(ORACLE_PROFILES),
+        default=None,
+        help=f"default: cfg data.oracle_profile, else {DEFAULT_PROFILE}",
+    )
+    parser.add_argument("--chunk", type=int, default=8, help="policy action-chunk length")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -88,6 +136,7 @@ def main() -> None:
     if args.device:
         cfg["device"] = args.device
     num_envs = args.num_envs or (int(cfg["env"]["num_envs"]) if cfg["device"] != "cpu" else 1)
+    profile = args.oracle_profile or str(cfg.get("data", {}).get("oracle_profile", DEFAULT_PROFILE))
     tasks = args.tasks.split(",")
     cells = args.cells.split(",")
     for c in cells:
@@ -98,16 +147,28 @@ def main() -> None:
     for task in tasks:
         results[task] = {}
         for cell in cells:
-            r = run_cell(cfg, task, cell, args.episodes, num_envs, args.seed)
+            r = run_cell(
+                cfg,
+                task,
+                cell,
+                args.episodes,
+                num_envs,
+                args.seed,
+                profile=profile,
+                chunk=args.chunk,
+            )
             results[task][cell] = r
             print(
                 f"{task:10s} {cell:15s} {r['successes']:4d}/{r['episodes']:<4d} "
                 f"{100 * r['rate']:5.1f}%  CI95 [{100 * r['ci95'][0]:.1f}, {100 * r['ci95'][1]:.1f}]  "
-                f"steps {r['mean_steps_success']}  ({r['seconds']}s)",
+                f"steps {r['mean_steps_success']}  decisions {r['decisions_success']}  "
+                f"near-object decisions {r['near_decisions']} "
+                f"({r['near_tcp_cm_per_step']} cm/step)  ({r['seconds']}s)",
                 flush=True,
             )
 
-    print("\n| task | " + " | ".join(cells) + " |")
+    print(f"\noracle profile {profile}")
+    print("| task | " + " | ".join(cells) + " |")
     print("|---|" + "---|" * len(cells))
     for task in tasks:
         row = [
@@ -129,6 +190,8 @@ def main() -> None:
             "device": cfg["device"],
             "num_envs": num_envs,
             "seed": args.seed,
+            "oracle_profile": profile,
+            "chunk": args.chunk,
             "config_hash": config_hash(cfg),
             "protocol_version": PROTOCOL_VERSION,
             "protocol_hash": protocol_hash(),
