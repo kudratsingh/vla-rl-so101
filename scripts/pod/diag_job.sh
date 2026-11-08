@@ -9,11 +9,13 @@
 # Optional: SEED (3; RL seeds 0-2 are the WO-04 runs, check_rl_seed allows 0-9), SFT_ADAPTER (WO-02
 #   a4 step_004000), RL_CFG (configs/rl.yaml), TEMPS (0.7,1.0,1.3), PROBE_GROUPS (64),
 #   LRS (5e-5,2e-4,5e-4,1e-3), SWEEP_ADAM_STEPS (8), APPROVAL_WAIT_S (1800), HUB_REPO.
-# Approval gate (CLAUDE.md rule 1): the lr sweep starts only once /workspace/APPROVED exists. The
-#   agent creates it over SSH on the owner's explicit go after posting the TEMP-PROBE lines, OR
-#   before launch when the owner pre-approved the whole pass (a dollar cap); a file that already
-#   exists when the gate is reached counts as that pre-approval. No file within APPROVAL_WAIT_S ->
-#   exit (upload + self-delete).
+# Approval gate (CLAUDE.md rule 1): the lr sweep starts only once THIS pod's approval file
+#   (/workspace/APPROVED.<RUNPOD_POD_ID>, written after the pod's first boot: scripts/pod/
+#   approval_lib.sh; a stale or unscoped /workspace/APPROVED never counts) exists. The agent writes
+#   it over SSH with `approval_write` on the owner's explicit go after posting the TEMP-PROBE
+#   lines, OR before launch when the owner pre-approved the whole pass (a dollar cap); a valid
+#   file that already exists when the gate is reached counts as that pre-approval. No valid file
+#   within APPROVAL_WAIT_S -> exit (upload + self-delete).
 # Needs /root/runpod.env (RUNPOD_POD_ID, pod-scoped RUNPOD_API_KEY, SPEND_CAP_SECONDS,
 # POD_HARD_DEADLINE) and /root/pod_start_epoch, both written by scripts/pod/pod_start_cmd.sh (the
 # pod's start command, which also arms the hard self-delete timer: docs/STATUS.md "Next paid run",
@@ -23,6 +25,8 @@
 set -uo pipefail
 # shellcheck source=scripts/pod/job_lib.sh
 . "$(dirname "$0")/job_lib.sh"
+# shellcheck source=scripts/pod/approval_lib.sh
+. "$(dirname "$0")/approval_lib.sh"
 STAGE_FILE=/workspace/stage
 export PATH="$HOME/.local/bin:$PATH"
 export HUB_REPO="${HUB_REPO:-KudratSingh22/vla-rl-so101-rl}"
@@ -127,19 +131,10 @@ if [ "$(left)" -lt "$NEED_S" ]; then
   echo "[job] not enough time before the soft deadline for the lr sweep; stopping"
   exit 23
 fi
-if [ -f /workspace/APPROVED ]; then
-  echo "[job] pre-approved at launch: $(cat /workspace/APPROVED)"
+if approval_valid; then
+  echo "[job] pre-approved at launch: $(cat "$(approval_file)")"
 else
-  APPROVAL_WAIT_S="${APPROVAL_WAIT_S:-1800}"
-  t0=$(date +%s)
-  until [ -f /workspace/APPROVED ]; do
-    if [ $(( $(date +%s) - t0 )) -ge "$APPROVAL_WAIT_S" ]; then
-      echo "[job] no owner approval within $((APPROVAL_WAIT_S / 60)) min; stopping"
-      exit 21
-    fi
-    sleep 15
-  done
-  echo "[job] approved: $(cat /workspace/APPROVED)"
+  await_approval "${APPROVAL_WAIT_S:-1800}" || exit 21
   if [ "$(left)" -lt "$NEED_S" ]; then
     echo "[job] the approval wait used the time the lr sweep needs; stopping"
     exit 23

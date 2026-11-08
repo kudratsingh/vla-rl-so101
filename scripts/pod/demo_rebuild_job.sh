@@ -17,6 +17,8 @@
 set -uo pipefail
 # shellcheck source=scripts/pod/job_lib.sh
 . "$(dirname "$0")/job_lib.sh"
+# shellcheck source=scripts/pod/approval_lib.sh
+. "$(dirname "$0")/approval_lib.sh"
 STAGE_FILE=/workspace/stage
 export PATH="$HOME/.local/bin:$PATH"
 export HUB_REPO="${HUB_REPO:-KudratSingh22/vla-rl-so101-sft}"
@@ -97,18 +99,11 @@ run_until_deadline uv run scripts/wo01r_rebuild_demos.py --preset sim --config "
 upload "render-gap probe"
 
 # Probe -> owner approval gate: no rebuild without an explicit go given AFTER the probe numbers
-# are posted. The agent posts them and, on the owner's go, creates /workspace/APPROVED over SSH.
+# are posted. The agent posts them and, on the owner's go, writes this pod's approval file over
+# SSH (`approval_write`, scripts/pod/approval_lib.sh: /workspace/APPROVED.<pod id>, newer than the
+# pod's first boot; a stale or unscoped /workspace/APPROVED is ignored).
 stage await-approval
-APPROVAL_WAIT_S="${APPROVAL_WAIT_S:-1800}"
-t0=$(date +%s)
-until [ -f /workspace/APPROVED ]; do
-  if [ $(( $(date +%s) - t0 )) -ge "$APPROVAL_WAIT_S" ]; then
-    echo "[job] no owner approval within $((APPROVAL_WAIT_S / 60)) min; stopping"
-    exit 21
-  fi
-  sleep 15
-done
-echo "[job] approved: $(cat /workspace/APPROVED)"
+await_approval "${APPROVAL_WAIT_S:-1800}" || exit 21
 
 stage build
 run_until_deadline uv run scripts/wo01r_rebuild_demos.py --preset sim --config "$CFG" \

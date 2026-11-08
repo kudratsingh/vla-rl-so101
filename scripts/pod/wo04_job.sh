@@ -21,6 +21,8 @@
 set -uo pipefail
 # shellcheck source=scripts/pod/job_lib.sh
 . "$(dirname "$0")/job_lib.sh"
+# shellcheck source=scripts/pod/approval_lib.sh
+. "$(dirname "$0")/approval_lib.sh"
 STAGE_FILE=/workspace/stage
 UPLOADER=""
 export PATH="$HOME/.local/bin:$PATH"
@@ -155,8 +157,10 @@ run_until_deadline uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed 
 stage await-approval
 grep "\[wo03_rl\] PROBE" /workspace/job.log | tail -6
 echo "[job] pod up $(( ($(date +%s) - $(cat /root/pod_start_epoch)) / 60 )) min so far (setup + checks + probe); soft deadline in $(( $(left) / 3600 )) h"
-# The agent posts the PROBE lines; on the owner's explicit go it creates /workspace/APPROVED over
-# SSH. No approval within APPROVAL_WAIT_S -> exit (upload + self-delete).
+# The agent posts the PROBE lines; on the owner's explicit go it writes this pod's approval file
+# over SSH (`approval_write`, scripts/pod/approval_lib.sh: /workspace/APPROVED.<pod id>, newer than
+# the pod's first boot; a stale or unscoped /workspace/APPROVED is ignored). No approval within
+# APPROVAL_WAIT_S -> exit (upload + self-delete).
 # Owner pre-approval (2026-10-27, WO-04 seeds): pass the gate automatically when the probe drops
 # <= AUTO_MAX_DROP of groups AND projects <= AUTO_MAX_USD for the full run; otherwise stop here
 # (upload + self-delete) and the agent reports. Unset -> the manual gate below.
@@ -172,23 +176,14 @@ print(f"[job] auto-gate: groups dropped {drop:.1%} (max {max_drop:.0%}), project
       f"${usd:.2f} per seed (max ${max_usd:.2f}) -> {'PASS' if ok else 'STOP'}")
 raise SystemExit(0 if ok else 3)
 EOF
-    echo "owner pre-approved 2026-10-27: auto-gate passed (drop <= $AUTO_MAX_DROP, projected <= \$$AUTO_MAX_USD)" \
-      > /workspace/APPROVED
+    approval_write "owner pre-approved 2026-10-27: auto-gate passed (drop <= $AUTO_MAX_DROP, projected <= \$$AUTO_MAX_USD)" \
+      || exit 22
   else
     echo "[job] auto-gate: conditions not met (or no probe record); stopping for the owner"
     exit 22
   fi
 fi
-APPROVAL_WAIT_S="${APPROVAL_WAIT_S:-1800}"
-t0=$(date +%s)
-until [ -f /workspace/APPROVED ]; do
-  if [ $(( $(date +%s) - t0 )) -ge "$APPROVAL_WAIT_S" ]; then
-    echo "[job] no owner approval within $((APPROVAL_WAIT_S / 60)) min; stopping"
-    exit 21
-  fi
-  sleep 15
-done
-echo "[job] approved: $(cat /workspace/APPROVED)"
+await_approval "${APPROVAL_WAIT_S:-1800}" || exit 21
 
 stage rl
 ( while sleep "${UPLOAD_EVERY_S:-7200}"; do upload "periodic (rl running)"; done ) &
