@@ -16,9 +16,9 @@ On the Mac (zsh; the sim renders on CPU through MoltenVK):
     uv run scripts/wo06_camera_match.py --preset real --with-arm               # sim arm at real joints
 
 Place the real objects where the sim panel shows them; in the blend panel table edges, robot base
-and objects must overlap. ``--with-arm`` reads the follower's joints (read-only, torque untouched)
-and poses the sim arm identically (an error, not a silent rest pose, if that fails): overlapping
-arms validate the unit mapping and camera pose.
+and objects must overlap. ``--with-arm`` reads the follower's joints (read-only; refuses if torque
+is on) and poses the sim arm identically (an error, not a silent rest pose, if that fails):
+overlapping arms validate the unit mapping and camera pose.
 """
 
 from __future__ import annotations
@@ -59,16 +59,27 @@ def real_frame(cfg: dict[str, Any], image: Path | None) -> Img:
         return cam.read().image
 
 
-def read_arm_joints(cfg: dict[str, Any]) -> Img:
-    """Follower joint angles (canonical rad). Opens the port only: no configure, torque untouched."""
-    from src.robot.driver import follower_from_config
+def read_arm_joints(cfg: dict[str, Any], bus: Any = None) -> Img:
+    """Follower joint angles (canonical rad). Opens the port only: no configure, torque untouched.
 
-    follower = follower_from_config(cfg)
-    bus = follower.bus
+    Refuses if any servo is torqued (e.g. after a crashed session): the operator poses the arm by
+    hand, and turning torque off here would drop an unsupported arm.
+    """
+    if bus is None:
+        from src.robot.driver import follower_from_config
+
+        bus = follower_from_config(cfg).bus
     bus.connect()
     try:
         if not bus.is_calibrated:
             sys.exit("follower motors do not match the calibration file; run wo06_calibrate.py")
+        torqued = [m for m, v in bus.sync_read("Torque_Enable").items() if int(v)]
+        if torqued:
+            sys.exit(
+                f"follower torque is ON ({', '.join(torqued)}; crashed session?): support the arm "
+                "and run `wo06_calibrate.py --preset real verify` (or power-cycle the servo "
+                "supply), then pose the limp arm and retry"
+            )
         raw = bus.sync_read("Present_Position")
     finally:
         bus.disconnect(disable_torque=False)
