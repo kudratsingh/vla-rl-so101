@@ -26,6 +26,7 @@ def _bash(tmp: Path, script: str, pod: str = POD) -> subprocess.CompletedProcess
     return subprocess.run(
         ["bash", "-c", f". {LIB}\n{script}"],
         env=env,
+        check=False,
         capture_output=True,
         text=True,
         timeout=30,
