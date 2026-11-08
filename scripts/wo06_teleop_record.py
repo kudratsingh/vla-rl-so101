@@ -5,26 +5,33 @@ Leader arm (so101_leader) -> canonical radians -> src/robot/safety.py -> followe
 with the front camera through the policy's image pipeline. Writes one LeRobotDataset (v3.0,
 lerobot 0.4.4) with the SAME schema as WO-01's sim demos: ``observation.images.front``
 (crop_to x crop_to RGB video), ``observation.state`` and ``action`` (float32[6] canonical radians;
-action = the safe command actually sent), per-frame ``task`` = language instruction.
+action = the safe command actually sent), per-frame ``task`` = the protocol instruction
+(``src.eval.protocol.instruction(task, RED_CUBE)``, the sim demos' string), also recorded with the
+protocol hash in ``meta/vla_rl_so101.json``.
 
 Needs: a leader arm in ``teleop.leader`` (otherwise exits with a message), both arms calibrated
 (scripts/wo06_calibrate.py), and the shared FK from WO-01 for the workspace check.
 
-    uv run scripts/wo06_teleop_record.py --preset real                  # 5 episodes x 3 tasks
-    uv run scripts/wo06_teleop_record.py --preset real --task Push --episodes 2
-    uv run scripts/wo06_teleop_record.py --preset real --push           # also upload (private)
+    uv run scripts/wo06_teleop_record.py --preset real --task Push --rehearsal   # 1 throwaway episode
+    uv run scripts/wo06_teleop_record.py --preset real                           # 5 episodes x 3 tasks
+    uv run scripts/wo06_teleop_record.py --preset real --push                    # also upload (private)
 
-Per episode: arrange the scene, press ENTER, the follower first eases onto the leader's pose
-(rate-limited, not recorded), then recording runs for ``teleop.episode_time_s`` or until Ctrl-C;
-keep or discard it. A lost frame / stall holds the arm and asks you; a serial error cuts torque.
+Torque is ON from connect until the session ends. Per episode: arrange the scene, press ENTER, the
+follower first eases onto the leader's pose clipped to the safety limits (rate-limited, not
+recorded), then recording runs for ``teleop.episode_time_s`` or until Ctrl-C, then the follower
+holds its pose; keep, redo or quit. ``q`` or Ctrl-C at any prompt ends the session the safe way:
+hold, ask the operator to support the arm, then torque off. A lost frame / stall holds the arm and
+asks you; a serial error cuts torque.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -35,13 +42,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import add_config_args, load_config
+from src.eval.protocol import (
+    PROTOCOL_VERSION,
+    RED_CUBE,
+    TASKS,
+    instruction,
+    protocol_hash,
+)
 from src.robot.camera import (
     CameraFault,
     OpenCVFrameSource,
     PolicyImagePipeline,
     sim_mismatches,
 )
-from src.robot.driver import DeadmanTripped, So101Driver, StepResult
+from src.robot.driver import DeadmanTripped, SerialFault, So101Driver, StepResult
 from src.robot.safety import DeadmanResponse, load_sim_fk
 from src.robot.units import JOINT_NAMES, UnitMap
 
@@ -50,6 +64,7 @@ STATE_KEY = "observation.state"
 ACTION_KEY = "action"
 SYNC_TOL_RAD = np.radians(3.0)
 SYNC_TIMEOUT_S = 10.0
+QUIT = "q"
 
 NO_LEADER = """No leader arm configured (teleop.leader is null in configs/real.yaml).
 
@@ -59,7 +74,7 @@ docs/STATUS.md - the rest of WO-06 (calibration, safety, camera match) does not 
 With a leader: set teleop.leader to
   {type: so101_leader, id: so101_leader, port: /dev/tty.usbmodemYYYY,
    calibration_dir: ~/.cache/huggingface/lerobot/calibration/teleoperators/so_leader}
-then run scripts/wo06_calibrate.py find-port/calibrate --device leader."""
+then run scripts/wo06_calibrate.py find-port/calibrate/verify --device leader."""
 
 
 def features(side: int) -> dict[str, dict[str, Any]]:
@@ -73,6 +88,20 @@ def features(side: int) -> dict[str, dict[str, Any]]:
         STATE_KEY: {"dtype": "float32", "shape": (6,), "names": names},
         ACTION_KEY: {"dtype": "float32", "shape": (6,), "names": names},
     }
+
+
+def protocol_instructions(tasks: Sequence[str]) -> dict[str, str]:
+    """Per-frame ``task`` strings: the protocol's seen-object instruction (= the sim demos')."""
+    return {t: instruction(t, RED_CUBE) for t in tasks}
+
+
+def ask(prompt: str) -> str:
+    """``input()``, lower-cased; Ctrl-C / EOF answer ``q`` (end the session the safe way)."""
+    try:
+        return input(prompt).strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return QUIT
 
 
 def make_leader(lc: dict[str, Any]) -> Any:
@@ -98,6 +127,7 @@ class Session:
     def __init__(self, arm: So101Driver, leader: Any, cam: OpenCVFrameSource, units: UnitMap):
         self.arm, self.leader, self.cam, self.units = arm, leader, cam, units
         self.period = 1.0 / arm.safety.config.control_hz
+        self.target: np.ndarray | None = None  # last leader pose, canonical rad
 
     def tick(self) -> tuple[Any, StepResult]:
         """One control step. Returns (camera frame or None, step result)."""
@@ -107,29 +137,151 @@ class Session:
             print(f"camera: {e}")
             frame = None
         try:
-            target = self.units.to_canonical(self.leader.get_action())
+            self.target = self.units.to_canonical(self.leader.get_action())
         except Exception as e:
             self.arm.deadman.trip(f"leader read failed: {e}", DeadmanResponse.HOLD)
             self.arm.hold()
             raise DeadmanTripped(self.arm.deadman.reason) from e
-        out = self.arm.step(target, frame_time=None if frame is None else frame.capture_time)
+        out = self.arm.step(self.target, frame_time=None if frame is None else frame.capture_time)
         return frame, out
 
     def sleep_to(self, t0: float) -> None:
         time.sleep(max(0.0, self.period - (time.perf_counter() - t0)))
 
-    def sync_to_leader(self) -> bool:
-        """Ease the follower onto the leader's pose through the rate limiter (not recorded)."""
-        t_end = time.perf_counter() + SYNC_TIMEOUT_S
+    def sync_to_leader(self, timeout_s: float = SYNC_TIMEOUT_S) -> bool:
+        """Ease the follower onto the leader's pose through the rate limiter (not recorded).
+
+        Converged when every joint is within SYNC_TOL_RAD of the leader pose CLIPPED to the
+        safety joint limits: the follower never goes past them, so a fully closed or open trigger
+        or a leader joint at its end stop must not block the sync. Prints why it waits on a
+        workspace rejection and which joints lag on a timeout.
+        """
+        sc = self.arm.safety.config
+        lo, hi = np.asarray(sc.lower_rad), np.asarray(sc.upper_rad)
+        t_end = time.perf_counter() + timeout_s
+        warned = False
+        goal = measured = None
         while time.perf_counter() < t_end:
             t0 = time.perf_counter()
             _, out = self.tick()
-            assert out.safety.command is not None
-            leader_q = self.units.to_canonical(self.leader.get_action())
-            if np.all(np.abs(out.measured - leader_q) <= SYNC_TOL_RAD):
+            assert out.safety.command is not None and self.target is not None
+            goal, measured = np.clip(self.target, lo, hi), out.measured
+            if np.all(np.abs(measured - goal) <= SYNC_TOL_RAD):
                 return True
+            ws = [iv.reason for iv in out.safety.interventions if iv.kind == "workspace_reject"]
+            if ws and not warned:
+                warned = True
+                print(
+                    f"safety rejects the leader pose ({ws[0]}). The follower holds: move the "
+                    f"leader's gripper into workspace_box_m x {sc.workspace_lo_m[0]}..."
+                    f"{sc.workspace_hi_m[0]}, y {sc.workspace_lo_m[1]}..{sc.workspace_hi_m[1]}, "
+                    f"z {sc.workspace_lo_m[2]}..{sc.workspace_hi_m[2]} m (robot base frame)."
+                )
             self.sleep_to(t0)
+        if goal is not None and measured is not None:
+            lag = [
+                f"{n} {np.degrees(m):.1f} vs {np.degrees(g):.1f}"
+                for n, m, g in zip(JOINT_NAMES, measured, goal, strict=True)
+                if abs(m - g) > SYNC_TOL_RAD
+            ]
+            print(f"not in sync after {timeout_s:.0f} s (follower vs target, deg): {lag}")
         return False
+
+
+def end_session(arm: So101Driver) -> None:
+    """Hold at the measured pose, then let the operator support the arm before torque goes off.
+
+    Called on every operator-ended session (``q`` / Ctrl-C at a prompt, no ``resume``). Torque
+    goes off afterwards, when the driver's ``with`` block closes normally.
+    """
+    if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
+        return  # torque is already off
+    try:
+        arm.hold()
+    except SerialFault:
+        return  # escalated to torque off already
+    ask(
+        "Ending the session. The follower holds its pose under torque. Put a hand under the "
+        "forearm (or check it rests on the table), then press ENTER: torque goes OFF, the arm "
+        "goes limp "
+    )
+
+
+def record_session(
+    sess: Session,
+    dataset: Any,
+    tasks: Sequence[str],
+    instructions: dict[str, str],
+    n_eps: int,
+    ep_time: float,
+    pipe: Callable[[Any], Any],
+) -> int:
+    """The interactive episode loop; returns the number of saved episodes. Ends through
+    ``end_session`` unless an exception (serial fault, torque-off deadman) ends it first."""
+    arm = sess.arm
+    saved = 0
+    for task in tasks:
+        k = 0
+        while k < n_eps:
+            msg = f"[{task} {k + 1}/{n_eps}] arrange the scene, hold the leader, ENTER (q = end): "
+            if ask(msg) == QUIT:
+                end_session(arm)
+                return saved
+            try:
+                try:
+                    synced = sess.sync_to_leader()
+                except KeyboardInterrupt:
+                    print("\nsync aborted")
+                    synced = False
+                if not synced:
+                    arm.hold()
+                    print("follower holds; retry")
+                    continue
+                t_start = time.perf_counter()
+                print(f"recording ({ep_time:.0f} s max, Ctrl-C to end) ...")
+                try:
+                    while time.perf_counter() - t_start < ep_time:
+                        t0 = time.perf_counter()
+                        frame, out = sess.tick()
+                        assert frame is not None and out.safety.command is not None
+                        dataset.add_frame(
+                            {
+                                IMAGE_KEY: pipe(frame.image),
+                                STATE_KEY: out.measured.astype(np.float32),
+                                ACTION_KEY: out.safety.command.astype(np.float32),
+                                "task": instructions[task],
+                            }
+                        )
+                        sess.sleep_to(t0)
+                except KeyboardInterrupt:
+                    print("\nepisode ended")
+                arm.hold()  # zero position error while the prompts wait (servo heat)
+            except DeadmanTripped as e:
+                print(f"\nSTOPPED: {e}\nEpisode discarded.")
+                dataset.clear_episode_buffer()
+                if arm.deadman.response is not DeadmanResponse.HOLD:
+                    raise  # torque is off: end the session
+                ans = ask("arm is holding; type 'resume' to clear the deadman, else end: ")
+                if ans != "resume":
+                    end_session(arm)
+                    return saved
+                arm.deadman.reset("operator typed resume")
+                arm.safety.reset_reference()
+                continue
+            n_frames = int(dataset.episode_buffer["size"])
+            keep = ask(f"keep this episode ({n_frames} frames)? [Y]es / [n]o, redo / [q]uit: ")
+            if keep == QUIT:
+                dataset.clear_episode_buffer()
+                end_session(arm)
+                return saved
+            if n_frames > 0 and keep in ("", "y", "yes"):
+                dataset.save_episode()
+                saved += 1
+                k += 1
+            else:
+                dataset.clear_episode_buffer()
+    end_session(arm)
+    return saved
 
 
 def main() -> None:
@@ -139,20 +291,35 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=None, help="per task (default config)")
     parser.add_argument("--overwrite", action="store_true", help="replace the local dataset")
     parser.add_argument("--push", action="store_true", help="upload to the Hub (private)")
+    parser.add_argument(
+        "--rehearsal",
+        action="store_true",
+        help="1 episode per task into a throwaway <dataset>-rehearsal folder (replaced each run, "
+        "never pushed); the real dataset is not touched",
+    )
     args = parser.parse_args()
     if args.preset != "real":
         parser.error("WO-06 hardware scripts run with --preset real")
+    if args.rehearsal and args.push:
+        parser.error("--rehearsal is never pushed")
     cfg = load_config(args.preset, args.config)
     tcfg = cfg.get("teleop") or {}
     if not tcfg.get("leader"):
         print(NO_LEADER)
         sys.exit(2)
-    instructions: dict[str, str] = dict(tcfg["instructions"])
-    tasks = args.task or list(instructions)
-    unknown = [t for t in tasks if t not in instructions]
+    config_instructions: dict[str, str] = dict(tcfg["instructions"])
+    tasks = args.task or list(config_instructions)
+    unknown = [t for t in tasks if t not in TASKS]
     if unknown:
-        sys.exit(f"no instruction for {unknown} in teleop.instructions")
-    n_eps = int(args.episodes or tcfg["episodes_per_task"])
+        sys.exit(f"unknown tasks {unknown}; protocol tasks are {list(TASKS)}")
+    instructions = protocol_instructions(tasks)
+    for t in tasks:
+        if config_instructions.get(t) != instructions[t]:
+            print(
+                f"NOTE {t}: recording the protocol instruction {instructions[t]!r} "
+                f"(teleop.instructions says {config_instructions.get(t)!r})"
+            )
+    n_eps = 1 if args.rehearsal else int(args.episodes or tcfg["episodes_per_task"])
     ep_time = float(tcfg["episode_time_s"])
     sim_cfg = load_config("sim")
     for m in sim_mismatches(cfg, sim_cfg):
@@ -163,8 +330,10 @@ def main() -> None:
     units = UnitMap.from_config(cfg)
     repo_id = str(tcfg["hub_repo"])
     root = REPO_ROOT / str(tcfg["dataset_root"]) / repo_id.split("/")[-1]
+    if args.rehearsal:
+        root = root.with_name(root.name + "-rehearsal")
     if root.exists():
-        if not args.overwrite:
+        if not (args.overwrite or args.rehearsal):
             sys.exit(f"{root} exists; pass --overwrite to replace it")
         shutil.rmtree(root)
     root.parent.mkdir(parents=True, exist_ok=True)
@@ -182,68 +351,31 @@ def main() -> None:
         video_backend="torchcodec",
         vcodec="libsvtav1",
     )
-    saved = 0
+    provenance = {
+        "source": "scripts/wo06_teleop_record.py",
+        "protocol_version": PROTOCOL_VERSION,
+        "protocol_hash": protocol_hash(),
+        "instructions": instructions,
+        "config_instructions": {t: config_instructions.get(t) for t in tasks},
+        "rehearsal": bool(args.rehearsal),
+    }
+    (root / "meta").mkdir(parents=True, exist_ok=True)
+    (root / "meta" / "vla_rl_so101.json").write_text(json.dumps(provenance, indent=2) + "\n")
     leader.connect(calibrate=False)  # leader configure() leaves its torque off
     try:
         if not leader.is_calibrated:
             sys.exit("leader motors do not match its calibration file; recalibrate the leader")
         with (
             OpenCVFrameSource(cfg["cameras"]["front"]) as cam,
-            So101Driver.from_config(cfg, fk) as arm,
+            So101Driver.from_config(cfg, fk) as arm,  # torque ON from here, holding the pose
         ):
             sess = Session(arm, leader, cam, units)
-            for task in tasks:
-                k = 0
-                while k < n_eps:
-                    msg = f"[{task} {k + 1}/{n_eps}] arrange the scene, hold the leader, ENTER: "
-                    input(msg)
-                    try:
-                        if not sess.sync_to_leader():
-                            print("follower did not reach the leader pose in time; retry")
-                            continue
-                        t_start = time.perf_counter()
-                        print(f"recording ({ep_time:.0f} s max, Ctrl-C to end) ...")
-                        try:
-                            while time.perf_counter() - t_start < ep_time:
-                                t0 = time.perf_counter()
-                                frame, out = sess.tick()
-                                assert frame is not None and out.safety.command is not None
-                                dataset.add_frame(
-                                    {
-                                        IMAGE_KEY: pipe(frame.image),
-                                        STATE_KEY: out.measured.astype(np.float32),
-                                        ACTION_KEY: out.safety.command.astype(np.float32),
-                                        "task": instructions[task],
-                                    }
-                                )
-                                sess.sleep_to(t0)
-                        except KeyboardInterrupt:
-                            print("\nepisode ended")
-                    except DeadmanTripped as e:
-                        print(f"\nSTOPPED: {e}\nEpisode discarded.")
-                        dataset.clear_episode_buffer()
-                        if arm.deadman.response is not DeadmanResponse.HOLD:
-                            raise  # torque is off: end the session
-                        ans = input(
-                            "arm is holding; type 'resume' to clear the deadman, else quit: "
-                        )
-                        if ans.strip() != "resume":
-                            raise
-                        arm.deadman.reset("operator typed resume")
-                        arm.safety.reset_reference()
-                        continue
-                    n_frames = int(dataset.episode_buffer["size"])
-                    keep = input(f"keep this episode ({n_frames} frames)? [Y/n] ").strip().lower()
-                    if n_frames > 0 and keep in ("", "y", "yes"):
-                        dataset.save_episode()
-                        saved += 1
-                        k += 1
-                    else:
-                        dataset.clear_episode_buffer()
+            record_session(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
     finally:
         dataset.finalize()
         if leader.is_connected:
             leader.disconnect()
+        saved = int(dataset.num_episodes)
         print(f"saved {saved} episodes to {root}")
     if args.push and saved:
         dataset.push_to_hub(private=True)
