@@ -34,12 +34,15 @@ slow and not noisy). Current: a motor whose readings stay above ``max_current_ma
 ``current_trip_s`` trips (acceleration spikes are brief; a blocked or squeezing servo is not).
 The response belongs to the driver: TORQUE OFF at once with the operator told to support the
 arm. Not HOLD (keeps the hot servo energized) and not a powered park (adds motion during the
-fault). The thresholds in ``configs/real.yaml`` are conservative placeholders that need the
-owner's confirmation on the arm (see that file).
+fault). The thresholds in ``configs/real.yaml`` (55 C, 1500 mA for 1 s) are PROVISIONAL: kept by
+the owner on 2026-11-08 for the first sessions, to be confirmed with the logged temperatures.
 
-Not covered: the arm is not monitored between control loops (an operator prompt with the arm
-holding), because a background reader would contend for the port with the control loop. The
-driver's ``check_servos()`` reads both registers once on demand (before a park, at a prompt).
+Not covered: the arm is not monitored continuously between control loops (an operator prompt
+with the arm holding), because the serial bus has a single owner (one thread) and a background
+reader would contend for the port with the control loop. The driver's ``check_servos()`` reads
+both registers once on demand: before a park, before and after each torque-on teleop prompt
+(whose wait is bounded, ``teleop.prompt_torque_timeout_s``), and after the real-eval settling
+interval.
 """
 
 from __future__ import annotations

@@ -17,7 +17,9 @@ from src.robot.driver import (
     RestTolerance,
     So101Driver,
     TorqueEnableRefused,
+    TorqueOffUnconfirmed,
     follower_from_config,
+    park_from_config,
     release_port,
 )
 from src.robot.safety import Deadman, DeadmanResponse, SafetyConfig, SafetyFilter
@@ -123,14 +125,49 @@ def test_connect_failure_leaves_arm_limp_and_port_closed() -> None:
     assert ("disconnect", False) in fol.bus.calls
 
 
-def test_torque_off_failure_is_loud(caplog: pytest.LogCaptureFixture) -> None:
+def _motion_writes(fol: FakeFollower) -> int:
+    """Goal-position and torque-enable traffic so far (policy/hold writes + raw bus writes)."""
+    raw = [
+        c
+        for c in fol.bus.calls
+        if c[0] == "enable_torque" or (c[0] == "sync_write" and c[1][0] == "Goal_Position")
+    ]
+    return len(fol.sent) + len(raw)
+
+
+def test_failed_torque_off_latches_and_blocks_all_further_motion(
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
     fol = FakeFollower()
     drv = make(fol)
     drv.connect()
-    fol.bus.fail_disable = True
+    drv.step(np.zeros(6), frame_time=50.0)
+    fol.bus.fail_disable = True  # the torque-off write raises
     with caplog.at_level(logging.CRITICAL, logger="src.robot.driver"):
         assert drv.torque_off() is False
-    assert any("CUT THE ARM'S POWER" in r.getMessage() for r in caplog.records)
+    assert drv.torque_off_unconfirmed == "ConnectionError: bus gone"
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "TORQUE OFF UNCONFIRMED" in msg and "inline power switch" in msg
+    assert "inline power switch" in capsys.readouterr().err  # loud without logging configured
+    assert drv.deadman.response is DeadmanResponse.TORQUE_OFF
+    n = _motion_writes(fol)
+    with pytest.raises(TorqueOffUnconfirmed, match="inline power switch"):
+        drv.step(np.zeros(6), frame_time=50.0)
+    drv.hold()  # refused, nothing written
+    drv.trip("operator Ctrl-C")  # its hold is refused too
+    park = ParkSettings(qpos=PARK, tol_rad=math.radians(1.0), timeout_s=1.0)
+    assert drv.park(park, frame_time_fn=lambda: 50.0) is False
+    drv.deadman.reset("operator typed resume")  # an operator reset does not clear the latch
+    with pytest.raises(TorqueOffUnconfirmed):
+        drv.move_to(np.zeros(6), frame_time_fn=lambda: 50.0, timeout_s=1.0)
+    with pytest.raises(TorqueEnableRefused, match="earlier torque-off write failed"):
+        fol.bus.enable_torque()  # the guarded torque enable (what connect/configure call)
+    fol.bus.fail_disable = False
+    assert drv.torque_off() is True  # a later success ...
+    assert drv.torque_off_unconfirmed == "ConnectionError: bus gone"  # ... does not clear it
+    with pytest.raises(TorqueOffUnconfirmed):
+        drv.step(np.zeros(6), frame_time=50.0)
+    assert _motion_writes(fol) == n
 
 
 def test_move_to_goes_through_safety() -> None:
@@ -165,6 +202,32 @@ def test_torque_enable_refused_outside_calibrated_range(
     assert "torque stays OFF" in str(e.value) and "move the joint(s) by hand" in str(e.value)
     assert not fol.bus.torque_enabled and "enable_torque" not in [c[0] for c in fol.bus.calls]
     assert ("disconnect", False) in fol.bus.calls  # port closed, nothing driven
+
+
+def test_torque_enable_refused_on_homing_offset_mismatch_with_matching_ranges() -> None:
+    """Regression (owner 2026-11-08): Min/Max_Position_Limit agree with the file, but one servo's
+    stored Homing_Offset differs. Refused before any torque-enable or goal write."""
+    fol = FakeFollower()
+    eeprom = full_sweep_calibration()
+    c = eeprom["wrist_flex"]
+    eeprom["wrist_flex"] = type(c)(
+        c.id, c.drive_mode, c.homing_offset + 37, c.range_min, c.range_max
+    )
+    fol.bus.eeprom = eeprom
+    assert all(
+        (eeprom[m].range_min, eeprom[m].range_max) == (f.range_min, f.range_max)
+        for m, f in fol.bus.calibration.items()
+    )
+    with pytest.raises(TorqueEnableRefused) as e:
+        make(fol).connect()
+    msg = str(e.value)
+    assert "torque stays OFF" in msg and "wrist_flex: servo Homing_Offset 37" in msg
+    assert "calibration file's homing_offset 0" in msg and "wo06_calibrate.py" in msg
+    assert not fol.bus.torque_enabled and _motion_writes(fol) == 0  # no torque / goal write
+    assert ("disconnect", False) in fol.bus.calls  # port closed
+    ok = FakeFollower()  # same offsets: torque comes on
+    make(ok).connect()
+    assert ok.bus.torque_enabled
 
 
 def test_torque_enable_refused_on_eeprom_mismatch_or_safety_limits() -> None:
@@ -227,6 +290,9 @@ def test_park_drives_through_safety_then_torque_off() -> None:
     assert not fol.bus.torque_enabled and fol.bus.calls[-1] == ("disable_torque", None)
     cfg = real_cfg()
     assert ParkSettings.from_config(cfg).qpos == tuple(cfg["deploy"]["home_qpos"])  # null -> home
+    assert park_from_config(cfg) is None  # robot.park.enabled: false by default (owner)
+    cfg["robot"]["park"]["enabled"] = True
+    assert park_from_config(cfg) == ParkSettings.from_config(cfg)
 
 
 def test_park_never_runs_on_a_fault_path() -> None:

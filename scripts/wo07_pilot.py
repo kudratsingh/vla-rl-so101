@@ -8,9 +8,12 @@
 --hardware  OWNER ONLY, never run by tests or agents: real arm, real camera, the policy server
             through an SSH tunnel (configs/real.yaml server). Refuses without --i-am-present, then
             needs 'go' typed. Moves the arm to the home pose before every trial; the operator
-            scores every trial y/n. A normal end parks the arm (robot.park) then turns torque
-            off; Ctrl-C during motion holds it, then torque goes off after ENTER; a servo
-            over-temperature / over-current fault cuts torque at once.
+            scores every trial y/n. A normal end holds the arm, asks the operator to support
+            it, then turns torque off (with robot.park.enabled, default false, it parks first);
+            Ctrl-C during motion holds it, then torque goes off after ENTER; a servo
+            over-temperature / over-current fault cuts torque at once. A failed torque-off
+            ("torque off unconfirmed") blocks all further motion and says to switch off the
+            inline power switch; the trial records and the session end keep that flag.
 
     uv run scripts/wo07_pilot.py --preset real --mock                     # real-time, ~1 min
     uv run scripts/wo07_pilot.py --preset real --mock --fake-clock --trials 3
@@ -48,6 +51,7 @@ from src.robot.client import (
     PolicyClient,
     ScriptedOperator,
     check_server,
+    final_session_end,
     latency_lines,
     run_trials,
     shutdown_session,
@@ -73,10 +77,11 @@ HARDWARE_BANNER = """
  THIS WILL MOVE THE REAL ARM.
  Before every trial it drives to the home pose (deploy.home_qpos) through the safety filter,
  then the policy moves it. Keep the workspace clear and a hand on the power switch.
- A normal end (all trials, or q / Ctrl-C at a prompt) PARKS the arm at robot.park.qpos
- (it moves), then torque goes off. Ctrl-C while the arm moves holds it; after ENTER
- torque goes off and the arm drops: support it. A servo over-temperature / over-current
- fault cuts torque AT ONCE: the arm drops, support it.
+ A normal end (all trials, or q / Ctrl-C at a prompt) holds the arm: support it, press
+ ENTER, torque goes off (robot.park.enabled true: it PARKS first, it moves). Ctrl-C while
+ the arm moves holds it; after ENTER torque goes off and the arm drops: support it. A servo
+ over-temperature / over-current fault cuts torque AT ONCE: the arm drops, support it.
+ TORQUE OFF UNCONFIRMED: switch off the servo supply at the inline power switch.
 ==========================================================================================
 """
 
@@ -142,8 +147,15 @@ def session(
             end = "operator_ctrl_c"
         finally:
             shutdown = shutdown_session(loop, operator, end)
+            end = final_session_end(loop.arm, end)  # a failed torque-off wins over any end
             summary = summarize(trials, loop.dcfg.latency_target_ms, loop.dcfg.capture_offset_ms)
-            run.results.update(session_end=end, shutdown=shutdown, trials=trials, summary=summary)
+            run.results.update(
+                session_end=end,
+                shutdown=shutdown,
+                torque_off_unconfirmed=loop.arm.torque_off_unconfirmed,
+                trials=trials,
+                summary=summary,
+            )
         print_summary(run.id, summary, end)
     return run.record_path
 
@@ -161,6 +173,8 @@ def print_summary(run_id: str, summary: dict[str, Any], end: str) -> None:
         print(line)
     print(f"  realised write Hz per trial: median {summary['write_hz']['median']}")
     print(f"  protocol {summary['protocol_version']} {summary['protocol_hash'][:12]}")
+    if summary.get("torque_off_unconfirmed") or end.startswith("torque_off_unconfirmed"):
+        print("  TORQUE OFF UNCONFIRMED: keep the servo supply OFF at the inline power switch")
 
 
 def run_mock(

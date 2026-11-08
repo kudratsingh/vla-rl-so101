@@ -77,11 +77,13 @@ def rig(
     server_chunk_len: int = 8,
     track: bool = True,
     policy_id: str = "mock:test",
+    park_enabled: bool = False,
     **deploy: Any,
 ) -> Iterator[Rig]:
     clock = FakeClock()
     cfg = real_cfg()
     cfg["deploy"] = {**cfg["deploy"], "home_qpos": TEST_HOME, **deploy}
+    cfg["robot"]["park"] = {**cfg["robot"]["park"], "enabled": park_enabled}
     dcfg = DeployConfig.from_config(cfg)
     policy = MockPolicy(
         waypoints or [TEST_TARGET], chunk_len=server_chunk_len, infer_s=infer_s, sleep=clock.sleep
@@ -482,7 +484,24 @@ def test_serve_main_names_its_adapter_and_keeps_a_run_record(
 
 
 def test_healthy_end_parks_then_torque_off_a_motion_abort_does_not() -> None:
-    with rig() as r:
+    with rig() as r:  # robot.park.enabled false (the default): hold + support prompt, no park
+        assert r.dcfg.park is None
+        _, end = run_trials(
+            r.loop,
+            ScriptedOperator(),
+            task="PickPlace",
+            cell="seen",
+            n_trials=1,
+            info=r.server_info,
+            camera_calibrated=False,
+            max_steps=16,
+        )
+        op = PromptLog()
+        n = len(r.fol.sent)
+        assert shutdown_session(r.loop, op, end) == "supported"
+        assert len(r.fol.sent) == n + 1 and r.fol.sent[-1] == pytest.approx(r.fol.pos)  # a hold
+        assert op.prompts and "support it" in op.prompts[0] and not r.fol.bus.torque_enabled
+    with rig(park_enabled=True) as r:
         trials, end = run_trials(
             r.loop,
             ScriptedOperator(),
@@ -540,6 +559,70 @@ def test_servo_fault_mid_trial_is_torque_off_with_support_prompt(
         assert shutdown_session(r.loop, op, "completed") == "torque_was_off"  # no park, no hold
         assert len(r.fol.sent) == n and "SERVO FAULT" in capsys.readouterr().out
         assert op.prompts and "servo supply is off" in op.prompts[0]
+
+
+def test_failed_torque_off_is_recorded_and_blocks_motion_to_the_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A servo fault whose torque-off write raises: 'torque off unconfirmed' in the operator
+    message, the trial record, the shutdown result and the session end; nothing moves after."""
+    with rig() as r:
+        r.arm.monitor = monitor_from_config(real_cfg())
+
+        def overheat_with_a_dead_bus(k: int) -> None:
+            def on_decision(timing: dict[str, float]) -> None:
+                r.fol.temperature_c["gripper"] = 66.0
+                r.fol.bus.fail_disable = True  # every torque-off write now raises
+
+            r.loop.on_decision = on_decision
+
+        class Op(PromptLog):
+            def ack_stop(self, reason: str) -> str | None:
+                return "scripted resume"  # would continue after a HOLD: must not here
+
+        op = Op()
+        rec_path = pilot.session(
+            real_cfg(),
+            r.loop,
+            op,
+            r.server_info,
+            mode="mock",
+            task="PickPlace",
+            cell="seen",
+            n_trials=3,
+            max_steps=40,
+            camera_calibrated=False,
+            runs_dir=tmp_path,
+            on_trial_start=overheat_with_a_dead_bus,
+        )
+        n_sent = len(r.fol.sent)
+        res = json.loads(rec_path.read_text())["results"]
+        assert len(res["trials"]) == 1  # the session ended at the fault
+        t = res["trials"][0]
+        assert t["stop_reason"] == "torque_off_unconfirmed" and t["torque_off_unconfirmed"]
+        assert t["stop_reason_before"] == "servo_fault" and t["outcome"] == "aborted"
+        assert "bus gone" in t["torque_off_unconfirmed_detail"]
+        assert res["shutdown"] == "torque_off_unconfirmed"
+        assert res["session_end"].startswith("torque_off_unconfirmed")
+        assert res["torque_off_unconfirmed"] and res["summary"]["torque_off_unconfirmed"]
+        out = capsys.readouterr().out
+        assert "TORQUE OFF UNCONFIRMED" in out and "inline power switch" in out
+        assert op.prompts and "inline power switch" in op.prompts[-1]
+        # later code paths cannot move the arm or clear the flag
+        r.fol.bus.fail_disable = False
+        r.arm.deadman.reset("operator typed resume")
+        assert safe_shutdown(r.arm, op, healthy=True, park=r.dcfg.park) == "torque_off_unconfirmed"
+        trials, end = run_trials(
+            r.loop,
+            ScriptedOperator(),
+            task="PickPlace",
+            cell="seen",
+            n_trials=1,
+            info=r.server_info,
+            camera_calibrated=False,
+        )
+        assert trials == [] and end.startswith("torque_off_unconfirmed")
+        assert len(r.fol.sent) == n_sent
 
 
 def test_latency_is_never_labelled_end_to_end_without_a_measured_offset() -> None:

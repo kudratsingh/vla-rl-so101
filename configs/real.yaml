@@ -23,7 +23,10 @@ robot:
   safety:
     joint_limits_deg: {}             # deg, canonical, {joint: [lo, hi]}; only NARROWS the URDF
                                      # limits minus urdf_limit_margin_deg. wo06_calibrate.py check --write-limits
-    urdf_limit_margin_deg: 5.0       # deg kept clear of each URDF joint limit
+    urdf_limit_margin_deg: 5.0       # deg kept clear of each URDF joint limit. Gripper floor =
+                                     # URDF -10 + 5 = -5 deg: the gripper never closes past it.
+                                     # Owner 2026-11-08: keep -5 deg for the first rehearsal
+                                     # (WO-06 checklist step 9); revisit only if cubes slip
     workspace_box_m: {x: [0.10, 0.40], y: [-0.20, 0.20], z: [0.00, 0.25]}  # m, TCP in robot base frame
     max_joint_step_deg: 4.0          # deg per command, every joint (hard ceiling 10)
     max_velocity_deg_s: 60.0         # deg/s, every joint (hard ceiling 180); 60 deg/s = 4 deg/step at 15 Hz
@@ -37,21 +40,27 @@ robot:
                                      #   so a gripper resting closed / a joint on its stop passes)
   park:                              # healthy shutdown (So101Driver.park): drive here through
                                      # src/robot/safety.py, then torque off. Never on a fault path.
+    enabled: false                   # OFF until the owner verifies a physically supported rest
+                                     # pose and a clear park path (WO-06 checklist step 5, "Park
+                                     # pose"). Off: every session ends hold + "support the arm"
+                                     # + torque off. Owner decision 2026-11-08
     qpos: null                       # rad, canonical; null = deploy.home_qpos (sim REST_QPOS). Set it
                                      # to the arm's resting pose (WO-06 checklist step 5) if torque-off
                                      # at REST_QPOS lets the arm sag onto its stops
     tol_deg: 3.0                     # deg, every joint
     timeout_s: 20                    # s; not reached -> hold + "support the arm" + torque off
   servo_monitor:                     # src/robot/servo_health.py. Fault -> torque OFF at once (not
-                                     # hold, not park) + "support the arm". UNVERIFIED ON HARDWARE:
-                                     # conservative placeholders, OWNER TO CONFIRM on the arm.
+                                     # hold, not park) + "support the arm". PROVISIONAL thresholds
+                                     # (owner 2026-11-08: keep 55 C and 1500 mA for 1 s for the
+                                     # first sessions), UNVERIFIED ON HARDWARE: revisit with the
+                                     # temperatures/currents logged in the WO-06 rehearsal.
     read_every_ticks: 4              # one extra sync_read every 4th tick (3.75 Hz at 15 Hz),
                                      # alternating registers: each refreshes every 533 ms
-    max_temperature_c: 55            # C; STS3215 factory Max_Temperature_Limit (EEPROM 13) is 70 C
+    max_temperature_c: 55            # C, PROVISIONAL; STS3215 factory Max_Temperature_Limit (EEPROM 13) is 70 C
                                      # (Feetech STS memory table; logged at connect): trip 15 C below
-    max_current_ma: 1500             # mA, sustained (below); lerobot caps the gripper's firmware
+    max_current_ma: 1500             # mA, PROVISIONAL, sustained (below); lerobot caps the gripper's firmware
                                      # Protection_Current at 250 x 6.5 mA = 1625 mA (so_follower.py:169)
-    current_trip_s: 1.0              # s above max_current_ma before the trip (spikes pass)
+    current_trip_s: 1.0              # s, PROVISIONAL, above max_current_ma before the trip
     current_ma_per_count: 6.5        # mA per Present_Current count (Feetech STS memory table)
     bus_budget_ms: 10                # ms per monitor read before a warning (15% of the 66.7 ms period)
 
@@ -61,6 +70,10 @@ teleop:
                                      #  calibration_dir: ~/.cache/huggingface/lerobot/calibration/teleoperators/so_leader}
   episodes_per_task: 5
   episode_time_s: 30                 # s, max per episode (Ctrl-C ends one early)
+  prompt_torque_timeout_s: 60        # s, max wait at a prompt with torque ON (servo health read
+                                     # before and after it); then "support the arm", grace, torque
+                                     # OFF, session ends. null = wait forever (not recommended)
+  prompt_support_grace_s: 10         # s between "SUPPORT THE ARM NOW" and torque off (ENTER = now)
   dataset_root: data/real_teleop     # local root; git-ignored
   hub_repo: KudratSingh22/vla-rl-so101-real-teleop
   instructions:                      # per-episode language task (keep in sync with the sim templates)
@@ -120,5 +133,8 @@ eval:                                # scripts/wo07_real_eval.py
   trials_per_cell: 50                # = protocol REAL_TRIALS_PER_CELL
   cells: [seen, shifted, unseen_objects]
   grid: docs/assets/placement-grid-a3.pdf   # scripts/make_placement_grid.py (print at 100%)
-  slot_seed: 0                       # placement plan (src/eval/real_grid.py); keep it equal for the
-                                     # SFT and SFT+RL sessions so their trials are paired
+  slot_seed: 0                       # placement plan (src/eval/real_grid.py). The SFT and SFT+RL
+                                     # sessions MUST use the same slot sequence (owner 2026-11-08):
+                                     # --hardware refuses any other --slot-seed
+  settle_s: 3.0                      # s the arm holds still after a trial before it is scored
+                                     # (judging rule real-judge-1; recorded per trial)

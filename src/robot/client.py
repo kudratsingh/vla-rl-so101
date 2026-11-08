@@ -45,10 +45,17 @@ the move home) holds (a deadman trip); the port is released first in case the Ct
 a bus transaction.
 
 Shutdown (``safe_shutdown``). Healthy (``healthy=True``: the session completed, or the operator
-quit / pressed Ctrl-C at a prompt with the arm idle, and the deadman has not tripped): park at
-``robot.park.qpos`` through the safety filter, then torque off. Otherwise (any fault, an abort
-during motion, a declined resume): hold, the operator supports the arm, then torque off; after a
-serial or servo fault torque is already off and nothing is written.
+quit / pressed Ctrl-C at a prompt with the arm idle, and the deadman has not tripped) AND parking
+enabled (``robot.park.enabled``, default false until the owner verifies the rest pose and park
+path): park at ``robot.park.qpos`` through the safety filter, then torque off. Otherwise (parking
+off, any fault, an abort during motion, a declined resume): hold, the operator supports the arm,
+then torque off; after a serial or servo fault torque is already off and nothing is written.
+
+Torque off unconfirmed (``So101Driver.torque_off_unconfirmed``, latched by the driver when a
+torque-off write fails): no further motion is possible in the process. The shutdown result is
+``torque_off_unconfirmed`` and the operator is told to switch off the inline power switch; every
+trial record from then on carries ``torque_off_unconfirmed: true`` and that stop reason, applied
+last so nothing after it can overwrite it; ``summarize`` reports it for the session.
 
 Latency, all from the injected ``clock`` (``time.perf_counter`` on the arm; the camera stamps with
 the same clock): frame stamp -> preprocessed (state read + image pipeline) -> send -> recv ->
@@ -87,11 +94,14 @@ from src.eval import protocol
 from src.robot.camera import CameraFault, Frame
 from src.robot.driver import (
     SERVO_FAULT_PROMPT,
+    TORQUE_OFF_UNCONFIRMED,
+    TORQUE_OFF_UNCONFIRMED_MSG,
     DeadmanTripped,
     ParkSettings,
     SerialFault,
     ServoFault,
     So101Driver,
+    park_from_config,
 )
 from src.robot.safety import DeadmanResponse
 from src.robot.serve import ACT_METHOD, INFO_METHOD, WIRE_VERSION, WireError, pack, unpack
@@ -125,7 +135,7 @@ class DeployConfig:
     stop_on_reject: bool
     policy_checkpoint: str | None = None  # server.policy_checkpoint: Info's policy_id must match
     capture_offset_ms: float | None = None  # optical event -> frame stamp, measured; None = not
-    park: ParkSettings | None = None  # healthy-shutdown park pose (robot.park)
+    park: ParkSettings | None = None  # healthy-shutdown park; None = robot.park.enabled false
 
     def __post_init__(self) -> None:
         if not 1 <= self.exec_steps <= self.chunk_len:
@@ -160,7 +170,7 @@ class DeployConfig:
             stop_on_reject=bool(d.get("stop_on_reject", True)),
             policy_checkpoint=None if checkpoint is None else str(checkpoint),
             capture_offset_ms=None if offset is None else float(offset),
-            park=ParkSettings.from_config(cfg),
+            park=park_from_config(cfg),
         )
 
 
@@ -323,7 +333,7 @@ class FrameSource(Protocol):
 @dataclass
 class TrialResult:
     stop_reason: str = ""  # max_steps | safety_reject | deadman | stale_chunk | serial_fault |
-    # servo_fault | home_failed |
+    # servo_fault | home_failed | torque_off_unconfirmed (set by run_trials, from the driver) |
     # server_{timeout,unavailable,error,bad_reply} | operator_abort | client_error
     stop_detail: str = ""
     deadman_response: str | None = None
@@ -668,6 +678,9 @@ def summarize(
         "frame_return_p95_under_target": None if p95 is None else bool(p95 < latency_target_ms),
         "latency_note": LATENCY_NOTE,
         "end_to_end_estimate_ms": None,
+        # any trial whose torque-off write failed: the session's numbers stand, the arm did not
+        # end in a confirmed safe state (support it, cut the supply at the inline switch)
+        "torque_off_unconfirmed": any(bool(t.get(TORQUE_OFF_UNCONFIRMED)) for t in trials),
     }
     if capture_offset_ms is not None:
         e2e = stats([v + capture_offset_ms for v in lat])
@@ -765,6 +778,7 @@ def run_trials(
     indices: Sequence[int] | None = None,
     placement_fn: PlacementFn | None = None,
     record_extra: Mapping[str, Any] | None = None,
+    settle_s: float | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Home -> trial -> outcome for each trial index (``indices``, default ``range(n_trials)``).
     Returns (trial records, why the session ended). A serial / servo fault (torque off), an
@@ -772,12 +786,18 @@ def run_trials(
     Records are appended to ``trials`` as they finish, so a Ctrl-C at a prompt keeps them.
     ``on_trial_start(k)`` runs right before each policy trial (the mock pilot resets its path);
     ``placement_fn(k)`` supplies the placement prompt and record (scripts/wo07_real_eval.py);
-    ``record_extra`` is merged into every record."""
+    ``record_extra`` is merged into every record. ``settle_s``: after a trial that ran, the arm
+    holds still this long (``loop.sleep``), the servos are read once, and only then is the
+    operator asked to score it (real-eval judging rule); recorded per trial as ``settle``.
+    A failed torque-off (driver latch) ends the session: that trial is ``aborted`` (never
+    scored) and its record carries ``torque_off_unconfirmed``, stamped after every other field."""
     if task not in protocol.TASKS or cell not in protocol.CELLS:
         raise ValueError(f"unknown task/cell {task}/{cell}")
     arm = loop.arm
     trials = [] if trials is None else trials
     for k in range(n_trials) if indices is None else indices:
+        if arm.torque_off_unconfirmed is not None:  # no motion is possible: never start a trial
+            return trials, f"{TORQUE_OFF_UNCONFIRMED}: {arm.torque_off_unconfirmed}"
         obj = trial_object(task, cell, k)
         instruction = protocol.instruction(task, obj)
         tag = f"[{task}/{cell} {k + 1}/{n_trials}]"
@@ -814,7 +834,29 @@ def run_trials(
             result = TrialResult(stop_reason="home_failed", stop_detail=str(home))
             if not arm.deadman.tripped:
                 arm.hold()
-        aborted = not ran or result.stop_reason == "operator_abort"
+        settle: dict[str, Any] | None = None
+        if settle_s is not None:
+            settle = {"settle_s": float(settle_s), "measured_s": None}
+        if (
+            settle is not None
+            and ran
+            and result.stop_reason != "operator_abort"
+            and arm.torque_off_unconfirmed is None
+        ):
+            t_settle = loop.clock()
+            loop.sleep(float(settle["settle_s"]))  # hold still before scoring
+            settle["measured_s"] = round(loop.clock() - t_settle, 3)
+            try:
+                arm.check_servos()  # the arm held under torque while it settled
+            except (ServoFault, SerialFault) as e:  # torque now off: the scene may be disturbed
+                result.stop_reason = "servo_fault" if isinstance(e, ServoFault) else "serial_fault"
+                result.stop_detail = f"after the settling interval: {e}"
+                ran = False
+        aborted = (
+            not ran
+            or result.stop_reason == "operator_abort"
+            or arm.torque_off_unconfirmed is not None
+        )
         outcome = "aborted" if aborted else operator.outcome(result)
         rec = trial_record(
             result,
@@ -833,12 +875,17 @@ def run_trials(
         )
         if placement is not None:
             rec["placement"] = placement
+        if settle is not None:
+            rec["settle"] = settle
         if record_extra:
             rec.update(record_extra)
+        stamp_torque_off_unconfirmed(rec, arm)  # last: nothing after it overwrites the flag
         trials.append(rec)
         if log_row is not None:
             log_row(kind="trial", **rec)
         log.info("%s %s: %s (%d steps)", tag, outcome, result.stop_reason, result.steps)
+        if arm.torque_off_unconfirmed is not None:
+            return trials, f"{TORQUE_OFF_UNCONFIRMED}: {arm.torque_off_unconfirmed}"
         if result.stop_reason == "operator_abort":
             return trials, "operator_abort"
         if arm.deadman.tripped:
@@ -852,14 +899,55 @@ def run_trials(
     return trials, "completed"
 
 
+def stamp_torque_off_unconfirmed(rec: dict[str, Any], arm: So101Driver) -> dict[str, Any]:
+    """Every trial record says whether torque off was confirmed. When the driver latched a failed
+    torque-off, the stop reason becomes ``torque_off_unconfirmed`` (the trial's own reason is kept
+    as ``stop_reason_before``). Call it last on a record."""
+    detail = arm.torque_off_unconfirmed
+    rec[TORQUE_OFF_UNCONFIRMED] = detail is not None
+    if detail is not None:
+        if rec.get("stop_reason") != TORQUE_OFF_UNCONFIRMED:
+            rec["stop_reason_before"] = rec.get("stop_reason")
+        rec["stop_reason"] = TORQUE_OFF_UNCONFIRMED
+        rec["torque_off_unconfirmed_detail"] = detail
+        rec["outcome"] = "aborted"
+    return rec
+
+
+def final_session_end(arm: So101Driver, end: str) -> str:
+    """The session end to record: a latched torque-off failure wins over any other end."""
+    if arm.torque_off_unconfirmed is not None and not end.startswith(TORQUE_OFF_UNCONFIRMED):
+        return f"{TORQUE_OFF_UNCONFIRMED}: {arm.torque_off_unconfirmed} (session end was {end})"
+    return end
+
+
 HEALTHY_ENDS = ("completed", "operator_quit", "operator_ctrl_c")
 """Session ends with the arm idle at a prompt: eligible for a park (if the deadman is clear)."""
 
 
-def _torque_already_off(arm: So101Driver, reason: str, operator: Operator) -> None:
+def _torque_off_unconfirmed(arm: So101Driver, operator: Operator) -> str:
+    """A torque-off write failed (driver latch): retry once (harmless), tell the operator to cut
+    the power at the inline switch, and wait for the acknowledgement. Nothing else is written."""
+    arm.torque_off()  # retry: the latch stays set whatever it returns
+    msg = TORQUE_OFF_UNCONFIRMED_MSG.format(detail=arm.torque_off_unconfirmed)
+    log.critical(msg)
+    print(f"\n{msg}", flush=True)
+    if arm.servo_fault is not None:
+        print(SERVO_FAULT_PROMPT.format(reason=arm.servo_fault), flush=True)
+    try:
+        operator.wait(
+            "press ENTER once the servo supply is switched OFF at the inline power switch: "
+        )
+    except (KeyboardInterrupt, EOFError):
+        pass
+    return TORQUE_OFF_UNCONFIRMED
+
+
+def _torque_already_off(arm: So101Driver, reason: str, operator: Operator) -> str:
+    """Returns torque_was_off, or torque_off_unconfirmed if the retry (or an earlier write) failed."""
+    if arm.torque_off_unconfirmed is not None or not arm.torque_off():  # retry, harmless
+        return _torque_off_unconfirmed(arm, operator)
     msg = f"torque is already OFF ({reason}): the arm is limp; check it is resting safely"
-    if not arm.torque_off():  # retry, harmless if it is already off
-        msg += ". TORQUE OFF FAILED: CUT THE ARM'S POWER NOW"
     log.critical(msg)
     print(msg, flush=True)
     if arm.servo_fault is not None:  # tell the operator to support the arm; wait for an ack
@@ -868,6 +956,7 @@ def _torque_already_off(arm: So101Driver, reason: str, operator: Operator) -> No
             operator.wait("press ENTER once the arm rests safely and the servo supply is off: ")
         except (KeyboardInterrupt, EOFError):
             pass
+    return "torque_was_off"
 
 
 def safe_shutdown(
@@ -878,38 +967,45 @@ def safe_shutdown(
     park: ParkSettings | None = None,
     frame_time_fn: Callable[[], float | None] | None = None,
 ) -> str:
-    """End of a real-arm session. Returns how it ended: parked | supported | torque_was_off.
+    """End of a real-arm session. Returns how it ended: parked | supported | torque_was_off |
+    torque_off_unconfirmed.
 
+    * Torque off unconfirmed (an earlier torque-off write failed, driver latch): nothing is
+      written; torque-off retried; the operator is told to cut power at the inline switch.
     * Deadman latched TORQUE_OFF (serial or servo fault): nothing is written; torque-off retried;
       after a servo fault the operator is told to support the arm and acknowledges.
-    * ``healthy`` (see ``HEALTHY_ENDS``) with ``park`` and a frame source, deadman clear: park at
-      ``park.qpos`` through the safety filter, then torque off. A park that fails falls through.
+    * ``healthy`` (see ``HEALTHY_ENDS``) with ``park`` (``robot.park.enabled``) and a frame
+      source, deadman clear: park at ``park.qpos`` through the safety filter, then torque off. A
+      park that fails falls through.
     * Otherwise: hold the measured pose so the arm stays up, let the operator support it, then
       disable torque (the arm goes limp). A second Ctrl-C at the prompt goes straight to torque off.
-    Leaving the driver's ``with`` block disables torque again.
+    Any torque-off that fails on the way returns ``torque_off_unconfirmed``. Leaving the driver's
+    ``with`` block disables torque again.
     """
+    if arm.torque_off_unconfirmed is not None:
+        return _torque_off_unconfirmed(arm, operator)
     if arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF:
-        _torque_already_off(arm, arm.deadman.reason, operator)
-        return "torque_was_off"
+        return _torque_already_off(arm, arm.deadman.reason, operator)
     if healthy and park is not None and frame_time_fn is not None and not arm.deadman.tripped:
         print("session ended normally: parking the arm (it moves), then torque off", flush=True)
         if arm.park(park, frame_time_fn):
             print("arm PARKED; torque OFF", flush=True)
             return "parked"
+        if arm.torque_off_unconfirmed is not None:
+            return _torque_off_unconfirmed(arm, operator)
         if arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF:
-            _torque_already_off(arm, arm.deadman.reason, operator)
-            return "torque_was_off"
+            return _torque_already_off(arm, arm.deadman.reason, operator)
         print("park did not complete: the arm holds; support it", flush=True)
     try:
         arm.hold()
-    except SerialFault as e:  # the driver already cut torque
-        _torque_already_off(arm, str(e), operator)
-        return "torque_was_off"
+    except SerialFault as e:  # the driver already cut torque (or tried to)
+        return _torque_already_off(arm, str(e), operator)
     try:
         operator.wait("arm HOLDING; support it, then press ENTER to disable torque: ")
     except (KeyboardInterrupt, EOFError):
         pass
-    arm.torque_off()
+    if not arm.torque_off():
+        return _torque_off_unconfirmed(arm, operator)
     return "supported"
 
 
