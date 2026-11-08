@@ -38,7 +38,9 @@ torch.cuda.synchronize(), so asynchronous GPU work is charged to the section tha
   host_copy    device->host copies into the CPU rollout buffers (observations, tokens, log-probs)
                and of the per-step success / termination flags.
   reset        env.reset() including its render, plus the group-reset check.
-  other        the rest of the call (loop bookkeeping, buffer stacking): total - sum of the above.
+  other        the rest (loop bookkeeping, buffer stacking; in the trainer's rollout/time/other_s
+               also its dynamic-sampling filter and entropy tally between env batches):
+               wall time - sum of the above, so the sections sum to rollout/time_s.
 """
 
 from __future__ import annotations
@@ -118,9 +120,13 @@ class RolloutTimer:
         self.pending_render = 0.0
         return out
 
-    def totals(self) -> dict[str, float]:
+    def totals(self, wall_s: float | None = None) -> dict[str, float]:
+        """Seconds per section. `other` = `wall_s` (default: the time inside collect_rollouts)
+        minus the named sections, so a caller that passes its own wall time (the trainer: its
+        bookkeeping between env batches too) gets parts that sum to it."""
         out = dict(self.seconds)
-        out["other"] = max(0.0, self.total_s - sum(v for k, v in out.items() if k != "other"))
+        wall = self.total_s if wall_s is None else wall_s
+        out["other"] = max(0.0, wall - sum(v for k, v in out.items() if k != "other"))
         return out
 
 

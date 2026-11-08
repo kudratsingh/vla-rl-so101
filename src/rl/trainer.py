@@ -501,7 +501,7 @@ class GRPOTrainer:
             "rollout/group_reset_diff_frac": reset_diff,
             "rollout/time_s": elapsed,
         }
-        for key, value in timer.totals().items():
+        for key, value in timer.totals(elapsed).items():  # sums to rollout/time_s
             stats[f"rollout/time/{key}_s"] = value
         for t, (gen_t, kept_t, trained_t) in per_task.items():
             if gen_t:
@@ -1086,7 +1086,7 @@ class GRPOTrainer:
                 row["probe/entropy"] = ent_sum / max(ent_tokens, 1)
                 row["probe/time_s"] = elapsed
                 row["probe/s_per_env_batch"] = elapsed / n_batches
-                for key, value in timer.totals().items():
+                for key, value in timer.totals(elapsed).items():
                     row[f"probe/time/{key}_s"] = value
                 self._log(row)
                 rows.append(row)

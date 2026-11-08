@@ -592,4 +592,7 @@ def test_sigterm_saves_interrupted_checkpoint_and_record(
     (run_dir,) = (tmp_path / "runs").iterdir()
     record = json.loads((run_dir / "record.json").read_text())
     assert record["status"] == "interrupted" and record["end_utc"] and record["dollars"] == 0.0
-    assert (run_dir / "checkpoints" / "step_000003_interrupted" / "adapter").is_dir()
+    ckpt = run_dir / "checkpoints" / "step_000003_interrupted"
+    assert (ckpt / "adapter").is_dir() and (ckpt / "optimizer.pt").is_file()
+    state = json.loads((ckpt / "trainer_state.json").read_text())
+    assert (state["step"], state["completed_step"]) == (3, 2)  # resume would redo step 3
