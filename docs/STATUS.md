@@ -149,8 +149,11 @@ What changed:
   2af16f6, first 3 of 25 episodes per task (223/163/209 frames), pixels and joints only, token
   comparison skipped). **This is a same-renderer pipeline check:** the stored 0.1 frames and the
   fresh frames were both rendered on the Mac CPU renderer. It is not a Mac-vs-GPU renderer gap
-  measurement. Its pooled all-frame pixel gap is within 0.03 mean-abs (<= 1.4%) of the codec floor
-  on all 3 tasks (e.g. PickPlace 2.070 vs 2.042), and joint drift is 0. The Mac-vs-GPU check (full
+  measurement. Headline, t = 0 (3 first frames per task, before any replay physics): pixel gap
+  mean-abs 1.997 / 1.968 / 2.001 (PickPlace / Push / Stack). This run recorded no t = 0 codec
+  floor and no tokens. Pooled all frames, reported separately because replay physics drift
+  contributes to them (joint drift was 0 in this run): within 0.03 mean-abs (<= 1.4%) of the
+  pooled codec floor on all 3 tasks (e.g. PickPlace 2.070 vs 2.042). The Mac-vs-GPU check (full
   25 episodes, with tokens, on the 4090) is still pending (see Next).
 - Protocol 0.2 (`src/eval/protocol_v02.py`, new; `scripts/wo02_eval.py --protocol 0.2`). Its hash
   combines the file bytes of the protocol, the eval loop (`src/eval/sim_eval.py`: episode seeds,
@@ -410,14 +413,19 @@ On PR #28 (`fix/pre-run-hardening`). Nothing ran on a GPU. Protocol `0.1-draft` 
   written for an interrupted run), the run summary and the console `GATE SUMMARY` line give the
   first step each gate would have stopped the run. They also give the flat gate's numbers at its
   check step and say whether it would have stopped the run there (step 38, where WO-04 seeds 1-2
-  stopped under the older rule). The gate log is checkpointed, so a resumed run keeps it.
+  stopped under the older rule). The gate log is checkpointed, so a resumed run keeps it. A
+  resume from a checkpoint without a gate log (written before this round) reports the steps
+  before it as unknown (`gate_log_complete: false`, `gate_log_from_step`,
+  `flat_check_unknown`), never as "not reached" or "would not have stopped".
 - **Render-gap reporting** (`scripts/wo01r_rebuild_demos.py`). The headline is t = 0, the first
   frame of each episode, rendered from the reset state before any replay physics. It reports
   `pixels_t0`, `tokens_stored_vs_fresh_t0` (every episode's first frame) and
   `state_max_abs_diff_t0_rad`, next to the codec floor's t0 numbers. Pooled all-frame numbers
   (`pixels_all`, `tokens_stored_vs_fresh_all`) go in a separate table and JSON block. They are
   labelled because open-loop replay physics drift contributes to them. Each run carries a
-  `comparison` label. The Mac result above is a **same-renderer pipeline check**, and its run
+  `comparison` label keyed on the renderer, not the sim device: macOS renders through MoltenVK,
+  and a Linux CUDA box renders on the GPU even with `--device cpu`. So a pod run with CPU physics
+  against the 0.1 set is still labelled the Mac-vs-GPU renderer gap. The Mac result above is a **same-renderer pipeline check**, and its run
   record now carries that note.
 - **RL rollout action clip (stated explicitly).** The current RL rollouts do **not** apply the
   4 deg/step joint clip that protocol 0.2 sim eval applies. I checked `src/rl/rollout.py`
@@ -441,7 +449,9 @@ On PR #28 (`fix/pre-run-hardening`). Nothing ran on a GPU. Protocol `0.1-draft` 
   successful demo whose release/retreat did not finish (oracle still running at the tail cap, or a
   grasp task ending off the release target). It reports the demo per seed and records the next
   seed instead, so one bad episode no longer blocks pushing the valid ones. A shortfall below
-  `demos_per_task` still blocks the push. `load_sft_frames` refuses a v2 demo set (v2 oracle or a
+  `demos_per_task` still blocks the push, before it runs, on both push paths (wo01r and
+  `wo01_build_env.py --push`, which records `push_refused` and exits 1). The protected-repo
+  check is case-insensitive, because Hub repo ids are. `load_sft_frames` refuses a v2 demo set (v2 oracle or a
   recorded tail) unless `data.chunk_pad: drop`.
 - **Mac test note.** `.venv/bin/pytest` starts with `#!/bin/sh`, and macOS strips
   `DYLD_FALLBACK_LIBRARY_PATH` from it, so torchcodec cannot find FFmpeg 7 and the recorder tests

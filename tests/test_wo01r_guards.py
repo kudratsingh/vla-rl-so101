@@ -24,20 +24,29 @@ def _load(name: str) -> ModuleType:
 
 
 def test_render_gap_comparison_labels() -> None:
-    """A Mac CPU run on a 0.1 set (both sides the Mac CPU renderer) is a same-renderer pipeline
-    check, not a Mac-vs-GPU gap; a GPU run on the 0.1 set is the renderer gap."""
+    """The label follows the RENDERER, not the sim device (review 2026-11-08): a Mac run on a
+    0.1 set is a same-renderer pipeline check whatever the device; a run on the Linux GPU pod is
+    the Mac-vs-GPU renderer gap even with --device cpu (SAPIEN still renders on the GPU)."""
     from src.config import CONFIG_DIR, load_config
 
     rebuild = _load("wo01r_rebuild_demos")
+    assert rebuild.render_backend("Darwin", False) == "mac"
+    assert rebuild.render_backend("Linux", True) == "gpu"  # GPU renderer, any physics device
+    assert rebuild.render_backend("Linux", False) == "unknown"
     cfg = load_config("sim", CONFIG_DIR / "demos_v2.yaml")
     old, new = cfg["render_gap"]["dataset"], cfg["data"]["hub_repo"]
     label = rebuild.comparison_label
-    assert label(cfg, old, "render-gap", "cpu").startswith("same-renderer pipeline check")
-    assert "NOT a Mac-vs-GPU" in label(cfg, old, "render-gap", "cpu")
-    assert label(cfg, old, "render-gap", "cuda").startswith("renderer gap")
-    assert label(cfg, new, "render-gap", "cuda").startswith("same-renderer pipeline check")
-    assert label(cfg, new, "render-gap", "cpu").startswith("renderer gap")
-    assert label(cfg, new, "dry-run", "cpu").startswith("same-renderer pipeline check")
+    same = "same-renderer pipeline check"
+    for device in ("cpu", "cuda"):
+        assert label(cfg, old, "render-gap", "mac", device).startswith(same)
+        assert "NOT a Mac-vs-GPU" in label(cfg, old, "render-gap", "mac", device)
+        assert label(cfg, old, "render-gap", "gpu", device).startswith("renderer gap")
+        assert label(cfg, new, "render-gap", "gpu", device).startswith(same)
+        assert label(cfg, new, "render-gap", "mac", device).startswith("renderer gap")
+        assert "UNKNOWN" in label(cfg, old, "render-gap", "unknown", device)
+    pod_cpu = label(cfg, old, "render-gap", "gpu", "cpu")  # CPU physics on the 4090 pod
+    assert "NVIDIA GPU" in pod_cpu and "sim device cpu" in pod_cpu and same not in pod_cpu
+    assert label(cfg, new, "dry-run", "mac", "cpu").startswith(same)
 
 
 def test_wo01r_push_path_refuses_the_protected_repos(
@@ -65,7 +74,13 @@ def test_wo01r_push_path_refuses_the_protected_repos(
     monkeypatch.setattr(recorder, "_ensure_hf_token", no_token)
     with pytest.raises(recorder.ProtectedRepoError):
         recorder.push_dataset(recorder.PROTECTED_HUB_REPOS[1], tmp_path / "nowhere")
+    # Hub repo ids resolve case-insensitively: a differently cased id is the same repo
+    for repo in recorder.PROTECTED_HUB_REPOS:
+        for variant in (repo.lower(), repo.upper(), f" {repo} "):
+            with pytest.raises(recorder.ProtectedRepoError):
+                recorder.check_push_target(variant)
     recorder.check_push_target("KudratSingh22/vla-rl-so101-demos-25-v2")  # the v2 repo is fine
+    recorder.check_push_target("kudratsingh22/vla-rl-so101-demos-25-v2")
     recorder.check_push_target(recorder.PROTECTED_HUB_REPOS[0], allow_protected=True)
 
 
@@ -210,3 +225,64 @@ def test_unfinished_demos_are_rejected_individually_and_replaced() -> None:
     assert [m["seed"] for m in rec.episodes] == [seed0, seed0 + 1, seed0 + 2]
     assert stats["rejected_episodes"] == []
     assert build.tail_problems("Push", True, 0.0) == []  # Push keeps the gripper closed
+
+
+def test_wo01_build_env_push_refuses_a_short_set_before_pushing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review F2 (2026-11-08): `wo01_build_env.py --push` with fewer valid demos than
+    demos_per_task (e.g. after rejecting unfinished demos) must not push, then exits 1."""
+    import functools
+    import json
+
+    from src.runs import Run
+
+    build = _load("wo01_build_env")
+    pushed: list[Any] = []
+
+    class _Rec:
+        image_hw = (4, 4)
+        repo_id = "KudratSingh22/vla-rl-so101-demos-25-v2"
+        root = tmp_path / "demos"
+        num_episodes = num_frames = 1
+
+        def finalize(self) -> None:
+            pass
+
+        def push_to_hub(self, **kw: Any) -> str:
+            pushed.append(kw)
+            return "https://huggingface.co/datasets/x"
+
+    class _Lazy:
+        def __init__(self, cfg: Any) -> None:
+            self.rec = _Rec()
+
+    recorded = {"Stack": 22}
+
+    def run_task(task: str, cfg: Any, api: Any, rec: Any, *, demos: int, **kw: Any) -> Any:
+        return {
+            "demos_recorded": recorded.get(task, demos),
+            "failed_demos_filled": 0,
+            "episodes": demos,
+            "oracle_success_rate": 1.0,
+            "mean_episode_len": 1.0,
+            "mean_demo_frames": 1.0,
+            "mean_post_success_frames": 1.0,
+            "env_steps": 1,
+            "wall_s": 1.0,
+            "rejected_episodes": [],
+            "demos_rejected": {},
+        }
+
+    monkeypatch.setattr(build, "Run", functools.partial(Run, runs_dir=tmp_path / "runs"))
+    monkeypatch.setattr(build, "env_api", lambda: None)
+    monkeypatch.setattr(build, "run_task", run_task)
+    monkeypatch.setattr(build, "LazyRecorder", _Lazy)
+    argv = ["--preset", "sim", "--config", "configs/demos_v2.yaml", "--push"]
+    assert build.main(argv) == 1
+    assert pushed == []  # refused before the push
+    (run_dir,) = (tmp_path / "runs").iterdir()
+    dataset = json.loads((run_dir / "record.json").read_text())["results"]["dataset"]
+    assert "Stack" in dataset["push_refused"] and "hub_url" not in dataset
+    recorded.clear()  # a full set still pushes
+    assert build.main(argv) == 0 and len(pushed) == 1

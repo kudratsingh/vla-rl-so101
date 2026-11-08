@@ -25,9 +25,11 @@ and RL rollout renders on the NVIDIA GPU sim. Two modes:
               pixels_t0, tokens_stored_vs_fresh_t0, state_max_abs_diff_t0_rad. The POOLED
               all-frame numbers (pixels_all, tokens_stored_vs_fresh_all) are reported separately:
               open-loop replay physics drift (state_mean_max_abs_diff_rad) contributes to them, so
-              they are not a pure renderer gap. `comparison` labels the run: a CPU run against a
-              set rendered on the Mac CPU renderer, or the rebuilt set re-rendered on the backend
-              that recorded it, is a SAME-RENDERER PIPELINE CHECK, not a Mac-vs-GPU gap.
+              they are not a pure renderer gap. `comparison` labels the run by the RENDERER
+              (macOS = Mac MoltenVK, Linux + CUDA = NVIDIA GPU; --device only moves physics):
+              a Mac run against a 0.1 set, or the rebuilt set re-rendered on the GPU, is a
+              SAME-RENDERER PIPELINE CHECK, not a Mac-vs-GPU gap; a GPU-pod run against a 0.1
+              set (with --device cpu too) is the Mac-vs-GPU renderer gap.
   dry-run     (tiny default) build, then render-gap against the dataset just built: CPU on both
               sides, so the gap must be codec noise only.
 
@@ -35,7 +37,7 @@ and RL rollout renders on the NVIDIA GPU sim. Two modes:
     uv run scripts/wo01r_rebuild_demos.py --preset sim --mode render-gap          # GPU box (~5 min)
     uv run scripts/wo01r_rebuild_demos.py --preset sim --mode build --push        # GPU box
     uv run scripts/wo01r_rebuild_demos.py --preset sim --device cpu --mode render-gap \
-        --skip-tokens --gap-episodes 3                                            # Mac: CPU-vs-CPU floor
+        --skip-tokens --gap-episodes 3                                            # Mac: pipeline check
 
 Non-tiny presets default to configs/demos_v2.yaml (render_gap.* there: the 0.1 dataset and the
 WO-02 attempt-4 adapter, a Hub path). tiny uses configs/demos_v2_tiny.yaml (tiny + the v2 data
@@ -50,6 +52,7 @@ import glob
 import importlib.util
 import json
 import math
+import platform
 import sys
 import time
 from pathlib import Path
@@ -481,20 +484,43 @@ def print_gap(gap: dict[str, Any]) -> None:
         )
 
 
-def comparison_label(cfg: Config, repo_id: str, mode: str, device: str) -> str:
-    """What a render-gap run compares, assuming the 0.1 sets were rendered on the Mac CPU renderer
-    (MoltenVK) and the rebuilt set (data.hub_repo) on the GPU renderer. Same renderer on both
-    sides: the dry run, a CPU run on a 0.1 set, the rebuilt set re-rendered on the GPU."""
-    rebuilt = repo_id == str(cfg.get("data", {}).get("hub_repo", ""))
-    cuda = device.startswith("cuda")
-    if mode == "dry-run" or (cuda and rebuilt):
-        return f"{SAME_RENDERER} (the set re-rendered on the renderer that recorded it)"
-    if not cuda and not rebuilt:
+def render_backend(system: str | None = None, cuda: bool | None = None) -> str:
+    """The renderer this machine uses, independent of the sim (physics) device: SAPIEN renders
+    through MoltenVK on macOS ("mac") and through NVIDIA Vulkan on a Linux GPU box ("gpu") even
+    when physics runs on the CPU (--device cpu). Anything else is "unknown"."""
+    system = platform.system() if system is None else system
+    if system == "Darwin":
+        return "mac"
+    cuda = torch.cuda.is_available() if cuda is None else cuda
+    return "gpu" if system == "Linux" and cuda else "unknown"
+
+
+def comparison_label(cfg: Config, repo_id: str, mode: str, backend: str, device: str) -> str:
+    """What a render-gap run compares. Keyed on the RENDERER (render_backend()), not the sim
+    device (review 2026-11-08: a --device cpu run on the GPU pod still renders on the GPU).
+    Assumes the 0.1 sets were rendered on the Mac (MoltenVK) and the rebuilt set (data.hub_repo)
+    on the GPU renderer."""
+    if mode == "dry-run":
+        return f"{SAME_RENDERER} (the set just built, re-rendered on the renderer that recorded it)"
+    recorded = "gpu" if repo_id == str(cfg.get("data", {}).get("hub_repo", "")) else "mac"
+    names = {"mac": "Mac (MoltenVK)", "gpu": "NVIDIA GPU (Vulkan)"}
+    if backend not in names:
         return (
-            f"{SAME_RENDERER} (Mac CPU renderer on both sides; NOT a Mac-vs-GPU renderer gap "
-            "measurement)"
+            f"renderer comparison UNKNOWN: {repo_id} stored frames ({names[recorded]} renderer) "
+            f"vs this machine's renderer, which is neither the Mac nor an NVIDIA GPU renderer"
         )
-    return f"renderer gap: {repo_id} stored frames vs this {device} renderer"
+    sim = f"sim device {device}"
+    if backend == recorded:
+        if backend == "mac":
+            return (
+                f"{SAME_RENDERER} (Mac renderer on both sides, {sim}; NOT a Mac-vs-GPU renderer "
+                "gap measurement)"
+            )
+        return f"{SAME_RENDERER} (the set re-rendered on the GPU renderer that recorded it, {sim})"
+    return (
+        f"renderer gap: {repo_id} stored frames ({names[recorded]} renderer) vs this "
+        f"{names[backend]} renderer ({sim})"
+    )
 
 
 # ------------------------------------------------------------------------------------ main
@@ -615,11 +641,14 @@ def main(argv: list[str] | None = None) -> int:
                 work_dir=run.dir,
             )
             gap["backend"] = {"device": device, "render": run.record["device"]}
-            gap["comparison"] = comparison_label(cfg, repo_id, mode, device)
+            backend = render_backend()
+            gap["backend"]["renderer"] = backend
+            gap["comparison"] = comparison_label(cfg, repo_id, mode, backend, device)
             (run.dir / "render_gap.json").write_text(json.dumps(gap, indent=2))
             run.results["render_gap"] = gap
             print(
-                f"\nrender gap: {repo_id} stored frames vs this backend ({device}), {gap['comparison']}"
+                f"\nrender gap: {repo_id} stored frames vs this machine's renderer ({backend}, sim device"
+                f" {device}), {gap['comparison']}"
             )
             print_gap(gap)
             print(f"wrote {run.dir / 'render_gap.json'}")

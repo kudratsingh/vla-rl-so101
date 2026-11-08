@@ -468,6 +468,43 @@ def test_gate_stop_false_logs_every_decision_and_when_it_would_have_stopped(
     assert state["gate_decisions"]["flat_check"]["step"] == 10
 
 
+
+def test_gate_summary_after_resuming_a_checkpoint_without_a_gate_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review F1 (2026-11-08): a checkpoint written before round 2 has no gate log. Resuming it
+    must report the flat check at step 10 as unknown, not 'not reached' / False."""
+    cfg = _cfg(steps=40, lr=0.0, eval_every=100, gate_stop=False, checkpoint_every=20)
+    _trainer(cfg, tmp_path / "a").run()
+    ckpt = tmp_path / "a" / "checkpoints" / "step_000020"
+    state_path = ckpt / "trainer_state.json"
+    state = json.loads(state_path.read_text())
+    assert state["gate_decisions"]["log_from"] == 1
+    # with the log: resuming keeps the definite answer
+    tr = _trainer(cfg, tmp_path / "b")
+    tr.load_checkpoint(ckpt)
+    g = tr.run()["gate_decisions"]
+    assert g["gate_log_complete"] and g["first_would_stop_step"] == 10
+    assert g["would_have_stopped_at_flat_check"] is True
+    # without it (an older checkpoint): unknown, never a false definite answer
+    del state["gate_decisions"]
+    state_path.write_text(json.dumps(state))
+    tr = _trainer(cfg, tmp_path / "c")
+    tr.load_checkpoint(ckpt)
+    with caplog.at_level("INFO", logger="src.rl.trainer"):
+        g = tr.run()["gate_decisions"]
+    assert g["steps_completed"] == 40 and not g["gate_log_complete"]
+    assert g["gate_log_from_step"] == 21 and g["flat_check_unknown"] is True
+    assert g["first_would_stop_step"] is None and g["first_logged_would_stop_step"] is None
+    assert g["would_have_stopped_at_flat_check"] is None
+    assert g["any_gate_would_have_stopped_by_flat_check_step"] is None
+    assert "flat gate check step 10: UNKNOWN" in caplog.text and "not reached" not in caplog.text
+    # a further checkpoint carries the gap forward
+    later = json.loads(
+        (tmp_path / "c" / "checkpoints" / "step_000040" / "trainer_state.json").read_text()
+    )
+    assert later["gate_decisions"]["log_from"] == 21
+
 def test_config_validation() -> None:
     rl = GRPOConfig.from_config(load_config("rl"))  # the next-run preset must parse
     assert (rl.clip_low, rl.clip_high) == (0.2, 0.28)

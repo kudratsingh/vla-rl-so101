@@ -52,9 +52,16 @@ class ProtectedRepoError(ValueError):
     """A push to one of PROTECTED_HUB_REPOS without an explicit override."""
 
 
+def is_protected_repo(repo_id: str) -> bool:
+    """Case-insensitive: Hub repo ids resolve regardless of case, so 'kudratsingh22/...' is the
+    same repo as 'KudratSingh22/...' (review 2026-11-08)."""
+    key = repo_id.strip().casefold()
+    return any(key == r.casefold() for r in PROTECTED_HUB_REPOS)
+
+
 def check_push_target(repo_id: str, *, allow_protected: bool = False) -> None:
     """Raise ProtectedRepoError for a protected repo (before any data or network is touched)."""
-    if repo_id in PROTECTED_HUB_REPOS and not allow_protected:
+    if is_protected_repo(repo_id) and not allow_protected:
         raise ProtectedRepoError(
             f"refusing to push to {repo_id}: it holds a 0.1-era demo set that reported SFT/RL "
             "numbers trained on; set data.hub_repo to a new repo"

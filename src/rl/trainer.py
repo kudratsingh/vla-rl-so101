@@ -444,6 +444,9 @@ class GRPOTrainer:
         # gate's numbers at its check step
         self._gate_log: list[tuple[int, list[str]]] = []
         self._flat_check: dict[str, Any] | None = None
+        # first step the gate log covers: > 1 after resuming a checkpoint that has no gate log
+        # (written before 2026-11-08 round 2), whose earlier gate decisions are unknown
+        self._gate_log_from = 1
 
     # ------------------------------------------------------------------ envs / logging
     def _env(self, task: str) -> VecEnv:
@@ -846,7 +849,11 @@ class GRPOTrainer:
             "gates": self.gates.state_dict(),
             "rl": asdict(self.rl),
             # optional on load (checkpoints written before 2026-11-08 round 2 lack it)
-            "gate_decisions": {"log": self._gate_log, "flat_check": self._flat_check},
+            "gate_decisions": {
+                "log": self._gate_log,
+                "flat_check": self._flat_check,
+                "log_from": self._gate_log_from,
+            },
         }
         (path / "trainer_state.json").write_text(json.dumps(state, indent=2))
         return path
@@ -923,7 +930,18 @@ class GRPOTrainer:
         ]
         self.gates.load_state_dict(state["gates"])
         self.gates.truncate(completed)
-        decisions = state.get("gate_decisions") or {}
+        decisions = state.get("gate_decisions")
+        if decisions is None:  # older checkpoint: gate decisions for steps <= completed unknown
+            log.warning(
+                "checkpoint %s has no gate log: gate decisions for steps 1-%d are unknown, the "
+                "gate summary will say so",
+                path,
+                completed,
+            )
+            decisions = {}
+            self._gate_log_from = completed + 1
+        else:
+            self._gate_log_from = min(int(decisions.get("log_from", 1)), completed + 1)
         self._gate_log = [
             (int(st), [str(r) for r in rs])
             for st, rs in decisions.get("log", [])
@@ -1087,20 +1105,35 @@ class GRPOTrainer:
         first = self._gate_log[0] if self._gate_log else None
         reached = bool(check) and self._completed_step >= check
         fc = self._flat_check
+        log_from = self._gate_log_from
+        complete = log_from <= 1  # False: resumed from a checkpoint without a gate log
+        # the flat check step fell in the unknown stretch before the log starts
+        flat_unknown = fc is None and bool(check) and check < log_from
+        if not reached:
+            any_by_check: bool | None = None
+        elif first is not None and first[0] <= check:
+            any_by_check = True  # fired at a logged step, so true whatever came before
+        else:
+            any_by_check = False if complete else None
         return {
             "gate_stop": self.rl.gate_stop,
             "steps_completed": self._completed_step,
-            "first_would_stop_step": first[0] if first else None,
-            "first_would_stop_reasons": first[1] if first else [],
+            "gate_log_complete": complete,
+            # steps before this have no gate log (older checkpoint resumed); the first_* and
+            # per-gate fields below then cover only steps >= gate_log_from_step
+            "gate_log_from_step": log_from,
+            "first_would_stop_step": (first[0] if first else None) if complete else None,
+            "first_would_stop_reasons": (first[1] if first else []) if complete else [],
+            "first_logged_would_stop_step": first[0] if first else None,
             "first_step_by_gate": first_by_gate,
             "steps_fired_by_gate": fired,
             "flat_check_step": check or None,
             "flat_check": fc,
-            # None: the check step was not reached (or the flat gate is off)
+            "flat_check_unknown": flat_unknown,
+            # None: the check step was not reached, the flat gate is off, or (flat_check_unknown)
+            # it fell before the gate log starts
             "would_have_stopped_at_flat_check": None if fc is None else bool(fc["would_stop"]),
-            "any_gate_would_have_stopped_by_flat_check_step": (
-                (first is not None and first[0] <= check) if reached else None
-            ),
+            "any_gate_would_have_stopped_by_flat_check_step": any_by_check,
         }
 
     def _console_gate_summary(self, g: dict[str, Any]) -> None:
@@ -1112,6 +1145,11 @@ class GRPOTrainer:
                 f"flat gate at step {check} {verdict} the run (gain {_fmt(fc['gain'])}, SE "
                 f"{_fmt(fc['gain_se'])}, gain + {fc['flat_z']:g} x SE = {_fmt(fc['gain_upper'])} vs "
                 f"min_gain {fc['min_gain']:.3f}, rule {fc['rule']})"
+            )
+        elif g["flat_check_unknown"]:
+            flat = (
+                f"flat gate check step {check}: UNKNOWN (resumed from a checkpoint without a "
+                f"gate log; steps 1-{g['gate_log_from_step'] - 1} not logged)"
             )
         elif check:
             flat = f"flat gate check step {check} not reached ({g['steps_completed']} steps)"
@@ -1126,7 +1164,10 @@ class GRPOTrainer:
             "first step per gate: %s",
             str(self.rl.gate_stop).lower(),
             flat,
-            first if first is not None else "none",
+            (first if first is not None else "none")
+            if g["gate_log_complete"]
+            else f"unknown (log starts at step {g['gate_log_from_step']}; first logged "
+            f"{g['first_logged_would_stop_step'] or 'none'})",
             g["first_would_stop_reasons"] or "",
             firsts,
         )

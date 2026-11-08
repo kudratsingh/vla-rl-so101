@@ -36,7 +36,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import add_config_args, load_config
-from src.data.recorder import PROTECTED_HUB_REPOS, DemoRecorder
+from src.data.recorder import PROTECTED_HUB_REPOS, DemoRecorder, is_protected_repo
 from src.runs import Run
 
 # Demo episodes use seeds DEMO_SEED_BASE + cfg.seed * 100_000 + k (k = 0, 1, ...), disjoint from
@@ -352,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_config(args.preset, args.config)
     hub_repo = str(cfg.get("data", {}).get("hub_repo", ""))
-    if args.push and hub_repo in PROTECTED_HUB_REPOS and not args.overwrite_hub:
+    if args.push and is_protected_repo(hub_repo) and not args.overwrite_hub:
         parser.error(
             f"refusing to --push over {hub_repo}: it holds a 0.1-era demo set that reported "
             "SFT/RL numbers trained on; set data.hub_repo to a new repo or pass --overwrite-hub"
@@ -399,7 +399,13 @@ def main(argv: list[str] | None = None) -> int:
                 "frames": recorder.num_frames,
             },
         )
-        if args.push:
+        # a shortfall below demos_per_task blocks the push here too, BEFORE it (review
+        # 2026-11-08: rejected unfinished demos make a short set more likely)
+        short = [t for t, s in stats.items() if s["demos_recorded"] < demos]
+        if args.push and short and not allow_failed:
+            run.results["dataset"]["push_refused"] = f"fewer than {demos} demos for {short}"
+            print(f"NOT pushed: fewer than {demos} successful demos for {short}", file=sys.stderr)
+        elif args.push:
             run.results["dataset"]["hub_url"] = recorder.push_to_hub(
                 private=True, allow_protected=args.overwrite_hub
             )
@@ -419,10 +425,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"seed {r['seed']} {'/'.join(r['reasons'])}" for r in s["rejected_episodes"]
                 )
             )
-    if args.push:
+    if "hub_url" in run.results["dataset"]:
         print(f"pushed: {run.results['dataset']['hub_url']}")
     print(f"record: {run.record_path}")
-    short = [t for t, s in stats.items() if s["demos_recorded"] < demos]
     if short and not allow_failed:
         print(f"ERROR: fewer than {demos} successful demos for {short}", file=sys.stderr)
         return 1
