@@ -47,8 +47,12 @@ def run_batch(
     seeds: Sequence[int],
     max_steps: int,
     exec_steps: int | None = None,
+    frames: list[Tensor] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """One batch of len(seeds) parallel episodes -> (success (N,) bool, length (N,) int).
+
+    `frames`, when given, receives the policy camera image (N, H, W, 3) at reset and after every
+    env step (for videos; scripts/record_videos.py).
 
     `exec_steps` executes only the first N actions of each predicted chunk before re-querying the
     policy (receding horizon); None executes the whole chunk. A policy setting, not protocol.
@@ -56,6 +60,8 @@ def run_batch(
     n = len(seeds)
     raw, _ = env.reset(seed=list(seeds))
     obs = obs_fn(raw)
+    if frames is not None:
+        frames.append(obs["image"].detach().cpu())
     instructions = list(env.unwrapped.get_instructions())
     if len(instructions) != n:
         raise ValueError(f"env gave {len(instructions)} instructions for {n} episodes")
@@ -69,6 +75,8 @@ def run_batch(
             if not bool(active.any()):
                 break
             raw, _, terminated, truncated, info = env.step(chunk[:, c])
+            if frames is not None:
+                frames.append(obs_fn(raw)["image"].detach().cpu())
             length += active.long()
             hit = _flag(info["success"], n) & active
             success |= hit
