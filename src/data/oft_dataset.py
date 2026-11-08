@@ -2,7 +2,8 @@
 
 Each sample is one frame t of a demo: the front image and joint state at t, the action chunk
 a[t : t + K] (LeRobot `delta_timestamps`; indices past the episode end are clamped, i.e. the last
-action repeats -- exactly OFT's RLDS `chunk_act_obs`), and the per-frame language `task`.
+action repeats -- exactly OFT's RLDS `chunk_act_obs`), and the per-frame language `task`. Frames
+whose chunk would need that pad are dropped by default (`data.chunk_pad`, see `load_sft_frames`).
 Everything model-specific (crop/augment/resize/normalise/tokenise) happens later in the policy's
 single `build_inputs`, so SFT, eval and RL share one preprocessing path.
 
@@ -38,8 +39,49 @@ class FrameSource(Protocol):
     def __getitem__(self, idx: int) -> dict[str, Any]: ...
 
 
+CHUNK_PAD_MODES = ("drop", "repeat")
+DEFAULT_CHUNK_PAD = "drop"  # load_sft_frames; `data.chunk_pad: repeat` = the 0.1-era behaviour
+
+
+def pad_free_indices(
+    frames: FrameSource, chunk_len: int, action_key: str = ACTION_KEY
+) -> list[int]:
+    """Indices of the frames whose action chunk lies entirely inside their episode.
+
+    The last `chunk_len - 1` frames of an episode get a chunk padded by repeating the final
+    action (LeRobot `delta_timestamps` clamping, `<action_key>_is_pad`). Training on that pad
+    teaches "stop and freeze" at whatever the last recorded command was (review 2026-11-07
+    section 3.2). Every recorded action still appears as a target in some kept frame's chunk.
+    A LeRobotDataset is resolved from its parquet columns (no video decode); other sources are
+    read item by item and use their `_is_pad` flags.
+    """
+    hf = getattr(frames, "hf_dataset", None)
+    meta = getattr(frames, "meta", None)
+    if hf is not None and meta is not None:
+        ep_len = {
+            int(i): int(n)
+            for i, n in zip(meta.episodes["episode_index"], meta.episodes["length"], strict=True)
+        }
+        eps = [int(e) for e in hf["episode_index"]]
+        fis = [int(f) for f in hf["frame_index"]]
+        return [
+            i for i, (e, f) in enumerate(zip(eps, fis, strict=True)) if f + chunk_len <= ep_len[e]
+        ]
+    keep = []
+    for i in range(len(frames)):
+        pad = frames[i].get(f"{action_key}_is_pad")
+        if pad is None or not bool(torch.as_tensor(pad).any()):
+            keep.append(i)
+    return keep
+
+
 class ChunkedDemoDataset(Dataset[dict[str, Any]]):
-    """LeRobot-style frames (with an action chunk per frame) -> SFT samples."""
+    """LeRobot-style frames (with an action chunk per frame) -> SFT samples.
+
+    `chunk_pad="repeat"` keeps every frame, including those whose chunk runs past the episode end
+    and is padded with the last action (the 0.1-era SFT runs, WO-02 attempts 1-4). `"drop"`
+    keeps only `pad_free_indices`, so no pad action reaches the SFT loss.
+    """
 
     def __init__(
         self,
@@ -49,15 +91,32 @@ class ChunkedDemoDataset(Dataset[dict[str, Any]]):
         image_key: str = IMAGE_KEY,
         state_key: str = STATE_KEY,
         action_key: str = ACTION_KEY,
+        chunk_pad: str = "repeat",
     ) -> None:
+        if chunk_pad not in CHUNK_PAD_MODES:
+            raise ValueError(f"chunk_pad must be one of {CHUNK_PAD_MODES}, got {chunk_pad!r}")
         self.frames = frames
         self.chunk_len = chunk_len
         self.image_key, self.state_key, self.action_key = image_key, state_key, action_key
+        self.chunk_pad = chunk_pad
+        self.indices: list[int] | None = None
+        if chunk_pad == "drop":
+            self.indices = pad_free_indices(frames, chunk_len, action_key)
+            if not self.indices:
+                raise ValueError(
+                    f"every frame's {chunk_len}-action chunk is padded (episodes too short)"
+                )
+
+    @property
+    def pad_frames_dropped(self) -> int:
+        return 0 if self.indices is None else len(self.frames) - len(self.indices)
 
     def __len__(self) -> int:
-        return len(self.frames)
+        return len(self.frames) if self.indices is None else len(self.indices)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        if self.indices is not None:
+            idx = self.indices[idx]
         item = self.frames[idx]
         actions = torch.as_tensor(item[self.action_key]).float()
         if actions.ndim != 2 or actions.shape[0] != self.chunk_len:
@@ -144,7 +203,11 @@ def _ensure_local(repo_id: str, root: Path) -> None:
 
 
 def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, dict[str, Any]]:
-    """The few-shot SFT set: the first `data.demos_per_task` successful `data.cell` demos per task."""
+    """The few-shot SFT set: the first `data.demos_per_task` successful `data.cell` demos per task.
+
+    `data.chunk_pad` (default "drop"): frames whose chunk is padded past the episode end are left
+    out of the SFT loss. Set `chunk_pad: repeat` to reproduce the 0.1-era SFT runs (WO-02
+    attempts 1-4), which trained on the pad."""
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
     rec: Any = importlib.import_module("src.data.recorder")  # WO-01
@@ -164,12 +227,14 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
     fps = int(LeRobotDatasetMetadata(repo_id, root=root).fps)
     delta = {rec.ACTION_KEY: [k / fps for k in range(chunk_len)]}
     frames = rec.load_demo_dataset(repo_id, root, episodes=sorted(episodes), delta_timestamps=delta)
+    chunk_pad = str(cfg["data"].get("chunk_pad", DEFAULT_CHUNK_PAD))
     ds = ChunkedDemoDataset(
         frames,
         chunk_len=chunk_len,
         image_key=rec.IMAGE_KEY,
         state_key=rec.STATE_KEY,
         action_key=rec.ACTION_KEY,
+        chunk_pad=chunk_pad,
     )
     info = {
         "repo_id": repo_id,
@@ -178,5 +243,7 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
         "cell": cell,
         "episodes_per_task": per_task,
         "num_frames": len(ds),
+        "chunk_pad": chunk_pad,
+        "pad_frames_dropped": ds.pad_frames_dropped,
     }
     return ds, info
