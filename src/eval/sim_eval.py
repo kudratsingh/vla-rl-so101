@@ -70,6 +70,7 @@ def run_batch(
     *,
     action_clip: float | None = None,
     end_info: dict[str, Tensor] | None = None,
+    instructions_out: list[str] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """One batch of len(seeds) parallel episodes -> (success (N,) bool, length (N,) int).
 
@@ -84,6 +85,8 @@ def run_batch(
     `end_info`, when given, receives per-episode (N,) tensors: every bool flag of the env `info`
     at the step the episode ended (success, is_grasped, obj_in_bowl, ...), "terminated",
     "truncated", and "clipped_steps" (steps on which the clip changed the action).
+    `instructions_out`, when given, receives the reset's per-episode instructions (they name the
+    episode's object, e.g. which unseen object an unseen_objects episode drew).
     """
     n = len(seeds)
     raw, _ = env.reset(seed=list(seeds))
@@ -93,6 +96,8 @@ def run_batch(
     instructions = list(env.unwrapped.get_instructions())
     if len(instructions) != n:
         raise ValueError(f"env gave {len(instructions)} instructions for {n} episodes")
+    if instructions_out is not None:
+        instructions_out.extend(instructions)
     active = torch.ones(n, dtype=torch.bool)
     success = torch.zeros(n, dtype=torch.bool)
     length = torch.zeros(n, dtype=torch.long)
@@ -139,13 +144,20 @@ class CellSeedResult:
 @dataclass(frozen=True)
 class EpisodeRecord:
     """One evaluated episode (runs/<id>/episodes.jsonl). `seed` is the protocol seed;
-    `end_reason`: success | terminated | truncated | horizon; `flags`: the env's bool info flags
-    at the last step (see `run_batch` end_info); `clipped_steps` is 0 without an action clip."""
+    `instruction` the reset's language instruction (it names the manipulated object, so the
+    unseen_objects cell splits by object). `end_reason`: success | terminated | horizon, where
+    horizon is the time limit, whether the env's truncation or the eval's `max_steps` cap ended
+    it (scripts/wo02_eval.py sets both to env.max_episode_steps, so ManiSkill truncates on that
+    same step; the raw flag stays in `flags["truncated"]`). With the current tasks "terminated"
+    does not occur: none defines a fail state, so ManiSkill's terminated equals success. `flags`:
+    the env's bool info flags at the last step (see `run_batch` end_info) + truncated;
+    `clipped_steps` is 0 without an action clip."""
 
     task: str
     cell: str
     seed: int
     episode_seed: int
+    instruction: str
     success: bool
     length: int
     end_reason: str
@@ -161,28 +173,26 @@ def _episode_records(
     s: Tensor,
     ln: Tensor,
     end: dict[str, Any],
+    instructions: Sequence[str],
 ) -> list[EpisodeRecord]:
     out = []
-    skip = {"terminated", "truncated", "clipped_steps"}
+    skip = {"terminated", "clipped_steps"}
     for i, ep in enumerate(seeds):
-        term, trunc = bool(end["terminated"][i]), bool(end["truncated"][i])
-        reason = (
-            "success"
-            if bool(s[i])
-            else "terminated" if term else "truncated" if trunc else "horizon"
-        )
+        term = bool(end["terminated"][i])
+        reason = "success" if bool(s[i]) else "terminated" if term else "horizon"
         flags = {k: bool(v[i]) for k, v in sorted(end.items()) if k not in skip}
         out.append(
             EpisodeRecord(
-                task,
-                cell,
-                int(seed),
-                int(ep),
-                bool(s[i]),
-                int(ln[i]),
-                reason,
-                int(end["clipped_steps"][i]),
-                flags,
+                task=task,
+                cell=cell,
+                seed=int(seed),
+                episode_seed=int(ep),
+                instruction=str(instructions[i]),
+                success=bool(s[i]),
+                length=int(ln[i]),
+                end_reason=reason,
+                clipped_steps=int(end["clipped_steps"][i]),
+                flags=flags,
             )
         )
     return out
@@ -225,6 +235,7 @@ def evaluate(
                         chunk = want[start : start + batch]
                         pad = chunk + [chunk[-1] + episodes + i for i in range(batch - len(chunk))]
                         end: dict[str, Tensor] = {}
+                        instr: list[str] = []
                         s, ln = run_batch(
                             act,
                             env,
@@ -234,9 +245,11 @@ def evaluate(
                             exec_steps,
                             action_clip=action_clip,
                             end_info=end if log_episode is not None else None,
+                            instructions_out=instr,
                         )
                         if log_episode is not None:
-                            for rec in _episode_records(task, cell, seed, chunk, s, ln, end):
+                            recs = _episode_records(task, cell, seed, chunk, s, ln, end, instr)
+                            for rec in recs:
                                 log_episode(rec)
                         succ.append(s[: len(chunk)])
                         lens.append(ln[: len(chunk)])
