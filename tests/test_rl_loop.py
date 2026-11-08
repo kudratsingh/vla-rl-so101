@@ -558,7 +558,7 @@ def test_entry_script_rejects_rl_seeds_on_the_protocol_range(tmp_path: Path) -> 
     protocol's held-out episode seeds; it is rejected before anything is built."""
     cfg_path = tmp_path / "maniskill.yaml"
     cfg_path.write_text(f"inherit: {REPO / 'configs' / 'rl.yaml'}\nseed: 10\n")
-    with pytest.raises(ValueError, match="overlapping"):
+    with pytest.raises(ValueError, match=r"must be in \[0, 10\)"):
         _load_script().main(["--preset", "rl", "--config", str(cfg_path), "--estimate"])
 
 
@@ -596,3 +596,5 @@ def test_sigterm_saves_interrupted_checkpoint_and_record(
     assert (ckpt / "adapter").is_dir() and (ckpt / "optimizer.pt").is_file()
     state = json.loads((ckpt / "trainer_state.json").read_text())
     assert (state["step"], state["completed_step"]) == (3, 2)  # resume would redo step 3
+    with pytest.raises(SystemExit):  # refused without --resume-approximate, before any build
+        script.main(["--preset", "tiny", "--resume", str(ckpt)])

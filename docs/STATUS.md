@@ -87,7 +87,10 @@ Nothing ran on a GPU. Protocol `0.1-draft` (`src/eval/protocol.py`, hash `e9ce5b
 What changed:
 - RL gates (`src/rl/gates.py`): the 64-episode kill switch and the 32-episode peak stop are
   replaced by windows of `rollout/success_rate` per trained task plus rollout entropy (`rl.gate_*`).
-  There are three gates: flat at step 38, decline from the best window, and entropy collapse. They
+  There are three gates: flat at step 38, decline from the best window, and entropy collapse. The
+  decline gate fires only when two consecutive non-overlapping windows are each more than
+  max(`gate_max_drop`, `gate_decline_z` x SE) below the best aligned window (z = 3: z = 2 stopped
+  35/100 simulated flat runs; the window SE is group-level, ~1-2 points, not ~0.5-1). They
   decide spending only; the protocol eval decides improvement. Periodic greedy evals run on the
   trained tasks only and are sanity logs. The removed config keys raise an error naming their
   replacement.
@@ -99,33 +102,47 @@ What changed:
   now say the old values were structurally ~0, not evidence of small updates.
 - Resume: checkpoints hold the optimizer, scheduler, RNG, trainable tensors and trainer state.
   `scripts/wo03_rl.py --resume <ckpt>` continues the step numbering. A CPU round trip is
-  bit-identical. Checkpoints are written every 25 steps and are about 1.2 GB each for OFT.
+  bit-identical. Resume from the newest `step_N` checkpoint without a suffix: a
+  `step_N_interrupted` one (weights may hold part of step N) is refused unless
+  `--resume-approximate`, which re-runs step N and sets `record.resume_approximate`. Checkpoints are written every 25 steps and are about 1.2 GB each for OFT.
 - `configs/rl.yaml` (ADR-0002 amendment 3, proposed): 16 prompts x K=8, lr 1e-4, `ppo_epochs` 2.
   The lr follows the published LoRA recipes (RIPT-VLA, RLinf-VLA), not the logged KL.
   `configs/rl_pickplace.yaml` inherits these settings. RL seeds >= 10 are rejected
-  (`src/eval/seed_ranges.py`, byte-identical to PR #25's copy).
+  (`src/eval/seed_ranges.py` `check_rl_seed`: an explicit [0, 10) bound, then the overlap check;
+  PR #25's copy has only the overlap check, which lets seeds 11-299 through, so keep this version
+  when #25 merges).
 - Rollout timing split (`src/rl/rollout.py`): policy / sim_step / render / obs_fn / host_copy /
   reset / other. It goes to `metrics.jsonl` (`rollout/time/*_s`) and to the PROBE line.
 - Probe modes on `scripts/wo03_rl.py`: `--lr-sweep` (offline, on one stored batch) and
   `--probe-temperatures` (rollouts only, the same prompts at each temperature). Both can be costed
   with `--estimate`.
-- Demos: the recorder keeps recording through release and retreat. It records at least 15 frames
-  past success, until the oracle has finished, with a cap of 45 frames. A demo is rejected if
-  success no longer holds at its end. The SFT loader drops chunks that would contain pad frames
-  (`data.chunk_pad: drop`). Measured on the existing 0.1 demo set: 11 of 25 PickPlace and 13 of 25
+- Demos: the recorder can keep recording through release and retreat. With
+  `configs/demos_v2.yaml` it records at least 15 frames past success, until the oracle has
+  finished, with a cap of 45 frames, and rejects a demo if success no longer holds at its end. The
+  SFT loader can drop chunks that would contain pad frames (`data.chunk_pad: drop`). The code
+  defaults are the 0.1 settings (no tail, oracle v1, `chunk_pad: repeat`), so `sim.yaml`,
+  `sft*.yaml` and `rl.yaml` keep their behaviour and config hashes; `demos_v2.yaml` (and
+  `demos_v2_tiny.yaml` for the CPU dry run) opt in, and an SFT config for the v2 set must set
+  `chunk_pad: drop`. `wo01_build_env.py --push` refuses the two 0.1 demo repos unless
+  `--overwrite-hub`. Measured on the existing 0.1 demo set: 11 of 25 PickPlace and 13 of 25
   Stack demos end below the 0.45 rad release target.
 - Oracle v2 (`src/data/oracle.py`) slows to 0.5 cm/step over the last 6 cm and the descent. Results
   on the Mac CPU sim, tiny preset, 100 episodes per cell: seen PickPlace / Push / Stack 100 / 100 /
   100%, shifted 96 / 92 / 96%. Under v1 the same cells were 100 / 98 / 100% and 99 / 91 / 96%.
-  Near-object decisions per episode rose from ~1.5 to ~2.6-3.0. v1 is kept and reproduces the
-  0.1-era oracle exactly.
+  Near-object decisions per episode rose from ~1.5 to ~2.6-3.0. v1 stays the default and
+  reproduces the 0.1-era oracle exactly; v2 is opt-in (`data.oracle_profile: v2`).
 - Demo rebuild (`scripts/wo01r_rebuild_demos.py`, `scripts/pod/demo_rebuild_job.sh`,
   `configs/demos_v2.yaml`): it rebuilds 25 demos per task on the GPU renderer into a new Hub repo
-  (`KudratSingh22/vla-rl-so101-demos-25-v2`), so the 0.1 set is never overwritten. It also has a
+  (`KudratSingh22/vla-rl-so101-demos-25-v2`); it does not write to the 0.1 repos. It also has a
   render-gap mode that compares stored and fresh frames and greedy tokens against a codec floor.
-  On the Mac CPU against the 0.1 set, the pixel gap equals the codec floor and joint drift is 0.
+  Preliminary single run on the Mac CPU (run 20261108T083504Z-wo01r-sim-c025, dirty tree at
+  2af16f6, first 3 of 25 episodes per task (223/163/209 frames), pixels and joints only, token
+  comparison skipped): the pixel gap is within 0.03 mean-abs (<= 1.4%) of the codec floor on all 3
+  tasks (e.g. PickPlace 2.070 vs 2.042) and joint drift is 0. The full 25-episode check with
+  tokens on the 4090 is still pending (see Next).
 - Protocol 0.2 (`src/eval/protocol_v02.py`, new; `scripts/wo02_eval.py --protocol 0.2`). Its hash
-  combines the file bytes of the protocol, env, success, camera and robot model with the canonical
+  combines the file bytes of the protocol, the eval loop (`src/eval/sim_eval.py`: episode seeds,
+  clip, success latch, episode end), env, success, camera and robot model with the canonical
   run settings, the clip, the episode-seed probes and the sim-stack pins. Per-episode records go to
   `runs/<id>/episodes.jsonl` under both protocols. Under 0.2 only, a 4 deg/step joint clip from
   `configs/real.yaml` applies. Runs that deviate get `protocol_complete: false` and a list of the
@@ -145,7 +162,11 @@ about $5 in total.
    - `--lr-sweep 5e-5,2e-4,5e-4,1e-3 --sweep-adam-steps 8`, 1.20 h;
    - then `--probe-temperatures 0.7,1.0,1.3 --probe-groups 64`, 0.60 h;
    - plus 0.5 h setup.
-   estimated: A100-80GB x 2.3 h = $4.12 (`--estimate`, from WO-04 A100 throughput).
+   estimated: A100-80GB x 2.3 h = $4.12 (`--estimate` from `cost.throughput`: rollout 86
+   actions/s measured on WO-04 pod gzxhwhjhdtc1kc; update 10.3 decisions/s from the WO-02 SFT
+   probe, pod u87r9sjnwig58d; forward 31 decisions/s estimated). The 2.3 h excludes the 7B load
+   and GPU env build of each of the two separate `uv run` invocations; `setup_hours` 0.5 covers
+   only the image, `uv sync` and the download.
 3. Only after 1-2, and after the recovery-SFT base clears rule 3: a GRPO run with the measured lr and
    temperature written into `configs/rl.yaml`, starting with `--probe-steps 3`. The worst case is
    estimated: A100-80GB x 41.3 h = $74 per 150-step seed, or 10.5 h = $18.72 if the flat gate stops
@@ -157,8 +178,8 @@ under protocol 0.2. It is priced from the measured eval runtime of ~1.05 h per c
 and PickPlace-only step 100 brings it to $5.0-5.3.
 
 Unverified on GPU: gate behaviour and thresholds (`gate_min_gain` 0.03 now applies to sampled
-rollout success and needs the owner's confirmation; `gate_max_drop` 0.04 and `gate_entropy_min` 0.5
-are not measured), diag/sweep forward cost, the throughput for the 16 x 8 / 2-epoch shape, the render
+rollout success and needs the owner's confirmation; `gate_max_drop` 0.04, `gate_decline_z` 3 and
+`gate_entropy_min` 0.5 are not measured on GPU; z = 3 is from a CPU simulation only), diag/sweep forward cost, the throughput for the 16 x 8 / 2-epoch shape, the render
 hook timing on `physx_cuda`, the CUDA RNG restore (a GPU resume is not bit-identical), v2 oracle
 success on `physx_cuda`, recorder tail stepping on the GPU env, render-gap replay and 7B token
 comparison, and the 0.2 clip and end-flag capture on CUDA.

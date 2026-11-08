@@ -32,7 +32,9 @@ def test_tiny_dry_run_builds_full_tails_and_zero_render_gap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = tmp_path / "tiny_rebuild.yaml"
-    cfg.write_text(f"inherit: configs/tiny.yaml\ndata:\n  dataset_root: {tmp_path / 'demos'}\n")
+    cfg.write_text(
+        f"inherit: configs/demos_v2_tiny.yaml\ndata:\n  dataset_root: {tmp_path / 'demos'}\n"
+    )
     runs = tmp_path / "runs"
     build = _load("wo01_build_env")
     rebuild = _load("wo01r_rebuild_demos")
@@ -62,3 +64,21 @@ def test_tiny_dry_run_builds_full_tails_and_zero_render_gap(
     assert tokens["token_agreement"] == pytest.approx(
         floor["tokens_raw_vs_decoded"]["token_agreement"], abs=0.02
     )
+
+
+def test_existing_presets_keep_the_01_recorder_and_cannot_clobber_the_01_repos() -> None:
+    """sim.yaml / sft_a4.yaml (no data.* opt-ins) record exactly as the 0.1 sets did, and
+    `wo01_build_env.py --push` refuses their Hub repos without --overwrite-hub."""
+    from src.config import CONFIG_DIR, load_config
+
+    build = _load("wo01_build_env")
+    for name in ("sim.yaml", "sft_a4.yaml"):
+        cfg = load_config("sim", CONFIG_DIR / name)
+        assert build.TailSettings.from_cfg(cfg) == build.TailSettings(0, 0, False)
+        assert build.oracle_profile(cfg) == "v1"
+        assert cfg["data"]["hub_repo"] in build.PROTECTED_HUB_REPOS
+        with pytest.raises(SystemExit):
+            build.main(["--preset", "sim", "--config", str(CONFIG_DIR / name), "--push"])
+    v2 = load_config("sim", CONFIG_DIR / "demos_v2.yaml")
+    assert build.TailSettings.from_cfg(v2) == build.TailSettings(15, 45, True)
+    assert build.oracle_profile(v2) == "v2" and v2["data"]["chunk_pad"] == "drop"

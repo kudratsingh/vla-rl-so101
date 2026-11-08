@@ -1,0 +1,11 @@
+# CPU tiny dry run of the WO-01r v2 demo rebuild (scripts/wo01r_rebuild_demos.py --preset tiny):
+# configs/tiny.yaml plus the v2 recorder/oracle opt-ins of configs/demos_v2.yaml. The code
+# defaults are the 0.1-era settings (oracle v1, no tail, chunk_pad repeat).
+inherit: configs/tiny.yaml
+
+data:
+  oracle_profile: v2
+  post_success_steps: 15
+  post_success_max_steps: 45
+  require_final_success: true
+  chunk_pad: drop

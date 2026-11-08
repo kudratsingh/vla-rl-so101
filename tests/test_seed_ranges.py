@@ -41,9 +41,12 @@ def test_standard_ranges_are_disjoint_and_cover_their_seeds() -> None:
 def test_guard_rejects_overlaps_and_strays() -> None:
     with pytest.raises(ValueError, match="selection seeds"):
         SR.standard_ranges(selection_seeds=(0,))
-    with pytest.raises(ValueError, match="overlapping"):
-        SR.check_rl_seed(10)  # train prompts 100M.. = protocol seed 0's episodes
-    SR.check_rl_seed(3)
+    assert SR.MAX_RL_SEED == 10
+    for bad in (10, 11, 39, -1):  # 10: train prompts 100M.. = protocol seed 0's episodes
+        with pytest.raises(ValueError, match=r"must be in \[0, 10\)"):
+            SR.check_rl_seed(bad)
+    for ok in (0, 3, 9):
+        SR.check_rl_seed(ok)
     with pytest.raises(ValueError, match="outside"):
         SR.assert_seeds_in([episode_seeds(0, 0, 0, 1)[0]], "recovery", SR.standard_ranges())
     leak = SR.SeedRange("leak", 100_000_000, 100_000_050)  # e.g. a sweep on protocol seed 0

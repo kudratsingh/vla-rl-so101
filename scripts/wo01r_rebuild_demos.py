@@ -26,8 +26,9 @@ and RL rollout renders on the NVIDIA GPU sim. Two modes:
         --skip-tokens --gap-episodes 3                                            # Mac: CPU-vs-CPU floor
 
 Non-tiny presets default to configs/demos_v2.yaml (render_gap.* there: the 0.1 dataset and the
-WO-02 attempt-4 adapter, a Hub path). tiny uses configs/tiny.yaml and the tiny random OFT policy
-(configs/sft_tiny.yaml). Writes runs/<id>/record.json and runs/<id>/render_gap.json.
+WO-02 attempt-4 adapter, a Hub path). tiny uses configs/demos_v2_tiny.yaml (tiny + the v2 data
+opt-ins) and the tiny random OFT policy (configs/sft_tiny.yaml). Writes runs/<id>/record.json and
+runs/<id>/render_gap.json.
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ MODES = ("build", "render-gap", "dry-run")
 
 
 def default_config(preset: str) -> Path:
-    return REPO_ROOT / "configs" / ("tiny.yaml" if preset == "tiny" else "demos_v2.yaml")
+    return REPO_ROOT / "configs" / ("demos_v2_tiny.yaml" if preset == "tiny" else "demos_v2.yaml")
 
 
 def _build_env_module() -> Any:

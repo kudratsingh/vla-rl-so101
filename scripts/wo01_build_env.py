@@ -6,10 +6,12 @@ For every task in `env.tasks`: run seeded oracle episodes on the `seen` cell unt
 have run; report oracle success over all episodes run. All tasks go into ONE LeRobotDataset
 (v3.0) at `<data.dataset_root>/<repo name>`, rebuilt from scratch each time.
 
-Each demo is recorded past its success step through release and retreat (`TailSettings`,
-`data.post_success_steps` / `data.post_success_max_steps`) with the `data.oracle_profile` oracle
-(src/data/oracle.py). The 0.1-era sets (KudratSingh22/vla-rl-so101-demos, -demos-25) were
-recorded with `post_success_steps: 0`, `post_success_max_steps: 0`, `oracle_profile: v1`.
+A config can record each demo past its success step through release and retreat
+(`TailSettings`, `data.post_success_steps` / `data.post_success_max_steps`) and pick the
+`data.oracle_profile` oracle (src/data/oracle.py). The defaults are the 0.1-era settings the
+existing sets (KudratSingh22/vla-rl-so101-demos, -demos-25) were recorded with: no tail, oracle
+v1. configs/demos_v2.yaml opts in to the v2 oracle and the 15/45 tail. `--push` refuses those two
+0.1 repos unless `--overwrite-hub` is passed: every reported SFT/RL number trained on them.
 
     uv run scripts/wo01_build_env.py --preset tiny             # CPU, < 2 min
     uv run scripts/wo01_build_env.py --preset sim --push       # GPU box; pushes privately to the Hub
@@ -40,6 +42,8 @@ from src.runs import Run
 # Demo episodes use seeds DEMO_SEED_BASE + cfg.seed * 100_000 + k (k = 0, 1, ...), disjoint from
 # small eval seeds, so evaluating on the "seen" cell never replays a training episode.
 DEMO_SEED_BASE = 1_000_000
+# The 0.1-era demo sets every reported SFT/RL number trained on: --push needs --overwrite-hub
+PROTECTED_HUB_REPOS = ("KudratSingh22/vla-rl-so101-demos", "KudratSingh22/vla-rl-so101-demos-25")
 
 EnvApi = tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]
 
@@ -78,14 +82,16 @@ class TailSettings:
 
     The 0.1-era demo sets stopped at that step, often mid-release (11 of 25 PickPlace and 13 of 25
     Stack demos end with the gripper at 0.22-0.29 rad, short of the 0.45 release target, with no
-    retreat; review 2026-11-07 section 3.2). Now recording continues for at least `min_steps`
-    frames and until the oracle has finished its script (release target reached, retreat done),
-    capped at `max_steps` frames. `min_steps = max_steps = 0` reproduces the 0.1 recorder.
+    retreat; review 2026-11-07 section 3.2). With `min_steps > 0` recording continues for at
+    least `min_steps` frames and until the oracle has finished its script (release target
+    reached, retreat done), capped at `max_steps` frames. The DEFAULTS (0 / 0 / no final check)
+    reproduce the 0.1 recorder, so sim.yaml / sft_a4.yaml keep their behaviour and config hash;
+    configs/demos_v2.yaml (and demos_v2_tiny.yaml) opt in with 15 / 45 / true.
     """
 
-    min_steps: int = 15  # data.post_success_steps
-    max_steps: int = 45  # data.post_success_max_steps
-    require_final_success: bool = True  # data.require_final_success: success must hold at the end
+    min_steps: int = 0  # data.post_success_steps (demos_v2: 15)
+    max_steps: int = 0  # data.post_success_max_steps (demos_v2: 45)
+    require_final_success: bool = False  # data.require_final_success: success holds at the end
 
     @classmethod
     def from_cfg(cls, cfg: dict[str, Any]) -> TailSettings:
@@ -286,6 +292,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--push", action="store_true", help="push the dataset to the Hub (private)")
     parser.add_argument(
+        "--overwrite-hub",
+        action="store_true",
+        help=f"allow --push to a 0.1-era demo repo ({', '.join(PROTECTED_HUB_REPOS)})",
+    )
+    parser.add_argument(
         "--eval-episodes",
         type=int,
         default=None,
@@ -300,6 +311,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cfg = load_config(args.preset, args.config)
+    hub_repo = str(cfg.get("data", {}).get("hub_repo", ""))
+    if args.push and hub_repo in PROTECTED_HUB_REPOS and not args.overwrite_hub:
+        parser.error(
+            f"refusing to --push over {hub_repo}: it holds a 0.1-era demo set that reported "
+            "SFT/RL numbers trained on; set data.hub_repo to a new repo or pass --overwrite-hub"
+        )
     if args.device:
         cfg["device"] = args.device
     num_envs = args.num_envs

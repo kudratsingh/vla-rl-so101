@@ -3,7 +3,7 @@
 Each sample is one frame t of a demo: the front image and joint state at t, the action chunk
 a[t : t + K] (LeRobot `delta_timestamps`; indices past the episode end are clamped, i.e. the last
 action repeats -- exactly OFT's RLDS `chunk_act_obs`), and the per-frame language `task`. Frames
-whose chunk would need that pad are dropped by default (`data.chunk_pad`, see `load_sft_frames`).
+whose chunk would need that pad are dropped with `data.chunk_pad: drop` (see `load_sft_frames`).
 Everything model-specific (crop/augment/resize/normalise/tokenise) happens later in the policy's
 single `build_inputs`, so SFT, eval and RL share one preprocessing path.
 
@@ -40,7 +40,9 @@ class FrameSource(Protocol):
 
 
 CHUNK_PAD_MODES = ("drop", "repeat")
-DEFAULT_CHUNK_PAD = "drop"  # load_sft_frames; `data.chunk_pad: repeat` = the 0.1-era behaviour
+# load_sft_frames: "repeat" (the 0.1-era SFT recipe, WO-02 attempts 1-4) keeps the reported
+# configs' behaviour under their unchanged config hash; the v2 set opts in to `chunk_pad: drop`.
+DEFAULT_CHUNK_PAD = "repeat"
 
 
 def pad_free_indices(
@@ -205,9 +207,9 @@ def _ensure_local(repo_id: str, root: Path) -> None:
 def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, dict[str, Any]]:
     """The few-shot SFT set: the first `data.demos_per_task` successful `data.cell` demos per task.
 
-    `data.chunk_pad` (default "drop"): frames whose chunk is padded past the episode end are left
-    out of the SFT loss. Set `chunk_pad: repeat` to reproduce the 0.1-era SFT runs (WO-02
-    attempts 1-4), which trained on the pad."""
+    `data.chunk_pad` (default "repeat", the 0.1-era SFT runs, WO-02 attempts 1-4, which trained
+    on the pad). `drop`: frames whose chunk is padded past the episode end are left out of the
+    SFT loss; set it in any SFT config for the v2 demo set (configs/demos_v2.yaml does)."""
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
     rec: Any = importlib.import_module("src.data.recorder")  # WO-01

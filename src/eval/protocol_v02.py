@@ -20,9 +20,10 @@ not mirrored in sim.
 
 Hash (``protocol_hash()``): SHA-256 of the canonical JSON of ``hash_components()``:
 
-- ``files``: SHA-256 of the BYTES of ``FILES`` (this file, protocol.py, the env package: scene,
-  spawn sampling, success checks, camera, robot, randomization, CPU vector env) and of the robot
-  model (URDF + meshes). Bytes, not extracted constants: spawn sampling in ``tasks.py`` is code
+- ``files``: SHA-256 of the BYTES of ``FILES`` (this file, protocol.py, the eval loop
+  ``src/eval/sim_eval.py``: episode seeds, the per-joint clip and its reference, the success latch
+  and episode-end rule, whole-chunk execution; the env package: scene, spawn sampling, success
+  checks, camera, robot, randomization, CPU vector env) and of the robot model (URDF + meshes). Bytes, not extracted constants: spawn sampling in ``tasks.py`` is code
   (rejection sampling, inline yaw ranges), so only its bytes pin it. A comment edit in one of these
   files therefore changes the hash too: a false alarm costs one re-freeze, a silent change costs a
   wrong comparison.
@@ -31,7 +32,8 @@ Hash (``protocol_hash()``): SHA-256 of the canonical JSON of ``hash_components()
   0.2 run: ``deviations()`` lists the differences and the eval marks it ``protocol_complete:
   false``.
 - ``action_clip``: the clip as read from ``configs/real.yaml`` (changing it there changes the hash).
-- ``episode_seed_probe``: the first episode seed of every (seed, task, cell), pinning the formula.
+- ``episode_seed_probe``: the first and last of the SIM_EPISODES_PER_CELL episode seeds of every
+  (seed, task, cell), pinning the formula and its stride (also pinned by sim_eval.py's bytes).
 - ``sim_stack``: the versions of the simulator packages pinned in ``uv.lock``.
 
 Control/physics rates (``CONTROL_HZ`` in ``src/env/__init__.py``, ``SIM_FREQ`` in ``tasks.py``)
@@ -74,6 +76,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 FILES: tuple[str, ...] = (
     "src/eval/protocol.py",
     "src/eval/protocol_v02.py",
+    "src/eval/sim_eval.py",
     "src/env/__init__.py",
     "src/env/tasks.py",
     "src/env/success.py",
@@ -158,12 +161,13 @@ def _sim_stack(root: Path) -> dict[str, list[str]]:
 def _episode_seed_probe() -> list[int]:
     from src.eval.sim_eval import episode_seeds
 
-    return [
-        episode_seeds(s, t, c, 1)[0]
-        for s in SIM_SEEDS
-        for t in range(len(TASKS))
-        for c in range(len(CELLS))
-    ]
+    out = []
+    for s in SIM_SEEDS:
+        for t in range(len(TASKS)):
+            for c in range(len(CELLS)):
+                seeds = episode_seeds(s, t, c, SIM_EPISODES_PER_CELL)
+                out += [seeds[0], seeds[-1]]
+    return out
 
 
 def hash_components(root: Path = REPO_ROOT) -> dict[str, Any]:

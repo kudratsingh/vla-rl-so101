@@ -42,6 +42,8 @@ def test_v02_hash_covers_env_success_and_clip(tmp_path: Path) -> None:
         ("src/env/tasks.py", r'^MIN_SEP = \{"PickPlace": 0\.11', 'MIN_SEP = {"PickPlace": 0.12'),
         ("src/env/cameras.py", r'"front_left_45": \(45\.0,', '"front_left_45": (46.0,'),
         (P02.REAL_CONFIG, r"max_joint_step_deg: 4\.0", "max_joint_step_deg: 3.0"),
+        ("src/eval/sim_eval.py", r"clamp\(-bound, bound\)", "clamp(-2 * bound, 2 * bound)"),
+        ("src/eval/sim_eval.py", r"success \|= hit", "success = hit"),
     ]
     seen = {ref}
     for rel, pattern, repl in edits:
@@ -67,6 +69,7 @@ def test_v02_keeps_01_semantics_and_reads_the_real_clip() -> None:
     parts = P02.hash_components()
     assert parts["action_clip"]["bound_deg"] == clip.bound_deg
     assert "src/env/success.py" in parts["files"] and "src/env/tasks.py" in parts["files"]
+    assert "src/eval/sim_eval.py" in parts["files"]  # the episode loop and the clip itself
     assert any(f.endswith(".urdf") for f in parts["files"])
 
 

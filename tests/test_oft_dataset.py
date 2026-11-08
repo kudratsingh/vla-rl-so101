@@ -110,7 +110,7 @@ def test_lerobot_chunks_repeat_last_action(fake_recorder: Path) -> None:
     cfg = load_config("tiny", "configs/sft_tiny.yaml")
     cfg["env"]["tasks"] = list(TASKS)
     cfg["data"]["demos_per_task"] = 1  # first demo of each task: episodes 0 and 2
-    cfg["data"]["chunk_pad"] = "repeat"  # the 0.1-era behaviour: padded chunks kept
+    cfg["data"].pop("chunk_pad", None)  # default = the 0.1-era behaviour: padded chunks kept
     ds, info = load_sft_frames(cfg, chunk_len=8)
     assert info["episodes_per_task"] == {"PickPlace": [0], "Push": [2]}
     assert info["chunk_pad"] == "repeat" and info["pad_frames_dropped"] == 0
@@ -131,10 +131,11 @@ def test_lerobot_chunks_repeat_last_action(fake_recorder: Path) -> None:
         load_sft_frames(cfg, chunk_len=8)
 
 
-def test_padded_chunks_are_dropped_by_default(fake_recorder: Path) -> None:
+def test_padded_chunks_are_dropped_with_chunk_pad_drop(fake_recorder: Path) -> None:
     cfg = load_config("tiny", "configs/sft_tiny.yaml")
     cfg["env"]["tasks"] = list(TASKS)
     cfg["data"]["demos_per_task"] = 1  # episodes 0 (5 frames) and 2 (6 frames)
+    cfg["data"]["chunk_pad"] = "drop"  # the v2 set's opt-in (configs/demos_v2.yaml)
     ds, info = load_sft_frames(cfg, chunk_len=3)
     assert info["chunk_pad"] == "drop" and info["pad_frames_dropped"] == 2 + 2
     assert len(ds) == (5 - 2) + (6 - 2)

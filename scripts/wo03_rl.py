@@ -194,7 +194,8 @@ def estimate_probes(
     temperatures: list[float] | None,
     groups: int,
 ) -> dict[str, float]:
-    """Projected GPU time of the Track B probes from cost.throughput (setup not included).
+    """Projected GPU time of the Track B probes from cost.throughput (not included: setup, and
+    the 7B load + GPU env build of each separate invocation).
 
     lr sweep drivers: one rollout collection (worst case: the refill cap), then per lr the old
     log-prob recompute, `adam_steps` mini-batch forward+backward passes and 2 no-grad forwards of
@@ -430,7 +431,14 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         type=Path,
         default=None,
         help="continue from a local checkpoint dir (runs/<id>/checkpoints/step_N): adapter, "
-        "optimizer, scheduler, step counter and RNG state",
+        "optimizer, scheduler, step counter and RNG state. Prefer the newest step_N checkpoint "
+        "without a suffix: an _interrupted one is refused unless --resume-approximate",
+    )
+    parser.add_argument(
+        "--resume-approximate",
+        action="store_true",
+        help="with --resume: accept a step_N_interrupted checkpoint, whose weights may already "
+        "hold part of step N; step N is re-run on top (record.resume_approximate = true)",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -515,6 +523,17 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         raise FileNotFoundError(
             f"--resume {args.resume}: no trainer_state.json (a checkpoint dir?)"
         )
+    if args.resume_approximate and args.resume is None:
+        parser.error("--resume-approximate needs --resume")
+    if args.resume is not None and not args.resume_approximate:
+        # fail before the run record, env and 7B load: GRPOTrainer.load_checkpoint says why
+        st = json.loads((args.resume / "trainer_state.json").read_text())
+        if int(st["step"]) != int(st["completed_step"]):
+            parser.error(
+                f"--resume {args.resume} is an _interrupted checkpoint (step {st['step']}, "
+                f"completed_step {st['completed_step']}): resume from the newest step_N "
+                "checkpoint without a suffix, or pass --resume-approximate"
+            )
     seed_everything(seed)
 
     t_start = time.perf_counter()
@@ -547,8 +566,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         seed=seed,
     )
     if args.resume is not None:
-        trainer.load_checkpoint(args.resume)  # restores RNG state too: after seed_everything
+        # restores RNG state too: after seed_everything
+        trainer.load_checkpoint(args.resume, allow_partial=args.resume_approximate)
         record["resumed_from"] = str(args.resume)
+        if args.resume_approximate:
+            record["resume_approximate"] = True
     # `timeout` (the pod job's soft deadline) sends SIGTERM: exit through the finally blocks so the
     # trainer saves an interrupted checkpoint and the run record gets its end time and dollars
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))

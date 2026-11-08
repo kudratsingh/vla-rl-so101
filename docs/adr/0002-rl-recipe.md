@@ -144,7 +144,9 @@ Applies to the next GRPO run only. No paid run has used it.
   evals run on the trained tasks only and are sanity logs. Thresholds: `gate_min_gain` 0.03 is
   the owner's +3 bar, but it now applies to sampled rollout success, a different quantity, so it
   needs the owner's confirmation. `gate_max_drop` 0.04 and `gate_entropy_min` 0.5 are the agent's
-  judgment calls and have not been measured.
+  judgment calls and have not been measured. The decline gate also needs the drop to exceed
+  `gate_decline_z` (3) x its group-level SE on two consecutive non-overlapping windows, so
+  sampling noise does not stop an improving run (z from a CPU simulation, `src/rl/gates.py`).
 - **Fixed-batch diagnostic** (`src/rl/diagnostics.py`): it scores the first 32 trajectories of
   each update batch before and after all optimizer steps. It logs |delta log p|, delta log p split
   by advantage sign, k3 KL, clip fraction and `grad_norm`. The mini-batch-averaged

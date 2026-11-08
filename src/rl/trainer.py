@@ -137,6 +137,7 @@ class GRPOConfig:
     gate_min_gain: float = 0.03  # flat: windowed rollout success gain over the first window
     gate_rule: Literal["any_task", "mean"] = "any_task"  # best trained task, or the task mean
     gate_max_drop: float = 0.0  # decline: score < best non-overlapping window - this; 0 = off
+    gate_decline_z: float = 3.0  # decline also needs drop > z x SE of (best - window), twice
     gate_entropy_min: float = 0.0  # entropy collapse: window rollout entropy < this; 0 = off
     gate_stop: bool = True  # False: gates only log their events
     # Fixed-batch pre/post-update diagnostic (src/rl/diagnostics.py)
@@ -213,6 +214,8 @@ class GRPOConfig:
             raise ValueError("gate_rule must be any_task|mean")
         if self.gate_max_drop < 0 or self.gate_entropy_min < 0:
             raise ValueError("gate_max_drop and gate_entropy_min must be >= 0 (0 = off)")
+        if self.gate_decline_z < 0:
+            raise ValueError("gate_decline_z must be >= 0")
         if self.diag_every < 0 or self.diag_trajectories < 0 or self.diag_trajectories % k:
             raise ValueError("diag_every >= 0, diag_trajectories >= 0 and a multiple of K")
         if self.group_reset_check not in ("error", "warn", "off"):
@@ -332,6 +335,7 @@ class GRPOTrainer:
             rule=rl.gate_rule,
             max_drop=rl.gate_max_drop,
             entropy_min=rl.gate_entropy_min,
+            decline_z=rl.gate_decline_z,
         )
         self._envs: dict[str, VecEnv] = {}
         self._next_prompt = seed * TRAIN_SEED_STRIDE
@@ -723,10 +727,37 @@ class GRPOTrainer:
         (path / "trainer_state.json").write_text(json.dumps(state, indent=2))
         return path
 
-    def load_checkpoint(self, path: Path) -> None:
+    def load_checkpoint(self, path: Path, *, allow_partial: bool = False) -> None:
         """Restore a `save_checkpoint` directory: trainable tensors, optimizer, scheduler, RNG,
-        counters, eval history and gate windows. Training continues at completed_step + 1."""
+        counters, eval history and gate windows. Training continues at completed_step + 1.
+
+        An `_interrupted` checkpoint (step != completed_step) holds weights, Adam state and
+        counters from inside step `step`, so resuming re-runs part or all of that step on top of
+        it. Refused unless `allow_partial` (`--resume-approximate`); then the gate windows and the
+        eval history are cut back to completed_step so the re-run step can be recorded again."""
         state = json.loads((path / "trainer_state.json").read_text())
+        step, completed = int(state["step"]), int(state["completed_step"])
+        if step != completed:
+            plain = sorted(
+                p.name
+                for p in path.parent.glob("step_*")
+                if p.name[5:].isdigit() and int(p.name[5:]) <= completed
+            )
+            exact = f"{path.parent / plain[-1]}" if plain else "none in this run"
+            if not allow_partial:
+                raise ValueError(
+                    f"{path} is an _interrupted checkpoint: its weights may hold part of step "
+                    f"{step} (completed_step {completed}). Resume exactly from the latest plain "
+                    f"checkpoint ({exact}), or pass --resume-approximate to re-run step {step} "
+                    "on top of these weights"
+                )
+            log.warning(
+                "APPROXIMATE RESUME from %s: step %d is re-run on weights that may already "
+                "contain part of it (exact resume point: %s)",
+                path,
+                step,
+                exact,
+            )
         tensors = torch.load(path / "trainable.pt", map_location=STORAGE, weights_only=True)
         if len(tensors) != len(self.params) or any(
             t.shape != p.shape for t, p in zip(tensors, self.params, strict=True)
@@ -746,12 +777,15 @@ class GRPOTrainer:
             log.warning("resuming %s with rl settings that differ from it: %s", path, diff)
         if int(state["seed"]) != self.seed:
             log.warning("resuming seed-%s checkpoint under seed %d", state["seed"], self.seed)
-        self._completed_step = int(state["completed_step"])
+        self._completed_step = completed
         self._start_step = self._completed_step + 1
         self._next_prompt = int(state["next_prompt_seed"])
         self._next_task = int(state["next_task"])
-        self._history = [(int(s), float(v)) for s, v in state["eval_history"]]
+        self._history = [
+            (int(s), float(v)) for s, v in state["eval_history"] if int(s) <= completed
+        ]
         self.gates.load_state_dict(state["gates"])
+        self.gates.truncate(completed)
         self.resumed_from = path
         log.info("resumed from %s: continuing at step %d", path, self._start_step)
 
@@ -867,10 +901,13 @@ class GRPOTrainer:
                 "policy?)"
             ),
             "decline": (
-                f"DECLINE: windowed rollout success {m.get('gate/success_window', 0.0):.3f} is more "
-                f"than {self.rl.gate_max_drop:.3f} below its best "
+                f"DECLINE: windowed rollout success {m.get('gate/success_window', 0.0):.3f} is "
+                f"{m.get('gate/decline_drop', 0.0):.3f} below its best "
                 f"{m.get('gate/best_success_window', 0.0):.3f} (window ending at step "
-                f"{int(m.get('gate/best_success_step', 0))})"
+                f"{int(m.get('gate/best_success_step', 0))}), more than the margin "
+                f"{m.get('gate/decline_margin', 0.0):.3f} = max(gate_max_drop "
+                f"{self.rl.gate_max_drop:.3f}, {self.rl.gate_decline_z:g} x SE), on this and the "
+                "previous non-overlapping window"
             ),
             "entropy": (
                 f"ENTROPY: windowed rollout entropy {m.get('gate/entropy_window', 0.0):.3f} "

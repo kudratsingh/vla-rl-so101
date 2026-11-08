@@ -4,6 +4,7 @@ exactly the uninterrupted run's weights, optimizer state and metrics."""
 import importlib.util
 import json
 import random
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +99,19 @@ def test_resume_round_trip_matches_uninterrupted_run(tmp_path: Path) -> None:
         assert rows_resumed[step] == rows_full[step], step
     assert summary["eval_history"] == summary_full["eval_history"]
     assert summary["steps_completed"] == 12 and summary["resumed_from"] == str(ckpt)
+
+    # an _interrupted checkpoint (weights from inside step 7) is refused unless approximate
+    part = tmp_path / "full" / "checkpoints" / "step_000007_interrupted"
+    shutil.copytree(ckpt, part)
+    st = json.loads((part / "trainer_state.json").read_text())
+    st["step"] = 7
+    st["gates"]["history"].append({**st["gates"]["history"][-1], "step": 7})
+    (part / "trainer_state.json").write_text(json.dumps(st))
+    with pytest.raises(ValueError, match="_interrupted.*step_000006"):
+        _trainer(cfg, tmp_path / "part", init_seed=0).load_checkpoint(part)
+    approx = _trainer(cfg, tmp_path / "approx", init_seed=0)
+    approx.load_checkpoint(part, allow_partial=True)
+    assert approx._start_step == 7 and approx.gates.history[-1].step == 6  # step 7 re-recordable
 
     bad = load_config("tiny")
     bad["toy"]["hidden"] = 32  # different adapter shapes

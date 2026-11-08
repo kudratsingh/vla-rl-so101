@@ -11,7 +11,8 @@ obj_half_height} — the privileged state the env exposes for this purpose only.
 Speed profiles (`OracleProfile`, `data.oracle_profile`): "v1" is the oracle that recorded the
 0.1-era demo sets (KudratSingh22/vla-rl-so101-demos, -demos-25): 1.5 cm/step nominal approach
 (the joint cap holds the real TCP to ~0.9 cm/step), 1 cm/step descent, so the last 10 cm before
-the grasp take ~1.5 policy chunks of 8 steps. "v2" (default, review 2026-11-07 section 3.2) runs
+the grasp take ~1.5 policy chunks of 8 steps; it is the default. "v2" (opt-in via
+`data.oracle_profile: v2`, configs/demos_v2.yaml; review 2026-11-07 section 3.2) runs
 the last `approach_slow_radius` (6 cm) of the approach and the descent to the grasp / push height
 at 0.5 cm/step: ~2.6-3.0 chunks in the last 10 cm (scripts/wo01_oracle_eval.py near_decisions).
 Everything else (waypoints, carry, release, retries) is identical; v1 reproduces the 0.1 oracle
@@ -59,7 +60,9 @@ ORACLE_PROFILES: dict[str, OracleProfile] = {
     "v1": OracleProfile(),
     "v2": OracleProfile(approach_slow_radius=0.06, approach_speed=0.005, descend_speed=0.005),
 }
-DEFAULT_PROFILE = "v2"
+# v1 by default so configs that do not set data.oracle_profile (sim.yaml, sft_a4.yaml) keep
+# recording the 0.1 oracle under their unchanged config hash; configs/demos_v2.yaml opts in to v2.
+DEFAULT_PROFILE = "v1"
 
 
 _SEEDS = torch.tensor(

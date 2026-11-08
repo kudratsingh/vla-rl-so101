@@ -38,7 +38,9 @@
 #
 # CURRENT SHAPE (2026-11-08, review 3.1 / 9: 16 prompts x K=8, lr 1e-4, ppo_epochs 2, periodic
 # evals on the trained tasks only). `uv run scripts/wo03_rl.py --preset rl --estimate` recomputes
-# this from cost.throughput (A100 numbers MEASURED on the WO-04 pods); worst case = the
+# this from cost.throughput (A100: rollout 86 actions/s MEASURED on WO-04 pod gzxhwhjhdtc1kc;
+# update 10.3 decisions/s from the WO-02 SFT probe, pod u87r9sjnwig58d; forward 31 decisions/s
+# ESTIMATED, ~3x update; see cost.throughput below); worst case = the
 # dynamic-sampling refill cap binds every step (K=8 probes dropped 72% of groups):
 #   trained trajectories   16 prompts x K=8                                =    128
 #   episodes generated     128 x 3.0 (refill cap: 3 rounds x 4 env batches) =    384
@@ -125,16 +127,20 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   # Spend gates (src/rl/gates.py), replacing the 64-episode kill switch and the 32-episode peak
   # stop (neither could tell +3 points from 0). They decide whether to KEEP SPENDING on this run;
   # they do not decide whether RL improved the policy. Inputs: windowed rollout/success_rate over
-  # every generated episode (~130-380 per step; a 10-step window has an SE of ~0.5-1 point; its
-  # episodes share scenes within a group and come from a changing policy, hence not a measure of
-  # improvement) and the rollout's sampled-token entropy.
+  # every generated episode (~130-380 per step), but the unit is the GROUP (its K samples share a
+  # scene): 8-24 groups per task per step, so under WO-04-like scene heterogeneity a 10-step
+  # window's score has a group-level SE of ~1-2 points (a two-window difference ~1.5-2.5). The
+  # episodes also come from a changing policy, hence not a measure of improvement. Plus the
+  # rollout's sampled-token entropy.
   gate_window: 10           # steps per window
   gate_check_frac: 0.25     # flat gate at step ceil(0.25 x 150) = 38: window 29-38 vs 1-10
   gate_min_gain: 0.03       # owner's +3 points (WO-04), now on windowed SAMPLED success (owner to
                             # confirm: sampled success moved 7.9% -> 12.6% over 150 K=16 steps)
   gate_rule: any_task       # owner 2026-10-28: pass if ANY trained task gained it
   gate_max_drop: 0.04       # decline: stop if the window is > 4 points below its best
-                            # non-overlapping window (replaces the step-50/100 peak stop)
+                            # non-overlapping window (replaces the step-50/100 peak stop) ...
+  gate_decline_z: 3.0       # ... AND > 3 x SE(best - window), on two consecutive non-overlapping
+                            # windows; z = 2 stopped 35/100 simulated flat runs (src/rl/gates.py)
   gate_entropy_min: 0.5     # nats/token at T: below this sampling has collapsed onto the argmax
                             # (WO-04 K=16 run: 1.32 -> 1.07 over 150 steps); judgment, not measured
   gate_stop: true
