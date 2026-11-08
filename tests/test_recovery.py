@@ -48,6 +48,10 @@ def test_pick_place_modes() -> None:
     assert classify("PickPlace", s, T, T) == ("dropped", 24)
     s["obj_pose"][24, :3] = s["goal_pose"][24, :3]  # ... or released over the bowl
     assert classify("PickPlace", s, T, T)[0] == "misplaced"
+    s["is_grasped"][10:] = True  # still in hand at the timeout: nothing was dropped
+    assert classify("PickPlace", s, T, T) == ("held", T)
+    s["qpos"][20:] = s["qpos"][20]  # ... and the arm froze while holding it
+    assert classify("PickPlace", s, T, T) == ("stalled", 20)
     s = series()
     s["qpos"][20:] = s["qpos"][20]  # arm frozen from step 20 to the timeout
     assert classify("PickPlace", s, T, T) == ("stalled", 20)
@@ -70,11 +74,14 @@ def test_choose_branch_backs_off_to_a_recoverable_state() -> None:
     bounds = [0, 8, 16, 24, 32]
     assert choose_branch("PickPlace", s, bounds, event=20, length=T, back=1) == 1
     assert choose_branch("PickPlace", s, bounds, event=20, length=T, back=0) == 2
-    assert choose_branch("PickPlace", s, bounds, event=3, length=T, back=1) == 0  # reset state
+    # never the reset state: an oracle run from there is a control demo, not a correction
+    assert choose_branch("PickPlace", s, bounds, event=3, length=T, back=1) is None
+    assert choose_branch("PickPlace", s, bounds, 3, T, back=1, allow_reset=True) == 0
     s["goal_pose"][8:, 3:] = torch.tensor([0.7071, 0.7071, 0.0, 0.0])  # bowl tipped from step 8
-    assert choose_branch("PickPlace", s, bounds, event=20, length=T, back=0) == 0
-    s["obj_pose"][:, 0] = 0.5  # object out of reach the whole episode
     assert choose_branch("PickPlace", s, bounds, event=20, length=T, back=0) is None
+    assert choose_branch("PickPlace", s, bounds, 20, T, back=0, allow_reset=True) == 0
+    s["obj_pose"][:, 0] = 0.5  # object out of reach the whole episode
+    assert choose_branch("PickPlace", s, bounds, 20, T, back=0, allow_reset=True) is None
     s = series("Stack")
     s["goal_pose"][:, 2] = 0.05  # base cube lifted off the table
     assert not recoverable("Stack", s, 0)

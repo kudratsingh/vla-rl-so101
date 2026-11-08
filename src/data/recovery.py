@@ -3,14 +3,16 @@
 From a `RolloutTrace` (src/eval/sim_eval.py) of failed SFT episodes:
 
 1. `classify` names each failure's mode and the step of its decisive event, per task:
-   PickPlace/Stack: dropped (grasped, then lost away from the goal), misplaced (released near
-   the goal, not a success), knocked (object pushed > 2 cm without a grasp), stalled (arm still
-   for the last 16 steps of a timed-out episode), never_grasped (none of these).
+   PickPlace/Stack: held (still grasped at the timeout, never released), dropped (grasped, then
+   lost away from the goal), misplaced (released near the goal, not a success), knocked (object
+   pushed > 2 cm without a grasp), stalled (arm still for the last 16 steps of a timed-out
+   episode, holding or not), never_grasped (none of these).
    Push: lifted (the latch, success impossible afterwards), no_contact (object moved < 1 cm),
    missed (moved, not into the target).
 2. `choose_branch` picks the chunk boundary `back` boundaries before that event at which the
    state is still recoverable (`recoverable`): object within reach, bowl upright, Stack base flat
-   on the table, Push never lifted yet. No such boundary -> the failure is unrecoverable.
+   on the table, Push never lifted yet. Never the reset state: an oracle run from reset is a
+   control demo, not a correction. No such boundary -> the failure is dropped.
 3. `interleave` caps each mode and orders the branches round-robin across modes, so any prefix
    of the recorded corrections (the per-task cap at load time) keeps the mode mix.
 
@@ -38,8 +40,8 @@ STACK_BASE_HALF = 0.015  # src/eval/protocol.py BLUE_CUBE size / 2
 UPRIGHT = 0.9
 
 MODES: dict[str, tuple[str, ...]] = {
-    "PickPlace": ("dropped", "misplaced", "knocked", "stalled", "never_grasped"),
-    "Stack": ("dropped", "misplaced", "knocked", "stalled", "never_grasped"),
+    "PickPlace": ("dropped", "misplaced", "held", "knocked", "stalled", "never_grasped"),
+    "Stack": ("dropped", "misplaced", "held", "knocked", "stalled", "never_grasped"),
     "Push": ("lifted", "no_contact", "missed"),
 }
 
@@ -82,17 +84,20 @@ def classify(task: str, s: Series, length: int, max_steps: int) -> tuple[str, in
         if float(moved.max()) < PUSH_MOVED:
             return "no_contact", int(tcp_obj.argmin())
         return "missed", int((obj[:, :2] - goal[:, :2]).norm(dim=-1).argmin())
+    still = (qpos - qpos[-1]).abs().amax(-1) < STALL_TOL
+    stalled = length >= max_steps and bool(still[-STALL_STEPS:].all())
+    onset = length
+    while stalled and onset > 0 and bool(still[onset - 1]):
+        onset -= 1
     if bool(grasped.any()):
+        if bool(grasped[length]):  # still in hand at the timeout: nothing was dropped
+            return ("stalled", onset) if stalled else ("held", length)
         t_last = int(torch.nonzero(grasped).max())
         near = float((obj[t_last, :2] - goal[t_last, :2]).norm()) < NEAR_GOAL[task]
         return ("misplaced" if near else "dropped"), t_last
     if float(moved.max()) > MOVED:
         return "knocked", int(torch.nonzero(moved > MOVED / 2).min())
-    still = (qpos - qpos[-1]).abs().amax(-1) < STALL_TOL
-    if length >= max_steps and bool(still[-STALL_STEPS:].all()):
-        onset = length
-        while onset > 0 and bool(still[onset - 1]):
-            onset -= 1
+    if stalled:
         return "stalled", onset
     return "never_grasped", int(tcp_obj.argmin())
 
@@ -114,16 +119,25 @@ def recoverable(task: str, s: Series, t: int) -> bool:
 
 
 def choose_branch(
-    task: str, s: Series, boundary_steps: Sequence[int], event: int, length: int, back: int
+    task: str,
+    s: Series,
+    boundary_steps: Sequence[int],
+    event: int,
+    length: int,
+    back: int,
+    allow_reset: bool = False,
 ) -> int | None:
     """Index into `boundary_steps` of the branch state: `back` boundaries before the last one at
-    or before `event` (at least the reset state), moved earlier until `recoverable`. None if no
-    boundary qualifies."""
+    or before `event`, moved earlier until `recoverable`. None if no boundary after the reset
+    state qualifies (from reset the oracle would record a control demo, not a correction), or,
+    with `allow_reset`, if not even the reset state does."""
     cands = [i for i, b in enumerate(boundary_steps) if b <= min(event, length - 1)]
     if not cands:
         return None
     k = max(cands[-1] - back, 0)
     while k >= 0:
+        if int(boundary_steps[k]) == 0 and not allow_reset:
+            return None
         if recoverable(task, s, int(boundary_steps[k])):
             return k
         k -= 1

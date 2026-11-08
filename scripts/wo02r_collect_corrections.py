@@ -61,12 +61,16 @@ DEFAULTS: dict[str, Any] = {
     "oracle_max_steps": 150,
     "control_episodes_per_task": 60,
     "restore_tol": 1.0e-4,  # max |restored - saved| sim-state entry
+    "allow_reset_branch": False,
 }
 TINY_DEFAULTS: dict[str, Any] = {
     **DEFAULTS,
     "rollouts_per_task": 2,
     "rollout_max_steps": 24,  # 3 chunks of the random tiny policy
     "cap_per_mode": 2,
+    # tiny proves plumbing only: the random policy fails in the first chunk, so allow branching
+    # from the reset state (never in sim: there an oracle run from reset is a control demo)
+    "allow_reset_branch": True,
     "control_episodes_per_task": 2,
 }
 
@@ -155,6 +159,7 @@ def find_branches(
     seeds: list[int],
     max_steps: int,
     back: int,
+    allow_reset: bool = False,
 ) -> tuple[list[Branch], list[Any], dict[str, Any]]:
     """SFT rollouts on `seeds` -> candidate branches, the traces (snapshots), rollout stats."""
     from src.eval.sim_eval import run_batch_traced
@@ -164,6 +169,7 @@ def find_branches(
     traces: list[Any] = []
     modes: Counter[str] = Counter()
     unrecoverable: Counter[str] = Counter()
+    reset_only: Counter[str] = Counter()  # recoverable only from reset: a control demo, dropped
     successes = 0
     for b, start in enumerate(range(0, len(seeds), n)):
         batch = seeds[start : start + n]
@@ -185,9 +191,12 @@ def find_branches(
             ep_len = int(length[row])
             mode, event = classify(task, ser, ep_len, max_steps)
             modes[mode] += 1
-            k = choose_branch(task, ser, steps, event, ep_len, back)
+            k = choose_branch(task, ser, steps, event, ep_len, back, allow_reset)
             if k is None:
-                unrecoverable[mode] += 1
+                if choose_branch(task, ser, steps, event, ep_len, back, allow_reset=True) is None:
+                    unrecoverable[mode] += 1
+                else:
+                    reset_only[mode] += 1
                 continue
             grasped = ser.get("is_grasped")
             branches.append(
@@ -209,6 +218,7 @@ def find_branches(
         "sft_success_rate": successes / max(1, len(seeds)),
         "failure_modes": dict(modes),
         "unrecoverable": dict(unrecoverable),
+        "reset_branch": dict(reset_only),
     }
     return branches, traces, stats
 
@@ -234,7 +244,15 @@ def run_corrections(
     SR.assert_seeds_in(seeds, "recovery", SR.standard_ranges())
     max_steps = int(rc["rollout_max_steps"] or cfg["env"]["max_episode_steps"])
     candidates, traces, stats = find_branches(
-        task, policy, env, env_mod, state_mod, seeds, max_steps, int(rc["branch_back"])
+        task,
+        policy,
+        env,
+        env_mod,
+        state_mod,
+        seeds,
+        max_steps,
+        int(rc["branch_back"]),
+        bool(rc["allow_reset_branch"]),
     )
     chosen = interleave(candidates, int(rc["cap_per_mode"]))
     tried: list[Branch] = []
