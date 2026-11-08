@@ -18,14 +18,38 @@ receiving (ignored) actions; and the loop stops as soon as every env is done.
 The env must reset deterministically per seed: identical seeds must give identical initial states,
 otherwise a "group" does not share a prompt and the group baseline is wrong. `check_group_reset`
 verifies this on every batch at no cost (tolerances in its docstring).
+
+Timing split (`RolloutTimer`, review 5: the 44.5 s per 32-env batch was not instrumented). Wall
+seconds per section, summed over a call; with CUDA initialised every section boundary calls
+torch.cuda.synchronize(), so asynchronous GPU work is charged to the section that queued it:
+  policy       policy.sample(): the wrapper's preprocessing (resize/crop/normalise), host->device
+               copy of the inputs, the forward pass, sampling and token->action decoding. The
+               policy API does not expose preprocessing separately, so it is inside this number.
+  sim_step     env.step() minus `render`: action clipping / PD targets, physics substeps, success
+               evaluation (get_info) and the non-image part of the observation.
+  render       ManiSkill's `_get_obs_sensor_data` inside env.step(): update_render, camera
+               capture, picture readout and its own CUDA sync. Measured by wrapping that method on
+               the unwrapped env (`instrument_render`); 0.0 where the env has no such method (toy
+               env). Approximate on the GPU sim: physics kernels still in flight when rendering
+               starts are synchronised inside it and counted here, not in sim_step. ManiSkill
+               renders on every env step, while the policy only uses the observation at decision
+               boundaries (every C = 8 steps).
+  obs_fn       env observation -> policy observation (src.env.policy_obs), at decision boundaries.
+  host_copy    device->host copies into the CPU rollout buffers (observations, tokens, log-probs)
+               and of the per-step success / termination flags.
+  reset        env.reset() including its render, plus the group-reset check.
+  other        the rest of the call (loop bookkeeping, buffer stacking): total - sum of the above.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+import time
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import torch
@@ -51,6 +75,97 @@ class VecEnv(Protocol):
 
     @property
     def unwrapped(self) -> Any: ...
+
+
+TIMING_KEYS = ("policy", "sim_step", "render", "obs_fn", "host_copy", "reset", "other")
+
+
+def _sync() -> None:
+    if torch.cuda.is_available() and torch.cuda.is_initialized():  # type: ignore[no-untyped-call]
+        torch.cuda.synchronize()
+
+
+class RolloutTimer:
+    """Wall seconds per rollout section (module docstring). One timer may span several
+    `collect_rollouts` calls; `totals()` sums them."""
+
+    def __init__(self) -> None:
+        self.seconds: dict[str, float] = dict.fromkeys(TIMING_KEYS, 0.0)
+        self.total_s = 0.0
+        self.pending_render = 0.0  # filled by the render hook during env.step / env.reset
+
+    @contextmanager
+    def section(self, name: str) -> Iterator[None]:
+        _sync()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            _sync()
+            self.seconds[name] += time.perf_counter() - t0
+
+    def env_step(self, env: VecEnv, action: Tensor) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
+        """env.step(action), split into sim_step and render (the render hook's share)."""
+        self.pending_render = 0.0
+        _sync()
+        t0 = time.perf_counter()
+        out = env.step(action)
+        _sync()
+        dt = time.perf_counter() - t0
+        render = min(self.pending_render, dt)
+        self.seconds["render"] += render
+        self.seconds["sim_step"] += dt - render
+        self.pending_render = 0.0
+        return out
+
+    def totals(self) -> dict[str, float]:
+        out = dict(self.seconds)
+        out["other"] = max(0.0, self.total_s - sum(v for k, v in out.items() if k != "other"))
+        return out
+
+
+_RENDER_HOOK = "_rl_render_timer"
+
+
+def _render_bases(env: Any) -> list[Any]:
+    """The ManiSkill envs that render for `env`: its unwrapped env (GPU sim), or each sub-env's
+    (src.env.vector.SerialVecEnv on the CPU sim)."""
+    base = getattr(env, "unwrapped", None)
+    if base is not None and callable(getattr(base, "_get_obs_sensor_data", None)):
+        return [base]
+    subs = getattr(base, "envs", None)
+    if isinstance(subs, list):
+        return [b for sub in subs for b in _render_bases(sub)]
+    return []
+
+
+def instrument_render(env: VecEnv, timer: RolloutTimer | None) -> bool:
+    """Point the env's render hook at `timer` (None detaches it). The first call installs the hook:
+    the unwrapped ManiSkill env's `_get_obs_sensor_data` is wrapped at instance level, so env.step
+    and env.reset call the timed version. False if the env has nothing to instrument (toy env)."""
+    bases = _render_bases(env)
+    for base in bases:
+        holder: dict[str, RolloutTimer | None] | None = getattr(base, _RENDER_HOOK, None)
+        if holder is None:
+            holder = {"timer": None}
+            base._get_obs_sensor_data = _timed(base._get_obs_sensor_data, holder)
+            setattr(base, _RENDER_HOOK, holder)
+        holder["timer"] = timer
+    return bool(bases)
+
+
+def _timed(original: Callable[..., Any], holder: dict[str, RolloutTimer | None]) -> Any:
+    def timed(*args: Any, **kwargs: Any) -> Any:
+        t = holder["timer"]
+        if t is None:
+            return original(*args, **kwargs)
+        t0 = time.perf_counter()
+        try:
+            return original(*args, **kwargs)
+        finally:
+            t.pending_render += time.perf_counter() - t0
+
+    return timed
 
 
 @dataclass
@@ -97,6 +212,16 @@ class RolloutBatch:
             episode_len=self.episode_len[idx],
             group_size=self.group_size,
         )
+
+    def save(self, path: Path) -> None:
+        """torch.save every field (CPU tensors, lists, ints): the lr sweep's replayable batch."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({f.name: getattr(self, f.name) for f in fields(self)}, path)
+
+    @staticmethod
+    def load(path: Path) -> RolloutBatch:
+        data = torch.load(path, map_location=STORAGE, weights_only=True)
+        return RolloutBatch(**data)
 
     @staticmethod
     def cat(batches: Sequence[RolloutBatch]) -> RolloutBatch:
@@ -179,18 +304,49 @@ def collect_rollouts(
     max_episode_steps: int,
     task: str,
     group_reset_check: Literal["error", "warn", "off"] = "error",
+    timer: RolloutTimer | None = None,
 ) -> tuple[RolloutBatch, float]:
     """Run one batch of episodes: len(prompt_seeds) prompts x group_size samples each.
 
     The env must have exactly len(prompt_seeds) * group_size parallel envs. Returns the batch and
-    the group-reset max diff (0.0 when groups share their initial observation).
+    the group-reset max diff (0.0 when groups share their initial observation). With `timer`, the
+    call's wall time is added to its sections (module docstring).
     """
+    tm = timer if timer is not None else RolloutTimer()
+    instrument_render(env, tm)
+    t_call = time.perf_counter()
+    try:
+        return _collect(
+            policy, env, obs_fn, prompt_seeds, group_size, temperature, max_episode_steps, task,
+            group_reset_check, tm,
+        )  # fmt: skip
+    finally:
+        instrument_render(env, None)
+        tm.total_s += time.perf_counter() - t_call
+
+
+def _collect(
+    policy: RLPolicy,
+    env: VecEnv,
+    obs_fn: ObsFn,
+    prompt_seeds: Sequence[int],
+    group_size: int,
+    temperature: float,
+    max_episode_steps: int,
+    task: str,
+    group_reset_check: Literal["error", "warn", "off"],
+    tm: RolloutTimer,
+) -> tuple[RolloutBatch, float]:
     seeds = [int(s) for s in prompt_seeds for _ in range(group_size)]
     n = len(seeds)
     policy.eval()
-    raw_obs, _ = env.reset(seed=seeds)
-    pobs = obs_fn(raw_obs)
-    reset_diff = check_group_reset(pobs, group_size, group_reset_check)
+    with tm.section("reset"):
+        raw_obs, _ = env.reset(seed=seeds)
+        tm.pending_render = 0.0  # reset's render stays in "reset"
+    with tm.section("obs_fn"):
+        pobs = obs_fn(raw_obs)
+    with tm.section("reset"):
+        reset_diff = check_group_reset(pobs, group_size, group_reset_check)
     instructions = list(env.unwrapped.get_instructions())
     if len(instructions) != n:
         raise ValueError(f"env returned {len(instructions)} instructions for {n} envs")
@@ -204,25 +360,29 @@ def collect_rollouts(
     mask_steps: list[Tensor] = []
     chunk_len = 0
     while bool(active.any()):
-        step = policy.sample(pobs, instructions, temperature)
+        with tm.section("policy"):
+            step = policy.sample(pobs, instructions, temperature)
         chunk_len = int(step.tokens.shape[1])
-        obs_steps.append({k: v.to(STORAGE).clone() for k, v in pobs.items()})
-        token_steps.append(step.tokens.to(STORAGE, torch.long))
-        logp_steps.append(step.log_probs.to(STORAGE, torch.float32))
+        with tm.section("host_copy"):
+            obs_steps.append({k: v.to(STORAGE).clone() for k, v in pobs.items()})
+            token_steps.append(step.tokens.to(STORAGE, torch.long))
+            logp_steps.append(step.log_probs.to(STORAGE, torch.float32))
         executed = torch.zeros(n, chunk_len, dtype=torch.bool)
         for c in range(chunk_len):
             if not bool(active.any()):
                 break
-            raw_obs, _, terminated, truncated, info = env.step(step.actions[:, c])
+            raw_obs, _, terminated, truncated, info = tm.env_step(env, step.actions[:, c])
             executed[:, c] = active
             episode_len += active.long()
-            hit = _flag(info["success"], n) & active
+            with tm.section("host_copy"):
+                hit = _flag(info["success"], n) & active
+                ended = hit | _flag(terminated, n) | _flag(truncated, n)
             success |= hit
-            ended = hit | _flag(terminated, n) | _flag(truncated, n)
             ended |= episode_len >= max_episode_steps
             active &= ~ended
         mask_steps.append(executed)
-        pobs = obs_fn(raw_obs)
+        with tm.section("obs_fn"):
+            pobs = obs_fn(raw_obs)
 
     num_slots = math.ceil(max_episode_steps / chunk_len)
     if len(token_steps) > num_slots:
