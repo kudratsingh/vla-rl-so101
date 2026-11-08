@@ -14,49 +14,24 @@
 #   before launch when the owner pre-approved the whole pass (a dollar cap); a file that already
 #   exists when the gate is reached counts as that pre-approval. No file within APPROVAL_WAIT_S ->
 #   exit (upload + self-delete).
-# Needs /root/runpod.env (RUNPOD_POD_ID, pod-scoped RUNPOD_API_KEY, SPEND_CAP_SECONDS; written by
-# the pod's start command), /root/pod_start_epoch and /root/.hf_token. The pod also has a hard
-# self-delete timer at the cap (docs/STATUS.md "Next paid run": SPEND_CAP_SECONDS 12240 = 3.4 h).
+# Needs /root/runpod.env (RUNPOD_POD_ID, pod-scoped RUNPOD_API_KEY, SPEND_CAP_SECONDS,
+# POD_HARD_DEADLINE) and /root/pod_start_epoch, both written by scripts/pod/pod_start_cmd.sh (the
+# pod's start command, which also arms the hard self-delete timer: docs/STATUS.md "Next paid run",
+# SPEND_CAP_SECONDS 12240 = 3.4 h), and /root/.hf_token. Every stage is time-limited and a watchdog
+# stops the job at the soft deadline (scripts/pod/job_lib.sh).
 # NOT RUN YET: needs the owner's explicit go (CLAUDE.md rule 1).
 set -uo pipefail
-source /root/runpod.env
-# cgroup CPU quota, not the host core count (scripts/pod/wo04_job.sh)
-if [ -z "${OMP_NUM_THREADS:-}" ]; then
-  read -r q p 2>/dev/null < /sys/fs/cgroup/cpu.max \
-    || { q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null); }
-  if [ -n "${q:-}" ] && [ "$q" != max ] && [ "$q" -gt 0 ] 2>/dev/null; then
-    export OMP_NUM_THREADS=$(( (q + p - 1) / p )) MKL_NUM_THREADS=$(( (q + p - 1) / p ))
-  fi
-fi
-echo "[job] OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset} (nproc $(nproc))"
-export RUNPOD_POD_ID
-export PATH="$HOME/.local/bin:$PATH"
-HF_TOKEN="$(cat /root/.hf_token)"
-export HF_TOKEN
-SEED="${SEED:-3}"
-SFT_ADAPTER="${SFT_ADAPTER:-KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000}"
-export SEED SFT_ADAPTER
-export HUB_REPO="${HUB_REPO:-KudratSingh22/vla-rl-so101-rl}"
-CFG="${RL_CFG:-configs/rl.yaml}"
-TEMPS="${TEMPS:-0.7,1.0,1.3}"
-PROBE_GROUPS="${PROBE_GROUPS:-64}"
-LRS="${LRS:-5e-5,2e-4,5e-4,1e-3}"
-SWEEP_ADAM_STEPS="${SWEEP_ADAM_STEPS:-8}"
+# shellcheck source=scripts/pod/job_lib.sh
+. "$(dirname "$0")/job_lib.sh"
 STAGE_FILE=/workspace/stage
-# soft deadline 20 min before the hard cap, so results are uploaded before the pod disappears
-DEADLINE=$(( $(cat /root/pod_start_epoch) + SPEND_CAP_SECONDS - 1200 ))
+export PATH="$HOME/.local/bin:$PATH"
+export HUB_REPO="${HUB_REPO:-KudratSingh22/vla-rl-so101-rl}"
 
 stage() { echo "$1" > "$STAGE_FILE"; echo "[job] $(date -u +%H:%M:%S) stage: $1"; }
-left() { echo $(( DEADLINE - $(date +%s) )); }
-run_until_deadline() {
-  local s; s=$(left)
-  if [ "$s" -le 60 ]; then echo "[job] soft deadline reached before: $*"; return 124; fi
-  timeout "$s" "$@"  # SIGTERM: wo03_rl.py finishes its run record (status interrupted)
-}
-pod_minutes() { echo $(( ($(date +%s) - $(cat /root/pod_start_epoch)) / 60 )); }
+pod_minutes() { echo $(( ($(date +%s) - $(cat /root/pod_start_epoch 2>/dev/null || date +%s)) / 60 )); }
 
 upload() {
-  uv run python - "$1" <<'EOF' || echo "[job] upload failed"
+  timeout -k 30 "$UPLOAD_TIMEOUT_S" uv run --no-sync python - "$1" <<'EOF' || echo "[job] upload failed or timed out"
 import os, sys
 from huggingface_hub import HfApi
 api, repo, pod = HfApi(), os.environ["HUB_REPO"], os.environ["RUNPOD_POD_ID"]
@@ -72,44 +47,62 @@ print(f"[job] uploaded to https://huggingface.co/{repo}/tree/main/{dest}")
 EOF
 }
 
+# installed before anything can fail: every exit uploads (time-limited), then self-deletes
 finish() {
   local rc=$?
+  stop_watchdog
   echo "[job] exit rc=$rc at stage $(cat "$STAGE_FILE" 2>/dev/null); pod up $(pod_minutes) min"
   upload "final (rc=$rc)"
-  echo "[job] terminating pod $RUNPOD_POD_ID"
-  # the pod-scoped key is accepted by REST v2 and GraphQL (REST v1 answers 403)
-  curl -fsS -X DELETE "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID" \
-    -H "Authorization: Bearer $RUNPOD_API_KEY" \
-    || curl -fsS https://api.runpod.io/graphql -H "Authorization: Bearer $RUNPOD_API_KEY" \
-      -H 'Content-Type: application/json' \
-      -d "{\"query\":\"mutation { podTerminate(input: {podId: \\\"$RUNPOD_POD_ID\\\"}) }\"}"
+  delete_pod
 }
 trap finish EXIT
+pod_env || exit 9
+start_watchdog
+
+# cgroup CPU quota, not the host core count (scripts/pod/wo04_job.sh)
+if [ -z "${OMP_NUM_THREADS:-}" ]; then
+  read -r q p 2>/dev/null < /sys/fs/cgroup/cpu.max \
+    || { q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null); }
+  if [ -n "${q:-}" ] && [ "$q" != max ] && [ "$q" -gt 0 ] 2>/dev/null; then
+    export OMP_NUM_THREADS=$(( (q + p - 1) / p )) MKL_NUM_THREADS=$(( (q + p - 1) / p ))
+  fi
+fi
+echo "[job] OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset} (nproc $(nproc))"
+HF_TOKEN="$(cat /root/.hf_token)"
+export HF_TOKEN
+SEED="${SEED:-3}"
+SFT_ADAPTER="${SFT_ADAPTER:-KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000}"
+export SEED SFT_ADAPTER
+CFG="${RL_CFG:-configs/rl.yaml}"
+TEMPS="${TEMPS:-0.7,1.0,1.3}"
+PROBE_GROUPS="${PROBE_GROUPS:-64}"
+LRS="${LRS:-5e-5,2e-4,5e-4,1e-3}"
+SWEEP_ADAM_STEPS="${SWEEP_ADAM_STEPS:-8}"
 
 stage setup
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+run_capped 900 apt-get install -y -qq --no-install-recommends \
   ffmpeg libvulkan1 git >/dev/null || exit 10
 echo "[job] diagnostics seed $SEED, SFT adapter $SFT_ADAPTER, config $CFG, commit $(git rev-parse --short HEAD)"
 # Vulkan for SAPIEN rendering: same EGL-library ICD as scripts/pod/wo04_job.sh
 mkdir -p /usr/share/vulkan/icd.d
 echo '{"file_format_version":"1.0.1","ICD":{"library_path":"libEGL_nvidia.so.0","api_version":"1.4.329"}}' \
   > /usr/share/vulkan/icd.d/nvidia_icd.json
-command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-uv sync --frozen --extra gpu --extra dev || exit 11
+command -v uv >/dev/null || run_capped 300 sh -c 'curl -LsSf --max-time 120 https://astral.sh/uv/install.sh | sh'
+run_capped 1200 uv sync --frozen --extra gpu --extra dev || exit 11
 
 stage gpu-check
-uv run python -c "import torch; assert torch.cuda.is_available(); print('[job] gpu', torch.cuda.get_device_name(), round(torch.cuda.mem_get_info()[1] / 1e9), 'GB')" || exit 12
+run_capped 300 uv run python -c "import torch; assert torch.cuda.is_available(); print('[job] gpu', torch.cuda.get_device_name(), round(torch.cuda.mem_get_info()[1] / 1e9), 'GB')" || exit 12
 # both probe commands must parse (seed range, config) before any GPU minute is spent on them
-uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
+run_capped 300 uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
   --probe-temperatures "$TEMPS" --probe-groups "$PROBE_GROUPS" | tail -1 || exit 13
-SWEEP_H=$(uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
+SWEEP_H=$(run_capped 300 uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" --estimate \
   --lr-sweep "$LRS" --sweep-adam-steps "$SWEEP_ADAM_STEPS" | awk '/lr_sweep_h:/ {print $2}')
 [ -n "$SWEEP_H" ] || exit 13
 echo "[job] lr sweep estimate ${SWEEP_H} h (cost.throughput)"
 
 stage download
 # the SFT adapter (fails fast on a wrong path); the 15 GB base downloads in the first probe
-uv run python - <<'EOF' || exit 16
+run_capped 900 uv run python - <<'EOF' || exit 16
 import os
 from src.policy.openvla_oft import resolve_adapter
 path = resolve_adapter(os.environ["SFT_ADAPTER"])
