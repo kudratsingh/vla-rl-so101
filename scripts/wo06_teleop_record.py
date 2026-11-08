@@ -21,17 +21,22 @@ follower first eases onto the leader's pose clipped to the safety limits (rate-l
 recorded), then recording runs for ``teleop.episode_time_s`` or until Ctrl-C, then the follower
 holds its pose; keep, redo or quit. ``q`` or Ctrl-C at any prompt ends the session the safe way:
 hold, ask the operator to support the arm, then torque off. A lost frame / stall holds the arm and
-asks you; a serial error cuts torque.
+asks you; a serial error cuts torque. Outside the prompts Ctrl-C never interrupts a bus or dataset
+call: it is a flag checked between control ticks (ends the sync or the episode), and ignored
+while an episode saves. ``--verbose`` also prints the safety filter's per-tick INFO clips.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import shutil
+import signal
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +70,10 @@ ACTION_KEY = "action"
 SYNC_TOL_RAD = np.radians(3.0)
 SYNC_TIMEOUT_S = 10.0
 QUIT = "q"
+SUPPORT_PROMPT = (
+    "Ending the session. The follower holds its pose under torque. Put a hand under the forearm "
+    "(or check it rests on the table), then press ENTER: torque goes OFF, the arm goes limp "
+)
 
 NO_LEADER = """No leader arm configured (teleop.leader is null in configs/real.yaml).
 
@@ -95,10 +104,19 @@ def protocol_instructions(tasks: Sequence[str]) -> dict[str, str]:
     return {t: instruction(t, RED_CUBE) for t in tasks}
 
 
+def prompt_input(prompt: str) -> str:
+    """``input()`` with Ctrl-C raising KeyboardInterrupt, also inside ``ctrl_c_as_flag``."""
+    prev = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        return input(prompt)
+    finally:
+        signal.signal(signal.SIGINT, prev)
+
+
 def ask(prompt: str) -> str:
     """``input()``, lower-cased; Ctrl-C / EOF answer ``q`` (end the session the safe way)."""
     try:
-        return input(prompt).strip().lower()
+        return prompt_input(prompt).strip().lower()
     except (KeyboardInterrupt, EOFError):
         print()
         return QUIT
@@ -128,6 +146,7 @@ class Session:
         self.arm, self.leader, self.cam, self.units = arm, leader, cam, units
         self.period = 1.0 / arm.safety.config.control_hz
         self.target: np.ndarray | None = None  # last leader pose, canonical rad
+        self.stop = False  # Ctrl-C under ctrl_c_as_flag; the loops check it between ticks
 
     def tick(self) -> tuple[Any, StepResult]:
         """One control step. Returns (camera frame or None, step result)."""
@@ -153,8 +172,11 @@ class Session:
 
         Converged when every joint is within SYNC_TOL_RAD of the leader pose CLIPPED to the
         safety joint limits: the follower never goes past them, so a fully closed or open trigger
-        or a leader joint at its end stop must not block the sync. Prints why it waits on a
-        workspace rejection and which joints lag on a timeout.
+        or a leader joint at its end stop must not block the sync. Like the filter, a joint already
+        outside a limit (gripper resting closed, arm folded on its stops) has that limit widened to
+        the current command: the filter holds it there rather than move it further out. Prints why
+        it waits on a workspace rejection and which joints lag on a timeout. Ctrl-C (``stop``)
+        aborts it: False.
         """
         sc = self.arm.safety.config
         lo, hi = np.asarray(sc.lower_rad), np.asarray(sc.upper_rad)
@@ -162,10 +184,15 @@ class Session:
         warned = False
         goal = measured = None
         while time.perf_counter() < t_end:
+            if self.stop:
+                print("\nsync aborted")
+                return False
             t0 = time.perf_counter()
             _, out = self.tick()
-            assert out.safety.command is not None and self.target is not None
-            goal, measured = np.clip(self.target, lo, hi), out.measured
+            cmd = out.safety.command
+            assert cmd is not None and self.target is not None
+            goal = np.clip(self.target, np.minimum(lo, cmd), np.maximum(hi, cmd))
+            measured = out.measured
             if np.all(np.abs(measured - goal) <= SYNC_TOL_RAD):
                 return True
             ws = [iv.reason for iv in out.safety.interventions if iv.kind == "workspace_reject"]
@@ -188,11 +215,39 @@ class Session:
         return False
 
 
+@contextmanager
+def ctrl_c_as_flag(sess: Session) -> Iterator[None]:
+    """Ctrl-C only sets ``sess.stop`` (``prompt_input`` turns it back into KeyboardInterrupt).
+
+    A KeyboardInterrupt raised mid-tick can land inside scservo_sdk's pure-Python packet loop,
+    which leaves the port marked busy (every later bus call fails, the hold too: the arm drops),
+    or inside ``add_frame``, which leaves the episode buffer ragged (``save_episode`` raises).
+    """
+
+    def on_sigint(signum: int, frame: Any) -> None:
+        sess.stop = True
+
+    prev = signal.signal(signal.SIGINT, on_sigint)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, prev)
+
+
+def discard_episode(dataset: Any) -> None:
+    try:
+        dataset.clear_episode_buffer()
+    except Exception:  # noqa: BLE001 - e.g. after a failed save_episode popped buffer keys
+        dataset.episode_buffer = dataset.create_episode_buffer()
+
+
 def end_session(arm: So101Driver) -> None:
     """Hold at the measured pose, then let the operator support the arm before torque goes off.
 
     Called on every operator-ended session (``q`` / Ctrl-C at a prompt, no ``resume``). Torque
-    goes off afterwards, when the driver's ``with`` block closes normally.
+    goes off afterwards, when the driver's ``with`` block closes normally. Only ENTER (or a closed
+    stdin) gets there: Ctrl-C at this prompt is ignored, a panicked second press must not drop
+    the arm.
     """
     if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
         return  # torque is already off
@@ -200,11 +255,18 @@ def end_session(arm: So101Driver) -> None:
         arm.hold()
     except SerialFault:
         return  # escalated to torque off already
-    ask(
-        "Ending the session. The follower holds its pose under torque. Put a hand under the "
-        "forearm (or check it rests on the table), then press ENTER: torque goes OFF, the arm "
-        "goes limp "
-    )
+    while True:
+        try:
+            prompt_input(SUPPORT_PROMPT)
+            return
+        except KeyboardInterrupt:
+            print(
+                "\nCtrl-C ignored: the follower still holds. Support the arm, then press ENTER "
+                "(or switch off the servo supply)."
+            )
+        except EOFError:
+            print("\nWARNING stdin closed: torque goes OFF without confirmation, the arm drops")
+            return
 
 
 def record_session(
@@ -218,6 +280,19 @@ def record_session(
 ) -> int:
     """The interactive episode loop; returns the number of saved episodes. Ends through
     ``end_session`` unless an exception (serial fault, torque-off deadman) ends it first."""
+    with ctrl_c_as_flag(sess):
+        return _episodes(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
+
+
+def _episodes(
+    sess: Session,
+    dataset: Any,
+    tasks: Sequence[str],
+    instructions: dict[str, str],
+    n_eps: int,
+    ep_time: float,
+    pipe: Callable[[Any], Any],
+) -> int:
     arm = sess.arm
     saved = 0
     for task in tasks:
@@ -227,33 +302,28 @@ def record_session(
             if ask(msg) == QUIT:
                 end_session(arm)
                 return saved
+            sess.stop = False  # drop a Ctrl-C pressed while saving / holding
             try:
-                try:
-                    synced = sess.sync_to_leader()
-                except KeyboardInterrupt:
-                    print("\nsync aborted")
-                    synced = False
-                if not synced:
+                if not sess.sync_to_leader():
                     arm.hold()
                     print("follower holds; retry")
                     continue
                 t_start = time.perf_counter()
                 print(f"recording ({ep_time:.0f} s max, Ctrl-C to end) ...")
-                try:
-                    while time.perf_counter() - t_start < ep_time:
-                        t0 = time.perf_counter()
-                        frame, out = sess.tick()
-                        assert frame is not None and out.safety.command is not None
-                        dataset.add_frame(
-                            {
-                                IMAGE_KEY: pipe(frame.image),
-                                STATE_KEY: out.measured.astype(np.float32),
-                                ACTION_KEY: out.safety.command.astype(np.float32),
-                                "task": instructions[task],
-                            }
-                        )
-                        sess.sleep_to(t0)
-                except KeyboardInterrupt:
+                while time.perf_counter() - t_start < ep_time and not sess.stop:
+                    t0 = time.perf_counter()
+                    frame, out = sess.tick()
+                    assert frame is not None and out.safety.command is not None
+                    dataset.add_frame(
+                        {
+                            IMAGE_KEY: pipe(frame.image),
+                            STATE_KEY: out.measured.astype(np.float32),
+                            ACTION_KEY: out.safety.command.astype(np.float32),
+                            "task": instructions[task],
+                        }
+                    )
+                    sess.sleep_to(t0)
+                if sess.stop:
                     print("\nepisode ended")
                 arm.hold()  # zero position error while the prompts wait (servo heat)
             except DeadmanTripped as e:
@@ -275,7 +345,13 @@ def record_session(
                 end_session(arm)
                 return saved
             if n_frames > 0 and keep in ("", "y", "yes"):
-                dataset.save_episode()
+                print("saving episode (encoding video, a few seconds; Ctrl-C is ignored) ...")
+                try:
+                    dataset.save_episode()
+                except Exception as e:  # noqa: BLE001 - the arm holds; never exit through __exit__
+                    print(f"saving failed ({type(e).__name__}: {e}); episode discarded, redo it")
+                    discard_episode(dataset)
+                    continue
                 saved += 1
                 k += 1
             else:
@@ -292,12 +368,20 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true", help="replace the local dataset")
     parser.add_argument("--push", action="store_true", help="upload to the Hub (private)")
     parser.add_argument(
+        "--verbose", action="store_true", help="also log the safety filter's per-tick INFO clips"
+    )
+    parser.add_argument(
         "--rehearsal",
         action="store_true",
         help="1 episode per task into a throwaway <dataset>-rehearsal folder (replaced each run, "
         "never pushed); the real dataset is not touched",
     )
     args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s", force=True
+    )
+    if args.verbose:
+        logging.getLogger("src.robot.safety").setLevel(logging.INFO)
     if args.preset != "real":
         parser.error("WO-06 hardware scripts run with --preset real")
     if args.rehearsal and args.push:
