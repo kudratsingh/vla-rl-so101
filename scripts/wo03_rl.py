@@ -333,7 +333,11 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             print_probe(cfg, probe, proj, gpu)
             return {**probe, "projection": proj, "run_dir": str(run_dir)}
         summary = trainer.run()
-        record["status"] = "stopped_flat" if summary["stopped_flat"] else "finished"
+        record["status"] = (
+            "stopped_flat"
+            if summary["stopped_flat"]
+            else "stopped_peak" if summary["stopped_peak"] else "finished"
+        )
         record["summary"] = summary
     except (KeyboardInterrupt, SystemExit):
         record["status"] = "interrupted"
