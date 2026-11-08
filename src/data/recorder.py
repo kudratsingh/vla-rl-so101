@@ -42,6 +42,24 @@ ROBOT_TYPE = "so101_follower"
 SIDECAR = "meta/vla_rl_so101_episodes.jsonl"
 VIDEO_BACKEND = "torchcodec"
 REQUIRED_META = ("task_family", "seed", "cell", "oracle_success")
+# The 0.1-era demo sets every reported SFT/RL number trained on. Every push goes through
+# `push_dataset`, which refuses them unless `allow_protected` (wo01_build_env.py --overwrite-hub;
+# scripts/wo01r_rebuild_demos.py has no override).
+PROTECTED_HUB_REPOS = ("KudratSingh22/vla-rl-so101-demos", "KudratSingh22/vla-rl-so101-demos-25")
+
+
+class ProtectedRepoError(ValueError):
+    """A push to one of PROTECTED_HUB_REPOS without an explicit override."""
+
+
+def check_push_target(repo_id: str, *, allow_protected: bool = False) -> None:
+    """Raise ProtectedRepoError for a protected repo (before any data or network is touched)."""
+    if repo_id in PROTECTED_HUB_REPOS and not allow_protected:
+        raise ProtectedRepoError(
+            f"refusing to push to {repo_id}: it holds a 0.1-era demo set that reported SFT/RL "
+            "numbers trained on; set data.hub_repo to a new repo"
+        )
+
 
 ArrayLike = np.ndarray[Any, Any] | torch.Tensor
 
@@ -289,10 +307,13 @@ class DemoRecorder:
             shutil.rmtree(images)
         self._finalized = True
 
-    def push_to_hub(self, *, private: bool = True) -> str:
+    def push_to_hub(self, *, private: bool = True, allow_protected: bool = False) -> str:
         """Push the finalized dataset (sidecar included) to the Hub. Needs HF_TOKEN."""
+        check_push_target(self.repo_id, allow_protected=allow_protected)
         self.finalize()
-        return push_dataset(self.repo_id, self.root, private=private)
+        return push_dataset(
+            self.repo_id, self.root, private=private, allow_protected=allow_protected
+        )
 
 
 def _ensure_hf_token() -> None:
@@ -311,8 +332,12 @@ def _ensure_hf_token() -> None:
         raise RuntimeError("no Hugging Face token: set HF_TOKEN in the environment or .env")
 
 
-def push_dataset(repo_id: str, root: str | Path, *, private: bool = True) -> str:
-    """Push an on-disk demo dataset to `repo_id` (private by default); returns its URL."""
+def push_dataset(
+    repo_id: str, root: str | Path, *, private: bool = True, allow_protected: bool = False
+) -> str:
+    """Push an on-disk demo dataset to `repo_id` (private by default); returns its URL. Refuses
+    PROTECTED_HUB_REPOS unless `allow_protected` (ProtectedRepoError, before the token check)."""
+    check_push_target(repo_id, allow_protected=allow_protected)
     _ensure_hf_token()
     ds = load_demo_dataset(repo_id, root)
     ds.push_to_hub(private=private, tags=["vla-rl-so101", "so101", "maniskill3", "lerobot"])

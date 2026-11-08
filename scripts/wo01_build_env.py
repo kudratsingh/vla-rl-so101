@@ -36,14 +36,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import add_config_args, load_config
-from src.data.recorder import DemoRecorder
+from src.data.recorder import PROTECTED_HUB_REPOS, DemoRecorder
 from src.runs import Run
 
 # Demo episodes use seeds DEMO_SEED_BASE + cfg.seed * 100_000 + k (k = 0, 1, ...), disjoint from
 # small eval seeds, so evaluating on the "seen" cell never replays a training episode.
 DEMO_SEED_BASE = 1_000_000
-# The 0.1-era demo sets every reported SFT/RL number trained on: --push needs --overwrite-hub
-PROTECTED_HUB_REPOS = ("KudratSingh22/vla-rl-so101-demos", "KudratSingh22/vla-rl-so101-demos-25")
+# PROTECTED_HUB_REPOS (src/data/recorder.py): the 0.1-era demo sets every reported SFT/RL number
+# trained on; --push needs --overwrite-hub
 
 EnvApi = tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]
 
@@ -360,7 +360,9 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         if args.push:
-            run.results["dataset"]["hub_url"] = recorder.push_to_hub(private=True)
+            run.results["dataset"]["hub_url"] = recorder.push_to_hub(
+                private=True, allow_protected=args.overwrite_hub
+            )
 
     print(f"\nrun {run.id}  preset={cfg['preset']}  wall={run.record['wall_clock_s']}s")
     print_table(stats)

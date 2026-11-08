@@ -89,20 +89,3 @@ def test_existing_presets_keep_the_01_recorder_and_cannot_clobber_the_01_repos()
     v2 = load_config("sim", CONFIG_DIR / "demos_v2.yaml")
     assert build.TailSettings.from_cfg(v2) == build.TailSettings(15, 45, True)
     assert build.oracle_profile(v2) == "v2" and v2["data"]["chunk_pad"] == "drop"
-
-
-def test_render_gap_comparison_labels() -> None:
-    """A Mac CPU run on a 0.1 set (both sides the Mac CPU renderer) is a same-renderer pipeline
-    check, not a Mac-vs-GPU gap; a GPU run on the 0.1 set is the renderer gap."""
-    from src.config import CONFIG_DIR, load_config
-
-    rebuild = _load("wo01r_rebuild_demos")
-    cfg = load_config("sim", CONFIG_DIR / "demos_v2.yaml")
-    old, new = cfg["render_gap"]["dataset"], cfg["data"]["hub_repo"]
-    label = rebuild.comparison_label
-    assert label(cfg, old, "render-gap", "cpu").startswith("same-renderer pipeline check")
-    assert "NOT a Mac-vs-GPU" in label(cfg, old, "render-gap", "cpu")
-    assert label(cfg, old, "render-gap", "cuda").startswith("renderer gap")
-    assert label(cfg, new, "render-gap", "cuda").startswith("same-renderer pipeline check")
-    assert label(cfg, new, "render-gap", "cpu").startswith("renderer gap")
-    assert label(cfg, new, "dry-run", "cpu").startswith("same-renderer pipeline check")

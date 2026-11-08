@@ -534,10 +534,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip-tokens", action="store_true", help="render-gap: pixels only")
     args = parser.parse_args(argv)
 
-    from src.data.recorder import dataset_location, push_dataset
+    from src.data.recorder import (
+        ProtectedRepoError,
+        check_push_target,
+        dataset_location,
+        push_dataset,
+    )
 
     cfg_path = args.config or default_config(args.preset)
     cfg = load_config(args.preset, cfg_path)
+    if args.push:  # fail before the build, not after it (push_dataset checks again)
+        try:
+            check_push_target(dataset_location(cfg)[0])
+        except ProtectedRepoError as exc:
+            parser.error(str(exc))
     if args.device:
         cfg["device"] = args.device
     device = str(cfg.get("device", "cpu"))
