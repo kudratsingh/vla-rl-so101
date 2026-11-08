@@ -58,6 +58,9 @@ from src.robot.units import (
 from src.robot.yamlio import update_yaml_file
 
 SHORT_NAMES = ("pan", "lift", "elbow", "wflex", "wroll", "grip")  # verify columns
+SUPPORT_PROMPT = (
+    "Torque goes OFF now (if it was on, the arm drops): support the arm, then press ENTER "
+)
 
 FOLLOWER_STEPS = """
 WHAT YOU DO PHYSICALLY (follower):
@@ -192,7 +195,7 @@ def run_calibration(
     path = Path(device.calibration_fpath)
     if reuse_file and not device.calibration:
         sys.exit(f"--reuse-file: no calibration file at {path}")
-    ask("Torque goes OFF now (if it was on, the arm drops): support the arm, then press ENTER ")
+    ask(SUPPORT_PROMPT)
     bus = device.bus
     bus.connect()  # opens the port and pings the motors; no configure(), no torque enable
     try:
@@ -272,7 +275,9 @@ def cmd_check(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         print("re-run with --write-limits to store them in the config")
 
 
-def cmd_verify(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+def cmd_verify(
+    args: argparse.Namespace, cfg: dict[str, Any], ask: Callable[[str], str] = input
+) -> None:
     units = UnitMap.from_config(cfg)
     sc = SafetyConfig.from_config(cfg)
     try:
@@ -285,6 +290,8 @@ def cmd_verify(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         sys.exit(f"no calibration file; run `calibrate --device {args.device}` first")
     bus = device.bus
     print(LEADER_VERIFY_STEPS if args.device == "leader" else VERIFY_STEPS)
+    if args.device == "follower":
+        ask(SUPPORT_PROMPT)  # torque can be on after a crashed session (the leader never has any)
     bus.connect()  # port only: no configure(), no torque enable
     try:
         bus.disable_torque()

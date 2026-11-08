@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 from pathlib import Path
@@ -105,3 +106,30 @@ def test_interrupted_calibration_keeps_old_file_and_disconnects(tmp_path: Path) 
         cal.run_calibration(dev, ask=lambda _: "")
     assert dev.bus.calls[-1] == "disconnect(disable_torque=True)"
     assert json.loads(path.read_text())["gripper"]["range_max"] == 6
+
+
+class VerifyBus(CalBus):
+    is_calibrated = True
+
+    def sync_read(self, data_name: str) -> Any:
+        raise KeyboardInterrupt  # the operator stops verify at the first reading
+
+
+def test_verify_asks_to_support_the_arm_before_torque_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from robot_fakes import real_cfg
+
+    path = tmp_path / "so101_follower.json"
+    path.write_text(json.dumps({"shoulder_pan": {"range_min": 0, "range_max": 1}}))
+    dev = CalDevice(path)
+    dev.bus = VerifyBus()
+    monkeypatch.setattr(cal, "_make_device", lambda args, cfg: dev)
+
+    def ask(prompt: str) -> str:
+        dev.bus.calls.append(f"ask: {prompt}")
+        return ""
+
+    cal.cmd_verify(argparse.Namespace(device="follower"), real_cfg(), ask=ask)
+    assert "support the arm" in dev.bus.calls[0]
+    assert dev.bus.calls[1:] == ["connect", "disable_torque", "disconnect(disable_torque=True)"]
