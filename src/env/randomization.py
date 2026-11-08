@@ -7,7 +7,8 @@ Object *positions* are always sampled per episode from the cell's spawn region
 - object_color_jitter: max per-channel RGB offset of manipulated/base objects (colour name kept)
 - object_physics: friction and mass jitter of manipulated/base objects
 - lighting: ambient + directional light intensity/direction per sub-scene
-- camera_*: per-episode camera pose jitter around the calibrated pose (+ fov jitter at load)
+- camera_*: per-episode camera pose jitter around the calibrated pose, drawn from the episode
+  seed's RNG so a seed replays its camera (+ fov jitter at load)
 - robot_color: random colour of the 3D-printed robot parts per sub-scene
 - action_latency_max_steps: each episode draws a latency in [0, max] control steps
 - reconfigure_every: rebuild the scene every K resets so load-time draws (colours, lights, fov)
