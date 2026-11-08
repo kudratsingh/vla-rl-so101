@@ -73,10 +73,14 @@ VRAM. Start from the WO-02 SFT checkpoint.
 
 ## Budget
 
-Compute target ≈ $200 (RunPod, Oct 2026 list: RTX 4090 $0.89/h, A100-80GB $1.79/h,
-H100 PCIe $2.89/h). WO-01–02 on a 4090; WO-04–05 on an A100-80GB. Hardware ≈ $300–600
-(SO-101 follower or pair, 2 webcams, clamps). The owner approves every run; the agent estimates
-cost in every training PR.
+Cloud compute has a **$1,100 lifetime planning cap**. The core sim-to-real work has a $700
+cap including recorded spend. Up to $400 is reserved for the original WO-05 ablation sweeps
+if earlier results justify them. See [spend and allocations](STATUS.md#spend) for the staged
+plan. Each paid run still requires its own estimate and explicit owner approval under
+[CLAUDE.md](../CLAUDE.md#hard-rules).
+
+Hardware is budgeted separately. The original hardware estimate was $300–600 for an SO-101
+follower or pair, webcams and clamps.
 
 ## Timeline (owner's)
 
