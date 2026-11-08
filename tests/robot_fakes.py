@@ -144,7 +144,8 @@ class FakeClock:
 class FakeCam:
     """640x480 RGB frames stamped with ``clock``. Failure switches:
 
-    ``fail`` / ``fail_after`` (reads): raise CameraFault (a lost frame);
+    ``fail`` / ``fail_after`` / ``fail_reads`` (all reads / reads > n / these read numbers):
+    raise CameraFault (a lost frame);
     ``stall_after`` (reads): keep returning the last frame, old stamp and all (a frozen stream);
     ``interrupt_after`` (reads): raise KeyboardInterrupt (the operator's Ctrl-C).
     """
@@ -157,6 +158,7 @@ class FakeCam:
         self.reads = 0
         self.fail = False
         self.fail_after: int | None = None
+        self.fail_reads: set[int] = set()
         self.stall_after: int | None = None
         self.interrupt_after: int | None = None
         self.last: Frame | None = None
@@ -166,7 +168,11 @@ class FakeCam:
         self.reads += 1
         if self.interrupt_after is not None and self.reads > self.interrupt_after:
             raise KeyboardInterrupt
-        if self.fail or (self.fail_after is not None and self.reads > self.fail_after):
+        if (
+            self.fail
+            or self.reads in self.fail_reads
+            or (self.fail_after is not None and self.reads > self.fail_after)
+        ):
             raise CameraFault("timed out waiting for a frame")
         if self.stall_after is not None and self.reads > self.stall_after and self.last:
             return self.last
