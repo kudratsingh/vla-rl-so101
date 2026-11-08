@@ -160,6 +160,11 @@ def run_batch_traced(
     if len(instructions) != n:
         raise ValueError(f"env gave {len(instructions)} instructions for {n} episodes")
     steps = [_privileged(raw, info, n)]
+    # ManiSkill's reset runs no physics step, so its contact query returns the previous episode's
+    # last step: a row that ended holding the object reports is_grasped at t = 0. A fresh episode
+    # is never grasped (arm at rest, object on the table).
+    if "is_grasped" in steps[0]:
+        steps[0]["is_grasped"] = torch.zeros_like(steps[0]["is_grasped"])
     last = steps[0].get("qpos", torch.zeros(n, 6))
     boundaries: list[ChunkBoundary] = []
     active = torch.ones(n, dtype=torch.bool)

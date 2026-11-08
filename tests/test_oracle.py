@@ -57,6 +57,15 @@ def test_oracle_takes_over_an_in_hand_state() -> None:
                 break
         assert grasped and cmd is not None
         snap = snapshot(env)
+        # reset runs no physics step, so it reports the held grasp of the episode before; the
+        # trace's reset step (recovery failure mining) must not
+        from src.eval.sim_eval import run_batch_traced
+
+        _, reset_info = env.reset(seed=seeds)
+        assert bool(reset_info["is_grasped"][0])
+        hold = cmd[:, None].expand(1, 8, 6)
+        trace = run_batch_traced(lambda o, i: hold, env, lambda o: o, seeds, 1)[2]
+        assert not bool(trace.steps[0]["is_grasped"].any())
         obs = restore(env, seeds, snap)
         fresh = make_oracle("PickPlace", env)
         with pytest.raises(ValueError, match="start_phase"):
