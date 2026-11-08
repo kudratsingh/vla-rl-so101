@@ -2,7 +2,7 @@
 # WO-04 on one RunPod A100-80GB pod, ONE SEED PER POD: setup -> GPU-sim check (render, group
 # reset, oracle; RL needs the GPU sim) -> SFT adapter download -> PROBE (SFT baseline eval + a few
 # GRPO steps: s/step, episodes/h, VRAM, projected h and $ per seed) -> owner approval gate -> full
-# GRPO run (kill switch at 25% of the steps) -> full-protocol eval of the final RL checkpoint ->
+# GRPO run (rollout-window spend gates, rl.gate_*) -> full-protocol eval of the final RL checkpoint ->
 # upload runs/ to the private Hub repo -> terminate this pod.
 # Launched over SSH from the repo root on the pod (one seed per pod):
 #   SEED=0 SFT_ADAPTER=KudratSingh22/vla-rl-so101-sft/wo02/<pod>/runs/<run>/checkpoints/step_00N000 \
@@ -154,8 +154,8 @@ print(f"[job] SFT adapter: {path}: {sorted(p.name for p in path.iterdir())}")
 EOF
 
 stage probe
-# Probe -> owner approval gate (owner rule, 2026-10-26): the 64-episode/task SFT baseline (the
-# same eval as the run's step 0; exits non-zero if it is 0 on every task, CLAUDE.md rule 3) and
+# Probe -> owner approval gate (owner rule, 2026-10-26): the SFT baseline (rl.eval_episodes greedy
+# episodes per trained task, a sanity check; the same eval as the run's step 0; exits non-zero if it is 0 on every task, CLAUDE.md rule 3) and
 # PROBE_STEPS GRPO steps; prints the `[wo03_rl] PROBE` lines. Saves no checkpoint.
 run_until_deadline uv run scripts/wo03_rl.py --preset rl --config "$CFG" --seed "$SEED" \
   --adapter "$SFT_ADAPTER" --probe-steps "$PROBE_STEPS" || exit 20
@@ -223,10 +223,11 @@ if [ "$STATUS" = stopped_flat ]; then
   # owner decision: a flat run stops at 25% and is diagnosed (frac_groups_dropped, temperature,
   # LoRA lr), not evaluated
   stage stopped-flat
-  echo "[job] KILL SWITCH: eval gain at the check step < rl.early_stop_min_improvement; no protocol eval"
+  echo "[job] FLAT GATE: windowed rollout success gain at the check step < rl.gate_min_gain; no protocol eval"
   exit 0
 fi
-# stopped_peak (rl.peak_stop_step): stopped past the peak; evaluated like a finished run
+# stopped_peak (decline or entropy gate, rl.gate_max_drop / rl.gate_entropy_min; record.stop_reason):
+# evaluated like a finished run
 [ "$STATUS" = finished ] || [ "$STATUS" = stopped_peak ] || { echo "[job] unexpected RL status $STATUS"; exit 32; }
 upload "RL run"
 
