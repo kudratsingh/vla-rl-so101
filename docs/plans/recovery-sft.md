@@ -5,11 +5,42 @@ Status: **plan + local code, no paid run approved.** Owner request 4 (2026-11-07
 diagnostic, $210 for up to three confirmatory seeds. Every paid step below still needs the
 owner's explicit go on its own probe numbers (CLAUDE.md rule 1).
 
+**Revision 2026-11-08** (project review `docs/reviews/2026-11-07-project-review.md`, sections 3.1,
+8 and 9; PR 1 `fix/pre-run-hardening`, #28):
+- The lr-escalation rule and every other rule keyed on the logged `train/clip_frac` /
+  `train/approx_kl` are replaced by PR 1's fixed-batch pre/post-update diagnostic (section 11).
+  With one PPO epoch the logged metric is structurally ~0 and uninformative; PR 1 removes it.
+- The step-20 checks use PR 1's rollout-window flat gate, not the 64-episode kill switch.
+- Every protocol eval must write per-episode records, so the comparisons can be paired (sections 9
+  and 10).
+- The matched ordinary-demo control (section 7) is unchanged.
+
+## 0. Order (review Track B)
+
+The review orders Track B as: $0 fixes (PR 1), then ~$5 of diagnostics, then this plan on a
+rebuilt base. Its decision 3 is the owner's to make. If approved, the base is rebuilt **before**
+failure mining:
+
+1. Rebuild the 25 demos/task on the GPU renderer with PR 1's fixed recorder, which records through
+   release and retreat with no pad frames in the SFT loss, and the v2 oracle. The tool is
+   `scripts/pod/demo_rebuild_job.sh`, and the output goes to the new repo
+   `KudratSingh22/vla-rl-so101-demos-25-v2` (~$0.7 on a 4090). The job's render-gap check runs
+   first.
+2. SFT from scratch on that set (A100, 8000 steps, ~$5), then the full protocol eval (~$1).
+3. Then sections 3-10 below, with that new base in place of `step_004000`: mine failures, record
+   corrections and the matched control on top of it, and warm-start both arms from it. Its own
+   protocol table is the baseline in section 9.
+
+Without that decision the plan runs as written, from `step_004000`. Either way the corrections and
+the control are recorded on the same pod and backend.
+
 ## 1. Question
 
 The current SFT checkpoint (WO-02 attempt 4 `step_004000`, 25 demos/task) reproduces its demos
 but does not recover once it drifts off them (ADR-0001: few-shot covariate shift). GRPO on it gave
-+3.7 to +5.0 points on PickPlace seen (results.md), with tiny updates (clip fraction 0.000).
++3.7 to +5.0 points on PickPlace seen (results.md). The logged clip fraction 0.000 and
+approx_kl ~3e-5 are uninformative with one PPO epoch (review 3.1), so they say nothing about the
+size of the updates.
 
 Recovery SFT asks: if the expert labels the states this policy actually fails in (DAgger-style
 corrections from representative failure states), does SFT success go up, by more than the same
@@ -41,7 +72,7 @@ would land in another range (RL seed >= 10 overlaps the protocol, `check_rl_seed
 | selection[7], [8] | 107,000,000 / 108,000,000 + ... (same formula, protocol seeds 7, 8) | checkpoint selection |
 | recovery | 3,000,000,000 + 1,000,000 x task_index + k | SFT failure mining (seen cell only) |
 | control | 3,100,000,000 + 1,000,000 x task_index + k | matched-control oracle demos (seen cell only) |
-| rl_eval | 4,000,000,000 + i | GRPO in-training evals and kill switch |
+| rl_eval | 4,000,000,000 + i | GRPO in-training greedy evals (sanity logs) |
 
 Failure states come only from the seen cell. Shifted and unseen-object cells stay pure
 generalization tests. No episode of any protocol eval run is ever mined.
@@ -174,13 +205,23 @@ protocol (3 tasks x 3 cells x 3 seeds x 100, horizon 150, GPU sim) runs for:
 2. The recovery pick.
 3. The control pick.
 
+All three runs play the same episode seeds (the protocol's seed formula), and each must write
+per-episode records (`runs/<id>/episodes.jsonl`, PR 1: task, cell, seed, episode seed, success,
+length, end reason and end-state flags). A run without them does not count for section 10.
+PR 1's `wo02_eval.py` writes them under `0.1-draft` too. If the owner has frozen protocol 0.2 by
+then, all three run under 0.2 instead. Either way, one protocol, one hash and one commit apply to
+all three.
+
 Every number cites the hash and its run id. Results are labelled single SFT run. Negative results
 go to docs/results.md as well.
 
 ## 10. Decision rules (fixed before any data)
 
-Primary metric: pooled seen success over the 3 tasks (900 episodes per checkpoint), with a
-one-sided two-proportion test as already used in results.md.
+Primary metric: pooled seen success over the 3 tasks (900 episodes per checkpoint). The test is
+**paired**: the arms play identical episode seeds, so differences are read from the per-episode
+records (section 9) with a one-sided exact McNemar test on the discordant episodes. The
+two-proportion test used in results.md is reported alongside. "p < 0.05" below means the paired
+test.
 
 - **Recovery improves**: recovery minus baseline (re-evaluated in step 9) is >= +3.0 points
   pooled seen over seeds 0-2 with p < 0.05 (primary; the seed-0 leak inflates the baseline, so
@@ -205,14 +246,23 @@ per mode are reported. None of them gates.
 
 Two stages, each its own owner go.
 
-**Stage A: matched short probes (about $3-5).** From the recovery pick, `--probe-steps 3` on
-`configs/rl_pickplace_lr5e-5.yaml` (the WO-04 lr, reference) and `configs/rl_pickplace_lr.yaml`
-(lr 5e-4, the on-hold proposal in STATUS.md), plus `configs/rl_pickplace_lr1e-3.yaml` if rule 1
-fires. The three configs differ only in lr: same base, RL seed 3 (passes `check_rl_seed`), so the
-same prompts, and the same rollout settings. The probes compare `train/clip_frac`,
-`train/approx_kl`, the group drop rate and `rollout/success_rate`.
+**Stage A: offline lr sweep on one fixed batch, then one matched probe (about $3-5).** From the
+recovery pick, on one A100 pod:
 
-**Stage B: continuation (about $9-30).** Proposed on the probe numbers: 75 steps at the lr rule 1
+```
+uv run scripts/wo03_rl.py --preset rl --config configs/rl_pickplace.yaml --adapter <pick> \
+  --seed 3 --lr-sweep 5e-5,2e-4,5e-4,1e-3 --sweep-adam-steps 8
+```
+
+This is PR 1's fixed-batch diagnostic. It collects one rollout batch and stores it as
+`sweep_batch.pt`. For each lr it restores the same adapter and optimizer state, runs 8 Adam steps,
+and scores the **whole** batch against the pre-update log-probs. It logs post-update k3 KL, clip
+and outside-clip fraction, dlogp split by advantage sign, mean(A*dlogp), the greedy argmax flip
+rate and grad_norm. Every lr sees the same batch, so lr is the only variable, and 5e-5 (the WO-04
+lr) is the reference. Rule 1 picks the lr. Then one `--probe-steps 3` at that lr measures s/step,
+the drop rate and the post-update `diag/post/*` medians on live batches.
+
+**Stage B: continuation (about $9-30).** Proposed on the stage A numbers: 75 steps at the lr rule 1
 picks, then the readout below.
 
 Every setting, as `scripts/wo03_rl.py --preset rl --estimate` validates it:
@@ -229,20 +279,44 @@ Every setting, as `scripts/wo03_rl.py --preset rl --estimate` validates it:
 - `peak_stop_step: 0` (off): the inherited ref 50 / stop 100 fails `GRPOConfig.validate` at 75
   steps, and a peak stop at the last step stops nothing.
 
+**After PR 1 merges**, several of these settings change:
+- The removed keys raise an error that names their replacement. The configs map as follows:
+  `early_stop_check_at_frac: 0.26` -> `gate_check_frac: 0.26`, plus `gate_window: 5` (a flat
+  gate at step 20 comparing steps 16-20 with 1-5); `early_stop_rule` -> `gate_rule: any_task`;
+  `early_stop_min_improvement` -> `gate_min_gain: 0.03`; `peak_stop_step: 0` -> the decline gate
+  (`gate_max_drop`).
+- `configs/rl_pickplace.yaml` then inherits PR 1's shape: 16 prompts x K=8, `ppo_epochs` 2 and
+  periodic evals on PickPlace only. The three stage configs still differ only in lr.
+- The stage B cost below is for the WO-04 shape. It must be repriced with `--estimate` on the
+  PR 1 shape, which is about +25% per step in the worst case (16.4 vs 13.1 min/step).
+
 The owner's diagnostic rules apply:
 
-1. **Rule 1 (stage A).** Escalate to lr 1e-3 (one more probe) if the lr 5e-4 probe's
-   `train/clip_frac`, averaged over its 3 steps, is **0.000**. That metric is the mean over the
-   update's two minibatches. The first minibatch runs before any optimizer step (ratio exactly 1
-   under recompute), so it contributes 0 by construction and the logged value is half the second
-   minibatch's. A reading of 0.000 therefore means the post-update minibatch was unclipped too.
-2. **Rule 2 (stage B). Kill switch at step 20**: stop unless at least one trained task gains >= 3
-   points over step 0 on the 64 kill-switch episodes (the trainer's kill switch, as configured).
-3. **Rule 3 (stage B).** If the clip fraction moves but **sampled success is flat by step 20**,
-   stop. Flat means `rollout/success_rate` averaged over steps 16-20 minus its average over steps
-   1-5 is < 0.03. The trainer does not implement this check (src/rl is outside this plan's code).
-   The stage B pod job reads it from `metrics.jsonl` at step 20 and stops the run. That job
-   script, with a tiny dry run of the check, must exist before stage B is proposed.
+1. **Rule 1 (stage A, fixed-batch diagnostic).** Pick the **smallest** lr in the sweep at which
+   the update moved the policy in the advantage's direction on the fixed batch. That requires all
+   three of:
+   - post-update mean(A*dlogp) > 0;
+   - dlogp for A>0 above dlogp for A<0;
+   - greedy argmax flip rate >= 1% of executed action tokens.
+
+   An lr is too far if its post-update outside-clip fraction is > 0.2. If 5e-5 already qualifies,
+   the lr stays at 5e-5. If no lr up to 1e-3 qualifies without being too far, stop and report:
+   do not escalate past 1e-3. The thresholds (1% flips, 0.2 outside-clip) are the agent's
+   proposal and must be confirmed by the owner before stage A runs. The logged
+   `train/clip_frac` / `train/approx_kl` are not used: with one PPO epoch they are structurally
+   ~0 whatever the update does (review 3.1), and PR 1 removes them.
+2. **Rule 2 (stage B). Flat gate at step 20** (PR 1 `src/rl/gates.py`): stop unless at least one
+   trained task's windowed `rollout/success_rate` over steps 16-20 is >= 3 points above its
+   steps 1-5 window (`gate_window: 5`, `gate_check_frac: 0.26`, `gate_rule: any_task`,
+   `gate_min_gain: 0.03`). The trainer implements this, so no separate job-script check is
+   needed. This replaces both the 64-episode kill switch, which cannot tell +3 from 0 (review
+   3.1), and the former clip-keyed rule 3. The periodic greedy evals are sanity logs only.
+3. **Rule 3 (stage B, every step).** The run is also stopped if the post-update fixed-batch
+   diagnostic (`diag/post/k3_kl`; argmax flips only with `diag_argmax: true`, about +31 s/step)
+   collapses to the stage A 5e-5 reference level for
+   10 consecutive steps, meaning the updates stopped moving the policy, or if PR 1's entropy gate
+   fires (`gate_entropy_min`). The job script reads the diagnostic from `metrics.jsonl`. It must
+   exist with a tiny dry run before stage B is proposed.
 
 The readout is the final checkpoint's protocol table on a 4090. PickPlace seen (300 episodes)
 versus its own base, from the same protocol run in section 9. Stage A isolates lr from the same
@@ -253,10 +327,10 @@ base. Stage B measures "GRPO gain from this base at this lr" over 75 steps.
 These run only if the diagnostic's PickPlace seen is **>= +10 points over its base** (the owner's
 +10 bar of 2026-10-28) with p < 0.05 and it passed its step-20 checks. Seeds 0, 1 and 2 use the
 diagnostic's exact settings and step budget, run sequentially. Seeds 1-2 start only after seed 0
-passes its step-20 kill switch, as in WO-04. At 75 steps that is the stage B config with only
-`seed` changed. At 150 steps the kill switch needs `early_stop_check_at_frac: 0.133`
-(ceil(19.95) = step 20; the inherited 0.25 would put it at step 38), and the inherited peak stop
-(ref 50, stop 100) applies. Each seed gets a full protocol eval. Between +3 and
+passes its step-20 flat gate, as in WO-04. At 75 steps that is the stage B config with only
+`seed` changed. At 150 steps the flat gate needs `gate_check_frac: 0.133`
+(ceil(19.95) = step 20; the inherited 0.25 would put it at step 38), and the decline gate
+(`gate_max_drop`) replaces the old peak stop. Each seed gets a full protocol eval. Between +3 and
 +10 points, the result is reported and the owner decides. Nothing runs automatically.
 
 ## 13. Cost, from measured numbers
@@ -290,13 +364,13 @@ GRPO diagnostic (A100 run + 4090 protocol eval):
 
 | Stage | Exit | A100 h | $ |
 |---|---|---|---|
-| A (own go) | each probe (separate setup, worst case) | 0.85 | 1.5 |
-| A | lr 5e-5 + 5e-4 probes; + lr 1e-3 if rule 1 fires | 1.7; 2.55 | 3.0; 4.6 |
-| B (own go) | kill switch at step 20 | 0.85 + 20 x 0.20 = 4.85 | 8.7 |
+| A (own go) | offline lr sweep, 4 lrs x 8 Adam steps (`--estimate`, PR 1), + 0.5 h setup | 1.7 | 3.0 |
+| A | + one 3-step probe at the chosen lr | 2.55 | 4.6 |
+| B (own go) | flat gate at step 20 | 0.85 + 20 x 0.20 = 4.85 | 8.7 |
 | B | full 75 steps + 4090 protocol eval ($0.93 + setup) | 0.85 + 75 x 0.20 = 15.85 | 28.4 + 1.2 = 29.6 |
-| A + B | worst case: three probes + full run | 18.4 | ~34 |
+| A + B | worst case: sweep + probe + full run | 18.4 | ~34 |
 
-estimated: stage A A100-80GB x 2.55 h = $4.6; stage B A100-80GB x 15.85 h + RTX-4090 x 1.4 h =
+estimated: stage A A100-80GB x 2.55 h = $4.6 (sweep + one probe); stage B A100-80GB x 15.85 h + RTX-4090 x 1.4 h =
 $29.6. Together ~$34 worst case, within the **$60** allowance (pod cap $40).
 `scripts/wo03_rl.py --estimate` gives 16.6 h / $29.7 for the 75-step run (worst-case refill), in
 line with the measured rate.
