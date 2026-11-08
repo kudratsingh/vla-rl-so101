@@ -324,3 +324,46 @@ def test_end_session_after_a_failed_torque_off_names_the_power_switch(
     n = len(fol.sent)
     teleop.end_session(sess.arm, sess)
     assert "inline power switch" in capsys.readouterr().out and len(fol.sent) == n
+
+
+class BrokenDataset(FakeDataset):
+    def add_frame(self, frame: dict[str, Any]) -> None:
+        raise ValueError("feature 'observation.state' has dtype float64, expected float32")
+
+    def clear_episode_buffer(self) -> None:
+        raise KeyError("size")  # discard_episode falls back to a fresh buffer
+
+    def create_episode_buffer(self) -> dict[str, int]:
+        return {"size": 0}
+
+
+def test_unexpected_error_holds_and_asks_for_support_before_torque_off(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression (PR 29 review): a non-deadman exception used to leave the driver's `with`
+    block at once: torque off, the raised follower dropped with no support prompt."""
+    sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
+    at_prompt: list[tuple[str, bool, int]] = []
+
+    def fake_input(prompt: str = "") -> str:
+        at_prompt.append((prompt, fol.bus.torque_enabled, len(fol.sent)))
+        return ""  # ENTER at the scene prompt, then at the support prompt
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    instr = teleop.protocol_instructions(["Push"])
+    with pytest.raises(ValueError, match="dtype float64"):
+        try:
+            teleop.record_session(sess, BrokenDataset(), ["Push"], instr, 1, 0.2, lambda im: im)
+        except ValueError as e:
+            sess.arm.__exit__(type(e), e, None)  # what the driver's `with` block then does
+            raise
+    out = capsys.readouterr().out
+    assert "STOPPED: unexpected ValueError" in out and "episode discarded" in out
+    assert len(at_prompt) == 2 and at_prompt[1][0] == teleop.SUPPORT_PROMPT
+    assert at_prompt[1][1] is True  # torque still on at the support prompt: the arm is held
+    assert fol.sent[at_prompt[1][2] - 1] == pytest.approx(fol.pos)  # a hold write came first
+    assert (
+        sess.arm.deadman.reason is not None
+        and "teleop error: ValueError" in sess.arm.deadman.reason
+    )
+    assert not fol.bus.torque_enabled  # torque off only after the prompt

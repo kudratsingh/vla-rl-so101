@@ -8,7 +8,14 @@ import time
 
 import numpy as np
 import pytest
-from robot_fakes import PORT_BUSY, FakeFollower, full_sweep_calibration, real_cfg, toy_fk
+from robot_fakes import (
+    LAST_TORQUE_OFF_CALL,
+    PORT_BUSY,
+    FakeFollower,
+    full_sweep_calibration,
+    real_cfg,
+    toy_fk,
+)
 
 from src.robot.driver import (
     DeadmanTripped,
@@ -23,7 +30,7 @@ from src.robot.driver import (
     release_port,
 )
 from src.robot.safety import Deadman, DeadmanResponse, SafetyConfig, SafetyFilter
-from src.robot.units import UnitMap
+from src.robot.units import JOINT_NAMES, UnitMap
 
 
 def make(
@@ -145,7 +152,9 @@ def test_failed_torque_off_latches_and_blocks_all_further_motion(
     fol.bus.fail_disable = True  # the torque-off write raises
     with caplog.at_level(logging.CRITICAL, logger="src.robot.driver"):
         assert drv.torque_off() is False
-    assert drv.torque_off_unconfirmed == "ConnectionError: bus gone"
+    detail = drv.torque_off_unconfirmed
+    assert detail is not None and "shoulder_pan (id 1: ConnectionError: bus gone)" in detail
+    assert "gripper (id 6: ConnectionError: bus gone)" in detail  # every motor was tried
     msg = " ".join(r.getMessage() for r in caplog.records)
     assert "TORQUE OFF UNCONFIRMED" in msg and "inline power switch" in msg
     assert "inline power switch" in capsys.readouterr().err  # loud without logging configured
@@ -164,7 +173,7 @@ def test_failed_torque_off_latches_and_blocks_all_further_motion(
         fol.bus.enable_torque()  # the guarded torque enable (what connect/configure call)
     fol.bus.fail_disable = False
     assert drv.torque_off() is True  # a later success ...
-    assert drv.torque_off_unconfirmed == "ConnectionError: bus gone"  # ... does not clear it
+    assert drv.torque_off_unconfirmed == detail  # ... does not clear it
     with pytest.raises(TorqueOffUnconfirmed):
         drv.step(np.zeros(6), frame_time=50.0)
     assert _motion_writes(fol) == n
@@ -287,7 +296,7 @@ def test_park_drives_through_safety_then_torque_off() -> None:
     assert drv.park(settings, frame_time_fn=time.perf_counter)
     steps = [s["wrist_flex.pos"] for s in fol.sent]
     assert steps[-1] == pytest.approx(10.0) and max(np.diff([0.0, *steps])) <= 4.0 + 1e-9
-    assert not fol.bus.torque_enabled and fol.bus.calls[-1] == ("disable_torque", None)
+    assert not fol.bus.torque_enabled and fol.bus.calls[-1] == LAST_TORQUE_OFF_CALL
     cfg = real_cfg()
     assert ParkSettings.from_config(cfg).qpos == tuple(cfg["deploy"]["home_qpos"])  # null -> home
     assert park_from_config(cfg) is None  # robot.park.enabled: false by default (owner)
@@ -311,3 +320,65 @@ def test_park_never_runs_on_a_fault_path() -> None:
     assert drv2.park(settings, time.perf_counter, stop_fn=lambda: next(stop)) is False
     assert len(fol2.sent) == 3 and fol2.sent[-1] == pytest.approx(fol2.pos)  # 2 steps + hold
     assert fol2.bus.torque_enabled  # the caller asks the operator to support the arm first
+
+
+# -- torque off on every motor ----------------------------------------------------------------------
+@pytest.mark.parametrize("fault", ["raise", "comm"])
+def test_torque_off_reaches_every_motor_when_one_fails(
+    fault: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression (PR 29 review): lerobot's disable_torque stopped at the first failing motor, so
+    elbow_flex (id 3) failing left wrist_flex, wrist_roll and gripper energized."""
+    fol = FakeFollower()
+    drv = make(fol)
+    drv.connect()
+    fol.bus.write_faults[3] = fault
+    assert drv.torque_off() is False
+    assert fol.bus.torque_writes() == [n for n in JOINT_NAMES if n != "elbow_flex"]
+    assert all(not fol.bus.torque_on[n] for n in ("wrist_flex", "wrist_roll", "gripper"))
+    detail = drv.torque_off_unconfirmed
+    assert detail is not None and "elbow_flex (id 3" in detail
+    assert not any(n in detail for n in JOINT_NAMES if n != "elbow_flex")  # only the failed one
+    assert "inline power switch" in capsys.readouterr().err
+    n = _motion_writes(fol)  # the latch blocks every later motion
+    with pytest.raises(TorqueOffUnconfirmed):
+        drv.step(np.zeros(6), frame_time=50.0)
+    drv.hold()
+    park = ParkSettings(qpos=PARK, tol_rad=math.radians(1.0), timeout_s=1.0)
+    assert drv.park(park, frame_time_fn=lambda: 50.0) is False
+    assert _motion_writes(fol) == n
+
+
+def test_torque_off_with_a_servo_error_bit_counts_as_written(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An overloaded servo accepts Torque_Enable=0 but its status reply carries the overload bit
+    (lerobot's write raised on it): written, logged, no latch, and the motors after it too."""
+    fol = FakeFollower()
+    drv = make(fol)
+    drv.connect()
+    fol.bus.write_faults[3] = "error_bit"
+    with caplog.at_level(logging.CRITICAL, logger="src.robot.driver"):
+        assert drv.torque_off() is True
+    assert fol.bus.torque_writes() == list(JOINT_NAMES) and not fol.bus.torque_enabled
+    assert drv.torque_off_unconfirmed is None
+    assert any("Overload" in r.getMessage() for r in caplog.records)
+
+
+def test_connect_failure_before_the_port_opens_raises_no_torque_alarm(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fol = FakeFollower()
+    fol.fail_open = True  # wrong robot.port / USB unplugged
+    drv = make(fol)
+    with pytest.raises(ConnectionError, match="Could not connect"):
+        drv.connect()
+    assert drv.torque_off_unconfirmed is None and "UNCONFIRMED" not in capsys.readouterr().err
+    assert not [c for c in fol.bus.calls if c[0] in ("write", "disconnect")]  # nothing written
+    opened = FakeFollower()  # the port opened, then configure failed and torque-off fails too
+    opened.fail_connect = True
+    opened.bus.write_faults = {i: "raise" for i in range(1, 7)}
+    drv = make(opened)
+    with pytest.raises(ConnectionError):
+        drv.connect()
+    assert drv.torque_off_unconfirmed is not None  # the port was open: the latch still applies

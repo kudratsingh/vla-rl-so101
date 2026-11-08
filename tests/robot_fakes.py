@@ -86,6 +86,42 @@ class FakePortHandler:
         self.clears += 1
 
 
+class FakePacketHandler:
+    """scservo_sdk ``protocol_packet_handler`` subset used by the driver's torque-off."""
+
+    def __init__(self, bus: FakeBus) -> None:
+        self.bus = bus
+
+    def write1ByteTxOnly(self, port: Any, scs_id: int, address: int, data: int) -> int:
+        self.bus.calls.append(("broadcast", (scs_id, address, data)))
+        if port.is_using:
+            return COMM_PORT_BUSY
+        if scs_id == BROADCAST_ID and address == TORQUE_ENABLE_ADDR and not self.bus.fail_disable:
+            for name in JOINT_NAMES:  # no reply; a faulty motor may or may not have heard it
+                if self.bus.write_faults.get(self.bus.motors[name].id) is None:
+                    self.bus.torque_on[name] = bool(data)
+        return COMM_SUCCESS
+
+    def getTxRxResult(self, comm: int) -> str:
+        return PORT_BUSY if comm == COMM_PORT_BUSY else "[TxRxResult] There is no status packet!"
+
+    def getRxPacketError(self, error: int) -> str:
+        return "[RxPacketError] Overload error!" if error & ERRBIT_OVERLOAD else f"error {error}"
+
+
+@dataclass(frozen=True)
+class FakeMotor:
+    id: int
+    model: str = "sts3215"
+
+
+COMM_SUCCESS, COMM_PORT_BUSY, COMM_RX_TIMEOUT = 0, -1, -6  # scservo_sdk scservo_def
+ERRBIT_OVERLOAD = 32
+BROADCAST_ID = 0xFE
+TORQUE_ENABLE_ADDR, LOCK_ADDR = 40, 55  # lerobot STS_SMS_SERIES_CONTROL_TABLE
+LAST_TORQUE_OFF_CALL = ("write", ("gripper", "Lock", 0))  # the driver's torque-off ends with it
+
+
 class FakeBus:
     """Records torque/goal traffic like lerobot's FeetechMotorsBus. Raw position ticks: arm
     2048 + int(deg*4095/360) (lerobot DEGREES with mid 2048), gripper range_min + pct% of the range.
@@ -94,18 +130,75 @@ class FakeBus:
     is set (a Ctrl-C that interrupted a transaction leaves it set). Temperature (deg C) and current
     (mA, read back as 6.5 mA counts) per motor come from ``follower.temperature_c`` /
     ``follower.current_ma``. ``eeprom``: the servos' Min/Max_Position_Limit (default = the file).
+
+    Torque per motor (``torque_on``; ``torque_enabled`` = any motor on). The driver's torque-off
+    uses the per-motor ``_write`` (one ("write", (motor, register, value)) call each).
+    ``fail_disable``: every torque-off write raises. ``write_faults`` {motor id: "raise" |
+    "comm" | "error_bit"}: that motor's writes raise / get no status reply / are written but the
+    reply carries an overload error bit (lerobot's ``write`` would raise on it).
     """
 
     def __init__(self, follower: FakeFollower):
         self.follower = follower
-        self.torque_enabled = False
+        self.torque_on: dict[str, bool] = {n: False for n in JOINT_NAMES}
         self.calls: list[tuple[str, Any]] = []
         self.fail_disable = False
         self.fail_health_read = False
+        self.write_faults: dict[int, str] = {}
         self.port_handler = FakePortHandler()
+        self.packet_handler = FakePacketHandler(self)
+        self.motors = {n: FakeMotor(i + 1) for i, n in enumerate(JOINT_NAMES)}
+        self.model_ctrl_table = {
+            "sts3215": {"Torque_Enable": (TORQUE_ENABLE_ADDR, 1), "Lock": (LOCK_ADDR, 1)}
+        }
+        self.port_open = False
         self.calibration: dict[str, FakeCal] = full_sweep_calibration()
         self.eeprom: dict[str, FakeCal] | None = None
         self.max_temperature_limit = 70
+
+    @property
+    def torque_enabled(self) -> bool:
+        return any(self.torque_on.values())
+
+    @property
+    def is_connected(self) -> bool:  # lerobot: port_handler.is_open
+        return self.port_open
+
+    def torque_writes(self, register: str = "Torque_Enable") -> list[str]:
+        """Motors that received a per-motor ``register`` := 0 write, in order."""
+        return [c[1][0] for c in self.calls if c[0] == "write" and c[1][1] == register]
+
+    def _is_comm_success(self, comm: int) -> bool:
+        return comm == COMM_SUCCESS
+
+    def _is_error(self, error: int) -> bool:
+        return error != 0
+
+    def _write(
+        self,
+        addr: int,
+        length: int,
+        motor_id: int,
+        value: int,
+        *,
+        num_retry: int = 0,
+        raise_on_error: bool = True,
+        err_msg: str = "",
+    ) -> tuple[int, int]:
+        assert not raise_on_error, "the driver's torque-off never lets lerobot raise"
+        name = next(n for n, m in self.motors.items() if m.id == motor_id)
+        reg = {TORQUE_ENABLE_ADDR: "Torque_Enable", LOCK_ADDR: "Lock"}[addr]
+        if self.port_handler.is_using:
+            return COMM_PORT_BUSY, 0
+        fault = self.write_faults.get(motor_id)
+        if self.fail_disable or fault == "raise":
+            raise ConnectionError("bus gone")
+        if fault == "comm":
+            return COMM_RX_TIMEOUT, 0
+        self.calls.append(("write", (name, reg, int(value))))
+        if reg == "Torque_Enable":
+            self.torque_on[name] = bool(value)
+        return COMM_SUCCESS, ERRBIT_OVERLOAD if fault == "error_bit" else 0
 
     def _check_port(self, what: str) -> None:
         if self.port_handler.is_using:
@@ -148,18 +241,23 @@ class FakeBus:
     def enable_torque(self, motors: Any = None, num_retry: int = 0) -> None:
         self._check_port("write 'Torque_Enable'")
         self.calls.append(("enable_torque", None))
-        self.torque_enabled = True
+        self.torque_on = {n: True for n in JOINT_NAMES}
 
     def disconnect(self, disable_torque: bool = True) -> None:
         self.calls.append(("disconnect", disable_torque))
+        if disable_torque:
+            self.disable_torque(num_retry=5)
+        self.port_open = False
         self.follower.connected = False
 
     def disable_torque(self, motors: Any = None, num_retry: int = 0) -> None:
+        """lerobot's own (configure() / disconnect(disable_torque=True)): the driver's torque_off
+        does not use it."""
         self._check_port("write 'Torque_Enable'")
         self.calls.append(("disable_torque", None))
         if self.fail_disable:
             raise ConnectionError("bus gone")
-        self.torque_enabled = False
+        self.torque_on = {n: False for n in JOINT_NAMES}
 
 
 class FakeFollower:
@@ -185,6 +283,7 @@ class FakeFollower:
         self.fail_read = False
         self.fail_write = False
         self.fail_connect = False
+        self.fail_open = False  # connect fails before the serial port opens (wrong port)
         self.interrupt_next: str | None = None
         self.temperature_c: dict[str, float] = {n: 35.0 for n in JOINT_NAMES}
         self.current_ma: dict[str, float] = {n: 100.0 for n in JOINT_NAMES}
@@ -208,6 +307,9 @@ class FakeFollower:
 
     def connect(self, calibrate: bool = True) -> None:
         assert calibrate is False, "the driver must never auto-calibrate"
+        if self.fail_open:
+            raise ConnectionError("Could not connect on port '/dev/tty.usbmodemXXXX'")
+        self.bus.port_open = True
         self.connected = True
         self.bus.disable_torque()  # like SOFollower.configure(): torque off ... torque on
         if self.fail_connect:
@@ -215,8 +317,7 @@ class FakeFollower:
         self.bus.enable_torque()
 
     def disconnect(self) -> None:
-        self.bus.disable_torque(num_retry=5)  # disable_torque_on_disconnect=True
-        self.connected = False
+        self.bus.disconnect(True)  # disable_torque_on_disconnect=True
 
     def get_observation(self) -> dict[str, Any]:
         self._maybe_interrupt("read")

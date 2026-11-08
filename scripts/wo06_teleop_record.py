@@ -27,8 +27,9 @@ first (it moves; Ctrl-C stops the park). If the park cannot complete, or the ses
 deadman stop (no ``resume``), it holds, asks the operator to support the arm, then torque off.
 
 Bounded torque-on waits (``teleop.prompt_torque_timeout_s``, default 60 s; null = wait forever):
-every prompt answered while the follower holds under torque reads the servos' temperature and
-current first, waits at most that long, and reads them again after the answer. With no answer
+every prompt answered while the follower holds under torque (scene, keep, resume) reads the
+servos' temperature and current first, waits at most that long, and reads them again after the
+answer; the final support prompt reads them once before its wait. With no answer
 in time it tells the operator to support the arm, waits ``teleop.prompt_support_grace_s``
 (default 10 s; ENTER = now), turns torque off and ends the session (saved episodes are kept; an
 unsaved one is discarded). The wait is ``select()`` on stdin in this one thread: the servo bus
@@ -37,6 +38,9 @@ keeps a single owner, and nothing reads it in the background.
 A failed torque-off write ("TORQUE OFF UNCONFIRMED", ``So101Driver.torque_off_unconfirmed``)
 blocks every further goal-position and torque-enable write; the script tells the operator to
 switch off the inline power switch and ends.
+
+Any other error (the dataset, the image pipeline, a bug) holds the follower, discards the
+episode and goes through the same support prompt before it is re-raised.
 
 A lost frame / stall holds the arm and asks you; a serial error cuts torque; a servo
 over-temperature / over-current (``robot.servo_monitor``) cuts torque AT ONCE and tells you to
@@ -92,6 +96,8 @@ from src.robot.driver import (
 )
 from src.robot.safety import DeadmanResponse, load_sim_fk
 from src.robot.units import JOINT_NAMES, UnitMap
+
+log = logging.getLogger(__name__)
 
 IMAGE_KEY = "observation.images.front"
 STATE_KEY = "observation.state"
@@ -401,7 +407,8 @@ def end_session(arm: So101Driver, sess: Session | None = None) -> None:
     safety filter, then torque off (``So101Driver.park``; Ctrl-C during the park stops it).
     Otherwise, or if the park does not complete: hold at the measured pose, then let the operator
     support the arm before torque goes off, when the driver's ``with`` block closes normally.
-    Only ENTER (or a closed stdin, or the bounded torque-on wait running out) gets there: Ctrl-C
+    The servos are read once after the hold, before the wait. Only ENTER (or a closed stdin, or
+    the bounded torque-on wait plus its grace running out) gets there: Ctrl-C
     at this prompt is ignored, a panicked second press must not drop the arm. A failed torque-off
     (driver latch) tells the operator to cut power at the inline switch.
     """
@@ -422,9 +429,10 @@ def end_session(arm: So101Driver, sess: Session | None = None) -> None:
         print("park did not complete: the follower holds")
     try:
         arm.hold()
-    except SerialFault:
+        _checked_servos(arm)  # heat from the hold so far, before the support wait
+    except (ServoFault, SerialFault):
         _torque_off_unconfirmed(arm)
-        return  # escalated to torque off already
+        return  # torque is already off (escalated, or the servo fault's response)
     tw = sess.torque_wait if sess is not None else None
     while True:
         try:
@@ -455,9 +463,39 @@ def record_session(
     pipe: Callable[[Any], Any],
 ) -> int:
     """The interactive episode loop; returns the number of saved episodes. Ends through
-    ``end_session`` unless an exception (serial fault, torque-off deadman) ends it first."""
+    ``end_session`` unless an exception (serial fault, torque-off deadman) ends it first. Any
+    other exception (a dataset or image-pipeline error, a bug) holds the follower and goes
+    through ``end_session``'s support prompt before it propagates (``_unexpected_error``): the
+    driver's ``with`` block would otherwise drop the arm at once."""
     with ctrl_c_as_flag(sess):
-        return _episodes(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
+        try:
+            return _episodes(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
+        except (DeadmanTripped, SerialFault):
+            raise  # torque already off (or not confirmed): nothing to hold or support
+        except Exception as e:
+            _unexpected_error(sess, dataset, e)
+            raise
+
+
+def _unexpected_error(sess: Session, dataset: Any, e: BaseException) -> None:
+    """Hold (a HOLD deadman trip), discard the episode, then the bounded support prompt."""
+    log.exception("teleop stopped on an unexpected error")
+    print(f"\nSTOPPED: unexpected {type(e).__name__}: {e}; episode discarded", flush=True)
+    try:
+        discard_episode(dataset)
+    except Exception as d:  # noqa: BLE001 - never skip the hold and the support prompt
+        print(f"discarding the episode failed too ({type(d).__name__}: {d})")
+    arm = sess.arm
+    torque_off = arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF
+    if arm.torque_off_unconfirmed is None and not torque_off:
+        try:
+            arm.trip(f"teleop error: {type(e).__name__}: {e}", DeadmanResponse.HOLD)
+        except SerialFault:
+            pass  # the hold escalated to torque off; end_session reports it
+    try:
+        end_session(arm, sess)
+    except Exception as f:  # noqa: BLE001 - the original error is the one to report
+        print(f"ending the session failed ({type(f).__name__}: {f})")
 
 
 def _episodes(
@@ -506,7 +544,7 @@ def _episodes(
                 print(f"\nSTOPPED: {e}\nEpisode discarded.")
                 if isinstance(e, ServoFault):
                     print("SUPPORT THE ARM NOW: torque is OFF (servo fault).")
-                dataset.clear_episode_buffer()
+                discard_episode(dataset)
                 if arm.deadman.response is not DeadmanResponse.HOLD:
                     raise  # torque is off: end the session
                 ans = torque_on_ask(
@@ -523,7 +561,7 @@ def _episodes(
                 sess, f"keep this episode ({n_frames} frames)? [Y]es / [n]o, redo / [q]uit: "
             )
             if keep == QUIT:
-                dataset.clear_episode_buffer()
+                discard_episode(dataset)
                 end_session(arm, sess)
                 return saved
             if n_frames > 0 and keep in ("", "y", "yes"):
@@ -537,7 +575,7 @@ def _episodes(
                 saved += 1
                 k += 1
             else:
-                dataset.clear_episode_buffer()
+                discard_episode(dataset)
     end_session(arm, sess)
     return saved
 

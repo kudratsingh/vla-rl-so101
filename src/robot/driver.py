@@ -33,9 +33,17 @@
   enable is refused, and the operator is told ``TORQUE_OFF_UNCONFIRMED_MSG``: switch off the
   servo supply at the inline power switch. Session code copies the latch into trial records,
   the shutdown result and the session end (``src/robot/client.py``).
-* Leaving the ``with`` block always disables torque (LeRobot's ``disable_torque_on_disconnect``;
-  explicitly first if leaving on an exception). Without a park first the arm goes limp and drops
-  onto the table: keep it low, or support it.
+* Leaving the ``with`` block always disables torque (``torque_off``, then the port is closed
+  with lerobot's ``disconnect(disable_torque=False)``). Without a park first the arm goes limp
+  and drops onto the table: keep it low, or support it.
+* ``torque_off`` writes Torque_Enable = 0 to EVERY motor, each in its own try (after a broadcast),
+  so one servo that fails (a status error bit such as overload/overheat, which lerobot's
+  ``write`` raises on, or a comm failure on a loose daisy-chain cable) never leaves the servos
+  after it energized. A write whose status reply carries an error bit counts as written (the
+  motor accepted it; the bit is logged). Motors whose write got no reply are named in the latch.
+* A ``connect`` that fails before the serial port opened (wrong ``robot.port``, USB unplugged)
+  wrote nothing: no torque-off and no "unconfirmed" alarm. Once the port is open, a failed
+  connect turns torque off (and latches on failure) before closing it.
 * ``connect`` never calibrates (calibration is interactive: ``scripts/wo06_calibrate.py``) and
   refuses an arm whose motors do not match the calibration file. Every torque enable (LeRobot's
   ``configure()`` re-enables torque at the end of ``connect``) is preceded by the rest-pose check
@@ -82,7 +90,7 @@ import numpy.typing as npt
 
 from src.config import Config
 from src.robot.safety import DeadmanResponse, FkFn, SafetyFilter, SafetyResult, make_safety
-from src.robot.servo_health import REGISTERS, ServoMonitor, monitor_from_config
+from src.robot.servo_health import CURRENT, REGISTERS, ServoMonitor, monitor_from_config
 from src.robot.units import (
     JOINT_NAMES,
     LEROBOT_DEG_PER_TICK,
@@ -286,6 +294,56 @@ def release_port(bus: Any) -> bool:
     return True
 
 
+TORQUE_ENABLE, LOCK = "Torque_Enable", "Lock"
+BROADCAST_ID = 0xFE  # scservo_sdk BROADCAST_ID
+
+
+def _bus_write(bus: Any, model: str, motor_id: int, register: str) -> str | None:
+    """One status-checked write of 0 to ``register``. None when the motor received it (a status
+    packet that carries a hardware error bit still means it was written: logged), else why not."""
+    addr, length = bus.model_ctrl_table[model][register]  # lerobot get_address
+    try:
+        comm, err = bus._write(addr, length, motor_id, 0, num_retry=5, raise_on_error=False)
+    except Exception as e:  # noqa: BLE001 - e.g. a serial exception on an unplugged USB cable
+        return f"{type(e).__name__}: {e}"
+    if not bus._is_comm_success(comm):
+        return f"no status reply: {bus.packet_handler.getTxRxResult(comm)}"
+    if bus._is_error(err):
+        log.critical(
+            "servo id %d accepted %s=0 but reports %s",
+            motor_id,
+            register,
+            bus.packet_handler.getRxPacketError(err),
+        )
+    return None
+
+
+def disable_torque_every_motor(bus: Any) -> dict[str, str]:
+    """Torque_Enable := 0 on EVERY motor of a lerobot ``FeetechMotorsBus``, then Lock := 0, each
+    motor in its own try so one failure never skips the motors after it. A broadcast
+    Torque_Enable=0 goes out first (no reply; best effort). Returns {motor: why} for the motors
+    whose Torque_Enable write was not confirmed (empty = all confirmed). Lock failures are logged
+    only: Lock guards the EEPROM, not the torque."""
+    motors = bus.motors
+    try:
+        addr = bus.model_ctrl_table[next(iter(motors.values())).model][TORQUE_ENABLE][0]
+        bus.packet_handler.write1ByteTxOnly(bus.port_handler, BROADCAST_ID, addr, 0)
+    except Exception as e:  # noqa: BLE001 - the per-motor writes below are what count
+        log.warning("broadcast torque-off failed: %s", e)
+    failed: dict[str, str] = {}
+    for name, m in motors.items():
+        why = _bus_write(bus, m.model, int(m.id), TORQUE_ENABLE)
+        if why is not None:
+            failed[name] = f"id {int(m.id)}: {why}"
+    for name, m in motors.items():
+        why = _bus_write(bus, m.model, int(m.id), LOCK)
+        if why is not None:
+            log.warning("%s: Lock=0 write not confirmed (%s)", name, why)
+    for name, why in failed.items():
+        log.critical("%s: torque-off write NOT confirmed (%s)", name, why)
+    return failed
+
+
 def install_hold_on_torque_enable(bus: Any, guard: Callable[[Any], None] | None = None) -> None:
     """Make every ``bus.enable_torque`` first run ``guard(motors)`` (which raises to refuse, torque
     still off), then write Goal_Position := Present_Position (raw ticks).
@@ -358,6 +416,14 @@ class So101Driver:
         try:
             self.follower.connect(calibrate=False)
         except BaseException:
+            if not getattr(self.follower.bus, "is_connected", True):
+                # the serial port never opened (wrong robot.port, USB unplugged): nothing was
+                # written, so there is no torque to switch off and no alarm to raise
+                log.error(
+                    "follower connect failed before the serial port opened: nothing was "
+                    "written to the servos"
+                )
+                raise
             log.critical("follower connect failed: torque off, closing the port")
             self.torque_off()
             try:
@@ -381,11 +447,13 @@ class So101Driver:
         if not self._connected:
             return
         self._connected = False
+        # torque off motor by motor first (torque_off), not lerobot's disconnect(disable_torque=
+        # True): that stops at the first motor whose write fails and never closes the port
+        self.torque_off()
         try:
-            self.follower.disconnect()  # disables torque (disable_torque_on_disconnect=True)
-        except Exception as e:  # noqa: BLE001 - must fall through to a direct torque-off
-            log.critical("disconnect failed (%s); attempting torque off directly", e)
-            self.torque_off()
+            self.follower.bus.disconnect(disable_torque=False)  # close the port (no cameras)
+        except Exception as e:  # noqa: BLE001 - torque is already handled above
+            log.warning("closing the servo port failed: %s", e)
 
     def __enter__(self) -> Self:
         self.connect()
@@ -504,14 +572,23 @@ class So101Driver:
 
     # -- bus primitives -------------------------------------------------------------------------
     def torque_off(self) -> bool:
-        """Disable torque on every motor. True if THIS write succeeded. On failure the driver
-        latches ``torque_off_unconfirmed`` (never cleared; later motion is refused) and tells
-        the operator to cut power at the inline switch. A later success does not clear it."""
-        release_port(self.follower.bus)
-        try:
-            self.follower.bus.disable_torque(num_retry=5)
-        except Exception as e:  # noqa: BLE001 - report every failure as "cut power"
-            self._latch_torque_off_unconfirmed(f"{type(e).__name__}: {e}")
+        """Disable torque on every motor. True if THIS attempt reached every motor. On failure the
+        driver latches ``torque_off_unconfirmed`` (never cleared; later motion is refused), naming
+        the motors not confirmed, and tells the operator to cut power at the inline switch. A
+        later success does not clear it.
+
+        Not lerobot's ``disable_torque``: that writes one motor at a time and stops at the first
+        exception, and its ``write`` also raises on a status packet carrying a hardware error bit
+        (overload / overheat / voltage) although that motor accepted the write, so one hot or
+        unplugged servo left every servo after it energized (``disable_torque_every_motor``)."""
+        bus = self.follower.bus
+        release_port(bus)
+        failed = disable_torque_every_motor(bus)
+        if failed:
+            self._latch_torque_off_unconfirmed(
+                "Torque_Enable=0 not confirmed on "
+                + "; ".join(f"{m} ({d})" for m, d in failed.items())
+            )
             return False
         if self.torque_off_unconfirmed is not None:
             log.critical(
@@ -637,13 +714,20 @@ class So101Driver:
     def check_servos(self) -> None:
         """Read temperature and current now (before a park, or while holding at a prompt).
         Raises ServoFault (torque already off) or SerialFault. No-op without a monitor, before
-        connect, or once torque is off."""
+        connect, or once torque is off.
+
+        A motor over the current threshold is re-read after ``current_trip_s`` (same thread, the
+        driver's sleep) before this returns, so a sustained over-current trips here, within about
+        ``current_trip_s``, and not only at the next read after a prompt's whole wait."""
         if self.monitor is None or not self._connected or self.torque_off_unconfirmed is not None:
             return
         if self.deadman.tripped and self.deadman.response is DeadmanResponse.TORQUE_OFF:
             return
         for reg in REGISTERS:
             self._read_health(reg)
+        if self.monitor.pending_over_current():
+            self.sleep(self.monitor.config.current_trip_s)
+            self._read_health(CURRENT)
 
     # -- control --------------------------------------------------------------------------------
     def step(

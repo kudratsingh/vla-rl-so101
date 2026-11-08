@@ -32,6 +32,11 @@ Registers, units and scaling (verified against the installed lerobot 0.4.4,
 Fault rule. Temperature: one reading at or above ``max_temperature_c`` trips (temperature is
 slow and not noisy). Current: a motor whose readings stay above ``max_current_ma`` for at least
 ``current_trip_s`` trips (acceleration spikes are brief; a blocked or squeezing servo is not).
+"Stay above" needs at least two consecutive over-threshold readings with no gap between two
+current reads longer than ``max(2 * register_period_s, current_trip_s)``: after a longer
+unmonitored gap (an operator prompt, the move home) the window restarts at the new reading, so
+two isolated spikes minutes apart never count as sustained. ``check_servos()`` re-reads a motor
+found over the threshold after ``current_trip_s`` before it returns.
 The response belongs to the driver: TORQUE OFF at once with the operator told to support the
 arm. Not HOLD (keeps the hot servo energized) and not a powered park (adds motion during the
 fault). The thresholds in ``configs/real.yaml`` (55 C, 1500 mA for 1 s) are PROVISIONAL: kept by
@@ -40,9 +45,11 @@ the owner on 2026-11-08 for the first sessions, to be confirmed with the logged 
 Not covered: the arm is not monitored continuously between control loops (an operator prompt
 with the arm holding), because the serial bus has a single owner (one thread) and a background
 reader would contend for the port with the control loop. The driver's ``check_servos()`` reads
-both registers once on demand: before a park, before and after each torque-on teleop prompt
-(whose wait is bounded, ``teleop.prompt_torque_timeout_s``), and after the real-eval settling
-interval.
+both registers once on demand (plus the over-current re-read above): before a park, before
+and after each torque-on teleop prompt (scene, keep, resume; the wait is bounded,
+``teleop.prompt_torque_timeout_s``), before the final teleop support prompt, and after the
+real-eval settling interval. The real-eval / pilot prompts (``src/robot/client.py``) wait
+without a time limit and are not read during the wait: an accepted gap (docs/STATUS.md).
 """
 
 from __future__ import annotations
@@ -121,6 +128,8 @@ class ServoMonitor:
         self._tick = 0
         self._next = 0  # index into REGISTERS
         self._over_since: dict[str, float] = {}
+        self._over_n: dict[str, int] = {}  # consecutive over-threshold current readings
+        self._last_current_t: float | None = None
         self.max_temperature_c: dict[str, float] = {}
         self.max_current_ma: dict[str, float] = {}
         self.last: dict[str, dict[str, float]] = {}
@@ -137,6 +146,15 @@ class ServoMonitor:
         reg = REGISTERS[self._next]
         self._next = (self._next + 1) % len(REGISTERS)
         return reg
+
+    @property
+    def max_current_gap_s(self) -> float:
+        """Longest gap between two current reads that still counts as continuous monitoring."""
+        return max(2 * self.config.register_period_s, self.config.current_trip_s)
+
+    def pending_over_current(self) -> bool:
+        """A motor's last current reading was over the threshold without tripping (yet)."""
+        return bool(self._over_since)
 
     def note_read_ms(self, ms: float) -> None:
         self._reads += 1
@@ -176,15 +194,23 @@ class ServoMonitor:
             self.last[CURRENT] = amps
             for m, a in amps.items():
                 self.max_current_ma[m] = max(self.max_current_ma.get(m, -math.inf), a)
+            gap = math.inf if self._last_current_t is None else now - self._last_current_t
+            self._last_current_t = now
+            if gap > self.max_current_gap_s:  # unmonitored in between: nothing was "sustained"
+                self._over_since.clear()
+                self._over_n.clear()
             for m, a in amps.items():
                 if a <= c.max_current_ma:
                     self._over_since.pop(m, None)
+                    self._over_n.pop(m, None)
                     continue
                 since = self._over_since.setdefault(m, now)
-                if now - since >= c.current_trip_s:
+                n = self._over_n[m] = self._over_n.get(m, 0) + 1
+                if now - since >= c.current_trip_s and (n >= 2 or c.current_trip_s == 0):
                     return (
                         f"over-current: {m} at {a:.0f} mA (> {c.max_current_ma:.0f} mA) for "
-                        f"{now - since:.2f} s (>= {c.current_trip_s:.2f} s); all currents (mA) "
+                        f"{now - since:.2f} s over {n} consecutive readings (>= "
+                        f"{c.current_trip_s:.2f} s); all currents (mA) "
                         f"{ {k: round(v) for k, v in amps.items()} }"
                     )
             return None

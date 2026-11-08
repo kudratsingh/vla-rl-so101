@@ -6,10 +6,11 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+from typing import Any
 
 import numpy as np
 import pytest
-from robot_fakes import FakeClock, FakeFollower, real_cfg, toy_fk
+from robot_fakes import LAST_TORQUE_OFF_CALL, FakeClock, FakeFollower, real_cfg, toy_fk
 
 from src.robot.driver import DeadmanTripped, ParkSettings, ServoFault, So101Driver
 from src.robot.safety import DeadmanResponse, make_safety
@@ -97,7 +98,7 @@ def test_over_temperature_cuts_torque_at_once_not_hold_not_park() -> None:
         arm.step(target, frame_time=clock())  # tick 4: writes, then reads the temperature
     assert "Support it" in str(e.value)
     assert len(fol.sent) == n_sent + 1  # this tick's command only: no hold write afterwards
-    assert not fol.bus.torque_enabled and fol.bus.calls[-1] == ("disable_torque", None)
+    assert not fol.bus.torque_enabled and fol.bus.calls[-1] == LAST_TORQUE_OFF_CALL
     assert arm.deadman.tripped and arm.deadman.response is DeadmanResponse.TORQUE_OFF
     assert arm.servo_fault is not None and "elbow_flex" in arm.servo_fault
     # nothing reaches the bus any more: no hold, no park, no step
@@ -124,3 +125,47 @@ def test_check_servos_on_demand_and_sustained_current_trip() -> None:
     assert not fol.bus.torque_enabled and arm.deadman.response is DeadmanResponse.TORQUE_OFF
     s = arm.monitor.summary() if arm.monitor else {}
     assert s["max_current_ma"]["gripper"] >= 2500.0 - 6.5
+
+
+def test_over_current_across_an_unmonitored_gap_is_not_sustained() -> None:
+    """Regression (PR 29 review): one over-threshold reading at a settle read and one spike at
+    the next homing read minutes later used to trip "for 90 s"."""
+    m = ServoMonitor(config(max_current_ma=1500.0, current_trip_s=1.0))
+    hi = {**{n: 100 for n in JOINT_NAMES}, "shoulder_lift": round(1599 / 6.5)}
+    assert m.update(CURRENT, hi, 0.0) is None
+    assert m.update(CURRENT, hi, 90.0) is None  # 90 s with no current read: the window restarts
+    assert m.update(CURRENT, hi, 90.533) is None
+    reason = m.update(CURRENT, hi, 91.066)  # continuously monitored for >= 1 s: trips
+    assert reason is not None and "3 consecutive readings" in reason
+    m2 = ServoMonitor(config(max_current_ma=1500.0, current_trip_s=1.0))
+    assert [m2.update(CURRENT, hi, t) for t in (0.0, 0.533)] == [None, None]
+    assert m2.update(CURRENT, hi, 1.066) is not None
+
+
+@pytest.mark.parametrize("stays_high", [True, False])
+def test_check_servos_rereads_an_over_current_before_a_prompt(stays_high: bool) -> None:
+    """Regression (PR 29 review): an over-current found by the pre-prompt read used to wait for
+    the next read after the whole prompt (up to 60 s) before it could trip."""
+    clock = FakeClock()
+    fol = FakeFollower()
+    arm = driver(fol, clock)
+    fol.current_ma["elbow_flex"] = 1800.0  # holding against an obstacle
+    real_read = fol.bus.sync_read
+
+    def sync_read(data_name: str, motors: Any = None, *, normalize: bool = True) -> Any:
+        out = real_read(data_name, motors, normalize=normalize)
+        if data_name == CURRENT and not stays_high:
+            fol.current_ma["elbow_flex"] = 200.0  # the next read is back under the limit
+        return out
+
+    fol.bus.sync_read = sync_read  # type: ignore[method-assign]
+    t0 = clock()
+    if stays_high:
+        with pytest.raises(ServoFault, match="over-current: elbow_flex"):
+            arm.check_servos()
+        assert not fol.bus.torque_enabled and arm.deadman.response is DeadmanResponse.TORQUE_OFF
+    else:
+        arm.check_servos()
+        assert fol.bus.torque_enabled and not arm.deadman.tripped
+    assert clock() - t0 == pytest.approx(1.0)  # one current_trip_s re-read, inside the call
+    assert sum(c == ("sync_read", CURRENT) for c in fol.bus.calls) == 2  # the read + the re-read
