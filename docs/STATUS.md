@@ -16,6 +16,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 04 | **benchmark not met; next step waits for the owner**, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
 | 05, 07, 08, 09 | not started | | |
 | pre-run hardening | PR open, **waits for owner review** (touches the RL loop) | `fix/pre-run-hardening` | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
+| robot safety (PR 2) | PR open against `wo-07-pilot`; merge after #23, #24 and #28 (it merges #24 and #28) | `fix/robot-safety` | Review 3.3 gaps 2, 3, 5 and 7, $0, **unverified on hardware**. See "Robot safety hardening" below. |
 
 ## Benchmarks met
 
@@ -187,9 +188,64 @@ comparison, and the 0.2 clip and end-flag capture on CUDA.
 Deferred: the 4 deg/step clip inside RL rollouts (review Track B item 4), so RL rollouts and 0.2
 eval do not yet see the same action limits; `src.eval.sim_eval.clip_joint_step` is ready to reuse.
 The robot items (servo temperature/current fault response, `park()` on healthy shutdown, camera
-timestamp, placement grid, `wo07_real_eval.py`) belong to PR 2, on PR #23's branch. The plan
+timestamp, placement grid, `wo07_real_eval.py`) are in PR 2 (`fix/robot-safety`, on PR #23's
+branch; see "Robot safety hardening" below). The plan
 revision for PR #25 is on `wo-recovery-sft`. PR #25's `configs/rl_pickplace_lr*.yaml` use the
 removed `early_stop_*` / `peak_stop_step` keys and need renaming when it merges, or they fail fast.
+
+## Robot safety hardening (PR 2, branch `fix/robot-safety`, 2026-11-08, $0)
+
+Review 3.3 and section 9's robot item. The branch is PR #23's branch (`wo-07-pilot`) with #24
+(`wo-06-bringup`) and #28 (`fix/pre-run-hardening`) merged in. Tested only with
+`tests/robot_fakes.py`. **Nothing here has run on the arm or camera.**
+
+- Healthy shutdown parks. `So101Driver.park` drives to `robot.park.qpos` (`null` =
+  `deploy.home_qpos`, the sim REST_QPOS) through the full safety filter, then turns torque off.
+  It is wired into `scripts/wo07_pilot.py`, `scripts/wo07_real_eval.py` (`shutdown_session`:
+  session completed, `q`, or Ctrl-C at a prompt) and the healthy end of
+  `scripts/wo06_teleop_record.py`. It refuses once the deadman has tripped, so a fault path or
+  a Ctrl-C during motion never parks: those hold, then the support prompt, then torque off.
+- Servo temperature and current monitor (`src/robot/servo_health.py`). After each tick's write,
+  every 4th tick does one extra `sync_read` of `Present_Temperature` (addr 63, deg C) or
+  `Present_Current` (addr 69, 6.5 mA/count, bit 15 masked). Each register is read every 533 ms
+  at 15 Hz. Registers were checked in lerobot 0.4.4's `STS_SMS_SERIES_CONTROL_TABLE`. Read time
+  is logged against a 10 ms budget. A fault means torque off at once, the deadman latched
+  TORQUE_OFF, and a `SERVO FAULT` prompt to support the arm and cut the supply: not HOLD, not a
+  park. Thresholds are 55 C (the firmware cut-out is 70 C) and 1500 mA sustained for 1 s. They
+  are **placeholders that need the owner's confirmation on the arm**. Teleop also reads both
+  registers after each scene prompt, before the follower moves. The monitor does not read while
+  a prompt waits.
+- Torque-enable refusal. Every torque enable first runs `check_rest_pose` with torque off. It
+  refuses when a joint rests more than 1 deg outside its calibrated range (the calibration file
+  and the servo EEPROM must also agree) or more than 6 deg outside the safety limits. Covers
+  #24's not-done item.
+- Ctrl-C port-busy backstop. scservo_sdk's `txPacket` sets `port.is_using`, and only the receive
+  or TxOnly paths clear it, so a Ctrl-C mid-transaction would block the hold or torque-off that
+  follows. `release_port` (`clearPort()`, `is_using = False`, then drop the input buffer, as
+  lerobot's `disconnect` does) runs first in `hold`, `torque_off`, `trip` and `park`. Covers
+  #24's skipped finding.
+- Latency. LeRobot 0.4.4 stamps a frame after `VideoCapture.read()` returns, and OpenCV 4.11's
+  AVFoundation backend exposes no capture time. The metric is renamed
+  `frame_return_to_first_write_ms` and is never called end-to-end.
+  `docs/bringup/latency-measurement.md` gives the one-off optical measurement (screen clock
+  filmed by the robot camera). With `deploy.capture_offset_ms` set, the summary adds a labelled
+  `end_to_end_estimate_ms`.
+- `scripts/wo07_real_eval.py`: protocol cells × `eval.trials_per_cell` (50), placement-grid slots
+  from `src/eval/real_grid.py` (seeded by `eval.slot_seed`, so SFT and SFT+RL sessions are paired
+  trial by trial), and the judging rule `real-judge-1`: judged once after the arm stops, no success
+  latch, doubt = n. Every trial record carries the protocol 0.2 hash, the 0.1-draft reference, and
+  the hashes of the rule, the grid and the PDF. The run record holds the Wilson table.
+  `--resume <run id>` redoes unscored trials with the same placement and refuses if the
+  evaluation changed. `--hardware` is gated like the pilot. `--mock` runs on the fakes.
+- `docs/assets/placement-grid-a3.pdf` (`scripts/make_placement_grid.py`, vector PDF written
+  directly, no new dependency): a 6 × 6 lattice of SHIFTED_REGION whose inner 4 × 4 is exactly
+  SEEN_REGION, slot ids A1-F6, the robot base outline from the URDF meshes, axes, and a 10 cm scale
+  bar. Print at 100% and measure the bar. `--check` fails if the committed PDF is stale.
+
+Unverified on hardware: every item above. In particular: the thresholds, the read cost on the
+Mac's USB-serial link, whether the park pose rests safely with torque off, the refusal
+tolerances against a real calibration, the port-busy recovery on a real interrupted packet, the
+capture offset, and the printed grid's scale and alignment with the real base.
 
 ## Blockers and decisions pending the owner
 
@@ -234,6 +290,9 @@ removed `early_stop_*` / `peak_stop_step` keys and need renaming when it merges,
 
 ## Decisions taken by the agent (one line each, link ADR if any)
 
+- 2026-11-08 Servo fault thresholds 55 C / 1500 mA for 1 s, read every 4th tick (placeholders: firmware Max_Temperature_Limit 70 C; lerobot sets the gripper's Protection_Current to 250 counts = 1625 mA); owner to confirm on the arm.
+- 2026-11-08 Real judging rule `real-judge-1`: judged once after the arm stops, all success conditions true at that moment, doubt = n (stricter than the sim's latched success).
+- 2026-11-08 Real placement: a stratified 6 x 6 slot lattice of SHIFTED_REGION (seen = inner 4 x 4) instead of continuous positions, so an operator can place objects by hand; one slot seed pairs the SFT and SFT+RL sessions.
 - 2026-10-26 Python 3.11 kept; LeRobot pinned to 0.4.4, the last release supporting 3.11 (0.5+ needs ≥3.12).
 - 2026-10-26 PyTorch 2.6.0 instead of 2.5.x: every LeRobot ≥0.3 needs torchcodec ≥0.2.1, which pairs with torch 2.6.
 - 2026-10-26 ManiSkill 3.0.1 (stable) instead of a 3.0.0bX beta; SAPIEN 3.0.3 (macOS wheels).

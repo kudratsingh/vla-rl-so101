@@ -21,5 +21,10 @@ logged (target <150 ms); video produced.
 
 ## Notes
 
+- Latency (2026-11-08): the client logs `frame_return_to_first_write_ms`, which starts at
+  LeRobot's frame stamp (taken after the driver returns the frame) and so excludes capture. The
+  benchmark's capture-to-write number needs the one-off optical offset from
+  `docs/bringup/latency-measurement.md` (`deploy.capture_offset_ms`). Until that is measured,
+  no latency is called end-to-end.
 - Expect real numbers well below sim. Published zero-real-demo sim-to-real landed at 17.5% → 38.5%.
   Report whatever happens; WO-08 is for fixing it.
