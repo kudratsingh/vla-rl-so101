@@ -234,7 +234,11 @@ class So101Driver:
 
     def hold(self, measured: FloatArray | None = None) -> None:
         """Goal := measured pose (zero position error, servos stop pushing). Bypasses the filter:
-        holding where the arm already is cannot move it."""
+        holding where the arm already is cannot move it. Refused (nothing read or written) while
+        the deadman is latched TORQUE_OFF: the bus is suspect and torque must stay off."""
+        if self.deadman.tripped and self.deadman.response is DeadmanResponse.TORQUE_OFF:
+            log.critical("hold refused: torque is OFF after %s", self.deadman.reason)
+            return
         q = self.read_state() if measured is None else measured
         self._write(q)
         self.safety.reset_reference()
