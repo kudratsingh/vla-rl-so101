@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-11-07
+Updated: 2026-11-08
 
 ## Current work order
 
@@ -84,6 +84,13 @@ probe gate.
   2026-10-31) remains on hold. The core plan prioritizes the hardware baseline and recovery SFT
   before approving a higher-LR diagnostic. WO-05 paid ablations remain deferred pending the
   sim results and a separate scope decision.
+- Track C (review section 8), pi0.5 action-expert option: plan in `docs/plans/track-c-pi05.md`
+  (2026-11-08, $0, nothing run on a GPU). LeRobot 0.4.4 ships pi0.5, but it needs the
+  `fix/lerobot_openpi` transformers fork (4.53.3), which conflicts with the frozen 4.57.6. It
+  therefore needs a separate pinned pod env (owner decision D1, rule 2). Probe
+  `estimated: A100 80GB x 0.9 h = $1.61`; full 25-demo run `estimated: A100 80GB x 11.1 h =
+  $19.87`. Unverified on GPU: VRAM, s/step, inference latency. Not few-shot (25 demos): label
+  any result as a real-data baseline.
 
 ## Owner decisions in effect
 
