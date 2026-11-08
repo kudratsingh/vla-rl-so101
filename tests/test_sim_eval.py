@@ -16,7 +16,16 @@ import pytest
 import torch
 from torch import Tensor
 
-from src.eval.sim_eval import episode_seeds, evaluate, run_batch, summarize, to_markdown
+import src.env.cameras  # noqa: F401  (real module cached before src.env is stubbed below)
+from src.eval import protocol_v02
+from src.eval.sim_eval import (
+    EpisodeRecord,
+    episode_seeds,
+    evaluate,
+    run_batch,
+    summarize,
+    to_markdown,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -29,6 +38,7 @@ class FakeEnv:
         self.task, self.num_envs, self.unwrapped = task, n, self
         self.steps = 0
         self.seeds: list[int] = []
+        self.actions: list[Tensor] = []
         self.closed = False
 
     def reset(self, seed: list[int]) -> tuple[dict[str, Tensor], dict[str, Any]]:
@@ -41,11 +51,15 @@ class FakeEnv:
 
     def step(self, actions: Tensor) -> tuple[Any, Tensor, Tensor, Tensor, dict[str, Tensor]]:
         assert actions.shape == (self.num_envs, 6)
+        self.actions.append(actions.clone())
         self.steps += 1
         success = torch.tensor([s % 3 == 0 and self.steps >= 3 for s in self.seeds])
         trunc = torch.full((self.num_envs,), self.steps >= 10)
         zeros = torch.zeros(self.num_envs, dtype=torch.bool)
-        return self._obs(), zeros.float(), zeros, trunc, {"success": success}
+        grasped = torch.tensor([s % 2 == 1 for s in self.seeds])
+        steps = torch.full((self.num_envs,), self.steps)  # not a bool flag: not an end flag
+        info = {"success": success, "is_grasped": grasped, "elapsed_steps": steps}
+        return self._obs(), zeros.float(), zeros, trunc, info
 
     def _obs(self) -> dict[str, Tensor]:
         return {
@@ -96,6 +110,30 @@ def test_run_batch_receding_horizon_requeries_policy() -> None:
     assert not s.any()
 
 
+def ones_act(obs: Mapping[str, Tensor], instructions: Sequence[str]) -> Tensor:
+    return torch.ones(len(instructions), 8, 6)  # 1 rad from the 0 rad reset pose on every joint
+
+
+def test_run_batch_action_clip_and_end_flags() -> None:
+    env = FakeEnv("Push", 3)
+    end: dict[str, Tensor] = {}
+    s, ln = run_batch(
+        ones_act, env, lambda o: o, [0, 1, 2], max_steps=150, action_clip=0.25, end_info=end
+    )
+    sent = torch.stack(env.actions)  # (T, 3, 6): 0.25, 0.5, 0.75, then 1.0 on every joint
+    assert torch.equal(sent[:4, 0, 0], torch.tensor([0.25, 0.5, 0.75, 1.0]))
+    assert float((sent[1:] - sent[:-1]).abs().max()) <= 0.25
+    assert s.tolist() == [True, False, False] and ln.tolist() == [3, 10, 10]
+    assert end["clipped_steps"].tolist() == [3, 3, 3]
+    assert end["success"].tolist() == [True, False, False]
+    assert end["truncated"].tolist() == [False, True, True]
+    assert end["is_grasped"].tolist() == [False, True, False]
+    assert "elapsed_steps" not in end  # only bool flags
+    env2 = FakeEnv("Push", 3)  # no clip: the raw chunk is executed, same outcome here
+    run_batch(ones_act, env2, lambda o: o, [0, 1, 2], max_steps=150)
+    assert torch.equal(torch.stack(env2.actions), torch.ones(10, 3, 6))
+
+
 def test_evaluate_summarize_markdown() -> None:
     envs: list[FakeEnv] = []
 
@@ -103,6 +141,7 @@ def test_evaluate_summarize_markdown() -> None:
         envs.append(FakeEnv(task, n))
         return envs[-1]
 
+    records: list[EpisodeRecord] = []
     res = evaluate(
         zero_act,
         make_env,
@@ -115,8 +154,18 @@ def test_evaluate_summarize_markdown() -> None:
         max_steps=150,
         all_tasks=["PickPlace", "Push", "Stack"],
         all_cells=["seen", "shifted", "unseen_objects"],
+        log_episode=records.append,
     )
     assert len(res) == 4 and all(r.episodes == 7 for r in res) and all(e.closed for e in envs)
+    assert len(records) == 4 * 7  # padding episodes (2 batches of 4 for 7) are not recorded
+    for r in res:
+        mine = [e for e in records if (e.cell, e.seed) == (r.cell, r.seed)]
+        assert [e.episode_seed for e in mine] == episode_seeds(
+            r.seed, 1, ["seen", "shifted"].index(r.cell), 7
+        )
+        assert sum(e.success for e in mine) == r.successes
+        assert all((e.end_reason == "success") == e.success for e in mine)
+        assert all(e.end_reason in ("success", "truncated") and e.clipped_steps == 0 for e in mine)
     for r in res:  # successes = seeds divisible by 3 among this cell's 7 episode seeds
         seeds = episode_seeds(r.seed, 1, ["seen", "shifted"].index(r.cell), 7)
         assert r.successes == sum(s % 3 == 0 for s in seeds)
@@ -128,8 +177,7 @@ def test_evaluate_summarize_markdown() -> None:
     assert "| Push | seen |" in md and "| Push | shifted |" in md
 
 
-@pytest.fixture()
-def wo01_standins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def _install_standins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub_protocol: bool) -> Path:
     protocol = types.ModuleType("src.eval.protocol")
     protocol.__dict__.update(
         TASKS=("PickPlace", "Push", "Stack"),
@@ -144,6 +192,7 @@ def wo01_standins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     env.__dict__.update(
         make_env=lambda cfg, task, num_envs, cell: FakeEnv(task, num_envs),
         policy_obs=lambda obs: obs,
+        CONTROL_HZ=15,
     )
 
     class Run:
@@ -163,9 +212,23 @@ def wo01_standins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     runs = types.ModuleType("src.runs")
     runs.Run = Run  # type: ignore[attr-defined]
-    for name, mod in (("src.eval.protocol", protocol), ("src.env", env), ("src.runs", runs)):
+    stubs: list[tuple[str, types.ModuleType]] = [("src.env", env), ("src.runs", runs)]
+    if stub_protocol:
+        stubs.append(("src.eval.protocol", protocol))
+    for name, mod in stubs:
         monkeypatch.setitem(sys.modules, name, mod)
     return tmp_path / "run"
+
+
+@pytest.fixture()
+def wo01_standins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    return _install_standins(tmp_path, monkeypatch, stub_protocol=True)
+
+
+@pytest.fixture()
+def env_standins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Fake env + run dir, real protocol modules."""
+    return _install_standins(tmp_path, monkeypatch, stub_protocol=False)
 
 
 def test_wo02_eval_tiny_end_to_end(wo01_standins: Path) -> None:
@@ -173,8 +236,27 @@ def test_wo02_eval_tiny_end_to_end(wo01_standins: Path) -> None:
 
     out = wo02_eval.main(["--preset", "tiny", "--episodes", "3", "--num-envs", "2"])
     assert out["protocol_complete"] is False and out["protocol_hash"] == "f" * 64
+    assert "action_clip_rad" not in out  # 0.1-draft (default): no clip
     saved = json.loads((wo01_standins / "eval.json").read_text())
     assert [(r["task"], r["cell"], r["episodes"]) for r in saved["rows"]] == [
         ("PickPlace", "seen", 3)
     ]
     assert (wo01_standins / "eval.md").read_text().startswith("Policy `tiny-random`")
+    lines = (wo01_standins / "episodes.jsonl").read_text().splitlines()
+    assert len(lines) == 3 and all(json.loads(x)["clipped_steps"] == 0 for x in lines)
+
+
+def test_wo02_eval_protocol_v02_tiny(env_standins: Path) -> None:
+    import wo02_eval
+
+    argv = ["--preset", "tiny", "--episodes", "3", "--num-envs", "2", "--protocol", "0.2"]
+    out = wo02_eval.main(argv)
+    assert out["protocol_version"] == "0.2"
+    assert out["protocol_hash"] == protocol_v02.protocol_hash()
+    assert out["action_clip_rad"] == protocol_v02.action_clip().bound_rad
+    assert out["protocol_complete"] is False  # tiny: CPU sim, 64 px images
+    assert any("image_size" in d for d in out["protocol_deviations"])
+    assert "src/env/success.py" in out["protocol_components"]["files"]
+    eps = [json.loads(x) for x in (env_standins / "episodes.jsonl").read_text().splitlines()]
+    assert [(e["task"], e["cell"], e["seed"]) for e in eps] == [("PickPlace", "seen", 0)] * 3
+    assert {"success", "is_grasped"} <= set(eps[0]["flags"])
