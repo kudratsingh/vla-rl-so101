@@ -86,12 +86,19 @@ class TailSettings:
     least `min_steps` frames and until the oracle has finished its script (release target
     reached, retreat done), capped at `max_steps` frames. The DEFAULTS (0 / 0 / no final check)
     reproduce the 0.1 recorder, so sim.yaml / sft_a4.yaml keep their behaviour and config hash;
-    configs/demos_v2.yaml (and demos_v2_tiny.yaml) opt in with 15 / 45 / true.
+    configs/demos_v2.yaml (and demos_v2_tiny.yaml) opt in with 15 / 45 / true / true.
+
+    `require_finished` (owner 2026-11-08): a successful episode whose tail did not finish -- the
+    oracle script was still running when the recording ended (the max_steps cap), or a grasp task's
+    last gripper command is off the release target -- is REJECTED on its own and reported
+    (`demos_rejected`, `rejected_episodes`); the next seed is recorded in its place, so one bad
+    episode no longer blocks pushing the valid ones.
     """
 
     min_steps: int = 0  # data.post_success_steps (demos_v2: 15)
     max_steps: int = 0  # data.post_success_max_steps (demos_v2: 45)
     require_final_success: bool = False  # data.require_final_success: success holds at the end
+    require_finished: bool = False  # data.require_tail_finished: release + retreat completed
 
     @classmethod
     def from_cfg(cls, cfg: dict[str, Any]) -> TailSettings:
@@ -102,10 +109,28 @@ class TailSettings:
             require_final_success=bool(
                 data.get("require_final_success", cls.require_final_success)
             ),
+            require_finished=bool(data.get("require_tail_finished", cls.require_finished)),
         )
         if not 0 <= out.min_steps <= out.max_steps:
             raise ValueError(f"need 0 <= post_success_steps <= post_success_max_steps: {out}")
         return out
+
+
+RELEASE_TOL = 1e-3  # rad: the last gripper command counts as "at the release target"
+
+
+def tail_problems(task: str, oracle_finished: bool, last_gripper: float) -> list[str]:
+    """Why a successful demo's recorded tail is unfinished ([] = fine): the oracle script had not
+    finished (release / retreat cut off), or a grasp task (not Push, which keeps the gripper closed)
+    ends with the gripper off the release target."""
+    from src.data.oracle import GRIPPER_RELEASE
+
+    out = []
+    if not oracle_finished:
+        out.append("oracle_unfinished")
+    if task != "Push" and abs(last_gripper - GRIPPER_RELEASE) >= RELEASE_TOL:
+        out.append("off_release_target")
+    return out
 
 
 def oracle_profile(cfg: dict[str, Any]) -> str:
@@ -138,6 +163,7 @@ def run_task(
 
     n_run = n_success = recorded = env_steps = tail_lost = 0
     lengths: list[int] = []
+    rejected: list[dict[str, Any]] = []  # successful episodes not recorded, and why
     rec_lengths: list[int] = []
     tails: list[int] = []
     finished_tails = 0
@@ -205,6 +231,15 @@ def run_task(
             if ok and recorded < demos:
                 if tail.require_final_success and not bool(final_ok[i]):
                     tail_lost += 1  # success did not hold through release / retreat
+                    rejected.append({"seed": seeds[i], "reasons": ["final_success_lost"]})
+                    continue
+                why = (
+                    tail_problems(task, bool(finished[i]), float(frames[2][-1][5]))
+                    if tail.require_finished
+                    else []
+                )
+                if why:  # rejected on its own; the next seed takes its place
+                    rejected.append({"seed": seeds[i], "reasons": why})
                     continue
                 for img, st, ac in zip(*frames, strict=True):
                     recorder.add_frame(img, st, ac, instructions[i])
@@ -255,6 +290,11 @@ def run_task(
         "mean_post_success_frames": float(np.mean(tails)) if tails else 0.0,
         "demos_oracle_finished": finished_tails,
         "demos_rejected_tail_lost_success": tail_lost,
+        "demos_rejected": {
+            r: sum(r in x["reasons"] for x in rejected)
+            for r in ("final_success_lost", "oracle_unfinished", "off_release_target")
+        },
+        "rejected_episodes": rejected,
         "oracle_profile": profile,
         "tail": asdict(tail),
         "env_steps": env_steps,
@@ -370,6 +410,15 @@ def main(argv: list[str] | None = None) -> int:
         f"dataset: {recorder.repo_id} -> {os.path.relpath(recorder.root, REPO_ROOT)}"
         f" ({recorder.num_episodes} episodes, {recorder.num_frames} frames)"
     )
+    for task, s in stats.items():
+        if s["rejected_episodes"]:
+            print(
+                f"{task}: rejected {len(s['rejected_episodes'])} successful episodes individually "
+                f"(not recorded; replaced by later seeds) {s['demos_rejected']}: "
+                + ", ".join(
+                    f"seed {r['seed']} {'/'.join(r['reasons'])}" for r in s["rejected_episodes"]
+                )
+            )
     if args.push:
         print(f"pushed: {run.results['dataset']['hub_url']}")
     print(f"record: {run.record_path}")

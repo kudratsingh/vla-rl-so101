@@ -87,5 +87,5 @@ def test_existing_presets_keep_the_01_recorder_and_cannot_clobber_the_01_repos()
         with pytest.raises(SystemExit):
             build.main(["--preset", "sim", "--config", str(CONFIG_DIR / name), "--push"])
     v2 = load_config("sim", CONFIG_DIR / "demos_v2.yaml")
-    assert build.TailSettings.from_cfg(v2) == build.TailSettings(15, 45, True)
+    assert build.TailSettings.from_cfg(v2) == build.TailSettings(15, 45, True, True)
     assert build.oracle_profile(v2) == "v2" and v2["data"]["chunk_pad"] == "drop"

@@ -9,6 +9,10 @@ and RL rollout renders on the NVIDIA GPU sim. Two modes:
               v2 oracle (configs/demos_v2.yaml), then a tail check of the written dataset (every
               PickPlace/Stack demo ends at the release target, every demo's oracle script ran to
               its end, TCP rise after success). `--push` uploads it (private) only if that passes.
+              An unfinished episode is rejected ON ITS OWN while recording (data.require_tail_
+              finished, wo01_build_env.py tail_problems; reported per seed) and the next seed is
+              recorded instead, so one bad episode does not block the valid ones; the tail check
+              is the safety net and still blocks a push that is short of demos_per_task.
   render-gap  re-render the stored demos on this machine's backend: reset each demo's seed, replay
               its recorded actions open loop, and diff every fresh frame against the stored
               (AV1-decoded) frame; the stored-vs-replayed joint state shows where physics diverges.
@@ -151,7 +155,9 @@ def tail_report(root: Path, tasks: list[str]) -> dict[str, dict[str, Any]]:
 
 
 def tail_ok(report: dict[str, dict[str, Any]], demos: int) -> list[str]:
-    """Problems that block a push: missing demos, unfinished release/retreat."""
+    """Problems that block a push: missing demos, unfinished release/retreat. With
+    data.require_tail_finished the build already rejected unfinished episodes one by one (and
+    replaced them), so only a shortfall should remain here."""
     bad = []
     for task, r in report.items():
         if r["demos"] < demos:

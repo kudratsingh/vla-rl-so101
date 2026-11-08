@@ -14,6 +14,7 @@ data:
   post_success_steps: 15        # record >= 15 frames past the success step ...
   post_success_max_steps: 45    # ... until release + retreat are done, at most 45 (0.1 set: 0 / 0)
   require_final_success: true   # success must still hold on the last recorded frame
+  require_tail_finished: true   # reject (and replace) a demo whose release/retreat did not finish
   chunk_pad: drop               # SFT on this set: no padded chunks in the loss (0.1 runs: repeat)
 
 render_gap:                     # --mode render-gap defaults

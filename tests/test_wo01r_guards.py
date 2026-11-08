@@ -67,3 +67,146 @@ def test_wo01r_push_path_refuses_the_protected_repos(
         recorder.push_dataset(recorder.PROTECTED_HUB_REPOS[1], tmp_path / "nowhere")
     recorder.check_push_target("KudratSingh22/vla-rl-so101-demos-25-v2")  # the v2 repo is fine
     recorder.check_push_target(recorder.PROTECTED_HUB_REPOS[0], allow_protected=True)
+
+
+class _Env:
+    """One env: success from the 3rd step on; obs state = step count."""
+
+    def __init__(self) -> None:
+        self.t = 0
+        self.num_envs = 1
+
+    @property
+    def unwrapped(self) -> Any:
+        return self
+
+    def get_instructions(self) -> list[str]:
+        return ["pick"]
+
+    def reset(self, *, seed: Any = None) -> tuple[Any, dict[str, Any]]:
+        self.t = 0
+        self.seed = int(seed)
+        return {"t": self.t}, {}
+
+    def step(self, action: Any) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
+        import torch
+
+        self.t += 1
+        return (
+            {"t": self.t},
+            0.0,
+            torch.zeros(1, dtype=torch.bool),
+            torch.zeros(1, dtype=torch.bool),
+            {"success": torch.tensor([self.t >= 3])},
+        )
+
+    def close(self) -> None:
+        pass
+
+
+class _Oracle:
+    """Finishes its script at step 5, except on BAD seeds, where the release never completes
+    (the recording hits post_success_max_steps with the gripper short of the release target)."""
+
+    def __init__(self, env: _Env, bad: set[int]) -> None:
+        self.env, self.bad = env, bad
+
+    def reset(self, obs: Any) -> None:
+        pass
+
+    def _ok(self) -> bool:
+        return self.env.seed not in self.bad
+
+    def act(self, obs: Any) -> Any:
+        import torch
+
+        from src.data.oracle import GRIPPER_RELEASE
+
+        grip = GRIPPER_RELEASE if self._ok() and self.env.t >= 3 else 0.25
+        return torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, grip]])
+
+    def finished(self) -> Any:
+        import torch
+
+        return torch.tensor([self._ok() and self.env.t >= 5])
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.episodes: list[dict[str, Any]] = []
+        self.frames = 0
+
+    def get(self, hw: Any) -> _Recorder:
+        return self
+
+    def add_frame(self, *a: Any) -> None:
+        self.frames += 1
+
+    def save_episode(self, meta: dict[str, Any]) -> None:
+        self.episodes.append(meta)
+
+
+def test_unfinished_demos_are_rejected_individually_and_replaced() -> None:
+    """Seeds 0 and 2 succeed but never finish release/retreat: each is dropped and reported on
+    its own; the next seeds are recorded instead, so the set still has 3 valid demos."""
+    import torch
+
+    build = _load("wo01_build_env")
+    seed0 = build.DEMO_SEED_BASE
+    bad = {seed0, seed0 + 2}
+    env = _Env()
+
+    def make_env(cfg: Any, task: str, **kw: Any) -> _Env:
+        return env
+
+    def policy_obs(obs: Any) -> dict[str, Any]:
+        return {"image": torch.zeros(1, 4, 4, 3), "state": torch.full((1, 6), float(obs["t"]))}
+
+    cfg = {
+        "env": {"max_episode_steps": 10, "image_size": 4},
+        "data": {
+            "post_success_steps": 2,
+            "post_success_max_steps": 4,
+            "require_final_success": True,
+            "require_tail_finished": True,
+            "oracle_profile": "v2",
+        },
+        "seed": 0,
+    }
+    rec = _Recorder()
+    stats = build.run_task(
+        "PickPlace",
+        cfg,
+        (make_env, policy_obs, lambda task, e, profile: _Oracle(e, bad)),
+        rec,
+        demos=3,
+        eval_episodes=3,
+        allow_failed=False,
+        num_envs=None,
+    )
+    assert stats["demos_recorded"] == 3 and stats["demos_oracle_finished"] == 3
+    assert [m["seed"] for m in rec.episodes] == [seed0 + 1, seed0 + 3, seed0 + 4]
+    assert all(m["oracle_finished"] for m in rec.episodes)
+    assert [r["seed"] for r in stats["rejected_episodes"]] == sorted(bad)
+    assert stats["rejected_episodes"][0]["reasons"] == ["oracle_unfinished", "off_release_target"]
+    assert stats["demos_rejected"] == {
+        "final_success_lost": 0,
+        "oracle_unfinished": 2,
+        "off_release_target": 2,
+    }
+    # without the opt-in (0.1 recorder settings) nothing is rejected for its tail
+    cfg["data"]["require_tail_finished"] = False
+    rec = _Recorder()
+    stats = build.run_task(
+        "PickPlace",
+        cfg,
+        (make_env, policy_obs, lambda task, e, profile: _Oracle(e, bad)),
+        rec,
+        demos=3,
+        eval_episodes=3,
+        allow_failed=False,
+        num_envs=None,
+    )
+    assert [m["seed"] for m in rec.episodes] == [seed0, seed0 + 1, seed0 + 2]
+    assert stats["rejected_episodes"] == []
+    assert build.tail_problems("Push", True, 0.0) == []  # Push keeps the gripper closed
