@@ -984,6 +984,70 @@ process group?), Ctrl-Z in the Mac Terminal during motion and at a prompt (and N
 delivery to the Python child under `uv run` when the Terminal window closes, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
 grid's scale and alignment with the real base.
 
+### PR 2: train
+
+SmolVLA and ACT fine-tune code for the real arm (SmolVLA pivot handoff, PR 2 items 1-2), branch
+`feat/smolvla-real-train` on `feat/smolvla-real`, 2026-11-09. $0: nothing was launched.
+
+- `scripts/wo07_train.py --preset {tiny,real} --policy {smolvla,act}` calls LeRobot 0.4.4's
+  `lerobot_train.train` in-process, the path `wo01_smolvla_smoke.py` uses. The configs are
+  `configs/wo07_train.yaml` and `configs/wo07_train_tiny.yaml`, with `policies.<p>.base` from config.
+  - Before training, the script refuses any dataset whose `meta/info.json` departs from
+    `src/robot/convention.py`, and any whose `meta/vla_rl_so101.json` does not cite this convention
+    hash. It also refuses rehearsal recordings.
+  - SmolVLA gets `convention.SMOLVLA_RENAME_MAP`. LeRobot saves that map in the checkpoint's
+    preprocessor, and the reload check verifies it.
+  - Each run record holds the config hash, git commit, device, the convention citation, a dataset
+    hash (SHA-256 over every file) and a checkpoint content hash (`src/policy/lerobot_ckpt.py`).
+- Real defaults:
+  - SmolVLA: `lerobot/smolvla_base`, 20k steps, batch 64, LeRobot's dtypes (the VLM in bf16), chunk
+    50, 10 flow steps, images resized to 512.
+  - ACT: LeRobot defaults (100k steps, batch 8, ResNet-18 ImageNet), with chunk 50 from the
+    convention.
+- `--probe` runs N timed steps and writes s/step, peak VRAM and the projected h and $ to
+  `probe.json`. Exit code 3 means CUDA OOM.
+- `scripts/pod/wo07_train_job.sh` runs one policy per pod, in this order:
+  - checks the launch-gate token (before setup);
+  - runs setup;
+  - downloads the dataset at `DATASET_REVISION`;
+  - runs the probe at batch 64, then 32, then 16 on OOM;
+  - waits at the pod-scoped approval gate;
+  - runs the full training with periodic uploads;
+  - uploads the final checkpoint and runs/ to the private `KudratSingh22/vla-rl-so101-real-policies`;
+  - deletes the pod.
+  `DRY_RUN=1` runs every stage and gate on the Mac in a sandbox, on the `tiny` preset, and makes no
+  apt, Hub or RunPod call (tested with failing stubs).
+- Tiny check, Mac M3 Pro CPU, fp32. These are plumbing numbers, never results. Each run trains 3
+  steps at batch 2, saves, reloads, and computes the same chunk on dataset frame 0:
+
+  | Policy | Wall time | Median step | In-memory vs reloaded chunk | Note |
+  |---|---|---|---|---|
+  | SmolVLA (full `smolvla_base`, no reduced model) | 28.6 s | 1.6 s | 0.0 rad (same explicit noise) | a different noise seed moves the chunk by 1.20 rad |
+  | ACT (small dims, no ImageNet download) | 9.5 s | 0.49 s | 0.0 rad | |
+
+- Defect found and fixed (`lerobot_ckpt.load_checkpoint`): LeRobot builds SmolVLA's action expert in
+  bf16, so `from_pretrained` rounded fp32 weights trained on CPU to bf16. The effect was 0.156 rad on
+  a chunk after 3 tiny steps. The CPU path now loads the saved weights into the fp32 model. CUDA
+  and MPS checkpoints are bf16 already and are not affected. `wo01_smolvla_smoke.py load_policy` has
+  the same CPU issue and is left unchanged.
+- Cost, PROVISIONAL. Reprice from the probe before requesting spend. The live RTX 4090 Secure price
+  is $0.89/h (public GraphQL, 2026-11-09T05:35Z; community $0.34, A100 PCIe Secure $1.79). A 50 GB
+  volume costs $0.10/GB-month, about $0.17/day while it exists.
+  - SmolVLA reference: the guide quotes about 4 h on one A100, about $7.16 at $1.79/h.
+  - The 4090 speeds below are not measured. They assume a 4090 step takes 1.5–2.5× an A100 step at
+    batch 64, if that batch fits in 24 GB.
+
+  | Line | Estimate | Assumption |
+  |---|---|---|
+  | SmolVLA, batch 64 | RTX 4090 × 6.35–10.35 h = $5.65–$9.21 | includes 0.35 h of setup |
+  | SmolVLA, batch 32 (OOM fallback) | RTX 4090 × 3.6–6.4 h = $3.2–$5.7 | steps not rescaled, so half the samples |
+  | ACT | RTX 4090 × 1.75–3.15 h = $1.55–$2.80 | 0.05–0.10 s/step guessed |
+  | Probe, per pod | RTX 4090 × 0.5–1.0 h = $0.45–$0.89 | setup, probe and up to 30 min waiting for approval |
+- Open:
+  - Pin `dataset.revision` once the 50 demos are pushed.
+  - Owner choice: if SmolVLA drops to batch 32, keep 20k steps (the guide's count) or rescale them.
+  - Size `SPEND_CAP_SECONDS` from the probe.
+
 ## Blockers and decisions pending the owner
 
 - WO-04: GRPO has not produced a clear gain (PickPlace seen +3.7 to +5.7 points across four
