@@ -51,6 +51,19 @@ stop reason, fault kind and shutdown cause ``lost_foreground``; Ctrl-Z never sus
 session. Without the handler (mock) a Ctrl-C mid-tick still holds; the port is released first in
 case it landed inside a bus transaction.
 
+Pre-write stop check (owner 2026-11-09). The same predicate (``DeployLoop.stop_requested``: a
+recorded hang-up / SIGTERM, a lost foreground, the Ctrl-C flag) is checked at the top of every
+tick AND as ``So101Driver.step``'s ``stop_fn``, after the tick's frame wait, policy query, joint
+read and safety filter, immediately before every policy goal and every move-home goal. A stop
+recorded while a tick waited (camera, policy, servo read) therefore never produces one more goal:
+``MotionStopped`` (nothing written) becomes the same ``SessionStop`` the top-of-tick check
+raises, with the same stop reason, fault kind, hold and shutdown. A write already begun when the
+stop is recorded finishes. Not guarded, on purpose: the hold at the measured pose (``arm.hold``,
+the deadman's HOLD response, ``arm.trip``) and the torque off, which are the safe-state actions,
+not motion goals; the settle writes nothing; the healthy-shutdown park has its own ``stop_fn``.
+The deadman needs no entry in the predicate: ``step`` refuses a latched deadman on entry and the
+filter refuses one right before ``stop_fn``.
+
 Prompts with torque on (``ConsoleOperator`` through ``src/robot/prompts.py``'s ``TorqueGuard``,
 owner 2026-11-08): every prompt answered while the arm holds under torque (between trials, the
 placement, the score, the 'resume' after a HOLD stop, the final support prompt) reads servo health
@@ -60,8 +73,10 @@ before the wait and after the answer, and waits at most ``deploy.prompt_torque_t
 the session ends (``prompt_timeout``; no park). Mock runs use ``ScriptedOperator`` (instant).
 
 Scoring (``run_trials`` / ``_score``, judging rule real-judge-2 in scripts/wo07_real_eval.py):
-a trial counts once its policy started (``TrialResult.policy_started``: the first action from the
-policy server was handed to ``So101Driver.step``, i.e. the safety filter). A fault after that
+a trial counts once its policy started (``TrialResult.policy_started``: the goal write of the
+trial's first policy action was begun, ``So101Driver.goal_write_attempted``; a write that raised
+from inside counts, since the goal may have reached the bus; a step stopped before its write, by
+the pre-write stop check, the deadman or a joint-read fault, does not). A fault after that
 (servo, serial, a safety-layer or deadman stop, server failure, Ctrl-C during motion, client
 error, torque off unconfirmed) is a failure with ``fault`` recorded and is never judged by the
 operator; an attempt whose policy never started is ``not_started`` (retried on a resume, never
@@ -127,6 +142,7 @@ from src.robot.driver import (
     TORQUE_OFF_UNCONFIRMED,
     TORQUE_OFF_UNCONFIRMED_MSG,
     DeadmanTripped,
+    MotionStopped,
     ParkSettings,
     SerialFault,
     ServoFault,
@@ -396,8 +412,10 @@ class TrialResult:
     t_end: float = 0.0
     t_first_write: float | None = None
     t_last_write: float | None = None
-    # policy started: the trial's first action, received from the policy server, was handed to
-    # So101Driver.step (deadman frame check -> SafetyFilter -> bus). Loop clock and UTC.
+    # policy started: the goal write of the trial's first policy action was begun
+    # (So101Driver.goal_write_attempted: it returned, or raised from inside the write or after
+    # it). Loop clock and UTC, stamped right after that step returned / raised. None: no policy
+    # goal was ever sent (e.g. the pre-write stop check blocked the first one): not started.
     policy_started_t: float | None = None
     policy_started_utc: str | None = None
 
@@ -454,13 +472,14 @@ class DeployLoop:
         self.arm, self.cam, self.pipe, self.client, self.dcfg = arm, cam, pipe, client, dcfg
         self.clock, self.sleep = clock, sleep
         self.on_decision = on_decision
-        # runs once per trial, right after its first action went to the safety filter (the
-        # durable "policy started" marker; run_trials)
+        # runs once per trial, right after the step that sent its first policy goal (returned or
+        # raised with goal_write_attempted): the durable "policy started" marker (run_trials)
         self.on_policy_start: Callable[[TrialResult], None] | None = None
         # the session's signal flags (src/robot/prompts.operator_signals; hardware only): a
         # Ctrl-C or a hang-up stops motion between ticks, never inside a bus transaction
         self.interrupts = interrupts
         self.period = 1.0 / dcfg.control_hz
+        self._pending_stop: SessionStop | None = None  # what the pre-write check found
 
     def stop_requested(self) -> SessionStop | None:
         """A Ctrl-C (flag) since the last prompt answer, a hang-up or a lost foreground (polled
@@ -485,6 +504,20 @@ class DeployLoop:
         if stop is not None:
             raise stop
 
+    def _pre_write_stop(self) -> bool:
+        """``So101Driver.step``'s ``stop_fn`` for every policy and move-home goal: the top-of-tick
+        predicate (``stop_requested``) again, immediately before the write (module doc)."""
+        self._pending_stop = self.stop_requested()
+        return self._pending_stop is not None
+
+    def _stopped(self, e: MotionStopped) -> SessionStop:
+        """The ``SessionStop`` for a step the pre-write check stopped (nothing written): the
+        same stop the top-of-tick check would have raised one tick later."""
+        stop, self._pending_stop = self._pending_stop or self.stop_requested(), None
+        if stop is None:  # MotionStopped only follows a True stop_fn: a bug, ends as one
+            raise RuntimeError(f"MotionStopped without a recorded stop: {e}") from e
+        return stop
+
     def _read_frame(self) -> Frame | None:
         try:
             return self.cam.read()
@@ -504,7 +537,8 @@ class DeployLoop:
         """Drive to ``home_qpos`` through the full safety filter at control_hz, reading a fresh
         frame every tick. MOVES THE ARM. Residuals under ``home_tol_deg`` count as reached and are
         logged (a P=16 servo under gravity may settle a degree or two off). May raise
-        DeadmanTripped / SerialFault like any step."""
+        DeadmanTripped / SerialFault like any step, and ``SessionStop`` from the top-of-tick or
+        the pre-write stop check (nothing written for that tick)."""
         target = np.asarray(self.dcfg.home_qpos, dtype=np.float64)
         t_end = self.clock() + self.dcfg.home_timeout_s
         steps, reached, rejected = 0, False, False
@@ -512,7 +546,14 @@ class DeployLoop:
             self._check_stop()  # SessionStop: the caller holds the arm (between ticks)
             t0 = self.clock()
             frame = self._read_frame()
-            out = self.arm.step(target, frame_time=None if frame is None else frame.capture_time)
+            try:
+                out = self.arm.step(
+                    target,
+                    frame_time=None if frame is None else frame.capture_time,
+                    stop_fn=self._pre_write_stop,
+                )
+            except MotionStopped as e:  # nothing written: the caller holds, as for SessionStop
+                raise self._stopped(e) from e
             steps += 1
             if out.safety.status == "rejected":
                 rejected = True
@@ -619,14 +660,13 @@ class DeployLoop:
                 frame_time = None if frame is None else frame.capture_time
                 if frame_time is not None:
                     res.max_frame_age_ms = max(res.max_frame_age_ms, _ms(frame_time, now))
-                first = res.policy_started_t is None
-                if first:  # the first policy action goes to the filter
-                    res.policy_started_t, res.policy_started_utc = self.clock(), utc_now()
                 try:
-                    out = self.arm.step(action, frame_time=frame_time)
+                    out = self.arm.step(action, frame_time=frame_time, stop_fn=self._pre_write_stop)
                     t_write = self.clock()
-                finally:
-                    if first:  # after the write and its stamp: never delays or skews either
+                except MotionStopped as e:  # nothing written: the top-of-tick stop's path
+                    raise self._stopped(e) from e
+                finally:  # after the write and its stamp: never delays or skews either
+                    if res.policy_started_t is None and self.arm.goal_write_attempted:
                         self._policy_started(res)
                 t_tick = t0
                 res.steps += 1
@@ -649,6 +689,9 @@ class DeployLoop:
                     return
 
     def _policy_started(self, res: TrialResult) -> None:
+        """The trial's first policy goal was sent (``So101Driver.goal_write_attempted``): stamp
+        it and write the durable marker. Never called for a step stopped before its write."""
+        res.policy_started_t, res.policy_started_utc = self.clock(), utc_now()
         if self.on_policy_start is None:
             return
         try:
@@ -1127,24 +1170,26 @@ def run_trials(
     ``settle_s``: after a clean trial the arm holds still this long (``loop.sleep``), the servos
     are read once, and only then is the operator asked to score it; recorded as ``settle``.
 
-    Scoring (``_score``, judging rule real-judge-2): ``policy_started`` (the trial's first action
-    from the policy server was handed to the safety filter) decides whether an attempt counts.
-    Not started (home failed / faulted / Ctrl-C, a server failure or a stale first chunk before
-    the first action, a failed torque-off before it, the placement prompt ended by q / timeout /
-    Ctrl-C / closed stdin / a servo read): ``not_started``, kept in the attempts log, never
-    scored, the slot is retried on a resume. Started: scored exactly once. A fault after the
-    start (servo, serial, safety-layer / deadman stop, server failure, operator Ctrl-C during
-    motion, a hang-up, client error, torque off unconfirmed; in the trial, at the settle read or
-    around the score prompt) is a failure with ``fault: {kind, stop_reason, reason, where}``,
-    never judged by the operator, and a later 'resume' does not change it. A score prompt that
-    ends without a judgement (Ctrl-C, EOF, timeout) is a failure with ``unjudged: {how, reason}``.
+    Scoring (``_score``, judging rule real-judge-2): ``policy_started`` (the goal write of the
+    trial's first policy action was begun: ``TrialResult.policy_started_t``) decides whether an
+    attempt counts. Not started (home failed / faulted / Ctrl-C, a server failure or a stale first
+    chunk before the first action, the first policy goal blocked by the pre-write stop check or
+    stopped before its write by the deadman / a joint-read fault, a failed torque-off before it,
+    the placement prompt ended by q / timeout / Ctrl-C / closed stdin / a servo read):
+    ``not_started``, kept in the attempts log, never scored, the slot is retried on a resume.
+    Started: scored exactly once. A fault after the start (servo, serial, safety-layer / deadman
+    stop, server failure, operator Ctrl-C during motion, a hang-up, client error, torque off
+    unconfirmed; in the trial, at the settle read or around the score prompt) is a failure with
+    ``fault: {kind, stop_reason, reason, where}``, never judged by the operator, and a later
+    'resume' does not change it. A score prompt that ends without a judgement (Ctrl-C, EOF,
+    timeout) is a failure with ``unjudged: {how, reason}``.
 
-    Durable start: the moment the policy starts, a ``trial_started`` row (the record as it would
-    stand if the process died there: a failure, fault kind ``session_lost``) goes to ``log_row``;
-    a resume (scripts/wo07_real_eval.load_prior) turns one without its ``trial`` row into that
-    failure, so a started slot is never re-rolled. An exception that ends the session between
-    the start and the record (a crash, a Ctrl-C without the flag handler) appends that record
-    before it propagates.
+    Durable start: the moment the policy starts (never before its first goal write was begun), a
+    ``trial_started`` row (the record as it would stand if the process died there: a failure,
+    fault kind ``session_lost``) goes to ``log_row``; a resume (scripts/wo07_real_eval.load_prior)
+    turns one without its ``trial`` row into that failure, so a started slot is never re-rolled.
+    An exception that ends the session between the start and the record (a crash, a Ctrl-C
+    without the flag handler) appends that record before it propagates.
 
     The session ends on: q (``operator_quit``), a torque-on prompt timeout (``prompt_timeout``:
     torque released), a servo / serial fault (``torque_off: ...``), a failed torque-off, a

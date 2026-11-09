@@ -50,6 +50,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 05 | cancelled with the OFT track (ADR-0003) | | |
 | 08, 09 | not started (08 is now filtered behaviour cloning in sim; plan in `docs/work-orders/WO-08-filtered-bc-sim.md`) | | |
 | pre-run hardening | merged | #28 (`fix/pre-run-hardening`) | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
+| deploy pre-write stop | PR open | `fix/deploy-prewrite-stop` | Owner 2026-11-09: the pilot / real-eval loop checks its stop right before every goal write; a blocked first policy goal is `not_started` (no start marker, slot retried). $0, fakes only. See "Pre-write stop in the policy loop" below. |
 | robot safety (PR 2) | merged | #29 (`fix/robot-safety`) | Review 3.3 gaps 2, 3, 5 and 7, plus the owner's 2026-11-08 review changes (homing offsets, torque off unconfirmed, real-eval session fingerprint, parking off by default), $0, **unverified on hardware**. See "Robot safety hardening" below. |
 
 ## Benchmarks met
@@ -1047,6 +1048,35 @@ and foreground checks under `uv run` in Terminal (is `uv`'s Python child in the 
 process group?), Ctrl-Z in the Mac Terminal during motion and at a prompt (and NOFLSH keeping a half-typed line there), `tcflush` of typed-ahead input on the Mac terminal, SIGHUP
 delivery to the Python child under `uv run` when the Terminal window closes, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
 grid's scale and alignment with the real base.
+
+## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
+
+Owner 2026-11-09: the stop check #30 added to teleop and the park now also guards the pilot and
+real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered policy trials.
+
+- `DeployLoop` passes its top-of-tick predicate (`stop_requested`: recorded SIGHUP / SIGTERM,
+  lost foreground, Ctrl-C flag) to `So101Driver.step` as `stop_fn` for every policy goal and
+  every move-home goal. `MotionStopped` (nothing written) ends the trial through the same
+  `SessionStop` path as the top-of-tick check (same stop reason, fault kind, hold, shutdown).
+  The hold at the measured pose and the torque off are not guarded (safe-state actions).
+- "Goal sent" is now explicit: `So101Driver.goal_write_attempted` is set once `step` begins its
+  goal write (a write that raises from inside counts: doubt = sent). `policy_started_t` and the
+  durable `trial_started` row are set only after the step that sent the first policy goal.
+  Before, they were set before `step` and in a `finally`, so a blocked first goal would have
+  counted as started. A first step stopped before its write (pre-write check, deadman, joint
+  read fault) is `not_started` and the slot is retried on a resume.
+- The real-eval judging text (`JUDGING_GENERAL`) now says "the bus write of its first action
+  was begun" instead of "reached the safety filter"; version stays `real-judge-2` (no real
+  session exists), the rule text hash changes. PR #32 moves this text to
+  `src/eval/protocol_real.py`: whichever of the two PRs lands second ports the new wording,
+  syncs with `main` and reruns `tests/test_deploy_prewrite_stop.py` plus the resume tests in
+  `tests/test_real_eval.py` and `tests/test_deploy.py` on the combined code before the real-eval
+  protocol is frozen.
+- Tests: `tests/test_deploy_prewrite_stop.py` (real signals through `operator_signals` /
+  `job_control`, inside the camera read, the policy query and the servo read; pilot and real
+  eval end to end, including `--resume`). Mutations checked: removing the pre-write `stop_fn`
+  fails 19 tests; restoring the old start-marker ordering fails 10.
+- Unverified on hardware.
 
 ## Blockers and decisions pending the owner
 

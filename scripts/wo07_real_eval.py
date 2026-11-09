@@ -23,10 +23,12 @@ keeps acting until ``trial_max_steps`` or a stop, so a success undone before the
 
 What real-judge-2 changes against real-judge-1 (which had the operator score faulted trials after
 supporting the arm, and left trials with a failed torque-off unscored): a trial counts once its
-policy STARTED (``policy_started``: the trial's first action from the policy server was handed to
-the safety filter; recorded with its UTC time). Every started trial is scored exactly once and is
-never redone. A fault after the start is a FAILURE in the primary metric without a judgement, the
-fault recorded separately (``fault: {kind, stop_reason, reason, where}``; kinds: servo, serial,
+policy STARTED (``policy_started``: the goal write of the trial's first action from the policy
+server was begun, ``So101Driver.goal_write_attempted``; recorded with its UTC time; a first goal
+blocked before its write, e.g. by the pre-write stop check after a hang-up, never started).
+Every started trial is scored exactly once and is never redone. A fault after the start is a
+FAILURE in the primary metric without a judgement, the fault recorded separately
+(``fault: {kind, stop_reason, reason, where}``; kinds: servo, serial,
 safety = a safety-layer or deadman stop (joint / workspace violation, lost frame, stall, stale
 chunk), server, operator_abort (Ctrl-C during motion), client_error, torque_off_unconfirmed),
 also when torque off is unconfirmed; a later operator 'resume' does not change it. The operator
@@ -35,8 +37,8 @@ A score prompt that ends without a judgement (Ctrl-C, closed stdin, no answer in
 ``deploy.prompt_torque_timeout_s``) is a failure, ``outcome_source: unjudged`` with the reason
 (doubt = n applied to a missing judgement; owner check). An attempt whose policy never started
 (the move home failed / faulted / was Ctrl-C'd, a server failure or a stale first chunk before the
-first action, a quit) is ``not_started``: kept in the attempts log, never scored, and retried with
-the same placement on a resume. Primary metric: successes / started trials, per cell, with the
+first action, the first goal stopped before its write, a quit) is ``not_started``: kept in the
+attempts log, never scored, and retried with the same placement on a resume. Primary metric: successes / started trials, per cell, with the
 Wilson interval; ``diagnostic_excluding_faulted`` (success rate over started trials without a
 fault) and ``faults_by_kind`` are a clearly labelled SECONDARY diagnostic. The rule's version and
 text hash are in the session fingerprint, so a session scored under real-judge-1 can be neither
@@ -157,8 +159,9 @@ JUDGING_GENERAL = (
     "Judge ONCE, after the trial has ended and the arm has then held still for the settling "
     "interval of {settle_s:g} s (eval.settle_s; this prompt only appears then), by eye, touching "
     "nothing. y only if ALL of the task's conditions hold NOW; a success that was undone before "
-    "the end is n. Doubt = n. A trial counts once its policy started (its first action from the "
-    "policy server reached the safety filter) and is then scored exactly once, never redone. A "
+    "the end is n. Doubt = n. A trial counts once its policy started (the bus write of its first "
+    "action from the policy server was begun; one stopped before its write never started) and is "
+    "then scored exactly once, never redone. A "
     "fault after the start (servo, serial, a safety-layer or deadman stop: joint / workspace "
     "violation, lost frame, stall, stale chunk; a policy-server failure; Ctrl-C during motion; a "
     "client error; torque off unconfirmed; inside the trial, at the settle read or while this "

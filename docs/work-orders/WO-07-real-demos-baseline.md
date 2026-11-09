@@ -103,9 +103,10 @@ selected checkpoints.
   `docs/bringup/latency-measurement.md` (`deploy.capture_offset_ms`). Until that is measured,
   no latency is called end-to-end.
 - Scoring (owner 2026-11-08, judging rule `real-judge-2`, `scripts/wo07_real_eval.py`): the
-  primary real metric is successes / trials whose policy started (the first action reached the
-  safety filter). A servo, serial or safety fault after the start (also with torque off
-  unconfirmed) is a failure, recorded separately (`fault`); the operator judges only clean
+  primary real metric is successes / trials whose policy started (the bus write of the first
+  policy goal was begun; a first goal blocked before its write, e.g. by the pre-write stop check
+  after a Ctrl-C or a closed Terminal, never started and is retried). A servo, serial or safety
+  fault after the start (also with torque off unconfirmed) is a failure, recorded separately (`fault`); the operator judges only clean
   trials; an unjudged score prompt (Ctrl-C, EOF, timeout) is a failure. Attempts that never
   started the policy are retried with the same placement, never scored. The success rate
   excluding faulted trials is reported only as a labelled secondary diagnostic.
