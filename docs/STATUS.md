@@ -1567,8 +1567,10 @@ the real limits commands), and the sim oracle unchanged (URDF range). Run
 - Frozen bowl (0.195, 0.205): carry, lower, release and retreat are REJECTED at all 25 slots and
   every yaw, with the TCP up to 1.05 cm outside the box. The pick phases pass. With the IK
   bounded by the safety limits, they pass with only the gripper's intended -5 deg floor clip.
-  The unchanged sim oracle also clips wrist_flex (up to 5 deg) at the pick at 16 slots; that is a
-  sim-oracle artefact (its IK uses the URDF range) and does not depend on the bowl.
+  The unchanged sim oracle also clips wrist_flex (up to 5 deg) at the pick at 16 slots (its IK
+  uses the URDF range, the filter the URDF range less 5 deg), AND in the bowl phases, where the
+  clip DOES depend on the bowl position (corrected in review round 2 below: every option clips
+  wrist_flex at the carry or the retreat under the unchanged oracle).
 - Constrained re-derivation: `derive_bowl`'s rule (>= 11.5 cm from all 36 slots, keep-out,
   reach - 5 mm) PLUS the box, shrunk by the 5 mm tolerance and the 9.3 mm TCP offset, on the
   same 5 mm lattice. **No position satisfies all constraints.** The grid spans y +-8.75 cm, so 11.5
@@ -1580,13 +1582,15 @@ the real limits commands), and the sim oracle unchanged (URDF range). Run
 |---|---|---|---|---|---|---|---|
 | frozen | (0.195, 0.205) | box | 11.75 cm | 28.3 cm | -1.93 cm | REJECT (carry..retreat) | C4 |
 | A: rule kept | (0.115, +-0.200) | box | 11.58 cm | 23.1 cm | -1.30 cm | REJECT (carry..retreat) | C4 |
-| B: box kept, max separation | (0.115, +-0.185) | separation (-1.37 cm vs 11.5) | 10.13 cm | 21.8 cm | +0.16 cm | pass (gripper floor clip only), cube over the floor 175/175 | C4 |
-| B': box kept, beside the grid | (0.205, +-0.185) | separation (-1.67 cm) | 9.83 cm | 27.6 cm | +0.12 cm | pass (gripper floor clip only), 175/175 | C4 |
+| B: box kept, max separation | (0.115, +-0.185) | separation (-1.37 cm vs 11.5) | 10.13 cm | 21.8 cm | +0.16 cm (own 8.4 mm offset; +0.07 at 9.3 mm) | pass with the safety-bounded IK (gripper floor clip only), cube over the floor 175/175; the unchanged oracle clips wrist_flex in the bowl phases (round 2) | C4 |
+| B': box kept, beside the grid | (0.205, +-0.185) | separation (-1.67 cm) | 9.83 cm | 27.6 cm | +0.12 cm (own 8.8 mm; +0.07 at 9.3 mm) | as B (round 2) | C4 |
 | C: in front | (0.385, 0.0) | reach (-10 cm vs 28.5) | 11.88 cm | 38.5 cm | (TCP 2.1 cm short of the centre: IK at full reach) | pass, 175/175 | C3 |
 
   *Bowl centre to the nearest box face, after the 5 mm tolerance and the measured TCP offset.
   Separation is a sim placement constraint (`MIN_SEP` 11 cm), not a safety limit. At 10 cm the
-  bowl's outer rim (~6.4 cm radius) still clears a 3 cm cube's corner (2.1 cm) by ~1.5 cm. The
+  bowl's outer rim (~6.4 cm radius) still clears a 3 cm cube's corner (2.1 cm) by ~1.5 cm: a
+  CUBE-ONLY figure (round 2: +1.1 cm for B and +0.8 cm for B' with the 5 mm tolerance; the open
+  jaws at the nearest slot are not checked, no collision model). The
   safety filter was not loosened. `protocol_real.py` is unchanged (the bowl, the hash and the
   schedules stay as frozen). The central-slot rule still picks C4 for A, B and B'. Only C changes
   it (to C3). The bowl stays PENDING: the owner chooses.
@@ -1652,13 +1656,86 @@ bowl is approved). It will touch:
 `src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/eval/protocol_real.py` and
 `src/env/success.py` are unchanged; so is the real-0.1 hash `edee44aa...`.
 
+### PR 2: owner follow-up, review round 2
+
+2026-11-09, $0, CPU / MPS, fakes, the mock rig and offline kinematics only. Main still NOT merged
+in; the #33 conflicts are still not resolved here. Twelve confirmed findings, all applied.
+
+**Capture / resume (F1-F5).**
+- F1: a started trial that ended `session_lost` (a client error after the start, or a kill) had
+  no `trial_id`, so the session end never staged its open episode and the resume flagged it
+  `recording_missing` under `None`. The trial id now travels in `record_extra` (the start marker
+  and the `session_lost` record carry it); `load_prior` derives it for older rows. Test: a client
+  error at trial 2's score stages its 5 frames; the resume recovers them as episode 1; COMPLETE.
+- F2: a trial whose first write faulted on the bus (started, frames 0, no capture error) needs no
+  recording. One predicate, `recording.recording_required`, now drives `reconcile_captures`,
+  `capture_gaps` and `export_bundle.missing_recordings`; the stage records `frames 0` so a kill
+  between the record and the save does not turn it into a missing recording. Test: a bus fault on
+  trial 3's first write gives no RECORDING MISSING and a COMPLETE export with the trial under
+  `uncaptured_started_trials`.
+- F3: a recovery that fails while the journal is whole (a transient save error) is now
+  `recovery_failed`, NOT the sticky `recording_missing`; the next resume retries it. Only an
+  absent or damaged (`staged journal unreadable`) journal is flagged. The trial record, the
+  session's `capture` block and the export now classify alike. Test: one `OSError` on the first
+  resume's save; the second resume recovers it; COMPLETE.
+- F4: `load_prior` keyed rows by (cell, trial_idx, start_utc) at one-second resolution, so a
+  not-started attempt retried in the same second received its retry's episode ("episode 0 is
+  claimed by two trial records"). Rows are now keyed by attempt too, and a capture row is merged
+  only into a started record. Test: a failed move home, retried in the same (pinned) second.
+- F5: the regression test now compares the recovered episode with the capture as it stood before
+  the kill (state, action, timing exactly; the first and last frame of each camera by a per-read
+  pixel stamp, decoded with torchcodec), and a kill at trial 2 of 3 recovers episode 1 before the
+  resume records trial 3 as episode 2.
+
+**Bowl (round 2).** Run `20261109T100819Z-wo07-bowl-check-real-98ba` (scratch). Per option, both
+IK variants, the release window (share of the 3 cm TCP disc over the bowl floor inside the box
+after the 5 mm tolerance, and its inscribed radius), the box margin with the search's 9.3 mm and
+the option's own TCP offset, and the CUBE-ONLY rim clearance (the nearest of the 36 slots, any yaw,
+the bowl 5 mm closer; jaws not modelled):
+
+| Option | xy (m) | Violates | Nearest slot (rim-cube, cube only) | Box margin 9.3 mm / own | Release window inside / inscribed | Filter, safety-bounded IK | Unchanged oracle (URDF IK): bowl-phase joint clips | Central |
+|---|---|---|---|---|---|---|---|---|
+| frozen | (0.195, 0.205) | box | 11.75 cm (+2.73) | -1.93 / -1.93 cm | 29% / 0 mm | REJECT | reject; carry wrist_flex 3.9 deg x7 slots | C4 |
+| A | (0.115, +-0.200) | box | 11.58 cm (+2.56) | -1.43 / -1.30 cm | 29% / 0 mm | REJECT | reject; carry wrist_flex 5.0 x25, retreat 2.6 x25 | C4 (C3 at -y) |
+| B | (0.115, +-0.185) | separation -1.37 cm | 10.13 cm (+1.11) | +0.07 / +0.16 cm | 50% / 10 mm | pass, 175/175 placed | carry wrist_flex 5.0 x10, retreat 1.1 x25 | C4 (C3 at -y) |
+| B' | (0.205, 0.185) | separation -1.67 cm | 9.83 cm (+0.81) | +0.07 / +0.12 cm | 71% / 10 mm | pass, 175/175 | carry wrist_flex 3.6 x6, retreat 5.0 x25 | C4 |
+| D (new: box kept, largest window, cube clear) | (0.205, 0.180) | separation -2.17 cm | 9.33 cm (+0.31) | +0.57 / +0.63 cm | 81% / 15 mm | pass, 175/175 | carry wrist_flex 5.0 x25, lower 1.5 x25, retreat 5.0 x25 | C4 |
+| D' | (0.180, 0.180) | separation -2.17 cm | 9.33 cm (+0.31) | +0.57 / +0.69 cm | 81% / 15 mm | pass, 175/175 | carry wrist_flex 4.2 x25, retreat 4.1 x25 | C4 |
+| C | (0.385, 0.0) | reach -10 cm | 11.88 cm (+2.86) | +0.07 / -1.06 cm (TCP 2.1 cm short) | 71% / 10 mm | pass, 175/175 | carry wrist_flex 1.6 x4 | C3 |
+
+- No option keeps the whole release region inside the box: B keeps half of it (a release more than 10 mm
+  toward +y or -x of centre is rejected), B' 71%, D 81%. The box options with a 100% window
+  ((0.205, 0.165), 7.85 cm) put the rim over the nearest cube (cube-only clearance -0.67 cm):
+  infeasible, excluded from the ranking.
+- Joint limits: with the IK bounded by the filter's limits nothing clips (by construction); the
+  UNCHANGED sim oracle (the motion the sim demos teach) clips wrist_flex by up to 5 deg in the
+  carry and / or retreat at EVERY option, so the joint-limit constraint holds for none of them
+  under that oracle. The clip is the oracle using the last 5 deg of the URDF range that
+  `urdf_limit_margin_deg` withholds; teleop demos go through the filter and cannot exceed it.
+- No position satisfies all constraints. `protocol_real.py`, the bowl, the hash and the PDF are
+  unchanged; the filter is not loosened. The bowl stays PENDING.
+- Preflight: `src/eval/bowl_fit.py` (`bowl_box_problem`) now refuses a real-0.1 hardware session
+  (`real_hardware_problems`) and `wo06_teleop_record.py --demo-schedule` while the protocol bowl
+  lies outside the box after the tolerance and the 9.3 mm offset. Not a hash input.
+
+**Other.** The real-0.1 mock now defaults to the protocol's 450-command cap and the CLI text
+names it (it said `deploy.trial_max_steps`, 150). `wo07_train.py` writes
+`results.batch_deviation` BEFORE training, so a stopped or OOM run's record carries it.
+
+**Gates.** Full pytest 577 passed + 1 skipped. `ruff check src tests scripts`, `black --check .` and
+`mypy --strict src` are clean. No shell file changed. `pyproject.toml`, `uv.lock`,
+`src/eval/protocol.py`, `protocol_v02.py`, `protocol_real.py` and `src/env/success.py` are
+unchanged; so is the real-0.1 hash `edee44aa...`.
+
 
 ## Blockers and decisions pending the owner
 
 - 2026-11-09 PR 2: the bowl is PENDING. The frozen (0.195, 0.205) is rejected by the safety box
   from the carry on, and no position satisfies `derive_bowl`'s rule and the box together. The
-  options are in "PR 2: owner follow-up" (B (0.115, +-0.185) or B' (0.205, +-0.185) pass the
-  filter at ~10 cm separation). Seen slots B2 B5 E2 E5 + C4, the cubes and the seeded schedules
+  options are in "PR 2: owner follow-up" and its round 2 (B (0.115, +-0.185), B' (0.205,
+  0.185) and D (0.205, 0.180) pass the filter with separation 10.1 / 9.8 / 9.3 cm and release
+  windows 50% / 71% / 81%; every option needs the oracle's wrist_flex clipped in the bowl phases).
+  The hardware eval and the demo schedule refuse the frozen bowl until it is decided. Seen slots B2 B5 E2 E5 + C4, the cubes and the seeded schedules
   are approved.
 - Resolved 2026-11-09 by the pivot (ADR-0003): the OFT track is stopped, so the WO-04 item below
   is closed. Open for the owner: the seen slots, bowl position and schedule freeze (PR 2), the
