@@ -10,9 +10,13 @@
 # produced one wrong "peak" at step 50; it is replaced by rl.yaml's decline gate (windowed rollout
 # success > gate_max_drop below its best window) and every eval step keeps a checkpoint.
 #   estimated: A100-80GB x 41.2 h = $74 (worst case, refill cap every step; same arithmetic as
-#   rl.yaml with 1 trained task in the evals: --estimate prints it); flat-gate stop 10.4 h = $19
+#   rl.yaml with 1 trained task in the evals: --estimate prints it); gate_stop false: no early stop
 inherit: configs/rl.yaml
 
 rl:
   train_tasks: [PickPlace]
+  gate_stop: false          # owner 2026-11-08: the first RL run observes the gates (gate/would_stop,
+                            # record gate_decisions) before they may stop a run; as configs/rl.yaml
   checkpoint_every: 25      # owner 2026-10-28: every eval step has a checkpoint
+  rollout_action_clip_deg: 4.0  # owner 2026-11-08: protocol 0.2's clip on the env action, as
+                            # configs/rl.yaml (inherited; repeated so the setting is explicit)

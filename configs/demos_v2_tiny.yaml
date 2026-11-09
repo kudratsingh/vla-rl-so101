@@ -8,4 +8,5 @@ data:
   post_success_steps: 15
   post_success_max_steps: 45
   require_final_success: true
+  require_tail_finished: true
   chunk_pad: drop

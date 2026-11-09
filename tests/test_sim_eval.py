@@ -165,7 +165,9 @@ def test_evaluate_summarize_markdown() -> None:
         )
         assert sum(e.success for e in mine) == r.successes
         assert all((e.end_reason == "success") == e.success for e in mine)
-        assert all(e.end_reason in ("success", "truncated") and e.clipped_steps == 0 for e in mine)
+        assert all(e.end_reason in ("success", "horizon") and e.clipped_steps == 0 for e in mine)
+        assert all(e.flags["truncated"] == (e.end_reason == "horizon") for e in mine)
+        assert all(e.instruction == "push the red cube to the target (Push)" for e in mine)
     for r in res:  # successes = seeds divisible by 3 among this cell's 7 episode seeds
         seeds = episode_seeds(r.seed, 1, ["seen", "shifted"].index(r.cell), 7)
         assert r.successes == sum(s % 3 == 0 for s in seeds)
@@ -260,3 +262,4 @@ def test_wo02_eval_protocol_v02_tiny(env_standins: Path) -> None:
     eps = [json.loads(x) for x in (env_standins / "episodes.jsonl").read_text().splitlines()]
     assert [(e["task"], e["cell"], e["seed"]) for e in eps] == [("PickPlace", "seen", 0)] * 3
     assert {"success", "is_grasped"} <= set(eps[0]["flags"])
+    assert all(e["instruction"] for e in eps)  # names the episode's object (unseen_objects split)

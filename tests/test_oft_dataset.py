@@ -152,6 +152,38 @@ def test_padded_chunks_are_dropped_with_chunk_pad_drop(fake_recorder: Path) -> N
         ChunkedDemoDataset(short, chunk_len=3, chunk_pad="drop")
 
 
+def test_v2_demo_set_needs_chunk_pad_drop(
+    fake_recorder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A v2 set (v2 oracle / release-retreat tail in the sidecar) is refused unless chunk_pad:
+    drop; the 0.1-style sidecar (no such fields) keeps loading with the default repeat."""
+    side = fake_recorder / "meta" / "vla_rl_so101_episodes.jsonl"
+    rows = [json.loads(x) for x in side.read_text().splitlines()]
+
+    def read_sidecar(r: Path) -> list[dict[str, Any]]:
+        return [json.loads(x) for x in (Path(r) / "meta/vla_rl_so101_episodes.jsonl").open()]
+
+    monkeypatch.setattr(
+        sys.modules["src.data.recorder"], "read_sidecar", read_sidecar, raising=False
+    )
+    cfg = load_config("tiny", "configs/sft_tiny.yaml")
+    cfg["env"]["tasks"] = list(TASKS)
+    cfg["data"]["demos_per_task"] = 1
+    cfg["data"].pop("chunk_pad", None)
+    assert load_sft_frames(cfg, chunk_len=3)[1]["chunk_pad"] == "repeat"  # 0.1-style rows
+    for v2 in ({"oracle_profile": "v2"}, {"post_success_frames": 15}):
+        side.write_text("".join(json.dumps({**r, **v2}) + "\n" for r in rows))
+        for pad in (None, "repeat"):
+            if pad is None:
+                cfg["data"].pop("chunk_pad", None)
+            else:
+                cfg["data"]["chunk_pad"] = pad
+            with pytest.raises(ValueError, match="v2 demo set.*chunk_pad: drop"):
+                load_sft_frames(cfg, chunk_len=3)
+        cfg["data"]["chunk_pad"] = "drop"
+        assert load_sft_frames(cfg, chunk_len=3)[1]["chunk_pad"] == "drop"
+
+
 def test_synthetic_frames_feed_the_policy() -> None:
     from src.policy.openvla_oft import build_policy
 

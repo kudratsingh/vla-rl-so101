@@ -42,26 +42,97 @@ def test_pooled_rate_uses_groups_as_the_unit() -> None:
 
 
 def test_flat_gate_any_task_and_mean_rules() -> None:
-    """Windows 1-2 vs 3-4: PickPlace +3.1 with Push -5 passes any_task, fails mean; +2.9 fails."""
+    """Linear ramps over steps 1-4 (the trend is exact, SE 0): PickPlace +3.1 with Push -5 passes
+    any_task, fails mean; +2.9 fails both."""
     cases = (
-        ("any_task", (0.531, 0.45), None),
-        ("any_task", (0.529, 0.529), "flat"),
-        ("mean", (0.531, 0.45), "flat"),
-        ("mean", (0.54, 0.54), None),
+        ("any_task", (0.031, -0.05), None),
+        ("any_task", (0.029, 0.029), "flat"),
+        ("mean", (0.031, -0.05), "flat"),
+        ("mean", (0.04, 0.04), None),
     )
     for rule, (pick, push), want in cases:
         g = _gates(rule=rule)
-        for step in (1, 2):
-            _feed(g, step, 0.5, 0.5)
-        for step in (3, 4):
-            _feed(g, step, pick, push)
+        for step in (1, 2, 3, 4):
+            frac = (step - 1) / 3
+            _feed(g, step, 0.5 + pick * frac, 0.5 + push * frac)
         assert g.evaluate(3).reason is None  # not the check step
         res = g.evaluate(4)
         assert res.reason == want, (rule, pick, push)
         assert ("event/flat_run" in res.metrics) is (want == "flat")
-        assert res.metrics["gate/success_window"] == pytest.approx((pick + push) / 2)
+        assert res.metrics["gate/flat_gain/PickPlace"] == pytest.approx(pick)
+        assert res.metrics["gate/flat_gain_se/PickPlace"] == pytest.approx(0.0, abs=1e-6)
+        best = max(pick, push) if rule == "any_task" else (pick + push) / 2
+        assert res.metrics["gate/flat_gain"] == pytest.approx(best)
+        # the old estimator (windows 3-4 vs 1-2) reads 2/3 of the trend here: still logged
+        assert res.metrics["gate/flat_window_gain"] == pytest.approx(best * 2 / 3)
     with pytest.raises(ValueError, match="overlap"):
         _gates(check_step=3)  # < 2 x window
+
+
+def test_flat_gate_counts_learning_from_the_base_policy() -> None:
+    """Review L-baseline: a learner that rises 10% -> 16% over steps 1-10 and then holds (window
+    10, check 38). The older rollout-window rule's baseline (steps 1-10) already holds half of that rise
+    and reads +3.0; the trend from step 1 reads +3.85 and passes, also with z = 0.5 (SE ~0.15
+    points: identical groups, only the misfit of a line). The front-loaded limit: +4 by step 10
+    reads +2.6 and stops (documented in src/rl/gates.py)."""
+    for rise, want in ((0.06, None), (0.04, "flat")):
+        g = _gates(tasks=["A"], window=10, check_step=38, flat_z=0.5)
+        for step in range(1, 39):
+            rate = 0.10 + rise * min(step - 1, 9) / 9
+            g.record(step, {"A": TaskTally.from_group_rates([rate] * 20)}, 1.0, 1)
+            res = g.evaluate(step)
+        assert res.reason == want, rise
+        if rise == 0.06:
+            assert res.metrics["gate/flat_gain"] == pytest.approx(0.0385, abs=5e-4)
+            assert res.metrics["gate/flat_window_gain"] == pytest.approx(0.03)
+            assert res.metrics["gate/flat_gain_upper"] > res.metrics["gate/flat_gain"]
+    with pytest.raises(ValueError, match="flat_z"):
+        _gates(flat_z=-1.0)
+
+
+def _refill_tallies(
+    rng: np.random.Generator, p: dict[str, float], next_task: int, conc: float = 2.0
+) -> tuple[dict[str, TaskTally], int]:
+    """One step of src/rl/trainer.py collect() under configs/rl.yaml (K=8, 32 envs = 4 groups
+    per env batch, tasks alternating, stop at 16 kept groups or 12 env batches); every generated
+    group counts. Group scene p ~ Beta(p x conc, (1 - p) x conc)."""
+    tasks = sorted(p)
+    rates: dict[str, list[float]] = {t: [] for t in tasks}
+    kept = 0
+    for _ in range(12):
+        t = tasks[next_task % len(tasks)]
+        next_task += 1
+        g = rng.binomial(8, rng.beta(p[t] * conc, (1 - p[t]) * conc, 4)) / 8
+        rates[t] += g.tolist()
+        kept += int(((g > 0) & (g < 1)).sum())
+        if kept >= 16:
+            break
+    return {t: TaskTally.from_group_rates(r) for t, r in rates.items() if r}, next_task
+
+
+def test_flat_gate_operating_characteristic() -> None:
+    """rl.yaml shape (check step 38, min_gain 0.03, any_task, gate_flat_z 0.5, 2 tasks), the
+    test noise model and the trainer's refill group counts, p0 = 0.13, linear gain over steps
+    1-38. Pins the provisional default (owner 2026-11-08): P(stop | flat) ~0.57 and P(stop | one task truly +5) ~0.08
+    in the 4000-run simulation (src/rl/gates.py table); 200 seeded runs here: 104 / 20 / 1."""
+
+    def stopped(seed: int, gain_a: float, gain_b: float) -> bool:
+        rng = np.random.default_rng(seed)
+        g = _gates(tasks=["A", "B"], window=10, check_step=38, flat_z=0.5)
+        nxt = 0
+        for step in range(1, 39):
+            frac = (step - 1) / 37
+            p = {"A": 0.13 + gain_a * frac, "B": 0.13 + gain_b * frac}
+            tallies, nxt = _refill_tallies(rng, p, nxt)
+            g.record(step, tallies, 1.0, 1)
+        return g.evaluate(38).reason == "flat"
+
+    runs = range(200)
+    flat = sum(stopped(s, 0.0, 0.0) for s in runs)
+    one = sum(stopped(1000 + s, 0.05, 0.0) for s in runs)
+    both = sum(stopped(2000 + s, 0.05, 0.05) for s in runs)
+    # seeded, so exact; within ~1.4 binomial SD of the 4000-run rates (114, 16 and 2.6 of 200)
+    assert (flat, one, both) == (104, 20, 1)
 
 
 def test_decline_and_entropy_gates_and_state_round_trip() -> None:

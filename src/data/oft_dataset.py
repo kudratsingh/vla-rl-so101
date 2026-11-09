@@ -45,6 +45,15 @@ CHUNK_PAD_MODES = ("drop", "repeat")
 DEFAULT_CHUNK_PAD = "repeat"
 
 
+def is_v2_demo_set(rows: Sequence[dict[str, Any]]) -> bool:
+    """Sidecar rows of a v2 demo set: recorded with the v2 oracle or a release/retreat tail
+    (scripts/wo01_build_env.py; configs/demos_v2.yaml). The 0.1 sets have neither."""
+    return any(
+        r.get("oracle_profile") == "v2" or int(r.get("post_success_frames", 0) or 0) > 0
+        for r in rows
+    )
+
+
 def pad_free_indices(
     frames: FrameSource, chunk_len: int, action_key: str = ACTION_KEY
 ) -> list[int]:
@@ -209,7 +218,9 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
 
     `data.chunk_pad` (default "repeat", the 0.1-era SFT runs, WO-02 attempts 1-4, which trained
     on the pad). `drop`: frames whose chunk is padded past the episode end are left out of the
-    SFT loss; set it in any SFT config for the v2 demo set (configs/demos_v2.yaml does)."""
+    SFT loss. A v2 demo set (`is_v2_demo_set`) is REFUSED unless `chunk_pad: drop` (owner
+    2026-11-08): its long release/retreat tails would otherwise teach "freeze at the last
+    command" from the repeated pad."""
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
     rec: Any = importlib.import_module("src.data.recorder")  # WO-01
@@ -226,10 +237,20 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
             raise ValueError(f"{repo_id}: {len(eps)} {cell!r} demos for {task}, need {n}")
         per_task[task] = eps
         episodes.extend(eps)
+    chunk_pad = str(cfg["data"].get("chunk_pad", DEFAULT_CHUNK_PAD))
+    read_sidecar = getattr(rec, "read_sidecar", None)
+    if read_sidecar is not None and chunk_pad != "drop":
+        chosen = set(episodes)
+        rows = [r for r in read_sidecar(root) if int(r["episode_index"]) in chosen]
+        if is_v2_demo_set(rows):
+            raise ValueError(
+                f"{repo_id} is a v2 demo set (v2 oracle / release-retreat tail): SFT on it needs "
+                f"data.chunk_pad: drop (got {chunk_pad!r}), or padded chunks teach the policy to "
+                "freeze at the last command"
+            )
     fps = int(LeRobotDatasetMetadata(repo_id, root=root).fps)
     delta = {rec.ACTION_KEY: [k / fps for k in range(chunk_len)]}
     frames = rec.load_demo_dataset(repo_id, root, episodes=sorted(episodes), delta_timestamps=delta)
-    chunk_pad = str(cfg["data"].get("chunk_pad", DEFAULT_CHUNK_PAD))
     ds = ChunkedDemoDataset(
         frames,
         chunk_len=chunk_len,
