@@ -12,8 +12,12 @@ and the rubric's success condition (``src/eval/protocol_real.py``, R1); the answ
 1 success, 0.5 lifted, 0 otherwise; never the headline).
 
 The output ``review.json`` records the reviewer id, the seed and order, every verdict with its
-(session, episode) key, and ``method: blinded_review``. Only such a file lets
-``scripts/wo07_export_bundle.py eval --review`` declare ``labels.method = blinded_review``. Live
+(session, episode) key, each session's policy (checkpoint hash; never shown) and ``method``. The
+policy identity is HIDDEN only when the pooled clips come from at least two different policies
+(review F2): reviewing one session alone, the reviewer knows whose clips they are, so the file
+says ``method: unblinded_clip_review``, ``policy_identity_hidden: false``. Only a
+``blinded_review`` file lets ``scripts/wo07_export_bundle.py eval --review`` declare
+``labels.method = blinded_review``. Live
 operator scores and automatic fault outcomes keep their own provenance in the trial records and
 are never relabelled. Rubric R2 (a fault after the start is a failure) is applied by the export
 from the recorded fault, not by the reviewer.
@@ -56,6 +60,18 @@ _DATASETS: dict[str, Any] = {}  # capture dir -> its LeRobotDataset (decoded wit
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def session_policy(capture: Path) -> str | None:
+    """The checkpoint hash of the policy a session ran (its capture provenance)."""
+    prov = json.loads((capture / "dataset" / PROVENANCE).read_text())
+    value = (prov.get("policy_identity") or {}).get("checkpoint_sha256")
+    return None if value is None else str(value)
+
+
+def identity_hidden(policies: dict[str, str | None]) -> bool:
+    """Blind only when every session names its policy and there are at least two policies."""
+    return all(policies.values()) and len(set(policies.values())) >= 2
 
 
 def session_items(capture: Path) -> list[dict[str, Any]]:
@@ -133,10 +149,22 @@ def review(
         sys.exit("no captured episodes to review")
     seed = int(seed if seed is not None else secrets.randbits(32))
     order = [int(i) for i in np.random.default_rng(seed).permutation(len(items))]
+    policies: dict[str, str | None] = {}
+    for cap in sessions:
+        prov = json.loads((cap / "dataset" / PROVENANCE).read_text())
+        policies[str(prov["session_id"])] = session_policy(cap)
+    hidden = identity_hidden(policies)
+    if not hidden:
+        print(
+            "NOTE: the clips do not come from two or more different policies, so the reviewer "
+            "knows whose they are: recorded as an UNBLINDED clip review (the export will not "
+            "declare blinded_review). Pool the SmolVLA and the ACT session for a blinded one."
+        )
     out_dir.mkdir(parents=True, exist_ok=False)
     rec: dict[str, Any] = {
-        "method": "blinded_review",
-        "policy_identity_hidden": True,
+        "method": "blinded_review" if hidden else "unblinded_clip_review",
+        "policy_identity_hidden": hidden,
+        "session_policies": policies,
         "reviewer_id": reviewer,
         "seed": seed,
         "rubric": {"id": PR.RUBRIC_ID, "version": PR.RUBRIC_VERSION, "rule": "R1_end_state"},

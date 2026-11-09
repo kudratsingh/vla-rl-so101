@@ -27,9 +27,20 @@ the trainer's, also used by the real eval and the vishwaroop export), as
 (name + sha256), sorted by name, of the checkpoint files of a pretrained dir: ``config.json``,
 ``model.safetensors``, ``train_config.json`` when present, both processor JSONs and every
 processor state file (the normalization stats), and ``checkpoint_revision`` = the Hub snapshot
-commit (None for a local dir). Loading is the trainer's ``lerobot_ckpt.load_checkpoint``. With ``local_policy.checkpoint_sha256`` set, any other hash is refused before the
-weights are read into the model and again by ``check_local``. A re-saved or retrained checkpoint
-under the same name gets a different hash.
+commit (None for a local dir). Loading is the trainer's ``lerobot_ckpt.load_checkpoint``. With
+``local_policy.checkpoint_sha256`` set, any other hash is refused before the weights are read
+into the model and again by ``check_local``. A re-saved or retrained checkpoint under the same
+name gets a different hash.
+
+Provenance (``lerobot_ckpt.PROVENANCE_FILE``, written by the trainer, inside the hash; reviews
+conv-1, F1): ``load_local_policy`` refuses a checkpoint whose cited convention hash is not this
+code's, or whose ``unit_map`` (``robot.units``: arm sign / offset) differs from the live
+``UnitMap`` it is given; a SmolVLA checkpoint loads its VLM, processor and tokenizer from the
+snapshot it trained with (``lerobot_ckpt.pinned_vlm_path``: the recorded commit, every non-weight
+file hash-checked), never whatever the Hub's ``main`` is today. ``require_provenance`` (the real
+arm) refuses a checkpoint without one; the mock rig and the latency script run Hub bases and
+untrained ACTs without one, recorded as such. ``strict_device`` (the real arm) refuses the
+MPS -> CPU fallback instead of logging it (review F2: SmolVLA on the CPU misses every deadline).
 
 Deadline. The policy runs on one worker thread; ``act`` waits at most ``timeout_s`` real seconds
 for it (the gRPC deadline's counterpart) and then re-checks the elapsed time on the loop's clock,
@@ -46,6 +57,7 @@ import concurrent.futures
 import dataclasses
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -83,12 +95,20 @@ checkpoint_files = lerobot_ckpt.checkpoint_files
 checkpoint_identity = lerobot_ckpt.checkpoint_identity
 
 
+_HUB_ID = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+(@[\w./-]+)?$")
+
+
 def resolve_checkpoint(spec: str) -> Path:
     """A local pretrained_model dir, or a Hub ``user/repo[@revision]`` downloaded (only the files
-    LeRobot loads) into the default Hugging Face cache."""
+    LeRobot loads) into the default Hugging Face cache. Anything that reads as a path (``/``,
+    ``.``, ``~`` first, more than one ``/``, or a first component that exists here) is local only
+    and must be a directory: a mistyped path is never fetched from the Hub (review F4)."""
     local = Path(spec).expanduser()
     if local.is_dir():
         return local
+    first = spec.split("/", 1)[0]
+    if not _HUB_ID.match(spec) or spec.startswith((".", "~", "/")) or Path(first).exists():
+        raise FileNotFoundError(f"checkpoint {spec!r} is not a directory (and not a Hub id)")
     from huggingface_hub import snapshot_download
 
     repo_id, _, revision = spec.partition("@")
@@ -114,6 +134,9 @@ class LocalPolicySpec:
     request_timeout_s: float
     exec_steps: int | None
     warmup: int
+    # the real arm: refuse a checkpoint without the trainer's provenance, refuse MPS -> CPU
+    require_provenance: bool = False
+    strict_device: bool = False
 
     def __post_init__(self) -> None:
         if self.family not in FAMILIES:
@@ -141,6 +164,44 @@ class LocalPolicySpec:
             exec_steps=None if exec_steps is None else int(exec_steps),
             warmup=int(lp.get("warmup", 2)),
         )
+
+
+class DeviceUnavailable(CheckpointMismatch):
+    """``strict_device``: the requested device is not available (no silent CPU fallback)."""
+
+
+def _canon(v: Any) -> Any:
+    return json.loads(json.dumps(v, sort_keys=True, default=str))
+
+
+def provenance_problems(
+    prov: Mapping[str, Any] | None,
+    pcfg: Any,
+    *,
+    units: Mapping[str, Any] | None,
+    required: bool,
+) -> list[str]:
+    """Why a checkpoint's provenance does not fit this deploy (empty = it does)."""
+    if prov is None:
+        if required:
+            return [f"no {lerobot_ckpt.PROVENANCE_FILE}: not saved by scripts/wo07_train.py"]
+        return []
+    out = []
+    cited = prov.get("convention") or {}
+    if cited.get("hash") != conv.convention_hash():
+        out.append(
+            f"trained under convention {cited.get('version')} {str(cited.get('hash'))[:12]}, "
+            f"this code is {conv.CONVENTION_VERSION} {conv.convention_hash()[:12]}"
+        )
+    if units is not None:
+        if prov.get("unit_map") is None:
+            if required:
+                out.append("trained on a dataset without a recorded unit_map (synthetic)")
+        elif _canon(prov["unit_map"]) != _canon(units):
+            out.append(f"robot.units {_canon(units)} != the training data's {prov['unit_map']}")
+    if pcfg.type == "smolvla" and not prov.get("vlm"):
+        out.append("a SmolVLA checkpoint without its pinned VLM revision")
+    return out
 
 
 def pick_device(requested: str) -> str:
@@ -188,8 +249,10 @@ class LocalPolicy:
         identity: Mapping[str, Any],
         rename_map: Mapping[str, str],
         clock: Callable[[], float] = time.perf_counter,
+        provenance: Mapping[str, Any] | None = None,
     ):
         self.policy, self.pre, self.post = policy, pre, post
+        self.provenance = None if provenance is None else dict(provenance)
         self.spec, self.device = spec, device
         self.identity = dict(identity)
         self.rename_map = dict(rename_map)
@@ -226,6 +289,7 @@ class LocalPolicy:
 
     def describe(self) -> dict[str, Any]:
         cfg = self.policy.config
+        vlm = (self.provenance or {}).get("vlm")
         return {
             "kind": "local",
             "family": self.spec.family,
@@ -238,6 +302,9 @@ class LocalPolicy:
             "image_features": sorted(cfg.image_features),
             "rename_map": dict(self.rename_map),
             "warmup_ms": list(self.warmup_ms),
+            "provenance": None if self.provenance is None else lerobot_ckpt.PROVENANCE_FILE,
+            "training_run_id": (self.provenance or {}).get("training_run_id"),
+            "vlm": None if not vlm else {k: vlm[k] for k in ("name", "revision")},
         }
 
 
@@ -293,10 +360,12 @@ def load_local_policy(
     spec: LocalPolicySpec,
     *,
     clock: Callable[[], float] = time.perf_counter,
+    units: Mapping[str, Any] | None = None,
 ) -> LocalPolicy:
-    """Resolve, hash (refusing a mismatch before the weights load), check the checkpoint against
-    the convention, load it with its own processors on ``spec.device`` (MPS -> CPU fallback),
-    and warm it up."""
+    """Resolve, hash (refusing a mismatch before the weights load), check the checkpoint and its
+    provenance against the convention and ``units`` (``dataclasses.asdict`` of the live
+    ``UnitMap``), load it with its own processors on ``spec.device`` (MPS -> CPU fallback, refused
+    with ``strict_device``) and, for SmolVLA with a provenance, the pinned VLM snapshot; warm up."""
     from lerobot.configs.policies import PreTrainedConfig
 
     ckpt = resolve_checkpoint(spec.base)
@@ -310,8 +379,25 @@ def load_local_policy(
             f"local_policy.checkpoint_sha256 {spec.checkpoint_sha256}"
         )
     device = pick_device(spec.device)
+    if spec.strict_device and device != spec.device:
+        raise DeviceUnavailable(
+            f"local_policy.device {spec.device} is not available in this Python / torch build "
+            f"(it would run on {device}); use the Mac's own Terminal and .venv"
+        )
     pcfg = PreTrainedConfig.from_pretrained(ckpt)
     _check_features(pcfg, spec, ckpt)
+    prov = lerobot_ckpt.read_provenance(ckpt)
+    bad = provenance_problems(prov, pcfg, units=units, required=spec.require_provenance)
+    if bad:
+        raise CheckpointMismatch(f"{spec.base}: " + "; ".join(bad))
+    vlm_path = None
+    if prov is not None and prov.get("vlm") and pcfg.type == "smolvla":
+        try:
+            vlm_path = lerobot_ckpt.pinned_vlm_path(
+                prov["vlm"], weights=bool(getattr(pcfg, "load_vlm_weights", False))
+            )
+        except (ValueError, OSError) as e:
+            raise CheckpointMismatch(f"{spec.base}: {e}") from e
     rename_map, override_rename = _rename_for(pcfg, ckpt)
     # the trainer's loader (CPU: fp32, the saved weights re-read past LeRobot's bf16 expert);
     # every chunk is executed whole by the deploy loop, so n_action_steps = chunk_size
@@ -323,6 +409,7 @@ def load_local_policy(
         preprocessor_overrides=(
             {RENAME_STEP: {"rename_map": rename_map}} if override_rename else None
         ),
+        vlm_path=vlm_path,
     )
     local = LocalPolicy(
         policy,
@@ -333,6 +420,7 @@ def load_local_policy(
         identity=identity,
         rename_map=rename_map,
         clock=clock,
+        provenance=prov,
     )
     local.warm(spec.warmup)
     return local
@@ -382,7 +470,8 @@ class LocalPolicyClient:
             "policy_id": self.policy.spec.base,
             "describe": self.policy.describe(),
             "server_run": {"run_id": self.run_id, "device": self.policy.device},
-            "convention": conv.citation(),
+            # what the CHECKPOINT was trained under (its provenance), not this module's citation
+            "convention": (self.policy.provenance or {}).get("convention"),
             "checkpoint_sha256": self.policy.identity.get("checkpoint_sha256"),
             "checkpoint_revision": self.policy.identity.get("checkpoint_revision"),
         }
@@ -453,13 +542,21 @@ def local_mismatches(
         "action_dim": dcfg.action_dim,
         "protocol_version": protocol.PROTOCOL_VERSION,
         "protocol_hash": protocol.protocol_hash(),
-        "convention": conv.citation(),
     }
     out = [
         f"{k}: policy {info.get(k)!r} != client {v!r}"
         for k, v in expected.items()
         if info.get(k) != v
     ]
+    cited = info.get("convention")
+    if cited is None:
+        if spec.require_provenance:
+            out.append("convention: the checkpoint cites none (no trainer provenance)")
+    elif (cited.get("hash"), cited.get("version")) != (
+        conv.convention_hash(),
+        conv.CONVENTION_VERSION,
+    ):
+        out.append(f"convention: checkpoint {cited!r} != client {conv.citation()!r}")
     sha = info.get("checkpoint_sha256")
     if not sha:
         out.append("checkpoint_sha256: none recorded")

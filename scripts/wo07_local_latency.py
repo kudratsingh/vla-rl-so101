@@ -13,7 +13,11 @@ fallback) through ``src/robot/local_policy.py``; only the arm (``FakeFollower``)
   ``FakeFollower.send_action``, within each trial.
 
 Camera capture is EXCLUDED (the fake cameras return at once). Single run, mock rig: NOT a result
-and never an arm number. Every action goes through the safety filter, so the pretrained base's
+and never an arm number. ``--capture`` (review F3) runs it the way a real-0.1 session does: the
+evaluation capture (``src/robot/recording.py`` ``EvalCapture``: both cameras + state + action
+into a LeRobotDataset, LeRobot's 8 PNG writer threads during the trial, the AV1 save and the
+per-episode checkpoint after it) on TEXTURED frames (a ring of 30 random-noise images per
+camera, the worst case for PNG / AV1), and also reports the per-episode save time. Every action goes through the safety filter, so the pretrained base's
 (or an untrained ACT's) actions, which are not ours, are clipped or rejected like any others. To
 time a full chunk rather than one write per trial, this script (only) sets
 ``deploy.stop_on_reject: false``: a rejected action still writes the filter's hold command on its
@@ -21,6 +25,7 @@ tick, so the loop's pacing and the bus writes are unchanged; the safety status c
 
     uv run scripts/wo07_local_latency.py --preset real --family smolvla          # MPS, smolvla_base
     uv run scripts/wo07_local_latency.py --preset real --family act              # fresh ACT
+    uv run scripts/wo07_local_latency.py --preset real --family smolvla --capture  # as the eval
     uv run scripts/wo07_local_latency.py --preset tiny                           # CPU, tiny ACT, <2 min
 
 Writes runs/<id>/record.json (results.latency: p50 / p95 / max of both, plus every trial record)
@@ -61,6 +66,7 @@ from src.robot.local_policy import (
     local_deploy_config,
     local_pipe,
 )
+from src.robot.recording import EvalCapture
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.servo_health import monitor_from_config
 from src.robot.units import UnitMap
@@ -83,14 +89,23 @@ TINY_TICKS = 40
 
 
 class StillCam:
-    """A fake ``FrameReader``: one fixed 640x480 RGB image, a fresh ``clock`` stamp per read."""
+    """A fake ``FrameReader``: a fixed 640x480 RGB noise image (``moving``: the next of a ring of
+    30), a fresh ``clock`` stamp per read."""
 
-    def __init__(self, seed: int, clock: Callable[[], float] = time.perf_counter):
+    def __init__(
+        self, seed: int, clock: Callable[[], float] = time.perf_counter, moving: bool = False
+    ):
         rng = np.random.default_rng(seed)
-        self.image = rng.integers(0, 256, conv.IMAGE_SHAPE_HWC, dtype=np.uint8)
+        n = 30 if moving else 1
+        self.ring = [rng.integers(0, 256, conv.IMAGE_SHAPE_HWC, dtype=np.uint8) for _ in range(n)]
+        self.reads = 0
         self.clock = clock
         self.connected = False
         self.fail = False
+
+    @property
+    def image(self) -> np.ndarray:
+        return self.ring[self.reads % len(self.ring)]
 
     def connect(self) -> None:
         self.connected = True
@@ -98,14 +113,16 @@ class StillCam:
     def read(self) -> Frame:
         if self.fail:
             raise CameraFault("timed out waiting for a frame")
-        return Frame(self.image, self.clock())
+        img = self.image
+        self.reads += 1
+        return Frame(img, self.clock())
 
     def disconnect(self) -> None:
         self.connected = False
 
 
-def mock_rig(clock: Callable[[], float] = time.perf_counter) -> CameraRig:
-    return CameraRig({name: StillCam(i, clock) for i, name in enumerate(conv.CAMERA_NAMES)})
+def mock_rig(clock: Callable[[], float] = time.perf_counter, moving: bool = False) -> CameraRig:
+    return CameraRig({name: StillCam(i, clock, moving) for i, name in enumerate(conv.CAMERA_NAMES)})
 
 
 def pct(values: Sequence[float]) -> dict[str, Any]:
@@ -157,6 +174,7 @@ def run(
     runs_dir: Path,
     fk: FkFn | None = None,
     act_overrides: dict[str, Any] | None = None,
+    capture: bool = False,
 ) -> Path:
     sys.path.insert(0, str(REPO_ROOT / "tests"))
     from robot_fakes import FakeFollower
@@ -211,14 +229,33 @@ def run(
                 decisions.append(row)
             run_.log_metrics(**row)
 
+        saves: list[float] = []
         with (
             LocalPolicyClient(policy, timeout_s=dcfg.request_timeout_s, run_id=run_.id) as client,
-            mock_rig() as rig,
+            mock_rig(moving=capture) as rig,
             arm,
         ):
             info = client.info()
             check_local(info, dcfg, spec)
             loop = DeployLoop(arm, rig, local_pipe, client, dcfg)
+            cap: EvalCapture | None = None
+            if capture:
+                cap = EvalCapture.open(
+                    run_.dir / "capture",
+                    "local/latency-capture",
+                    {"source": __file__, "purpose": "latency measurement", "session_id": run_.id},
+                    resume=False,
+                    follower=fol,
+                    end_state=lambda: rig.read().images,
+                )
+                loop.on_write = cap.on_write
+                loop.on_settled = cap.on_settled
+
+            def trial_start(_k: int) -> None:
+                marks.append(len(writes))
+                if cap is not None:
+                    cap.begin(f"latency/{_k}", conv.DEMO_TASK_STRING)
+
             k, end = 0, "completed"
             while sum(t["steps"] for t in trials) < ticks and end == "completed":
                 _, end = run_trials(
@@ -232,12 +269,18 @@ def run(
                     camera_calibrated=False,
                     log_row=log_row,
                     trials=trials,
-                    on_trial_start=lambda _k: marks.append(len(writes)),
+                    on_trial_start=trial_start,
                     max_steps=min(dcfg.trial_max_steps, ticks - sum(t["steps"] for t in trials)),
                 )
+                if cap is not None and trials:
+                    t0 = time.perf_counter()
+                    trials[-1]["capture"] = cap.finish(trials[-1])
+                    saves.append(time.perf_counter() - t0)
                 k += 1
                 if trials and not trials[-1]["policy_started"]:
                     break  # the policy never started: more trials would only repeat it
+            if cap is not None:
+                cap.close()
         gaps: list[float] = []
         for mark, t in zip(marks, trials, strict=False):
             w = writes[mark : mark + int(t["steps"])]
@@ -274,6 +317,16 @@ def run(
             "safety_status": dict(
                 sum((Counter(t["safety"]["status_counts"]) for t in trials), Counter())
             ),
+            "capture": (
+                {
+                    "on": True,
+                    "frames": "textured: a ring of 30 random-noise 640x480 images per camera",
+                    "episode_save_s": pct(saves),
+                    "frames_per_episode": [int(t["steps"]) for t in trials],
+                }
+                if capture
+                else {"on": False}
+            ),
         }
         run_.results.update(
             label=LABEL,
@@ -285,6 +338,7 @@ def run(
         )
     if fresh:  # untrained weights: only their hash (results.policy_info) is worth keeping
         shutil.rmtree(run_.dir / "act_init", ignore_errors=True)
+    shutil.rmtree(run_.dir / "capture", ignore_errors=True)  # noise frames: only the timing
     _print(run_.id, latency)
     return run_.record_path
 
@@ -296,7 +350,7 @@ def _print(run_id: str, lat: dict[str, Any]) -> None:
         print(f"  {key:<15} n={s['n']:<4} p50 {s['p50']}  p95 {s['p95']}  max {s['max']}")
     print(
         f"  {lat['ticks']} writes, {lat['decisions']} chunks, {lat['actions_per_chunk_mean']} "
-        f"actions/chunk, stops {lat['stop_reasons']}"
+        f"actions/chunk, stops {lat['stop_reasons']}, capture {lat['capture']}"
     )
 
 
@@ -309,6 +363,9 @@ def main(argv: Sequence[str] | None = None) -> Path:
     )
     parser.add_argument("--device", choices=("mps", "cpu"), default=None)
     parser.add_argument("--ticks", type=int, default=None, help="bus writes to collect (300)")
+    parser.add_argument(
+        "--capture", action="store_true", help="with the evaluation capture on textured frames"
+    )
     parser.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.preset not in ("real", "tiny"):
@@ -330,6 +387,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
         ticks=ticks,
         runs_dir=args.runs_dir,
         act_overrides=TINY_ACT if tiny else None,
+        capture=args.capture,
     )
 
 

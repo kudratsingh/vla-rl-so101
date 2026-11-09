@@ -407,3 +407,73 @@ def calibrate_intrinsics(
         rms_px=float(rms),
     )
     return intr, found
+
+
+# ------------------------------------------------------------------------------------------------
+# Which physical camera is which (review conv-4)
+# ------------------------------------------------------------------------------------------------
+CAMERA_ROLES: dict[str, str] = {
+    "front": "the table, the grid and the arm from the front, about 45 deg above",
+    "wrist": "the gripper jaws close up (the module on the gripper)",
+}
+CAMERA_CHECK_ANSWER = "yes"
+
+
+class CameraRoleError(RuntimeError):
+    """The operator did not confirm that each camera name shows its view (nothing recorded)."""
+
+
+def camera_check_sheet(images: Mapping[str, ImageU8]) -> ImageU8:
+    """Every camera side by side, 320 x 240 each, its NAME printed large on it (RGB)."""
+    tiles = []
+    for name, img in images.items():
+        tile = cv2.resize(np.ascontiguousarray(img), (320, 240))
+        cv2.rectangle(tile, (0, 0), (319, 34), (0, 0, 0), -1)
+        cv2.putText(tile, name.upper(), (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+        tiles.append(tile)
+    sheet: ImageU8 = np.concatenate(tiles, axis=1)
+    return sheet
+
+
+def confirm_camera_roles(
+    rig: CameraRig,
+    out_path: Any,
+    ask: Any,
+    *,
+    indices: Mapping[str, Any] | None = None,
+    show: Any = None,
+) -> dict[str, Any]:
+    """Before anything is recorded: which OpenCV index is which camera is decided by USB
+    enumeration on macOS and can change after a re-plug or a reboot, and both cameras stream the
+    same 640 x 480 at 30 fps, so no setting tells them apart. One frame of every camera is written
+    as a labelled sheet (``out_path``, opened with ``show``), and the operator must type
+    ``CAMERA_CHECK_ANSWER`` to confirm that each name shows its view (``CAMERA_ROLES``); anything
+    else raises ``CameraRoleError``. Returns the record (sheet path, indices, time)."""
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    frame = rig.read()
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sheet = camera_check_sheet(frame.images)
+    cv2.imwrite(str(path), cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
+    if show is not None:
+        show(path)
+    print(f"camera check: {path}")
+    for name in frame.images:
+        print(f"  {name.upper()} must show {CAMERA_ROLES.get(name, name)}")
+    try:
+        answer = str(ask(f"type '{CAMERA_CHECK_ANSWER}' if every label matches its view: "))
+    except (KeyboardInterrupt, EOFError):
+        answer = ""
+    if answer.strip().lower() != CAMERA_CHECK_ANSWER:
+        raise CameraRoleError(
+            "camera roles not confirmed (front / wrist swapped?): fix cameras.<name>.index in "
+            "configs/real.yaml; nothing was recorded"
+        )
+    return {
+        "sheet": str(path),
+        "indices": dict(indices or {}),
+        "confirmed_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "method": "operator confirmed a labelled frame of every camera",
+    }

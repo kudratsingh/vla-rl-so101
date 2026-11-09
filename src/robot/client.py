@@ -487,6 +487,10 @@ class DeployLoop:
         # capture, src/robot/recording.py: both cameras, measured state, written command). A
         # failure in it is logged and never reaches the arm or the trial
         self.on_write: Callable[[Frame | RigFrame | None, StepResult], None] | None = None
+        # runs once at the end of a clean trial's settling interval, before the servo read and
+        # the score prompt (the evaluation capture reads the end-state stills the rubric
+        # judges). A failure in it is logged and never reaches the arm or the score
+        self.on_settled: Callable[[], None] | None = None
         # the session's signal flags (src/robot/prompts.operator_signals; hardware only): a
         # Ctrl-C or a hang-up stops motion between ticks, never inside a bus transaction
         self.interrupts = interrupts
@@ -686,6 +690,14 @@ class DeployLoop:
             self.on_policy_start(res)
         except Exception:  # a logging failure must not stop the trial
             log.exception("recording the policy start failed")
+
+    def settled(self) -> None:
+        if self.on_settled is None:
+            return
+        try:
+            self.on_settled()
+        except Exception:  # a recording failure must not stop the scoring
+            log.exception("recording the settled end state failed")
 
     def _wrote(self, frame: Frame | RigFrame | None, out: StepResult) -> None:
         if self.on_write is None:
@@ -1108,6 +1120,7 @@ def _score(
                 raise gone_error(stop.kind, stop.reason)
             if stop is not None:
                 raise KeyboardInterrupt
+            loop.settled()  # the end state, before the servo read and the score prompt
             try:
                 arm.check_servos()  # the arm held under torque while it settled
             except (ServoFault, SerialFault) as e:  # torque now off: the same physical event

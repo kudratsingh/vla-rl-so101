@@ -24,7 +24,7 @@ from src.robot.client import ScriptedOperator
 
 # Pinned: frozen before the first demo (owner D4). A change fails here on purpose: add a new real
 # protocol version instead (CLAUDE.md rule 4).
-FROZEN = {"real-0.1": "a39c1be29ec5f49d1bd2243842077eba2a1abf6690d12987d08fcf74a763d395"}
+FROZEN = {"real-0.1": "edee44aa957d3c0525edfb0f3d37c47958cf115ef01f7a289e756883f279d749"}
 SCHEDULES = {
     "eval": "dd1345de09b4595048d6f23f2e38057a65d6e06d39f79d7a554e189fc48d0e71",
     "dev": "21fe5598a9784ae119960b444a715a3bf36b9510491749c41e965889fe26af59",

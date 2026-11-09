@@ -20,10 +20,17 @@ Joint vector, state and action (``observation.state`` and ``action``, float32[6]
       configuration_smolvla.py:35-40``; ``lerobot/policies/act/configuration_act.py:89-94``), and a
       fine-tune normalizes with the FINE-TUNE dataset's own stats (``lerobot/scripts/
       lerobot_train.py:262-280`` overrides the pretrained normalizer with ``dataset.meta.stats``).
-      Every candidate unit is a per-joint affine map of the others with a positive scale
-      (deg = rad * 180/pi; LeRobot 0-100 gripper = affine in the URDF gripper angle;
-      RANGE_M100_100 = affine in the raw tick), so after normalization the policy sees the SAME
-      numbers whichever unit the dataset stores. The unit cannot help or hurt the pretrained prior.
+      Every candidate unit is a per-joint affine map of the others (deg = rad * 180/pi; LeRobot
+      0-100 gripper = affine in the URDF gripper angle; RANGE_M100_100 = affine in the raw tick),
+      with a positive scale under the default ``robot.units.arm_sign`` (+1 per joint), so after
+      normalization the policy sees the SAME numbers whichever unit the dataset stores. A joint
+      with ``arm_sign`` -1 is MIRRORED, not rescaled: what the stored radians mean depends on
+      ``robot.units`` (canonical q = deg2rad(sign * deg + offset)). Those values are calibration of
+      the canonical frame, not part of this hash: every recording stores them (``unit_map`` in
+      ``meta/vla_rl_so101.json``), the trainer copies them into the checkpoint's provenance
+      (``src/policy/lerobot_ckpt.py`` ``PROVENANCE_FILE``, inside the checkpoint hash) and the
+      deploy path refuses a checkpoint whose ``unit_map`` or convention hash differs from the live
+      ones (``src/robot/local_policy.py``).
     * The pretraining data is not one unit anyway: ``lerobot/svla_so100_pickplace`` (SmolVLA
       paper data) stores pre-2025-calibration degrees (wrist_roll mean 85.8, range 56..123), and
       ``lerobot/svla_so101_pickplace`` stores RANGE_M100_100 values (shoulder_lift reaches -100.0,
@@ -62,6 +69,15 @@ Action semantics
     seconds of LeRobot's ACT default of 100 steps at 30 fps, ``configuration_act.py:86``). How
     many of them are executed per query is a deploy setting, never more than the chunk.
 
+    Timing (``TIMING_KEY`` = ``timing_s``, float32[2] = [write, camera_frame], from version 1.1):
+    seconds since the episode's first command write, on the recorder's clock, at which this
+    frame's command was written and at which its (oldest) camera image was grabbed. LeRobot's
+    ``timestamp`` is always ``frame_index / fps`` (nominal); a demo ticks at 15 Hz, but an
+    evaluation rollout writes in bursts (an in-process SmolVLA runs a few actions, then pauses
+    for the next chunk), so the real timing lives here. Not an ``observation.*`` / ``action`` key:
+    LeRobot never makes it a policy input. (A [1]-shaped scalar feature does not survive
+    LeRobot 0.4.4's ``save_episode`` with numpy 2, hence the pair.)
+
 Cameras
     Two, both in every frame of every demo and every eval trial (final2 hardware floor; a frame
     without both is refused): ``front`` (Logitech C920x at the sim front pose, elevated 45 deg:
@@ -83,8 +99,10 @@ Cameras
     it in the checkpoint's preprocessor, which then renames at inference too.
 
 Language and dataset
-    Per-frame ``task`` = the protocol instruction of the trial's task and object, the template in
-    ``src.eval.protocol.INSTRUCTIONS``; demos are PickPlace with the red cube: ``DEMO_TASK_STRING``.
+    Per-frame ``task`` = the protocol instruction of the trial's task and object
+    (``src.eval.protocol.instruction``, the one function the recorder, ``run_trials`` and the real
+    protocol's schedules call; its templates ``INSTRUCTIONS`` are hashed here); demos are PickPlace
+    with the red cube: ``DEMO_TASK_STRING``.
     Dataset: LeRobot ``codebase_version`` v3.0 (what lerobot 0.4.4 writes), ``robot_type``
     ``so101_follower``, fps = ``FPS``.
 
@@ -108,7 +126,7 @@ import numpy.typing as npt
 import torch
 
 from src.config import Config
-from src.eval.protocol import BLUE_CUBE, INSTRUCTIONS, RED_CUBE, instruction
+from src.eval.protocol import INSTRUCTIONS, RED_CUBE, instruction
 from src.robot.units import (
     GRIPPER_INDEX,
     JOINT_NAMES,
@@ -120,11 +138,13 @@ from src.robot.units import (
 )
 
 CONVENTION_ID = "so101-real-obs-action"
-CONVENTION_VERSION = "1.0"
+CONVENTION_VERSION = "1.1"  # 1.1: + timing_s (review conv-3 / F6)
 
 STATE_KEY = "observation.state"
 ACTION_KEY = "action"
 TASK_KEY = "task"
+TIMING_KEY = "timing_s"
+TIMING_NAMES = ("write", "camera_frame")
 JOINT_UNIT = "rad"
 DECLARED_UNITS: dict[str, str] = {name: JOINT_UNIT for name in JOINT_NAMES}
 GRIPPER_CLOSED_RAD, GRIPPER_OPEN_RAD = URDF_LIMITS_RAD["gripper"]
@@ -213,6 +233,13 @@ def spec() -> dict[str, Any]:
             "recorded": "uint8 HWC, uncropped",
             "policy_input": "float32 CHW in [0, 1]",
         },
+        "timing": {
+            "key": TIMING_KEY,
+            "dtype": "float32",
+            "names": list(TIMING_NAMES),
+            "meaning": "s since the episode's first command write (recorder clock): this frame's "
+            "command write, its oldest camera grab",
+        },
         "smolvla_rename_map": dict(SMOLVLA_RENAME_MAP),
         "task": {"key": TASK_KEY, "templates": dict(INSTRUCTIONS), "demo": DEMO_TASK_STRING},
         "dataset": {
@@ -238,13 +265,6 @@ def citation() -> dict[str, str]:
         "version": CONVENTION_VERSION,
         "hash": convention_hash(),
     }
-
-
-def task_string(task: str, obj_label: str) -> str:
-    """The per-frame ``task`` string: the protocol template filled with the object's label."""
-    if task not in INSTRUCTIONS:
-        raise ConventionError(f"unknown task {task!r}; templates: {sorted(INSTRUCTIONS)}")
-    return INSTRUCTIONS[task].format(obj=obj_label, base=BLUE_CUBE.label)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -274,7 +294,7 @@ def check_unit_map(units: UnitMap) -> list[str]:
 # Dataset schema
 # ------------------------------------------------------------------------------------------------
 def dataset_features() -> dict[str, dict[str, Any]]:
-    """``LeRobotDataset.create(features=...)``: both cameras, state, action."""
+    """``LeRobotDataset.create(features=...)``: both cameras, state, action, timing."""
     names = list(JOINT_NAMES)
     feats: dict[str, dict[str, Any]] = {
         c.key: {
@@ -286,6 +306,7 @@ def dataset_features() -> dict[str, dict[str, Any]]:
     }
     feats[STATE_KEY] = {"dtype": "float32", "shape": (NUM_JOINTS,), "names": names}
     feats[ACTION_KEY] = {"dtype": "float32", "shape": (NUM_JOINTS,), "names": names}
+    feats[TIMING_KEY] = {"dtype": "float32", "shape": (2,), "names": list(TIMING_NAMES)}
     return feats
 
 
@@ -307,6 +328,11 @@ def check_dataset_info(info: Mapping[str, Any]) -> list[str]:
             )
         if list(f.get("names") or []) != list(JOINT_NAMES):
             out.append(f"{key} names {f.get('names')} != {list(JOINT_NAMES)}")
+    wt = feats.get(TIMING_KEY) or {}
+    if wt.get("dtype") != "float32" or list(wt.get("names") or []) != list(TIMING_NAMES):
+        out.append(
+            f"{TIMING_KEY} must be float32{list(TIMING_NAMES)} (convention 1.1), got {wt or 'missing'}"
+        )
     for c in CAMERAS:
         f = feats.get(c.key) or {}
         if f.get("dtype") != "video" or list(f.get("shape") or []) != list(IMAGE_SHAPE_HWC):
@@ -372,15 +398,28 @@ def _hwc_u8(name: str, img: Any) -> npt.NDArray[np.uint8]:
 
 
 def recording_frame(
-    images: Mapping[str, Any], state: Any, action: Any, task: str
+    images: Mapping[str, Any],
+    state: Any,
+    action: Any,
+    task: str,
+    *,
+    write_time_s: float,
+    frame_time_s: float,
 ) -> dict[str, Any]:
-    """The ``LeRobotDataset.add_frame`` dict of one tick. Refuses a frame missing either camera."""
+    """The ``LeRobotDataset.add_frame`` dict of one tick. Refuses a frame missing either camera.
+    ``write_time_s`` / ``frame_time_s``: seconds since the episode's first command write at this
+    tick's write (>= 0) and at its oldest camera grab (``TIMING_KEY``)."""
     _missing_cameras(images)
     if not task:
         raise ConventionError("empty task string")
+    if not (math.isfinite(write_time_s) and write_time_s >= 0.0 and math.isfinite(frame_time_s)):
+        raise ConventionError(
+            f"timing must be finite with write_time_s >= 0, got {write_time_s!r}, {frame_time_s!r}"
+        )
     frame: dict[str, Any] = {IMAGE_KEYS[n]: _hwc_u8(n, images[n]) for n in CAMERA_NAMES}
     frame[STATE_KEY] = _joints("state", state)
     frame[ACTION_KEY] = _joints("action", action)
+    frame[TIMING_KEY] = np.array([write_time_s, frame_time_s], np.float32)
     frame[TASK_KEY] = task
     return frame
 

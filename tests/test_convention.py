@@ -25,6 +25,7 @@ from robot_fakes import FakeFollower, real_cfg, toy_fk
 from src.config import REPO_ROOT
 from src.data.recorder import load_demo_dataset
 from src.robot import convention as conv
+from src.robot import recording
 from src.robot.camera import CameraFault, CameraRig, Frame
 from src.robot.driver import DeadmanTripped, So101Driver
 from src.robot.safety import make_safety
@@ -39,7 +40,10 @@ _spec.loader.exec_module(teleop)
 
 # Pinned. A change to spec() fails here on purpose: bump CONVENTION_VERSION and pin the new hash
 # (demos recorded earlier keep citing the hash they were recorded under).
-FROZEN = {"1.0": "b8701c5784f73dc0fec0fc12bf695be8c7b7db826c2f8faae460716fe1c912b5"}
+FROZEN = {
+    "1.0": "b8701c5784f73dc0fec0fc12bf695be8c7b7db826c2f8faae460716fe1c912b5",
+    "1.1": "c387f1751d58e8ff5463173885092825b556cc0807e9962f7aff1c68b807b30c",  # + timing_s
+}
 
 FRONT_RGB = (30, 60, 200)  # blue-dominant
 WRIST_RGB = (200, 60, 30)  # red-dominant
@@ -163,11 +167,17 @@ def test_a_frame_without_both_cameras_is_never_recorded() -> None:
     img = np.zeros(conv.IMAGE_SHAPE_HWC, np.uint8)
     q = np.zeros(6)
     with pytest.raises(conv.ConventionError, match="missing \\['wrist'\\]"):
-        conv.recording_frame({"front": img}, q, q, "t")
+        conv.recording_frame({"front": img}, q, q, "t", write_time_s=0.0, frame_time_s=0.0)
     with pytest.raises(conv.ConventionError, match="missing \\['front'\\]"):
         conv.policy_observation({"wrist": img}, q, "t")
     with pytest.raises(conv.ConventionError, match="uint8"):  # a 224 crop is not this convention
-        conv.recording_frame({"front": img, "wrist": img[:224, :224]}, q, q, "t")
+        conv.recording_frame(
+            {"front": img, "wrist": img[:224, :224]}, q, q, "t", write_time_s=0.0, frame_time_s=0.0
+        )
+    with pytest.raises(conv.ConventionError, match="timing"):  # convention 1.1: real times
+        conv.recording_frame(
+            {"front": img, "wrist": img}, q, q, "t", write_time_s=-1.0, frame_time_s=0.0
+        )
 
     # a wrist camera fault on the tick: no frame, the deadman holds, nothing reaches the dataset
     rig, cams = _rig()
@@ -197,11 +207,12 @@ def test_recorder_check_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
 
     monkeypatch.setattr(sess.arm, "step", step)
     repo_id, root = "local/convention-check", tmp_path / "ds"
-    dataset = teleop.create_dataset(repo_id, root)
+    # the recorder's own durable dataset (finalized and reopened after every saved episode)
+    dataset = recording.DurableDataset(teleop.create_dataset(repo_id, root), repo_id)
     instr = teleop.protocol_instructions(["PickPlace"])
     with rig:
         saved = teleop.record_session(sess, dataset, ["PickPlace"], instr, 1, 0.5)
-    dataset.finalize()
+    dataset.close()
     assert saved == 1 and not answers
 
     info = json.loads((root / "meta" / "info.json").read_text())
@@ -210,6 +221,10 @@ def test_recorder_check_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     n = len(ds)
     assert n >= 5 and sorted(ds.meta.video_keys) == sorted(conv.IMAGE_KEYS.values())
     rec_steps, rec_leader = steps[-n:], leader.history[-n:]  # the recorded ticks, in order
+    # convention 1.1 timing: real write times from 0, increasing; each camera grab before it
+    timing = np.stack([ds[i][conv.TIMING_KEY].numpy() for i in range(n)])
+    assert timing.shape == (n, 2) and timing[0, 0] == 0.0
+    assert np.all(np.diff(timing[:, 0]) > 0) and np.all(timing[:, 1] <= timing[:, 0])
 
     live = rig.read()  # what the inference path would build from the same cameras
     live_batch = conv.policy_observation(
@@ -296,6 +311,13 @@ def test_teleop_main_cites_the_convention(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.setattr(teleop, "load_sim_fk", lambda: toy_fk)
     monkeypatch.setattr(teleop, "make_leader", lambda _lc: Leader())
     monkeypatch.setattr(teleop.CameraRig, "from_config", classmethod(lambda cls, c, n: rig))
+    checked: list[Any] = []
+
+    def confirm(cam: Any, path: Path, _ask: Any, **kw: Any) -> dict[str, Any]:
+        checked.append((cam.names, path, kw["indices"]))
+        return {"sheet": str(path), "indices": kw["indices"], "method": "test"}
+
+    monkeypatch.setattr(teleop, "confirm_camera_roles", confirm)
     monkeypatch.setattr(teleop, "record_session", record_session)
     monkeypatch.setattr(
         teleop.So101Driver,
@@ -313,6 +335,9 @@ def test_teleop_main_cites_the_convention(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert prov["convention"] == conv.citation()
     assert prov["units"] == conv.DECLARED_UNITS
     assert set(prov["cameras"]) == {"front", "wrist"}
+    # review conv-4: the camera roles were confirmed before torque on, recorded per sitting
+    assert checked and checked[0][0] == conv.CAMERA_NAMES
+    assert prov["sittings"][0]["camera_check"]["method"] == "test"
 
     # a config outside the convention is refused before the leader, the dataset or the follower
     cfg["cameras"]["wrist"] = {**cfg["cameras"]["wrist"], "enabled": False}

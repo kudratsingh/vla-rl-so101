@@ -67,6 +67,11 @@ Agent notes on these items:
   (PR 2) also comes before any camera-match frame (step 7) or teleop episode (step 10) that shows
   objects: until then step 7 runs with an empty table. Frames never show the unseen objects
   (purple cube, green cube) and use no slot outside the five seen slots.
+- **Camera roles and interrupted demos (PR 2 review round 1).** Every demo sitting and every real
+  eval session starts with a labelled frame of each camera (opened in Preview); type `yes` only
+  if FRONT shows the front view and WRIST the gripper (USB re-plugs and reboots can swap the
+  OpenCV indices). A demo sitting that ends early continues with `--demo-schedule --resume` at
+  the next demo; saved demos survive a power loss (each is finalized when it is saved).
 
 ---
 

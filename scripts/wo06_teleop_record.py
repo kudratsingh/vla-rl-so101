@@ -19,6 +19,8 @@ Needs: a leader arm in ``teleop.leader`` (otherwise exits with a message), both 
     .venv/bin/python scripts/wo06_teleop_record.py --preset real                  # 5 x 3 tasks
     .venv/bin/python scripts/wo06_teleop_record.py --preset real --push           # also upload
     .venv/bin/python scripts/wo06_teleop_record.py --preset real --task PickPlace --demo-schedule
+    .venv/bin/python scripts/wo06_teleop_record.py --preset real --task PickPlace --demo-schedule \
+        --resume                                                          # continue the 50 demos
 
 WO-07 demos (``--demo-schedule``; owner 2026-11-09, final2 item 6 / amendments D1, D2, D4): the 50
 PickPlace demos of protocol real-0.1 (``src/eval/protocol_real.py`` ``demo_schedule()``): 10 at each
@@ -30,6 +32,20 @@ PLANNED pose); a redo keeps the same placement; ``meta/vla_rl_so101.json`` maps 
 to its placement and cites the protocol hash, the session id, the time, the follower id and the
 calibration copied to ``meta/calibration_follower.json`` (what ``scripts/wo07_export_bundle.py
 demo`` needs; it refuses a dataset recorded without ``--demo-schedule``).
+
+Durable and resumable (review F1 / F5). Every kept episode is saved, its placement written to
+``meta/vla_rl_so101.json``, then the dataset is finalized and reopened (``src/robot/recording.py``
+``DurableDataset``): a power loss or a kill costs at most the episode being saved. A session that
+ended early (a servo fault, a timeout, ``q``, a closed Terminal) continues with ``--resume``: it
+recovers the dataset (``recover_dataset``), refuses unless the dataset cites the same protocol
+hash, convention hash, demo schedule and ``robot.units`` and the follower loads the same
+calibration, and continues the frozen schedule at the next demo index (the session id stays the
+dataset's; each sitting is listed under ``sittings``).
+
+Camera roles (review conv-4): before torque goes on, one frame of each camera is written as a
+labelled sheet (``meta/camera_check_<n>.png``, opened in Preview) and the operator types ``yes``
+only if FRONT shows the front view and WRIST the gripper (``src/robot/camera.py``
+``confirm_camera_roles``); OpenCV indices follow USB enumeration on macOS. Recorded per sitting.
 
 (``.venv/bin/python``, not ``uv run``: under ``uv run`` a Ctrl-Z also stops ``uv`` and the session
 ends; ``src/robot/prompts.py``.)
@@ -82,12 +98,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
 import shutil
+import subprocess
 import sys
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -113,7 +131,9 @@ from src.robot import recording
 from src.robot.camera import (
     CameraFault,
     CameraRig,
+    CameraRoleError,
     RigFrame,
+    confirm_camera_roles,
     sim_mismatches,
 )
 from src.robot.driver import (
@@ -245,6 +265,8 @@ class Session:
         self.stop = False  # Ctrl-C under ctrl_c_as_flag; the loops check it between ticks
         # saved episode index -> its demo-schedule placement (``--demo-schedule``)
         self.placements: dict[str, dict[str, Any]] = {}
+        # after every saved episode, before the dataset is finalized: write the provenance
+        self.on_saved: Callable[[], None] | None = None
 
     @property
     def torque_released(self) -> bool:
@@ -396,6 +418,18 @@ def torque_on_ask(sess: Session, msg: str) -> str:
     if reply.how == TIMEOUT:
         return QUIT  # torque already released (support message, grace, torque off)
     return reply.answer
+
+
+def save_durably(dataset: Any, hook: Callable[[int], None]) -> int:
+    """Save the buffered episode; ``hook(index)`` records it; a ``recording.DurableDataset`` is
+    then finalized and reopened (module doc). Returns the episode's index."""
+    if isinstance(dataset, recording.DurableDataset):
+        return dataset.save_episode(before_checkpoint=hook)
+    index = int(getattr(dataset, "num_episodes", 0))
+    with datasets_write_compat():
+        dataset.save_episode()
+    hook(index)
+    return index
 
 
 def discard_episode(dataset: Any) -> None:
@@ -604,6 +638,7 @@ def _episodes(
                     print("follower holds; retry")
                     continue
                 t_start = time.perf_counter()
+                t_first: float | None = None  # the episode's first write (timing_s origin)
                 print(f"recording ({ep_time:.0f} s max, Ctrl-C to end) ...")
                 while time.perf_counter() - t_start < ep_time and not sess.stop_requested():
                     t0 = time.perf_counter()
@@ -611,9 +646,16 @@ def _episodes(
                         frame, out = sess.tick()
                     except MotionStopped:  # recorded mid-tick: no goal, no frame this tick
                         break
+                    t_write = time.perf_counter()  # the goal was written inside the tick
+                    t_first = t_write if t_first is None else t_first
                     assert frame is not None and out.safety.command is not None
                     row = conv.recording_frame(  # refuses a frame without both cameras
-                        frame.images, out.measured, out.safety.command, instructions[task]
+                        frame.images,
+                        out.measured,
+                        out.safety.command,
+                        instructions[task],
+                        write_time_s=t_write - t_first,
+                        frame_time_s=float(frame.capture_time) - t_first,
                     )
                     with datasets_write_compat():
                         dataset.add_frame(row)
@@ -647,18 +689,23 @@ def _episodes(
                 return saved
             if n_frames > 0 and keep in ("", "y", "yes"):
                 print("saving episode (encoding video, a few seconds; Ctrl-C is ignored) ...")
-                # the dataset index this episode gets (only the demo schedule records it)
-                index = int(dataset.num_episodes) if placements is not None else -1
+
+                def on_saved(index: int, k: int = k) -> None:
+                    if placements is not None:  # only the demo schedule records the placement
+                        sess.placements[str(index)] = dict(placements[k])
+                    if sess.on_saved is not None:
+                        sess.on_saved()  # before the checkpoint: a kill keeps the map
+
                 try:
-                    with datasets_write_compat():
-                        dataset.save_episode()
+                    save_durably(dataset, on_saved)
+                except recording.CheckpointFailed:  # saved, but not durable: stop recording
+                    saved += 1
+                    raise
                 except Exception as e:  # noqa: BLE001 - the arm holds; never exit through __exit__
                     print(f"saving failed ({type(e).__name__}: {e}); episode discarded, redo it")
                     discard_episode(dataset)
                     continue
                 saved += 1
-                if placements is not None:
-                    sess.placements[str(index)] = dict(placements[k])
                 k += 1
             else:
                 discard_episode(dataset)
@@ -696,7 +743,48 @@ def recording_provenance(
         "demo_schedule": demo_schedule,
         "protocol": PR.citation() if demo_schedule else None,
         "episodes": {},
+        "sittings": [],
     }
+
+
+PROVENANCE_FILE = "meta/vla_rl_so101.json"
+
+
+def resume_problems(
+    prov: dict[str, Any], units: UnitMap, num_episodes: int, placements: Sequence[dict[str, Any]]
+) -> list[str]:
+    """Why a recorded demo dataset may not be continued (empty = it may): the same protocol,
+    convention, demo schedule and ``robot.units``, and its placements = demos 0..N-1 in order."""
+    out = []
+    if not prov.get("demo_schedule"):
+        out.append("--resume continues a --demo-schedule recording only")
+    if prov.get("rehearsal"):
+        out.append("a rehearsal recording is never continued")
+    if (prov.get("protocol") or {}).get("hash") != PR.protocol_hash():
+        out.append(f"recorded under protocol hash {(prov.get('protocol') or {}).get('hash')}")
+    if (prov.get("convention") or {}).get("hash") != conv.convention_hash():
+        out.append(f"recorded under convention {(prov.get('convention') or {}).get('hash')}")
+    if prov.get("unit_map") != json.loads(json.dumps(dataclasses.asdict(units))):
+        out.append(f"robot.units changed: recorded {prov.get('unit_map')}")
+    eps = prov.get("episodes") or {}
+    if sorted(int(i) for i in eps) != list(range(num_episodes)):
+        out.append(f"episodes {sorted(eps, key=int)} != the dataset's 0..{num_episodes - 1}")
+    idx = [int(eps[str(i)].get("demo_idx", -1)) for i in range(num_episodes) if str(i) in eps]
+    if idx != list(range(len(idx))):
+        out.append(f"recorded demo indices {idx} are not 0..{len(idx) - 1} in order")
+    for i in range(min(num_episodes, len(placements))):
+        if str(i) in eps and eps[str(i)] != placements[i]:
+            out.append(f"episode {i}'s placement is not demo {i} of the frozen schedule")
+            break
+    return out
+
+
+def show_file(path: Path) -> None:
+    """Open a picture in Preview (macOS); harmless where ``open`` does not exist."""
+    try:
+        subprocess.run(["open", str(path)], check=False)
+    except OSError:
+        pass
 
 
 def main() -> None:
@@ -716,6 +804,11 @@ def main() -> None:
         "fixed bowl); --episodes N records its first N",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue an interrupted --demo-schedule recording at its next demo (module doc)",
+    )
+    parser.add_argument(
         "--rehearsal",
         action="store_true",
         help="1 episode per task into a throwaway <dataset>-rehearsal folder (replaced each run, "
@@ -731,6 +824,8 @@ def main() -> None:
         parser.error("WO-06 hardware scripts run with --preset real")
     if args.rehearsal and args.push:
         parser.error("--rehearsal is never pushed")
+    if args.resume and (args.rehearsal or args.overwrite or not args.demo_schedule):
+        parser.error("--resume continues a --demo-schedule recording (no --rehearsal/--overwrite)")
     require_terminal("wo06_teleop_record")  # before the leader, the dataset or the follower
     cfg = load_config(args.preset, args.config)
     tcfg = cfg.get("teleop") or {}
@@ -775,61 +870,123 @@ def main() -> None:
     root = REPO_ROOT / str(tcfg["dataset_root"]) / repo_id.split("/")[-1]
     if args.rehearsal:
         root = root.with_name(root.name + "-rehearsal")
-    if root.exists():
+    start = 0  # the first demo index of this sitting
+    recovery: dict[str, Any] | None = None
+    if args.resume:
+        if not (root / "meta" / "info.json").is_file():
+            sys.exit(f"--resume: no recording at {root}")
+        recovery = recording.recover_dataset(root)  # a kill mid-save: quarantine, rebuild meta
+        provenance = json.loads((root / PROVENANCE_FILE).read_text())
+        dropped = recording.prune_provenance(provenance, int(recovery["episodes"]))
+        assert placements is not None
+        problems = resume_problems(provenance, units, int(recovery["episodes"]), placements)
+        if recovery["episodes"] == 0:
+            problems.append("no episode was saved: record it anew with --overwrite")
+        if problems:
+            sys.exit("--resume refused; nothing was opened:\n  " + "\n  ".join(problems))
+        start = int(recovery["episodes"])
+        if start >= len(placements):
+            sys.exit(f"--resume: all {len(placements)} demos are recorded")
+        n_eps = min(int(args.episodes or len(placements) - start), len(placements) - start)
+        placements = placements[start:]
+        recovery["pruned_placements"] = dropped
+        print(f"resuming {root} at demo {start + 1}/{start + len(placements)}: {recovery}")
+    elif root.exists():
         if not (args.overwrite or args.rehearsal):
-            sys.exit(f"{root} exists; pass --overwrite to replace it")
+            sys.exit(f"{root} exists; pass --overwrite to replace it, or --resume to continue")
         shutil.rmtree(root)
     root.parent.mkdir(parents=True, exist_ok=True)
 
     leader = make_leader(dict(tcfg["leader"]))
-    dataset = create_dataset(repo_id, root)
+    if args.resume:
+        dataset = recording.DurableDataset(recording.open_dataset(repo_id, root), repo_id)
+    else:
+        dataset = recording.DurableDataset(create_dataset(repo_id, root), repo_id)
+        provenance = recording_provenance(
+            cfg,
+            units,
+            instructions,
+            {t: config_instructions.get(t) for t in tasks},
+            rehearsal=bool(args.rehearsal),
+            demo_schedule=placements is not None,
+        )
     cite = conv.citation()
     print(f"recording in {cite['id']} {cite['version']} ({cite['module']}, sha256 {cite['hash']})")
-    provenance = recording_provenance(
-        cfg,
-        units,
-        instructions,
-        {t: config_instructions.get(t) for t in tasks},
-        rehearsal=bool(args.rehearsal),
-        demo_schedule=placements is not None,
-    )
-    (root / "meta").mkdir(parents=True, exist_ok=True)
-    (root / "meta" / "vla_rl_so101.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    sitting: dict[str, Any] = {
+        "started_utc": _utc_now(),
+        "first_episode": start,
+        "cameras": {n: dict(cfg["cameras"][n]) for n in conv.CAMERA_NAMES},
+        "recovery": recovery,
+    }
+    provenance.setdefault("sittings", []).append(sitting)
+    prov_path = root / PROVENANCE_FILE
+    recording.write_json(prov_path, provenance)
     leader.connect(calibrate=False)  # leader configure() leaves its torque off
     try:
         if not leader.is_calibrated:
             sys.exit("leader motors do not match its calibration file; recalibrate the leader")
         arm = So101Driver.from_config(cfg, fk)
         # the follower's calibration as loaded (lerobot read <calibration_dir>/<id>.json)
-        provenance["calibration"] = recording.copy_calibration(arm.follower, root)
+        if args.resume:
+            data, _src = recording.calibration_bytes(arm.follower)
+            if hashlib.sha256(data).hexdigest() != (provenance.get("calibration") or {}).get(
+                "sha256"
+            ):
+                sys.exit(
+                    "--resume refused: the follower loads another calibration than the recorded "
+                    "demos (its sha256 differs); torque was never enabled"
+                )
+        else:
+            provenance["calibration"] = recording.copy_calibration(arm.follower, root)
+        recording.write_json(prov_path, provenance)
         sess: Session | None = None
         # Ctrl-Z ignored, foreground watched: from before torque on until the session's record
         # is written, the TORQUE OFF UNCONFIRMED instruction included (review F3)
         with job_control():
             try:
-                with (
-                    CameraRig.from_config(cfg, conv.CAMERA_NAMES) as cam,  # front + wrist
-                    arm,  # torque ON from here, holding the pose
-                ):
-                    sess = Session(
-                        arm,
-                        leader,
-                        cam,
-                        units,
-                        park=park_from_config(cfg),  # None unless robot.park.enabled
-                        torque_wait=TorqueWait.from_config(cfg, "teleop", allow_none=True),
-                    )
-                    record_session(sess, dataset, tasks, instructions, n_eps, ep_time, placements)
+                with CameraRig.from_config(cfg, conv.CAMERA_NAMES) as cam:  # front + wrist
+                    n_check = len(provenance["sittings"])
+                    try:  # before torque: which index is which camera (review conv-4)
+                        sitting["camera_check"] = confirm_camera_roles(
+                            cam,
+                            root / "meta" / f"camera_check_{n_check}.png",
+                            prompt_input,
+                            indices={n: cfg["cameras"][n].get("index") for n in conv.CAMERA_NAMES},
+                            show=show_file,
+                        )
+                    except CameraRoleError as e:
+                        sys.exit(str(e))
+                    recording.write_json(prov_path, provenance)
+                    with arm:  # torque ON from here, holding the pose
+                        sess = Session(
+                            arm,
+                            leader,
+                            cam,
+                            units,
+                            park=park_from_config(cfg),  # None unless robot.park.enabled
+                            torque_wait=TorqueWait.from_config(cfg, "teleop", allow_none=True),
+                        )
+                        sess.placements = dict(provenance.get("episodes") or {})  # a resume
+                        live = sess
+
+                        def save_provenance() -> None:
+                            provenance["episodes"] = dict(live.placements)
+                            recording.write_json(prov_path, provenance)
+
+                        sess.on_saved = save_provenance
+                        record_session(
+                            sess, dataset, tasks, instructions, n_eps, ep_time, placements
+                        )
             finally:
                 _torque_off_unconfirmed(arm)  # also after the driver's own torque-off on exit
-                provenance.update(session_record(arm, sess))
+                ended = session_record(arm, sess)
+                provenance.update(ended)
+                sitting.update(ended)
                 if sess is not None:
                     provenance["episodes"] = dict(sess.placements)
-                (root / "meta" / "vla_rl_so101.json").write_text(
-                    json.dumps(provenance, indent=2) + "\n"
-                )
+                recording.write_json(prov_path, provenance)
     finally:
-        dataset.finalize()
+        dataset.close()
         if leader.is_connected:
             leader.disconnect()
         saved = int(dataset.num_episodes)

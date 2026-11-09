@@ -612,6 +612,7 @@ def test_teleop_main_ignores_ctrl_z_from_torque_on_until_its_record_is_written(
     monkeypatch.setattr(teleop, "load_sim_fk", lambda: toy_fk)
     monkeypatch.setattr(teleop, "make_leader", lambda _lc: Leader(wrist_flex=2.0))
     monkeypatch.setattr(teleop, "CameraRig", Cam)
+    monkeypatch.setattr(teleop, "confirm_camera_roles", lambda *_a, **_k: {"method": "test"})
     monkeypatch.setattr(teleop, "record_session", record_session)
     monkeypatch.setattr(teleop, "_torque_off_unconfirmed", torque_off_unconfirmed)
     monkeypatch.setattr(

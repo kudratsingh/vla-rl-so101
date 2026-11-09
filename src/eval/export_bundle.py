@@ -20,7 +20,12 @@ seal``); this repo only produces the inputs, per recording session, next to the 
   the hash the evaluation session recorded at its start; ``family_id`` is stable per training
   family (``FAMILIES``: SmolVLA and ACT are two) and ``training_run_id`` names the training run.
 * demonstration sessions: ``placements.json`` (each episode's planned placement from the frozen
-  demo schedule).
+  demo schedule); a rehearsal recording is refused.
+* development sessions (``--include-dev``; never reported) are declared with protocol_version
+  ``real-0.1-dev``, so the sealed declaration itself says they are not the evaluation.
+* timing: LeRobot's ``timestamp`` (what the importer reads) is nominal; every frame's real write
+  and camera times are the ``timing_s`` feature (convention 1.1), each trial's achieved write rate
+  is in ``trials.json`` and ``bundle.json`` warns when it is more than 10% off the nominal fps.
 
 ``object_pose`` is omitted (``null``): only PLANNED initial poses exist (grid slot centres and
 yaws), and vishwaroop imports ``object_pose`` as a per-frame stream; a per-frame feature filled with
@@ -58,6 +63,7 @@ PURPOSES: tuple[str, ...] = ("demonstration", "evaluation")
 LABEL_METHODS: tuple[str, ...] = ("physical_sensor_and_review", "blinded_review")
 MAX_TIMESTAMP_SLIP_FRAMES = 0.5
 FAMILIES: dict[str, str] = {"smolvla": "so101-real-smolvla", "act": "so101-real-act"}
+WRITE_RATE_TOLERANCE = 0.10  # bundle.json warns when an episode's write rate is further off
 
 CALIBRATION_FILE = "calibration.json"
 RUBRIC_FILE = "rubric.json"
@@ -446,7 +452,16 @@ def _protocol(prov: Mapping[str, Any]) -> None:
         raise ExportRefused("recorded under a different observation/action convention hash")
 
 
-def _common(prov: Mapping[str, Any], purpose: str, sessions: Mapping[int, str]) -> dict[str, Any]:
+DEV_SUFFIX = "-dev"  # a development session's protocol_version (never reported; review F9)
+
+
+def _common(
+    prov: Mapping[str, Any],
+    purpose: str,
+    sessions: Mapping[int, str],
+    *,
+    protocol_version: str = PR.PROTOCOL_VERSION,
+) -> dict[str, Any]:
     return {
         "format": FORMAT,
         "dataset_root": DATASET_ROOT,
@@ -455,7 +470,7 @@ def _common(prov: Mapping[str, Any], purpose: str, sessions: Mapping[int, str]) 
         "rubric": RUBRIC_FILE,
         "task_id": PR.TASK_ID,
         "task_version": PR.TASK_VERSION,
-        "protocol_version": PR.PROTOCOL_VERSION,
+        "protocol_version": protocol_version,
         "recorded_at": str(_need(prov, "recorded_at", "the recording's provenance")),
         "robot_id": str(_need(prov, "robot_id", "the recording's provenance")),
         "purpose": purpose,
@@ -479,6 +494,10 @@ def build_demo_bundle(dataset: Path, out: Path) -> dict[str, Any]:
     """Bundle a finished teleop demo recording (``scripts/wo06_teleop_record.py --demo-schedule``)."""
     prov = _provenance(dataset)
     _protocol(prov)
+    if prov.get("rehearsal") is not False:
+        raise ExportRefused("a rehearsal recording (or one that does not say) is never exported")
+    if prov.get("purpose") != "demonstration" or prov.get("demo_schedule") is not True:
+        raise ExportRefused("not a --demo-schedule demonstration recording")
     sid = str(_need(prov, "session_id", "the recording's provenance"))
     eps = _episode_indices(dataset)
     placements = _need(prov, "episodes", "the recording's provenance")
@@ -510,6 +529,12 @@ def _review_labels(
     for rv in reviews:
         if rv.get("method") != "blinded_review" or not rv.get("policy_identity_hidden"):
             raise ExportRefused("a review file is not a blinded clip review")
+        policies = rv.get("session_policies") or {}
+        if sid not in policies or not all(policies.values()) or len(set(policies.values())) < 2:
+            raise ExportRefused(
+                "a blinded review must pool clips of at least two different policies (and this "
+                f"session's): {policies or 'no session_policies recorded'}"
+            )
         reviewer = str(_need(rv, "reviewer_id", "a review file"))
         got = {
             int(it["episode_index"]): it
@@ -568,6 +593,11 @@ def build_eval_bundle(
     ident = _need(settings, "policy_identity", f"session {sid}")
     for key in ("family_id", "training_run_id", "checkpoint_sha256"):
         _need(ident, key, f"session {sid} policy_identity")
+    if not ident.get("training_run_verified") and mode != "mock":
+        raise ExportRefused(
+            f"session {sid}: training_run_id {ident['training_run_id']!r} was not verified against "
+            "the checkpoint's provenance: nothing is guessed"
+        )
     got = checkpoint_identity(checkpoint_dir)
     if got["sha256"] != ident["checkpoint_sha256"]:
         raise ExportRefused(
@@ -575,13 +605,25 @@ def build_eval_bundle(
             f"{str(ident['checkpoint_sha256'])[:12]}: not the evaluated checkpoint"
         )
     eps = _episode_indices(capture_dataset)
-    by_episode: dict[int, Mapping[str, Any]] = {}
-    for t in trials:
+    recs = [dict(t) for t in trials]  # a filled capture block below never edits the caller's
+    by_episode: dict[int, dict[str, Any]] = {}
+    for t in recs:
         idx = (t.get("capture") or {}).get("episode_index")
         if idx is not None:
             if int(idx) in by_episode:
                 raise ExportRefused(f"episode {idx} is claimed by two trial records")
             by_episode[int(idx)] = t
+    by_trial = {str(t.get("trial_id")): t for t in recs if t.get("policy_started")}
+    for i in sorted(set(eps) - set(by_episode)):  # saved, then killed before its capture row
+        entry = (prov.get("episodes") or {}).get(str(i)) or {}
+        rec = by_trial.get(str(entry.get("trial_id")))
+        if rec is not None and (rec.get("capture") or {}).get("episode_index") is None:
+            by_episode[i] = rec
+            rec["capture"] = {
+                **(rec.get("capture") or {}),
+                "episode_index": i,
+                "filled_from": "capture provenance (the run ended before its capture row)",
+            }
     orphans = sorted(set(eps) - set(by_episode))
     if orphans:
         raise ExportRefused(f"episodes {orphans} have no trial record (a run killed mid-trial?)")
@@ -603,7 +645,7 @@ def build_eval_bundle(
             "trial_idx": t.get("trial_idx"),
             "capture": t.get("capture"),
         }
-        for t in trials
+        for t in recs
         if t.get("policy_started") and (t.get("capture") or {}).get("episode_index") is None
     ]
     _write(
@@ -618,13 +660,19 @@ def build_eval_bundle(
             "provenance (outcome_source operator | scripted | fault | unjudged | not_scored); "
             "the declared labels, if any, come from the blinded review only",
             "uncaptured_started_trials": uncaptured,
-            "trials": list(trials),
+            "trials": recs,
         },
     )
     for name in got["files"]:
         shutil.copyfile(Path(checkpoint_dir) / name, out / name)
     _write(out / CHECKPOINT_INDEX, {"sha256": got["sha256"], "files": got["files"]})
-    decl = _common(prov, "evaluation", {i: sid for i in eps})
+    dev = settings.get("schedule") != "eval"
+    decl = _common(
+        prov,
+        "evaluation",
+        {i: sid for i in eps},
+        protocol_version=PR.PROTOCOL_VERSION + (DEV_SUFFIX if dev else ""),
+    )
     decl["policy"] = {
         "origin": "trained",
         "checkpoint_id": f"sha256:{got['sha256']}",
@@ -651,11 +699,32 @@ def build_eval_bundle(
         ]
     _write(out / DECLARATION_FILE, decl)
     summary = validate_bundle(out, capture_dataset)
+    rates = {
+        i: (t.get("capture") or {}).get("write_rate_hz") for i, t in sorted(by_episode.items())
+    }
+    off = {
+        str(i): r
+        for i, r in rates.items()
+        if r is not None and abs(float(r) - conv.FPS) > WRITE_RATE_TOLERANCE * conv.FPS
+    }
     index = {
         "dataset": str(capture_dataset),
         "extras": extras,
         "purpose": "evaluation",
+        "protocol_version": decl["protocol_version"],
         "mode": mode,
+        "timing": {
+            "note": "LeRobot timestamps are nominal (frame_index / fps); the real write and camera "
+            f"times are the {conv.TIMING_KEY} feature",
+            "nominal_fps": conv.FPS,
+            "episodes_off_nominal_rate": off,
+            "warning": (
+                f"{len(off)} episodes wrote at a rate more than "
+                f"{WRITE_RATE_TOLERANCE:.0%} off the nominal {conv.FPS} fps"
+                if off
+                else None
+            ),
+        },
         "labels": decl["labels"],
         "uncaptured_started_trials": len(uncaptured),
         "blinded_vs_live_disagreements": disagreements,

@@ -98,10 +98,15 @@ episode = trial; ``capture.episode_index`` in the trial record, the trial id in 
 ``meta/vla_rl_so101.json``); a not-started attempt is never an episode. The summary reports seen,
 shifted, unseen per object and unseen pooled (the headline). ``--report RUN RUN`` prints two
 sessions side by side and refuses unless they ran the same protocol hash and schedule.
-Bench budget: 150 trials per policy at up to ~65 s each (home ~5 s, place ~15 s, up to 30 s of
-policy, 3 s settle, ~5 s to score, the episode save: 7.3 s for a 30 s episode of both cameras on
-an M3 Pro, measured 2026-11-09; the capture itself costs 0.4 ms per control tick) is 2.3-2.7 h per
-policy, so one policy per bench session.
+Bench budget (review F4; single-run mock-rig figures, synthetic frames, M3 Pro): a trial has no
+success latch and runs to ``TRIAL_MAX_STEPS`` = 450 policy writes, so its policy time is 450 /
+the achieved write rate, which differs per family at the current ``max_chunk_age_ms``: SmolVLA on
+MPS ~6.2 writes/s -> ~73 s, ACT ~12.8 writes/s -> ~35 s (the 450-step horizon is a fixed number of
+commands, not a fixed wall-clock time). Plus home ~5 s, place ~15 s, settle 3 s, score ~5 s and
+the episode save + checkpoint (~7.3 s for 450 frames of both cameras): SmolVLA ~108 s per trial
+= ~4.5 h for 150, ACT ~70 s = ~2.9 h. Plan the SmolVLA session over two bench sittings through
+``--resume`` (the capture is durable per episode), or decide the command-rate issue first
+(overlap inference with execution, or another chunk age: docs/STATUS.md, PR 2 owner decisions).
 
 Audit against final2 item 5 (where each requirement lives):
 * randomized trial order, seeded and recorded, the same for both policies: real-0.1 =
@@ -183,7 +188,12 @@ from src.eval import protocol_real as PR
 from src.eval import protocol_v02 as P2
 from src.eval import real_grid as G
 from src.robot import convention as conv
-from src.robot.camera import CameraRig, PolicyImagePipeline
+from src.robot.camera import (
+    CameraRig,
+    CameraRoleError,
+    PolicyImagePipeline,
+    confirm_camera_roles,
+)
 from src.robot.client import (
     ConsoleOperator,
     DeployConfig,
@@ -204,7 +214,7 @@ from src.robot.client import (
 )
 from src.robot.driver import So101Driver
 from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals, require_terminal
-from src.robot.recording import EvalCapture, RigFrameSource
+from src.robot.recording import EvalCapture, RigFrameSource, check_capture_resumable
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
@@ -389,6 +399,7 @@ def fingerprint_values(
                 "adapter_sha256": info.get("adapter_sha256"),  # the weights, not the name
                 "adapter_revision": info.get("adapter_revision"),
                 **({} if identity is None else {"identity": _identity_key(identity)}),
+                **_local_runtime(info),
             },
             "camera": {"cameras": cfg["cameras"]},
             "calibration": calibration_values(arm, cfg),
@@ -410,6 +421,15 @@ def fingerprint_values(
             },
         }
     )
+
+
+def _local_runtime(info: dict[str, Any]) -> dict[str, Any]:
+    """The in-process policy's device and dtype (review F2): a session that ran on MPS never
+    pools with or resumes on a CPU fallback. Empty for the gRPC server (unchanged fingerprints)."""
+    if info.get("transport") != "in_process":
+        return {}
+    d = info.get("describe") or {}
+    return {"runtime": {"device": d.get("device"), "dtype": d.get("dtype")}}
 
 
 def _identity_key(identity: dict[str, Any]) -> dict[str, Any]:
@@ -511,11 +531,15 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     seen = {(t["cell"], t["trial_idx"], t["start_utc"]) for t in trials}
     metrics = run_dir / "metrics.jsonl"
     started: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    captures: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
     if metrics.is_file():
         for line in metrics.read_text().splitlines():
             try:
                 row = json.loads(line)
             except ValueError:  # a line cut short by the kill
+                continue
+            if row.get("kind") == "capture":  # the episode saved after the trial's record
+                captures[(row["cell"], row["trial_idx"], row["start_utc"])] = row["capture"]
                 continue
             if row.get("kind") not in ("trial", "trial_started"):
                 continue
@@ -534,6 +558,10 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 "has no record (the run ended mid-trial): scored a FAILURE (session_lost)"
             )
             trials.append(rec)
+    for t in trials:
+        got = captures.get((t["cell"], t["trial_idx"], t["start_utc"]))
+        if got is not None and (t.get("capture") or {}).get("episode_index") is None:
+            t["capture"] = got
     return settings, trials
 
 
@@ -708,6 +736,7 @@ def session(
     on_trial_start: Callable[[int], None] | None = None,
     prior_runs: Sequence[str] = (),
     torque_wait: TorqueWait | None = None,
+    camera_check: dict[str, Any] | None = None,
 ) -> Path:
     task = str(settings["task"])
     settle_s = float(settings["settle_s"])
@@ -725,7 +754,9 @@ def session(
         work_order="WO-07",
         script=__file__,
         cfg=cfg,
-        device="cpu",
+        # where the policy runs in this process (in-process SmolVLA / ACT: mps | cpu); the gRPC
+        # path's policy runs on the server, this process only on the CPU
+        device=str(_local_runtime(info).get("runtime", {}).get("device") or "cpu"),
         runs_dir=runs_dir,
         run_id=new_run_id("WO-07", f"realeval-{mode}"),
     ) as run:
@@ -740,13 +771,14 @@ def session(
             judging_rule=judging_rule(settle_s),
             session_runs=[*prior_runs, run.id],
             torque_wait=None if torque_wait is None else torque_wait.record(),
+            camera_check=camera_check,
             trials=trials,  # the same list: every flush carries the trials so far
         )
         run.flush()  # the session is on disk before the first motion: a killed run resumes
 
         def log_row(**row: Any) -> None:
             run.log_metrics(**row)
-            if row.get("kind") == "trial":
+            if row.get("kind") in ("trial", "capture"):
                 run.flush()
 
         print(f"{judging_rule(settle_s)['general']}\n  {task} success = {JUDGING_RULE[task]}.")
@@ -755,7 +787,11 @@ def session(
         try:
             if real and settings.get("capture"):
                 capture = open_capture(cfg, settings, run, loop, resumed=resumed_from is not None)
+                capture.provenance.setdefault("camera_checks", []).append(
+                    {"run": run.id, **(camera_check or {"skipped": f"{mode} rig"})}
+                )
                 loop.on_write = capture.on_write  # every policy write: both cameras, state, action
+                loop.on_settled = capture.on_settled  # the end-state stills, before the score
                 run.results["capture"] = {
                     "root": str(capture.root),
                     "dataset": str(capture.dataset_root),
@@ -795,6 +831,7 @@ def session(
             raise
         finally:
             loop.on_write = None
+            loop.on_settled = None
             shutdown = shutdown_or_record(run.results, loop, operator, end)
             end = final_session_end(loop.arm, end)  # a failed torque-off wins over any end
             if capture is not None:
@@ -903,7 +940,11 @@ def _run_schedule(
     on_trial_start: Callable[[int], None] | None,
 ) -> str:
     """real-0.1: the frozen schedule in its seeded order, one trial at a time across the cells;
-    a started (cell, trial_idx) is never re-run, a never-started one is retried in its place."""
+    a started (cell, trial_idx) is never re-run, a never-started one is retried IN ITS PLACE
+    (review F3: the same item again before the next, up to ``MAX_START_ATTEMPTS`` per run, then
+    the session ends so a resume retries it first; every record carries its ``attempt``). The
+    capture of a trial is saved AFTER its scored record is logged and flushed (review F7), then
+    a ``capture`` row logs the episode index."""
     task, n = str(settings["task"]), int(settings["trials_per_cell"])
     items = session_items(settings)
     total = len(items)
@@ -948,39 +989,73 @@ def _run_schedule(
 
         def hook(rec: dict[str, Any], tid: str = tid) -> None:
             rec["trial_id"] = tid
-            if capture is None:
-                rec["capture"] = {
-                    "episode_index": None,
-                    "reason": "capture off (mock --no-capture)",
-                }
-                return
-            try:
-                rec["capture"] = capture.finish(rec)
-            except Exception as e:  # noqa: BLE001 - never let the capture end the session
-                rec["capture"] = {"episode_index": None, "error": f"{type(e).__name__}: {e}"}
+            rec["capture"] = (
+                {"episode_index": None, "reason": "capture off (mock --no-capture)"}
+                if capture is None
+                else {"episode_index": None, "reason": CAPTURE_PENDING}
+            )
 
-        _, why = run_trials(
-            loop,
-            operator,
-            task=task,
-            cell=cell,
-            n_trials=n,
-            info=info,
-            camera_calibrated=camera_calibrated,
-            log_row=log_row,
-            max_steps=max_steps,
-            trials=trials,
-            on_trial_start=start,
-            indices=[k],
-            placement_fn=place,
-            record_extra={**base, "schedule_pos": pos},
-            settle_s=float(settings["settle_s"]),
-            object_fn=lambda _k, obj=obj: obj,
-            record_hook=hook,
-        )
-        if why != "completed":
-            return why
+        while True:
+            n0 = len(trials)
+            attempt = 1 + sum(1 for t in trials if t.get("trial_id") == tid)
+            _, why = run_trials(
+                loop,
+                operator,
+                task=task,
+                cell=cell,
+                n_trials=n,
+                info=info,
+                camera_calibrated=camera_calibrated,
+                log_row=log_row,
+                max_steps=max_steps,
+                trials=trials,
+                on_trial_start=start,
+                indices=[k],
+                placement_fn=place,
+                record_extra={**base, "schedule_pos": pos, "attempt": attempt},
+                settle_s=float(settings["settle_s"]),
+                object_fn=lambda _k, obj=obj: obj,
+                record_hook=hook,
+            )
+            if capture is not None:
+                for rec in trials[n0:]:
+                    if rec.get("trial_id") == tid:
+                        save_capture(capture, rec, log_row)
+            if why != "completed":
+                return why
+            if k in done_indices(trials, cell):
+                break
+            if attempt >= MAX_START_ATTEMPTS:
+                return (
+                    f"not_started: schedule item {pos + 1} did not start in {attempt} attempts "
+                    "this run; resume to retry it in its place"
+                )
     return "completed"
+
+
+def save_capture(capture: EvalCapture, rec: dict[str, Any], log_row: Callable[..., None]) -> None:
+    """After the trial record is logged: save (or discard) its episode, put the capture block in
+    the record and log it as a ``capture`` row (merged into the record by ``load_prior``)."""
+    try:
+        block = capture.finish(rec)
+    except Exception as e:  # noqa: BLE001 - never let the capture end the session
+        block = {"episode_index": None, "error": f"{type(e).__name__}: {e}"}
+    rec["capture"] = block
+    log_row(
+        kind="capture",
+        trial_id=rec.get("trial_id"),
+        cell=rec["cell"],
+        trial_idx=rec["trial_idx"],
+        start_utc=rec["start_utc"],
+        capture=block,
+    )
+
+
+MAX_START_ATTEMPTS = 3  # per schedule item and run (review F3)
+CAPTURE_PENDING = (
+    "pending: the episode is saved after this record is logged (stays pending if the run "
+    "ended first: not captured)"
+)
 
 
 def open_capture(
@@ -1015,12 +1090,33 @@ def open_capture(
     }
     return EvalCapture.open(
         root,
-        f"local/so101-real-eval-{sid}",
+        capture_repo_id(sid),
         provenance,
         resume=resumed,
         follower=loop.arm.follower,
         end_state=lambda: rig.read().images,
+        clock=loop.clock,
     )
+
+
+def capture_repo_id(session_id: str) -> str:
+    return f"local/so101-real-eval-{session_id}"
+
+
+def precheck_capture(runs_dir: Path, settings: dict[str, Any]) -> dict[str, Any] | None:
+    """A resumed real-0.1 session, BEFORE the arm is connected (review F1): recover its capture
+    dataset (a kill mid-save) and make sure it reopens; refuses with a clear message if not."""
+    sid = settings.get("session_id")
+    if not sid or not settings.get("capture"):
+        return None
+    root = Path(runs_dir) / str(sid) / "capture"
+    try:
+        report = check_capture_resumable(root, capture_repo_id(str(sid)), sid)
+    except Exception as e:  # noqa: BLE001 - nothing is open yet
+        sys.exit(f"--resume refused: the session's capture {root} cannot be reopened ({e})")
+    if report and (report["moved"] or report["pruned"]):
+        print(f"capture recovered after an interrupted save: {report}")
+    return report
 
 
 def policy_identity(args: argparse.Namespace) -> dict[str, Any] | None:
@@ -1030,13 +1126,30 @@ def policy_identity(args: argparse.Namespace) -> dict[str, Any] | None:
         return None
     if any(v is None for v in given):
         sys.exit("--family, --training-run-id and --checkpoint-dir go together")
-    from src.eval.export_bundle import FAMILIES, checkpoint_identity
+    from src.eval.export_bundle import FAMILIES, ExportRefused, checkpoint_identity
+    from src.policy import lerobot_ckpt
 
-    ident = checkpoint_identity(Path(args.checkpoint_dir))
+    try:
+        ident = checkpoint_identity(Path(args.checkpoint_dir))
+    except ExportRefused as e:
+        sys.exit(f"--checkpoint-dir refused: {e}")
+    # review F8: the run id must be the one that wrote the checkpoint (its provenance is inside
+    # the hash); without a provenance it is unverified (the real arm refuses that later)
+    prov = lerobot_ckpt.read_provenance(Path(args.checkpoint_dir))
+    recorded = None if prov is None else prov.get("training_run_id")
+    if recorded is not None and recorded != str(args.training_run_id):
+        sys.exit(
+            f"--training-run-id {args.training_run_id} != {recorded}, the run that saved "
+            f"{args.checkpoint_dir} ({lerobot_ckpt.PROVENANCE_FILE}); nothing was opened"
+        )
     return {
         "family": args.family,
         "family_id": FAMILIES[args.family],
         "training_run_id": str(args.training_run_id),
+        "training_run_verified": recorded is not None,
+        "training_run_verified_by": (
+            f"checkpoint {lerobot_ckpt.PROVENANCE_FILE}" if recorded is not None else None
+        ),
         "checkpoint_sha256": ident["sha256"],
         "checkpoint_files": ident["files"],
         "checkpoint_dir": str(Path(args.checkpoint_dir).resolve()),
@@ -1061,6 +1174,8 @@ def check_identity(settings: dict[str, Any], args: argparse.Namespace) -> None:
             f"--resume refused: the checkpoint files changed ({path} hashes to {now[:12]}, the "
             f"session ran {str(ident['checkpoint_sha256'])[:12]})"
         )
+    # review F4: the path just verified is the one the local backend loads (a moved dir)
+    ident["checkpoint_dir"] = str(path.resolve())
 
 
 def new_settings(args: argparse.Namespace, cfg: Config) -> dict[str, Any]:
@@ -1203,12 +1318,18 @@ def resolve_backend(args: argparse.Namespace, real: bool) -> str:
 
 @contextmanager
 def local_backend(
-    cfg: Config, settings: dict[str, Any], clock: Callable[[], float] = time.perf_counter
+    cfg: Config,
+    settings: dict[str, Any],
+    clock: Callable[[], float] = time.perf_counter,
+    *,
+    hardware: bool = False,
 ) -> Iterator[tuple[Any, dict[str, Any], DeployConfig]]:
     """The in-process policy bound to the session's ``policy_identity``: the checkpoint is loaded
     only if it hashes to the recorded ``checkpoint_sha256`` (one hash definition:
-    ``src.policy.lerobot_ckpt.checkpoint_identity``), then checked against the convention, the
-    chunk and the deploy settings (``check_local``). Runs before the arm is connected."""
+    ``src.policy.lerobot_ckpt.checkpoint_identity``), its provenance fits the live convention and
+    ``robot.units`` (and, for SmolVLA, its pinned VLM snapshot), then checked against the chunk and
+    the deploy settings (``check_local``). ``hardware``: the provenance is required and the MPS ->
+    CPU fallback refused (reviews conv-1, F2). Runs before the arm is connected."""
     from src.robot import local_policy as LP
 
     ident = settings.get("policy_identity") or {}
@@ -1216,6 +1337,7 @@ def local_backend(
     spec = LP.LocalPolicySpec.from_config(
         cfg, base=ident.get("checkpoint_dir"), family=ident.get("family")
     )
+    spec = dataclasses.replace(spec, require_provenance=hardware, strict_device=hardware)
     if spec.checkpoint_sha256 is not None and spec.checkpoint_sha256 != want:
         sys.exit(
             f"local_policy.checkpoint_sha256 {spec.checkpoint_sha256[:12]} != the session's "
@@ -1223,8 +1345,10 @@ def local_backend(
         )
     spec = dataclasses.replace(spec, checkpoint_sha256=want)
     try:
-        policy = LP.load_local_policy(spec, clock=clock)
-    except LP.CheckpointMismatch as e:
+        policy = LP.load_local_policy(
+            spec, clock=clock, units=dataclasses.asdict(UnitMap.from_config(cfg))
+        )
+    except (LP.CheckpointMismatch, FileNotFoundError) as e:
         sys.exit(f"{e}; nothing was opened")
     dcfg = LP.local_deploy_config(cfg, policy)
     with LP.LocalPolicyClient(policy, timeout_s=dcfg.request_timeout_s, clock=clock) as client:
@@ -1344,6 +1468,8 @@ def run(
         resumed_from: str | None = prior_dir.name
         check_identity(settings, args)
         settings.setdefault("backend", "grpc")  # sessions recorded before --backend
+        if settings.get("protocol_id") == PR.PROTOCOL_VERSION:  # before anything is opened
+            precheck_capture(args.runs_dir, settings)
         if args.backend not in (None, settings["backend"]):
             sys.exit(f"--resume refused: the session ran --backend {settings['backend']}")
     else:
@@ -1391,6 +1517,11 @@ def real_hardware_problems(cfg: Config, settings: dict[str, Any]) -> list[str]:
         out.append(
             "--family, --training-run-id and --checkpoint-dir are required (policy identity)"
         )
+    elif not settings["policy_identity"].get("training_run_verified"):
+        out.append(
+            "the checkpoint has no trainer provenance: --training-run-id cannot be verified "
+            "(a checkpoint saved by scripts/wo07_train.py carries it)"
+        )
     full = len(PR.schedule(str(settings.get("schedule")))) // len(PR.CELLS)
     if int(settings["trials_per_cell"]) != full or set(settings["cells"]) != set(PR.CELLS):
         out.append("--trials / --cells: a hardware session runs the whole frozen schedule")
@@ -1437,7 +1568,7 @@ def run_hardware(
     from src.robot.camera import OpenCVFrameSource
 
     fk = load_sim_fk()
-    with _hardware_backend(cfg, settings) as (client, info, dcfg, pipe, calibrated):
+    with _hardware_backend(cfg, settings, hardware=True) as (client, info, dcfg, pipe, calibrated):
         # builds the follower (lerobot reads the calibration file; no port is opened) so the
         # fingerprint and the resume check run before anything can move
         arm = So101Driver.from_config(cfg, fk)
@@ -1456,40 +1587,63 @@ def run_hardware(
             if real
             else OpenCVFrameSource(cfg["cameras"]["front"])
         )
-        with operator_signals() as interrupts, cams as cam, arm:
-            # local: the policy reads the rig itself (every camera); gRPC real-0.1 (mock
-            # only): the front view, the rig for the capture; protocol 0.2: the front camera
-            source: Any = (
-                cam if settings["backend"] == "local" else RigFrameSource(cam) if real else cam
-            )
-            loop = DeployLoop(arm, source, pipe, client, dcfg, interrupts=interrupts)
-            return session(
-                cfg,
-                loop,
-                operator,
-                info,
-                mode="hardware",
-                settings=settings,
-                prior_trials=prior,
-                resumed_from=resumed_from,
-                max_steps=max_steps,
-                camera_calibrated=calibrated,
-                runs_dir=args.runs_dir,
-                prior_runs=prior_runs,
-                torque_wait=torque_wait,
-            )
+        with operator_signals() as interrupts, cams as cam:
+            camera_check = None
+            if real:  # which index is which camera, before torque on (review conv-4)
+                try:
+                    camera_check = confirm_camera_roles(
+                        cam,
+                        args.runs_dir / "camera_checks" / f"{utc_now().replace(':', '')}.png",
+                        input,
+                        indices={n: cfg["cameras"][n].get("index") for n in conv.CAMERA_NAMES},
+                        show=_show_file,
+                    )
+                except CameraRoleError as e:
+                    sys.exit(str(e))
+            with arm:
+                # local: the policy reads the rig itself (every camera); gRPC real-0.1 (mock
+                # only): the front view, the rig for the capture; protocol 0.2: the front camera
+                source: Any = (
+                    cam if settings["backend"] == "local" else RigFrameSource(cam) if real else cam
+                )
+                loop = DeployLoop(arm, source, pipe, client, dcfg, interrupts=interrupts)
+                return session(
+                    cfg,
+                    loop,
+                    operator,
+                    info,
+                    mode="hardware",
+                    settings=settings,
+                    prior_trials=prior,
+                    resumed_from=resumed_from,
+                    max_steps=max_steps,
+                    camera_calibrated=calibrated,
+                    runs_dir=args.runs_dir,
+                    prior_runs=prior_runs,
+                    torque_wait=torque_wait,
+                    camera_check=camera_check,
+                )
+
+
+def _show_file(path: Path) -> None:
+    import subprocess
+
+    try:
+        subprocess.run(["open", str(path)], check=False)
+    except OSError:
+        pass
 
 
 @contextmanager
 def _hardware_backend(
-    cfg: Config, settings: dict[str, Any]
+    cfg: Config, settings: dict[str, Any], *, hardware: bool = True
 ) -> Iterator[tuple[Any, dict[str, Any], DeployConfig, Any, bool]]:
     """(client, info, deploy config, image pipe, camera calibrated) of the session's backend,
     checked before the arm is connected: a wrong policy never moves it."""
     if settings["backend"] == "local":
         from src.robot.local_policy import local_pipe
 
-        with local_backend(cfg, settings) as (client, info, dcfg):
+        with local_backend(cfg, settings, hardware=hardware) as (client, info, dcfg):
             yield client, info, dcfg, local_pipe, False  # raw frames: no undistortion, no crop
         return
     dcfg = DeployConfig.from_config(cfg)

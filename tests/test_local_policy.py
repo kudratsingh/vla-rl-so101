@@ -7,6 +7,7 @@ one FakeClock. No serial port, no camera, no network.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import math
@@ -121,7 +122,8 @@ def test_tiny_act_runs_through_the_real_deploy_loop(act_dir: Path) -> None:
         info = r.client.info()
         lp.check_local(info, r.dcfg, r.spec)
         assert info["checkpoint_sha256"] == lp.checkpoint_identity(act_dir)["checkpoint_sha256"]
-        assert info["convention"] == conv.citation() and info["chunk_len"] == 50
+        # an untrained ACT has no trainer provenance: it cites no convention (the mock allows it)
+        assert info["convention"] is None and info["chunk_len"] == 50
         trials, end = run_trials(
             r.loop,
             ScriptedOperator(),
@@ -320,3 +322,82 @@ def test_latency_script_tiny_preset(tmp_path: Path) -> None:
     lat = json.loads(Path(record).read_text())["results"]["latency"]
     assert lat["ticks"] == 12 and lat["chunk_ms"]["n"] >= 1 and lat["command_gap_ms"]["n"] >= 10
     assert lat["fresh_init"] and "EXCLUDES camera capture" in lat["label"]
+
+
+def _with_provenance(src: Path, dst: Path, **prov: Any) -> Path:
+    import shutil
+
+    from src.policy import lerobot_ckpt
+
+    out = Path(shutil.copytree(src, dst))
+    lerobot_ckpt.write_provenance(
+        out,
+        {
+            "training_run_id": "run-x",
+            "convention": conv.citation(),
+            "unit_map": json.loads(json.dumps(dataclasses.asdict(UnitMap()))),
+            **prov,
+        },
+    )
+    return out
+
+
+def test_provenance_is_checked_against_the_live_setup(act_dir: Path, tmp_path: Path) -> None:
+    """Review conv-1: the checkpoint's convention and unit_map (inside its hash) must match the
+    live ones; the real arm also refuses a checkpoint without a provenance."""
+    live = dataclasses.asdict(UnitMap())
+    good = _with_provenance(act_dir, tmp_path / "good")
+    assert "vla_rl_so101.json" in lp.checkpoint_identity(good)["checkpoint_files"]  # hashed
+    spec = lp.LocalPolicySpec.from_config(_cfg(good))
+    strict = dataclasses.replace(spec, require_provenance=True)
+    policy = lp.load_local_policy(strict, units=live)
+    with local_rig(_cfg(good), policy) as r:
+        info = r.client.info()
+        assert info["convention"] == conv.citation()
+        lp.check_local(info, r.dcfg, strict)
+    # wrist_flex mirrored after the demos were recorded: refused before the weights load
+    mirrored = {**live, "arm_sign": [1.0, 1.0, 1.0, -1.0, 1.0]}
+    with pytest.raises(lp.CheckpointMismatch, match="robot.units"):
+        lp.load_local_policy(spec, units=mirrored)
+    # another convention version / hash
+    other = _with_provenance(
+        act_dir, tmp_path / "conv", convention={**conv.citation(), "hash": "0" * 64}
+    )
+    with pytest.raises(lp.CheckpointMismatch, match="trained under convention"):
+        lp.load_local_policy(lp.LocalPolicySpec.from_config(_cfg(other)), units=live)
+    # no provenance: the mock runs it, the real arm refuses it
+    with pytest.raises(lp.CheckpointMismatch, match="vla_rl_so101.json"):
+        lp.load_local_policy(
+            dataclasses.replace(
+                lp.LocalPolicySpec.from_config(_cfg(act_dir)), require_provenance=True
+            ),
+            units=live,
+        )
+
+
+def test_strict_device_refuses_the_cpu_fallback(
+    act_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review F2: on the real arm an unavailable MPS is refused, never a silent CPU run."""
+    monkeypatch.setattr(lp.torch.backends.mps, "is_available", lambda: False)
+    spec = dataclasses.replace(
+        lp.LocalPolicySpec.from_config(_cfg(act_dir, device="mps")), strict_device=True
+    )
+    with pytest.raises(lp.DeviceUnavailable, match="not available"):
+        lp.load_local_policy(spec)
+    loose = dataclasses.replace(spec, strict_device=False)
+    assert lp.load_local_policy(loose).device == "cpu"  # the mock / latency script: logged only
+
+
+def test_resolve_checkpoint_never_fetches_a_mistyped_path(tmp_path: Path, monkeypatch: Any) -> None:
+    """Review F4: a path-like spec that is not a directory is refused, not downloaded."""
+    import huggingface_hub
+
+    monkeypatch.setattr(
+        huggingface_hub, "snapshot_download", lambda *a, **k: pytest.fail("Hub fetch")
+    )
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "checkpoints").mkdir()
+    for spec in ("checkpoints/smolvla", "./ckpt", "/no/such/dir", "~/nope", "a/b/c"):
+        with pytest.raises(FileNotFoundError, match="not a directory"):
+            lp.resolve_checkpoint(spec)

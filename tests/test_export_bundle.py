@@ -54,7 +54,9 @@ def demo_dataset(tmp_path_factory: pytest.TempPathFactory) -> Path:
         mp.setattr("builtins.input", lambda _p="": answers.pop(0))
         rig, _ = tc._rig()
         sess, fol = tc._session(tc.MovingLeader(), rig)
-        dataset = tc.teleop.create_dataset("local/so101-demos", root)
+        dataset = recording.DurableDataset(
+            tc.teleop.create_dataset("local/so101-demos", root), "local/so101-demos"
+        )
         instr = tc.teleop.protocol_instructions(["PickPlace"])
         cfg = real_cfg()
         prov = tc.teleop.recording_provenance(
@@ -66,7 +68,7 @@ def demo_dataset(tmp_path_factory: pytest.TempPathFactory) -> Path:
             saved = tc.teleop.record_session(
                 sess, dataset, ["PickPlace"], instr, 2, 0.4, placements
             )
-        dataset.finalize()
+        dataset.close()
         assert saved == 2 and not answers
         prov["episodes"] = dict(sess.placements)
         recording.write_json(root / recording.PROVENANCE, prov)
@@ -83,14 +85,12 @@ class _Session:
         return out
 
 
-@pytest.fixture(scope="module")
-def eval_session(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Session]:
-    base = tmp_path_factory.mktemp("eval")
+def _mock_session(base: Path, family: str, weights: bytes, run_id: str) -> _Session:
     runs = base / "runs"
     ckpt = base / "pretrained_model"
     ckpt.mkdir()
-    (ckpt / "model.safetensors").write_bytes(b"\x00weights\x01")
-    (ckpt / "config.json").write_text('{"type": "smolvla", "chunk_size": 50}\n')
+    (ckpt / "model.safetensors").write_bytes(weights)
+    (ckpt / "config.json").write_text(f'{{"type": "{family}", "chunk_size": 50}}\n')
     (ckpt / "policy_preprocessor.json").write_text("{}\n")
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(ev, "ScriptedOperator", ScriptedOperator)
@@ -98,11 +98,24 @@ def eval_session(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Session]
             [
                 "--preset", "real", "--mock", "--fake-clock", "--max-steps", "5",
                 "--task", "PickPlace", "--trials", "1", "--labeler", "mock-labeler",
-                "--family", "smolvla", "--training-run-id", "20261109T000000Z-wo07-smolvla-abcd",
+                "--family", family, "--training-run-id", run_id,
                 "--checkpoint-dir", str(ckpt), "--runs-dir", str(runs),
             ]
         )  # fmt: skip
-    yield _Session(runs, rec, ckpt)
+    return _Session(runs, rec, ckpt)
+
+
+@pytest.fixture(scope="module")
+def eval_session(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Session]:
+    base = tmp_path_factory.mktemp("eval")
+    yield _mock_session(base, "smolvla", b"\x00weights\x01", "20261109T000000Z-wo07-smolvla-abcd")
+
+
+@pytest.fixture(scope="module")
+def eval_session_act(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Session]:
+    """A second session, another policy: what a blinded review pools with the first."""
+    base = tmp_path_factory.mktemp("eval-act")
+    yield _mock_session(base, "act", b"\x00act weights\x02", "20261109T000000Z-wo07-act-ef01")
 
 
 def _export(s: _Session, out: Path, *extra: str) -> dict[str, Any]:
@@ -187,39 +200,51 @@ def test_eval_bundle_is_complete_and_valid(eval_session: _Session, tmp_path: Pat
         _export(eval_session, tmp_path / "y", "--checkpoint-dir", str(other))
 
 
-def test_blinded_review_labels_and_provenance(eval_session: _Session, tmp_path: Path) -> None:
+def _capture(s: _Session) -> Path:
+    return s.runs / s.results["session"]["session_id"] / "capture"
+
+
+def test_blinded_review_labels_and_provenance(
+    eval_session: _Session, eval_session_act: _Session, tmp_path: Path
+) -> None:
     sid = eval_session.results["session"]["session_id"]
-    capture = eval_session.runs / sid / "capture"
-    answers = iter(["y", "n", "y"])
+    sid_act = eval_session_act.results["session"]["session_id"]
+    answers = iter(["y", "n", "y", "y", "n", "y"])
     prompts: list[str] = []
 
     def ask(msg: str) -> str:
         prompts.append(msg)
         return next(answers)
 
-    path = br.review([capture], "reviewer-a", tmp_path / "rev", seed=1, ask=ask)
+    # the SmolVLA and the ACT session pooled: the reviewer cannot tell whose clip it is
+    caps = [_capture(eval_session), _capture(eval_session_act)]
+    path = br.review(caps, "reviewer-a", tmp_path / "rev", seed=1, ask=ask)
     rv = json.loads(path.read_text())
     assert rv["complete"] and rv["method"] == "blinded_review" and rv["policy_identity_hidden"]
+    assert set(rv["session_policies"]) == {sid, sid_act}
     packets = sorted((tmp_path / "rev" / "packets").iterdir())
-    assert len(packets) == 3
+    assert len(packets) == 6
     for p in packets:  # nothing in a packet or a prompt names the session or the policy
         assert sid not in p.name and {f.name for f in p.iterdir()} == {
             "trial_contact_sheet.png",
             "end_state_front.png",
             "end_state_wrist.png",
         }
-    assert not any(sid in m or "smolvla" in m for m in prompts)
+    assert not any(sid in m or sid_act in m or "smolvla" in m for m in prompts)
     out = tmp_path / "labelled"
     index = _export(eval_session, out, "--review", str(path))
     decl = json.loads((out / X.DECLARATION_FILE).read_text())
     assert decl["labels"] == {"file": "labels.json", "method": "blinded_review"}
     labels = json.loads((out / X.LABELS_FILE).read_text())
-    by_ep = {it["episode_index"]: it["verdict"] for it in rv["items"]}
+    mine = {it["episode_index"]: it["verdict"] for it in rv["items"] if it["session_id"] == sid}
+    assert set(labels) == {str(i) for i in mine}
     for k, v in labels.items():
-        assert v["success"] == (by_ep[int(k)] == "success")  # no fault in these trials
+        assert v["success"] == (mine[int(k)] == "success")  # no fault in these trials
         assert v["reviewer_ids"] == ["reviewer-a"] and v["truncated"] is True
-    # the live (scripted) scores were all success: the blinded n is a disagreement, reported
-    assert [d["blinded"] for d in index["blinded_vs_live_disagreements"]] == [False]
+    # the live (scripted) scores were all success: every blinded n is a disagreement, reported
+    assert sorted(d["episode_index"] for d in index["blinded_vs_live_disagreements"]) == sorted(
+        i for i, v in mine.items() if v == "failure"
+    )
     # an incomplete review is refused, never partially declared
     part = dict(rv, items=rv["items"][:2])
     p2 = tmp_path / "partial.json"
@@ -228,12 +253,35 @@ def test_blinded_review_labels_and_provenance(eval_session: _Session, tmp_path: 
         _export(eval_session, tmp_path / "z", "--review", str(p2))
 
 
+def test_one_session_review_is_not_blinded(eval_session: _Session, tmp_path: Path) -> None:
+    """Review F2: one policy's clips alone: the reviewer knows whose they are, so the file says
+    unblinded and the export refuses to declare blinded_review from it."""
+    answers = iter(["y"] * 3)
+    path = br.review(
+        [_capture(eval_session)],
+        "reviewer-a",
+        tmp_path / "rev",
+        seed=1,
+        ask=lambda _m: next(answers),
+    )
+    rv = json.loads(path.read_text())
+    assert rv["method"] == "unblinded_clip_review" and rv["policy_identity_hidden"] is False
+    with pytest.raises(SystemExit, match="not a blinded clip review"):
+        _export(eval_session, tmp_path / "x", "--review", str(path))
+    forged = dict(rv, method="blinded_review", policy_identity_hidden=True)
+    p2 = tmp_path / "forged.json"
+    p2.write_text(json.dumps(forged))
+    with pytest.raises(SystemExit, match="at least two different policies"):
+        _export(eval_session, tmp_path / "y", "--review", str(p2))
+
+
 def test_rubric_r2_fault_after_start_is_a_failure_label() -> None:
     rec = {"fault": {"kind": "safety"}, "stop_reason": "deadman", "trial_id": "s/seen/000"}
     rv = {
         "method": "blinded_review",
         "policy_identity_hidden": True,
         "reviewer_id": "r",
+        "session_policies": {"s": "sha-a", "t": "sha-b"},
         "items": [{"session_id": "s", "episode_index": 0, "verdict": "success"}],
     }
     labels = X._review_labels([rv], "s", {0: rec})

@@ -9,6 +9,16 @@ pipelines, which carry the dataset's normalization stats and, for SmolVLA, the
 Inputs are the batch ``src.robot.convention.policy_observation`` builds (dataset feature names,
 float32 CHW images in [0, 1], canonical radians); outputs are un-normalized absolute joint targets
 in canonical radians, (1, chunk, 6), for ``convention.action_targets``.
+
+Provenance (``PROVENANCE_FILE``, written into every saved ``pretrained_model`` dir by the trainer,
+part of the checkpoint hash; reviews conv-1, F1, F8): the training run id, the dataset's
+convention citation, ``unit_map`` (``robot.units``: arm sign / offset decide what the stored
+radians mean), calibration hash, dataset hash, protocol citation and, for SmolVLA, the VLM
+dependency LeRobot loads from the Hub on EVERY load (``vlm_model_name``: the tokenizer the
+instruction goes through, the processor and the VLM config/weights; ``processor_smolvla.py:74``,
+``smolvlm_with_expert.py:76-87``), pinned to the commit it resolved to at training with the
+sha256 of every non-weight file (``vlm_identity``). The deploy path (``src/robot/local_policy.py``)
+loads that exact snapshot (``vlm_path`` below) and refuses any other.
 """
 
 from __future__ import annotations
@@ -20,8 +30,20 @@ from typing import Any
 import torch
 
 POLICY_TYPES = ("smolvla", "act")
-# Everything LeRobot's from_pretrained / make_pre_post_processors read from a checkpoint dir.
-CHECKPOINT_GLOBS = ("config.json", "model.safetensors", "train_config.json", "policy_*")
+PROVENANCE_FILE = "vla_rl_so101.json"
+# Every file a load reads from a checkpoint dir (LeRobot's from_pretrained /
+# make_pre_post_processors) plus this repo's provenance. SmolVLA's VLM files come from the Hub and
+# are covered through the provenance's ``vlm`` block, not by these globs.
+CHECKPOINT_GLOBS = (
+    "config.json",
+    "model.safetensors",
+    "train_config.json",
+    "policy_*",
+    PROVENANCE_FILE,
+)
+# The non-weight files of a VLM snapshot (tokenizer, processor, chat template, configs)
+VLM_META_PATTERNS = ("*.json", "*.txt", "*.jinja", "*.model", "tokenizer*", "merges*", "vocab*")
+VLM_WEIGHT_PATTERNS = ("*.safetensors",)
 
 
 def cpu_fp32(policy: Any, device: str) -> Any:
@@ -53,9 +75,13 @@ def checkpoint_files(ckpt: Path) -> list[Path]:
 
 def checkpoint_identity(ckpt: str | Path) -> dict[str, Any]:
     """Content identity of a checkpoint dir, as ``src.robot.serve.adapter_identity`` does for the
-    OFT adapters: ``checkpoint_sha256`` over ``name:sha256`` of every file a load reads, and
-    ``checkpoint_revision``, the Hub snapshot commit when the dir is a ``snapshots/<sha>/``
-    download (None for a local dir). Same weights + processors = same hash, wherever they live.
+    OFT adapters: ``checkpoint_sha256`` over ``name:sha256`` of every checkpoint file
+    (``CHECKPOINT_GLOBS``: config, weights, train config, processors and their stats, the
+    provenance), and ``checkpoint_revision``, the Hub snapshot commit when the dir is a
+    ``snapshots/<sha>/`` download (None for a local dir). Same files = same hash, wherever they
+    live. A SmolVLA load ALSO reads the VLM from the Hub; that dependency is in the hash only
+    through the provenance's pinned ``vlm`` block (module doc), so a SmolVLA checkpoint without
+    a provenance is not fully identified by this hash.
 
     The ONE checkpoint identity of PR 2: the trainer's run record, the Mac inference path's
     ``checkpoint_sha256`` (``src/robot/local_policy.py``), the real eval's ``policy_identity`` and
@@ -76,6 +102,68 @@ def checkpoint_identity(ckpt: str | Path) -> dict[str, Any]:
     }
 
 
+def read_provenance(ckpt: str | Path) -> dict[str, Any] | None:
+    """The checkpoint's ``PROVENANCE_FILE`` (None when the trainer did not write one: a Hub base
+    such as smolvla_base, an untrained ACT)."""
+    import json
+
+    path = Path(ckpt) / PROVENANCE_FILE
+    if not path.is_file():
+        return None
+    value: dict[str, Any] = json.loads(path.read_text())
+    return value
+
+
+def write_provenance(ckpt: str | Path, value: dict[str, Any]) -> Path:
+    import json
+
+    path = Path(ckpt) / PROVENANCE_FILE
+    path.write_text(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
+    return path
+
+
+def _files_sha(root: Path) -> dict[str, str]:
+    return {
+        p.relative_to(root).as_posix(): _sha256(p)
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and p.suffix != ".safetensors"  # the weights: model.safetensors
+    }
+
+
+def vlm_snapshot(name: str, revision: str | None, *, weights: bool) -> Path:
+    """The local HF-cache snapshot of the VLM at ``revision`` (None = what ``main`` resolves to
+    now), downloading what is missing: the non-weight files, plus the weights when asked."""
+    from huggingface_hub import snapshot_download
+
+    patterns = list(VLM_META_PATTERNS) + (list(VLM_WEIGHT_PATTERNS) if weights else [])
+    return Path(snapshot_download(name, revision=revision, allow_patterns=patterns))
+
+
+def vlm_identity(name: str, revision: str | None = None) -> dict[str, Any]:
+    """{name, revision (the commit), files: {path: sha256}} of the VLM's non-weight files."""
+    path = vlm_snapshot(name, revision, weights=False)
+    files = _files_sha(path)
+    if not files:
+        raise FileNotFoundError(f"{name}@{revision}: no tokenizer / config files in {path}")
+    return {"name": name, "revision": path.name, "files": files}
+
+
+def pinned_vlm_path(vlm: dict[str, Any], *, weights: bool) -> Path:
+    """The snapshot of a provenance's ``vlm`` block, refused unless every non-weight file hashes
+    as recorded at training (``ValueError``)."""
+    path = vlm_snapshot(str(vlm["name"]), str(vlm["revision"]), weights=weights)
+    got = _files_sha(path)
+    if path.name != vlm["revision"] or got != vlm["files"]:
+        changed = sorted(
+            k for k in set(got) | set(vlm["files"]) if got.get(k) != vlm["files"].get(k)
+        )
+        raise ValueError(
+            f"VLM {vlm['name']}@{vlm['revision']}: the local snapshot {path} differs from the one "
+            f"trained with ({changed[:5]})"
+        )
+    return path
+
+
 def load_checkpoint(
     ckpt: str | Path,
     device: str,
@@ -83,6 +171,7 @@ def load_checkpoint(
     config: Any | None = None,
     n_action_steps: int | None = None,
     preprocessor_overrides: dict[str, Any] | None = None,
+    vlm_path: Path | None = None,
 ) -> tuple[Any, Any, Any]:
     """(policy in eval mode, preprocessor, postprocessor) from a ``pretrained_model`` dir.
 
@@ -90,7 +179,9 @@ def load_checkpoint(
     (``src/robot/local_policy.py``). ``config``: the dir's ``PreTrainedConfig`` when the caller
     already read (and checked) it; ``n_action_steps``: override the saved value (the deploy loop
     executes whole chunks); ``preprocessor_overrides``: extra processor-step overrides (e.g. a
-    rename map), merged with the device override."""
+    rename map), merged with the device override; ``vlm_path`` (SmolVLA): load the VLM, its
+    processor and the tokenizer from this local snapshot (``pinned_vlm_path``) instead of
+    resolving ``vlm_model_name`` on the Hub."""
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
@@ -102,6 +193,10 @@ def load_checkpoint(
         raise ValueError(f"{path}: policy type {pcfg.type!r} is not one of {POLICY_TYPES}")
     pcfg.device = device
     pcfg.pretrained_path = path
+    overrides: dict[str, Any] = dict(preprocessor_overrides or {})
+    if vlm_path is not None and pcfg.type == "smolvla":
+        pcfg.vlm_model_name = str(vlm_path)  # in memory only: the saved config keeps the Hub name
+        overrides["tokenizer_processor"] = {"tokenizer_name": str(vlm_path)}
     policy = get_policy_class(pcfg.type).from_pretrained(path, config=pcfg)
     cpu_fp32(policy.to(device), device).eval()
     if device == "cpu":
@@ -112,10 +207,7 @@ def load_checkpoint(
 
         # strict=False as LeRobot's own from_pretrained (a Hub base may carry extra buffers)
         policy.load_state_dict(load_file(str(path / "model.safetensors")), strict=False)
-    overrides: dict[str, Any] = {
-        **(preprocessor_overrides or {}),
-        "device_processor": {"device": device},
-    }
+    overrides["device_processor"] = {"device": device}
     pre, post = make_pre_post_processors(
         pcfg, pretrained_path=str(path), preprocessor_overrides=overrides
     )

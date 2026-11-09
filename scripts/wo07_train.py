@@ -7,7 +7,15 @@ the frozen real-arm convention ``src/robot/convention.py``: ``observation.images
 ``observation.images.wrist`` (480 x 640), ``observation.state`` / ``action`` in canonical radians,
 absolute targets, 15 Hz. The dataset is refused unless its ``meta/info.json`` conforms
 (``convention.check_dataset_info``) and its ``meta/vla_rl_so101.json`` cites this convention's
-hash. SmolVLA gets ``convention.SMOLVLA_RENAME_MAP`` (front -> camera1, wrist -> camera2, as the
+hash; a recorded (not synthetic) dataset must also be the real-0.1 DEMO recording (review conv-2):
+``purpose`` demonstration, recorded with ``--demo-schedule`` under this protocol hash, every episode
+one placement of the frozen demo schedule (the five seen slots, the fixed bowl, the red cube), never
+an evaluation capture, a rehearsal or a WO-06 sanity recording.
+
+Every saved checkpoint gets ``vla_rl_so101.json`` (``lerobot_ckpt.PROVENANCE_FILE``, inside the
+checkpoint hash): this run's id, the dataset's convention citation, ``unit_map``, calibration
+hash, dataset hash and protocol citation, and (SmolVLA) the VLM revision + file hashes it trained
+with; the deploy path refuses a checkpoint whose provenance does not match the live setup. SmolVLA gets ``convention.SMOLVLA_RENAME_MAP`` (front -> camera1, wrist -> camera2, as the
 LeRobot SmolVLA guide); LeRobot saves it in the checkpoint's preprocessor, so inference renames
 the same way. ACT reads the dataset keys directly.
 
@@ -50,6 +58,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.config import Config, add_config_args, load_config
 from src.data.recorder import datasets_write_compat, install_torchcodec_compat, load_demo_dataset
+from src.eval import protocol_real as PR
 from src.policy import lerobot_ckpt as ck
 from src.robot import convention as conv
 from src.robot.units import JOINT_NAMES, URDF_LIMITS_RAD
@@ -188,6 +197,7 @@ def build_synthetic_dataset(ref: DatasetRef, episodes: int, frames: int, seed: i
             q = [mid + amp * np.sin(phase + 0.2 * t) for t in range(frames + 1)]
             for t in range(frames):
                 s = (q[t] - lo) / (hi - lo)  # in [0, 1]
+                wt = t / conv.FPS
                 front = np.empty(conv.IMAGE_SHAPE_HWC, np.uint8)
                 front[..., 0] = (255 * s[0] * xx / conv.IMAGE_WIDTH).astype(np.uint8)
                 front[..., 1] = (255 * s[1] * yy / conv.IMAGE_HEIGHT).astype(np.uint8)
@@ -196,7 +206,12 @@ def build_synthetic_dataset(ref: DatasetRef, episodes: int, frames: int, seed: i
                 wrist[...] = (int(255 * s[3]), int(255 * s[4]), int(255 * s[5]))
                 ds.add_frame(
                     conv.recording_frame(
-                        {"front": front, "wrist": wrist}, q[t], q[t + 1], conv.DEMO_TASK_STRING
+                        {"front": front, "wrist": wrist},
+                        q[t],
+                        q[t + 1],
+                        conv.DEMO_TASK_STRING,
+                        write_time_s=wt,
+                        frame_time_s=wt,
                     )
                 )
             ds.save_episode()
@@ -211,9 +226,39 @@ def build_synthetic_dataset(ref: DatasetRef, episodes: int, frames: int, seed: i
     (ref.root / PROVENANCE).write_text(json.dumps(provenance, indent=2) + "\n")
 
 
-def check_dataset(root: Path, *, allow_rehearsal: bool) -> dict[str, Any]:
+def demo_problems(prov: dict[str, Any], episodes: int) -> list[str]:
+    """Why a recorded dataset is not the real-0.1 demo recording (empty = it is; review conv-2)."""
+    out: list[str] = []
+    if prov.get("purpose") != "demonstration":
+        out.append(f"purpose is {prov.get('purpose')!r}, not 'demonstration' (an eval capture?)")
+    if prov.get("demo_schedule") is not True:
+        out.append("not recorded with --demo-schedule (a WO-06 sanity recording?)")
+    proto = prov.get("protocol") or {}
+    if proto.get("hash") != PR.protocol_hash():
+        out.append(
+            f"recorded under protocol {proto.get('version')} {str(proto.get('hash'))[:12]}, "
+            f"this trainer is {PR.PROTOCOL_VERSION} {PR.protocol_hash()[:12]}"
+        )
+    schedule = PR.demo_schedule()
+    eps = prov.get("episodes") or {}
+    for i in range(episodes):
+        pl = eps.get(str(i))
+        if pl is None:
+            out.append(f"episode {i} has no recorded placement")
+            continue
+        k = pl.get("demo_idx")
+        if not isinstance(k, int) or not 0 <= k < len(schedule) or pl != schedule[k]:
+            out.append(f"episode {i}'s placement is not a demo of the frozen schedule: {pl}")
+        elif pl["object_slot"] not in PR.SEEN_SLOTS:
+            out.append(f"episode {i} is at {pl['object_slot']}, not a seen slot")
+    return out
+
+
+def check_dataset(root: Path, *, allow_rehearsal: bool, demos: bool = True) -> dict[str, Any]:
     """Refuse a dataset outside the convention: ``meta/info.json`` must conform and
-    ``meta/vla_rl_so101.json`` must cite THIS convention version and hash."""
+    ``meta/vla_rl_so101.json`` must cite THIS convention version and hash. ``demos`` (every
+    recorded dataset; only the tiny preset's synthetic one is exempt): also the real-0.1 demo
+    recording (``demo_problems``)."""
     info_path = root / "meta" / "info.json"
     if not info_path.is_file():
         raise TrainSetupError(
@@ -237,6 +282,8 @@ def check_dataset(root: Path, *, allow_rehearsal: bool) -> dict[str, Any]:
             )
         if prov.get("rehearsal") and not allow_rehearsal:
             problems.append("a rehearsal recording (dataset.allow_rehearsal is false)")
+        if demos and not prov.get("synthetic"):
+            problems += demo_problems(prov, int(info.get("total_episodes", 0)))
     if problems:
         raise TrainSetupError(f"dataset {root} refused:\n  " + "\n  ".join(problems))
     return {
@@ -246,6 +293,38 @@ def check_dataset(root: Path, *, allow_rehearsal: bool) -> dict[str, Any]:
         "codebase_version": info["codebase_version"],
         "rehearsal": bool(prov.get("rehearsal", False)),
         "synthetic": bool(prov.get("synthetic", False)),
+        "protocol": prov.get("protocol"),
+        "session_id": prov.get("session_id"),
+        "unit_map": prov.get("unit_map"),
+        "calibration_sha256": (prov.get("calibration") or {}).get("sha256"),
+        "convention": prov.get("convention"),
+    }
+
+
+def checkpoint_provenance(
+    run_id: str, name: str, block: dict[str, Any], ref: DatasetRef, ds: dict[str, Any], vlm: Any
+) -> dict[str, Any]:
+    """``lerobot_ckpt.PROVENANCE_FILE`` of this run's checkpoints (module doc)."""
+    return {
+        "source": "scripts/wo07_train.py",
+        "training_run_id": run_id,
+        "policy": name,
+        "base": block["base"],
+        "convention": ds["convention"],
+        "unit_map": ds["unit_map"],
+        "calibration_sha256": ds["calibration_sha256"],
+        "protocol": ds["protocol"],
+        "dataset": {
+            "repo_id": ref.repo_id,
+            "revision": ref.revision,
+            "sha256": ds["sha256"],
+            "episodes": ds["episodes"],
+            "frames": ds["frames"],
+            "session_id": ds["session_id"],
+            "synthetic": ds["synthetic"],
+        },
+        "rename_map": dict(conv.SMOLVLA_RENAME_MAP) if name == "smolvla" else {},
+        "vlm": vlm,
     }
 
 
@@ -280,6 +359,7 @@ class Trained:
     pre: Any = None
     post: Any = None
     peak: dict[str, float] = field(default_factory=dict)
+    out: Path | None = None
 
 
 def _sync(device: str) -> None:
@@ -381,6 +461,7 @@ def train(
         }
     if save:
         res.checkpoint = (out / "checkpoints" / "last" / "pretrained_model").resolve()
+    res.out = out
     return res
 
 
@@ -519,8 +600,15 @@ def _run(
             )
             run.results["synthetic_build_s"] = round(time.monotonic() - t0, 1)
         ds_info = check_dataset(
-            ref.root, allow_rehearsal=bool(cfg["dataset"].get("allow_rehearsal", False))
+            ref.root,
+            allow_rehearsal=bool(cfg["dataset"].get("allow_rehearsal", False)),
+            demos=not ref.synthetic,
         )
+        ds_hash = dataset_hash(ref.root)
+        vlm = None
+        if args.policy == "smolvla":  # the Hub VLM LeRobot loads: pin the commit it resolves to
+            vlm_name = str(make_policy_config("smolvla", block, "cpu").vlm_model_name)
+            vlm = ck.vlm_identity(vlm_name)
         run.results.update(
             policy=args.policy,
             base=block["base"],
@@ -531,8 +619,10 @@ def _run(
                 "root": str(ref.root),
                 "revision": ref.revision,
                 **ds_info,
-                **dataset_hash(ref.root),
+                **ds_hash,
             },
+            protocol=ds_info["protocol"],
+            vlm=vlm,
         )
         run.flush()
         t0 = time.monotonic()
@@ -580,7 +670,19 @@ def _run(
                 f" ${est['total_usd']:.2f} at ${est['usd_per_hour']}/h ({est['gpu']})"
             )
         else:
-            assert trained.checkpoint is not None
+            assert trained.checkpoint is not None and trained.out is not None
+            if vlm is not None and ck.vlm_identity(vlm["name"]) != vlm:
+                raise RunFailed(1, f"{vlm['name']} moved on the Hub during the run: rerun")
+            prov = checkpoint_provenance(
+                run.id, args.policy, block, ref, {**ds_info, **ds_hash}, vlm
+            )
+            saved = sorted((trained.out / "checkpoints").glob("*/pretrained_model"))
+            for d in saved:  # every checkpoint (checkpoint selection may pick an earlier one)
+                ck.write_provenance(d, prov)
+            run.results["checkpoint_provenance"] = {
+                "file": ck.PROVENANCE_FILE,
+                "dirs": [str(d.parent.name) for d in saved],
+            }
             run.results["checkpoint"] = {
                 "path": str(trained.checkpoint),
                 **ck.checkpoint_identity(trained.checkpoint),

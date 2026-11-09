@@ -89,7 +89,9 @@ def demos(tmp_path_factory: pytest.TempPathFactory) -> Path:
         mp.setattr("builtins.input", lambda _p="": answers.pop(0))
         rig, _ = tc._rig()
         sess, fol = tc._session(tc.MovingLeader(), rig)
-        dataset = tc.teleop.create_dataset("local/so101-demos", root)
+        dataset = recording.DurableDataset(
+            tc.teleop.create_dataset("local/so101-demos", root), "local/so101-demos"
+        )
         instr = tc.teleop.protocol_instructions(["PickPlace"])
         cfg = real_cfg()
         prov = tc.teleop.recording_provenance(
@@ -100,7 +102,7 @@ def demos(tmp_path_factory: pytest.TempPathFactory) -> Path:
             saved = tc.teleop.record_session(
                 sess, dataset, ["PickPlace"], instr, 2, 1.0, PR.demo_schedule()[:2]
             )
-        dataset.finalize()
+        dataset.close()
         assert saved == 2 and not answers
         prov["episodes"] = dict(sess.placements)
         recording.write_json(root / recording.PROVENANCE, prov)
@@ -154,9 +156,41 @@ def test_trainer_reads_the_recorder_dataset(
     assert lp.checkpoint_identity(ckpt)["checkpoint_sha256"] == sha
     assert X.checkpoint_identity(ckpt)["sha256"] == sha
     assert set(X.checkpoint_identity(ckpt)["files"]) == set(res["checkpoint"]["checkpoint_files"])
+    # reviews conv-1 / F1 / F8: the checkpoint carries (inside its hash) what it was trained on
+    assert lerobot_ckpt.PROVENANCE_FILE in res["checkpoint"]["checkpoint_files"]
+    prov = lerobot_ckpt.read_provenance(ckpt)
+    assert prov is not None and prov["training_run_id"] == rec["run_id"]
+    assert prov["convention"] == conv.citation() and prov["unit_map"] is not None
+    assert prov["protocol"]["hash"] == PR.protocol_hash()
+    assert prov["dataset"]["sha256"] == ds["sha256"]
+    if _family == "smolvla":  # the Hub VLM it loads, pinned by commit and file hashes
+        assert prov["vlm"]["revision"] and "tokenizer.json" in prov["vlm"]["files"]
+    else:
+        assert prov["vlm"] is None
 
 
-def _local_cfg(ckpt: Path, family: str, sha: str) -> dict[str, Any]:
+def test_smolvla_loads_only_the_vlm_it_trained_with(
+    trained: tuple[str, dict[str, Any], Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review F1: a tokenizer / processor file that differs from the training snapshot is
+    refused before the weights load (the checkpoint hash alone does not cover the Hub VLM)."""
+    import shutil
+
+    family, _rec, ckpt = trained
+    if family != "smolvla":
+        pytest.skip("SmolVLA only")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    copy = Path(shutil.copytree(ckpt, tmp_path / "copy"))
+    prov = lerobot_ckpt.read_provenance(copy)
+    assert prov is not None
+    prov["vlm"]["files"]["tokenizer.json"] = "0" * 64
+    lerobot_ckpt.write_provenance(copy, prov)
+    spec = lp.LocalPolicySpec.from_config(_local_cfg(copy, family, None))
+    with pytest.raises(lp.CheckpointMismatch, match="differs from the one trained with"):
+        lp.load_local_policy(spec)
+
+
+def _local_cfg(ckpt: Path, family: str, sha: str | None) -> dict[str, Any]:
     from test_local_policy import _cfg
 
     return _cfg(
@@ -233,6 +267,15 @@ def test_real_eval_local_capture_and_export(
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     runs = tmp_path / "runs"
     run_id = rec["run_id"]  # the training run: the export's training_run_id
+    with pytest.raises(SystemExit, match="the run that saved"):  # review F8
+        ev.main(
+            [
+                "--preset", "real", "--mock", "--fake-clock", "--max-steps", "4",
+                "--task", "PickPlace", "--trials", "1", "--labeler", "mock-labeler",
+                "--backend", "local", "--family", family, "--training-run-id", "the-probe-run",
+                "--checkpoint-dir", str(ckpt), "--runs-dir", str(runs),
+            ]
+        )  # fmt: skip
     record = ev.main(
         [
             "--preset", "real", "--mock", "--fake-clock", "--max-steps", "4",
@@ -246,6 +289,8 @@ def test_real_eval_local_capture_and_export(
     assert info["transport"] == lp.TRANSPORT and info["checkpoint_sha256"] == sha
     assert st["backend"] == "local" and st["policy_identity"]["checkpoint_sha256"] == sha
     assert st["policy_identity"]["family_id"] == X.FAMILIES[family]
+    assert st["policy_identity"]["training_run_verified"] is True
+    assert info["describe"]["training_run_id"] == run_id
     trials = res["trials"]
     assert len(trials) == 3 and {t["cell"] for t in trials} == set(PR.CELLS)
     assert all(t["policy_started"] and t["policy_id"] == str(ckpt) for t in trials)
