@@ -23,10 +23,12 @@ keeps acting until ``trial_max_steps`` or a stop, so a success undone before the
 
 What real-judge-2 changes against real-judge-1 (which had the operator score faulted trials after
 supporting the arm, and left trials with a failed torque-off unscored): a trial counts once its
-policy STARTED (``policy_started``: the trial's first action from the policy server was handed to
-the safety filter; recorded with its UTC time). Every started trial is scored exactly once and is
-never redone. A fault after the start is a FAILURE in the primary metric without a judgement, the
-fault recorded separately (``fault: {kind, stop_reason, reason, where}``; kinds: servo, serial,
+policy STARTED (``policy_started``: the goal write of the trial's first action from the policy
+server was begun, ``So101Driver.goal_write_attempted``; recorded with its UTC time; a first goal
+blocked before its write, e.g. by the pre-write stop check after a hang-up, never started).
+Every started trial is scored exactly once and is never redone. A fault after the start is a
+FAILURE in the primary metric without a judgement, the fault recorded separately
+(``fault: {kind, stop_reason, reason, where}``; kinds: servo, serial,
 safety = a safety-layer or deadman stop (joint / workspace violation, lost frame, stall, stale
 chunk), server, operator_abort (Ctrl-C during motion), client_error, torque_off_unconfirmed),
 also when torque off is unconfirmed; a later operator 'resume' does not change it. The operator
@@ -35,12 +37,21 @@ A score prompt that ends without a judgement (Ctrl-C, closed stdin, no answer in
 ``deploy.prompt_torque_timeout_s``) is a failure, ``outcome_source: unjudged`` with the reason
 (doubt = n applied to a missing judgement; owner check). An attempt whose policy never started
 (the move home failed / faulted / was Ctrl-C'd, a server failure or a stale first chunk before the
-first action, a quit) is ``not_started``: kept in the attempts log, never scored, and retried with
-the same placement on a resume. Primary metric: successes / started trials, per cell, with the
-Wilson interval; ``diagnostic_excluding_faulted`` (success rate over started trials without a
-fault) and ``faults_by_kind`` are a clearly labelled SECONDARY diagnostic. The rule's version and
-text hash are in the session fingerprint, so a session scored under real-judge-1 can be neither
-resumed nor pooled with real-judge-2 records.
+first action, the first goal stopped before its write, a quit) is ``not_started``: kept in the
+attempts log, never scored, and retried with the same placement on a resume. Primary metric:
+successes / started trials, per cell, with the Wilson interval; ``diagnostic_excluding_faulted``
+(success rate over started trials without a fault) and ``faults_by_kind`` are a clearly labelled
+SECONDARY diagnostic. The rule's version and text hash are in the session fingerprint, so a
+session scored under real-judge-1 can be neither resumed nor pooled with real-judge-2 records.
+
+Start-rule wording change inside real-judge-2 (2026-11-09, PR fix/deploy-prewrite-stop; before
+the real-eval protocol is frozen, no real session recorded): "started" moved from "the first
+action reached the safety filter" to "the bus write of the first action was begun". Deliberate
+reclassification: a first step that ends before its write (the pre-write stop check, a deadman
+trip at its frame check or in the filter, a joint-read serial fault) is now ``not_started`` and
+retried instead of a started failure. The text hash changed with it; the first FROZEN real-eval
+protocol (PR #32, ``src/eval/protocol_real.py``) must carry this wording, and real-judge-2 is
+cited only from that frozen version.
 
 Paired placements (owner 2026-11-08): the SFT and the SFT+RL sessions use the SAME slot sequence.
 ``--hardware`` refuses a ``--slot-seed`` other than ``eval.slot_seed``, and the plan is
@@ -69,6 +80,9 @@ a slot whose attempts all ended before the policy started is retried with the sa
 The start is durable: the moment the policy starts, a ``trial_started`` row goes to
 metrics.jsonl, and a resume scores a started trial that has no record (the process was killed,
 crashed or lost power mid-trial) as a FAILURE with fault kind ``session_lost`` (``load_prior``).
+A first goal blocked after that row (a stop recorded during its I/O, or the row failed to save:
+the session then ends ``start_marker_failed``) was never sent: a ``trial_start_retracted`` row
+cancels the marker, and the slot is retried with the same placement.
 Each invocation is its own run record, holding every trial of the session so far; record.json is
 written when the session is bound and after every trial, so a run killed without exiting
 (SIGKILL, power loss) can be resumed itself. Closing the Terminal (SIGHUP / SIGTERM) is not a
@@ -217,6 +231,7 @@ from src.robot.driver import So101Driver
 from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals, require_terminal
 from src.robot.recording import (
     NO_POLICY_WRITE,
+    STAGED_NOT_STARTED,
     STAGED_UNREADABLE,
     EvalCapture,
     RigFrameSource,
@@ -234,8 +249,8 @@ PROTOCOLS = (PR.PROTOCOL_VERSION, P2.PROTOCOL_VERSION)
 
 JUDGING_RULE_VERSION = PR.JUDGING_RULE_VERSION  # "real-judge-2"
 DEFAULT_SETTLE_S = 3.0  # eval.settle_s
-# the rule's text lives in src/eval/protocol_real.py (hashed by real-0.1); unchanged, so the
-# judging_rule_sha256 of protocol 0.2 sessions is unchanged too
+# the rule's text lives in src/eval/protocol_real.py (hashed by real-0.1); #33's start wording
+# is ported there with real-judge-3 (the follow-up commit), and protocol 0.2 sessions share it
 JUDGING_GENERAL = PR.JUDGING_GENERAL
 JUDGING_RULE: dict[str, str] = PR.JUDGING_RULE
 
@@ -526,7 +541,11 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     plus every ``trial_started`` row without its trial: the policy started and the process died
     before the trial was recorded (killed, crashed, power lost). That row is the record as it
     stood at the start, a FAILURE with fault kind ``session_lost``: the started slot is done and
-    is never re-run (real-judge-2).
+    is never re-run (real-judge-2). A ``trial_started`` row with a ``trial_start_retracted`` row
+    of the same attempt is dropped: the first goal was blocked after the marker (a stop recorded
+    during its I/O, a frame / chunk gone stale during it, or the marker failed), nothing was sent,
+    the attempt never started and the slot is retried (``DeployLoop._first_goal_check``); a
+    ``capture`` row of a retracted attempt is dropped too (it has no recording).
 
     Rows are keyed by (cell, trial_idx, start_utc, attempt): ``start_utc`` has one-second
     resolution, so a not-started attempt and its in-place retry can share it (review F4). A
@@ -545,8 +564,9 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     trials: list[dict[str, Any]] = list(results.get("trials") or [])
     seen = {_row_key(t) for t in trials}
     metrics = run_dir / "metrics.jsonl"
-    started: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
-    captures: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    started: dict[tuple[Any, Any, Any, Any], dict[str, Any]] = {}
+    captures: dict[tuple[Any, Any, Any, Any], dict[str, Any]] = {}
+    retracted: set[tuple[Any, Any, Any, Any]] = set()
     if metrics.is_file():
         for line in metrics.read_text().splitlines():
             try:
@@ -556,9 +576,12 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             if row.get("kind") == "capture":  # the episode saved after the trial's record
                 captures[_row_key(row)] = row["capture"]
                 continue
-            if row.get("kind") not in ("trial", "trial_started"):
+            if row.get("kind") not in ("trial", "trial_started", "trial_start_retracted"):
                 continue
             key = _row_key(row)
+            if row["kind"] == "trial_start_retracted":
+                retracted.add(key)
+                continue
             rec = {k: v for k, v in row.items() if k not in ("kind", "t", "step")}
             if row["kind"] == "trial_started":
                 started.setdefault(key, rec)
@@ -566,13 +589,20 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 seen.add(key)
                 trials.append(rec)
     for key, rec in started.items():
-        if key not in seen:
+        if key in retracted and key not in seen:
+            print(
+                f"--resume: {key[0]} trial {key[1]}: its start was retracted (the first goal was "
+                "blocked before its write): not started, the slot is retried"
+            )
+        elif key not in seen:
             seen.add(key)
             print(
                 f"--resume: {key[0]} trial {key[1]} started at {rec.get('policy_started_utc')} and "
                 "has no record (the run ended mid-trial): scored a FAILURE (session_lost)"
             )
             trials.append(rec)
+    for key in retracted:  # a retracted attempt never started: it has no recording
+        captures.pop(key, None)
     real = settings.get("protocol_id") == PR.PROTOCOL_VERSION and settings.get("session_id")
     for t in trials:
         if real and t.get("trial_id") is None:
@@ -1144,7 +1174,15 @@ def reconcile_captures(
         "recovered": [],
         "recovery_failed": [],
         "recording_missing": [],
+        "discarded": [],
     }
+    started_tids = {str(t.get("trial_id")) for t in trials if t.get("policy_started")}
+    for tid in sorted({str(t["trial_id"]) for t in trials if t.get("trial_id") is not None}):
+        # a slot none of whose attempts started (e.g. a retracted start): no recording belongs
+        # to it, and a journal must never reach its later attempt (recording module doc)
+        if tid not in started_tids and has_staged(capture.root, tid):
+            capture.drop_staged(tid)
+            out["discarded"].append({"trial_id": tid, "reason": STAGED_NOT_STARTED})
     for t in trials:
         cap = t.get("capture") or {}
         if not recording_required(t) or cap.get("episode_index") is not None:
@@ -1166,7 +1204,7 @@ def reconcile_captures(
             capture.drop_staged(tid)
             out["attached"].append(tid)
         else:
-            block = capture.recover_staged(tid)
+            block = capture.recover_staged(tid, expect=t)
             if (
                 block.get("episode_index") is None
                 and block.get("reason") != STAGED_UNREADABLE

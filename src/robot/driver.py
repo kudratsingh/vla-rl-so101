@@ -8,7 +8,8 @@
 
 * ``step`` = deadman frame check -> read joints -> ``SafetyFilter`` -> optional ``stop_fn``
   (True: ``MotionStopped``, nothing written) -> bus write (-> scheduled servo-health read). The
-  only way a policy action reaches the bus.
+  only way a policy action reaches the bus. ``goal_write_attempted`` tells the caller afterwards
+  whether that step's goal write was begun (``step`` docstring: "goal sent").
 * On a deadman trip it performs the response (HOLD: write the measured pose as the goal, so the
   servos stop pushing; TORQUE_OFF: disable torque) and raises ``DeadmanTripped``: the loop stops.
   A caller may catch it, ask the operator, ``deadman.reset(...)`` and continue.
@@ -398,6 +399,8 @@ class So101Driver:
         self.servo_fault: str | None = None  # reason of the latest ServoFault
         # first failed torque-off write; latched for the life of the process (module doc)
         self.torque_off_unconfirmed: str | None = None
+        # did the latest ``step`` attempt its goal write ("goal sent", ``step`` docstring)?
+        self.goal_write_attempted = False
         self._connected = False
 
     @classmethod
@@ -749,7 +752,18 @@ class So101Driver:
         never sends unsafely. ``stop_fn`` is evaluated after the joint read and the safety
         filter, immediately before the goal write: True raises ``MotionStopped`` with nothing
         written, so a stop recorded while the caller waited on its camera frame or while this
-        tick read the servos never produces one more goal (review F1, round 8)."""
+        tick read the servos never produces one more goal (review F1, round 8).
+
+        Goal sent (``goal_write_attempted``, reset to False on entry): True from the moment this
+        step begins its goal write, i.e. once ``stop_fn`` (if any) returned False. After a step
+        returns it is always True. After a step raises it says whether the goal may have reached
+        the bus: False for everything raised before the write (``MotionStopped``, a refusal, a
+        deadman trip at the frame check or in the filter, a ``SerialFault`` from the joint read:
+        nothing of this goal was written; a deadman response may have written its hold), True
+        for a ``SerialFault`` from inside the write (some bytes may have gone out: doubt counts
+        as sent) and for anything raised after it (a servo-health read). Callers decide "the
+        policy started" on this flag alone (``src/robot/client.py`` ``DeployLoop``)."""
+        self.goal_write_attempted = False
         if self.torque_off_unconfirmed is not None:
             raise self._refuse_motion("step")
         if not self._connected:
@@ -765,6 +779,7 @@ class So101Driver:
             raise self._respond_to_deadman(measured)
         if stop_fn is not None and stop_fn():
             raise MotionStopped("stop requested before the goal write")
+        self.goal_write_attempted = True  # from here on the goal may reach the bus
         self._write(result.command)
         if self.monitor is not None:
             reg = self.monitor.due()

@@ -1029,8 +1029,8 @@ def test_fault_acknowledgements_record_how_they_were_given(
         assert "inline power switch" in sd.ack["prompt"]
 
 
-def test_policy_started_is_the_first_action_handed_to_the_safety_filter() -> None:
-    with rig() as r:  # the first query fails: no action ever reached the filter
+def test_policy_started_is_the_first_policy_goal_write() -> None:
+    with rig() as r:  # the first query fails: no goal was ever written
         r.policy.mode = "error"
         res = r.loop.run_trial(INSTRUCTION, max_steps=16)
         assert res.stop_reason == "server_error" and not res.policy_started and res.steps == 0
@@ -1042,7 +1042,7 @@ def test_policy_started_is_the_first_action_handed_to_the_safety_filter() -> Non
         res = r.loop.run_trial(INSTRUCTION, max_steps=16)
         assert res.policy_started and res.policy_started_utc and res.steps == 16
         assert res.t_first_write is not None and res.policy_started_t is not None
-        assert res.policy_started_t <= res.t_first_write  # stamped as the action was handed over
+        assert res.policy_started_t == res.t_first_write  # stamped at the first goal write
 
 
 # -- review round 3: signals as flags, hang-up, Ctrl-C outside a read, durable records -----------

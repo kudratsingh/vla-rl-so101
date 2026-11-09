@@ -671,6 +671,14 @@ trips before the prompt waits.
   `hangup`) and `support_confirmed: false`. Outside a prompt Ctrl-C is a flag checked between
   control ticks (like teleop): during motion it holds the arm at the next tick and the trial is
   a failure (fault `operator_abort`); it never interrupts a servo transfer or the shutdown.
+  The same stop check (Ctrl-C flag, closed Terminal / SIGTERM, lost foreground) also runs right
+  before every policy goal and every move-home goal is written (owner 2026-11-09), so a stop
+  that lands while a tick waits for its camera frame, the policy or the servo read never sends
+  one more goal: the arm holds at its measured pose and the session ends as above. If that
+  happens before the trial's first policy goal was written, the trial never started: it is
+  recorded as an unscored attempt with the stop cause, and a resume retries that slot with the
+  same placement. Once the first goal was written (or its write failed part-way), the trial is
+  a failure with the fault recorded.
   Anything typed before a prompt appears is discarded: an ENTER pressed during motion never
   confirms support or starts the next trial. After a servo or serial fault torque is already off: the script tells you to support
   the arm and waits for ENTER (bounded); the run record keeps how you answered

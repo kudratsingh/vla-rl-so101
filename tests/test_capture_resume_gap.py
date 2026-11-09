@@ -477,3 +477,121 @@ def test_a_same_second_retry_keeps_each_attempt_its_own_capture(
     assert first[1]["capture"]["episode_index"] == 0
     index = _export(runs, rec.parent.name, tmp_path / "export")
     assert index["status"] == "COMPLETE" and index["episodes"] == 3
+
+
+# -- PR #33 x the capture: a retracted start never has (or lends) a recording ---------------------
+def test_a_retracted_start_has_no_recording_and_its_retry_records_its_own(
+    tmp_path: Path, hard_timeout: None
+) -> None:
+    """The first trial's ``trial_started`` row takes 400 ms on the fake clock: the frame goes
+    stale, the first goal is blocked and the marker retracted (``not_started``, attempt 1). The
+    in-place retry (attempt 2) starts and is captured as its own episode. Attempt 1 has no
+    recording and nothing staged; its retraction row carries its attempt and trial id; resume
+    keys it apart from attempt 2; the export is COMPLETE with one episode per started trial."""
+    from src.robot.client import DeployLoop
+    from src.runs import Run
+
+    loops: list[DeployLoop] = []
+
+    class SlowMarkerLoop(DeployLoop):
+        def __init__(self, *a: Any, **k: Any) -> None:
+            super().__init__(*a, **k)
+            loops.append(self)
+
+    real_log = Run.log_metrics
+    slowed = [0]
+
+    def log_metrics(run: Run, step: int | None = None, **row: Any) -> None:
+        if row.get("kind") == "trial_started" and not slowed[0]:
+            slowed[0] = 1
+            loops[-1].clock.advance(0.4)  # type: ignore[attr-defined]
+        real_log(run, step, **row)
+
+    runs, ckpt = tmp_path / "runs", _ckpt(tmp_path)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ev, "DeployLoop", SlowMarkerLoop)
+        mp.setattr(Run, "log_metrics", log_metrics)
+        rec = _new_session(runs, ckpt)
+    r1 = json.loads(rec.read_text())["results"]
+    tid = r1["trials"][0]["trial_id"]
+    first = [t for t in r1["trials"] if t["trial_id"] == tid]
+    assert [(t["attempt"], bool(t["policy_started"])) for t in first] == [(1, False), (2, True)]
+    assert first[0]["stop_reason"] == "deadman" and "start marker took" in first[0]["stop_detail"]
+    assert first[0]["capture"]["episode_index"] is None
+    assert "not started" in first[0]["capture"]["reason"] and not first[0]["capture"]["frames"]
+    assert not recording.recording_required(first[0])
+    rows = [json.loads(x) for x in (rec.parent / "metrics.jsonl").read_text().splitlines()]
+    (retracted,) = [r for r in rows if r["kind"] == "trial_start_retracted"]
+    assert (retracted["trial_id"], retracted["attempt"]) == (tid, 1)
+    capture_root = runs / r1["session"]["session_id"] / "capture"
+    assert not list((capture_root / recording.STAGED_DIR).glob("*"))  # nothing staged, ever
+    _, trials = ev.load_prior(rec.parent)
+    again = [t for t in trials if t["trial_id"] == tid]
+    assert [(t["attempt"], t["capture"].get("episode_index")) for t in again] == [(1, None), (2, 0)]
+    eps = X.check_dataset(capture_root / "dataset", {"units": conv.DECLARED_UNITS})
+    lengths = {int(e["episode_index"]): int(e["length"]) for e in eps}
+    assert lengths[0] == again[1]["capture"]["frames"] == again[1]["steps"]
+    prov = json.loads((capture_root / "dataset" / recording.PROVENANCE).read_text())
+    assert prov["episodes"]["0"]["trial_id"] == tid and len(prov["episodes"]) == 3
+    index = _export(runs, rec.parent.name, tmp_path / "export")
+    assert index["status"] == "COMPLETE" and index["episodes"] == 3
+
+
+def test_a_journal_of_another_attempt_or_a_not_started_slot_is_discarded(tmp_path: Path) -> None:
+    """A staged journal is never attached to an attempt it was not written for: the resume's
+    reconcile discards the journal of a slot none of whose attempts started (e.g. a retracted
+    start), and ``recover_staged`` discards one whose recorded attempt differs from the record it
+    would be recovered for (``journal_mismatch``; journals without ``attempt`` match on the rest).
+    """
+    tid = "sess/seen/000"
+    d = recording.staged_path(tmp_path, tid)
+    d.mkdir(parents=True)
+    rec1 = {"cell": "seen", "trial_idx": 0, "start_utc": "2026-11-09T12:00:00Z", "attempt": 1}
+    (d / recording.STAGED_INDEX).write_text(json.dumps({"trial_id": tid, "record": rec1}))
+
+    class Cap:
+        def __init__(self) -> None:
+            self.root = tmp_path
+            self.provenance: dict[str, Any] = {"episodes": {}}
+
+        def drop_staged(self, trial_id: str) -> None:
+            shutil.rmtree(recording.staged_path(tmp_path, trial_id), ignore_errors=True)
+
+        def recover_staged(self, trial_id: str, expect: Any = None) -> dict[str, Any]:
+            raise AssertionError("a not-started slot is never recovered")
+
+    logged: list[dict[str, Any]] = []
+    trials = [{**rec1, "trial_id": tid, "policy_started": False, "outcome": "not_started"}]
+    out = ev.reconcile_captures(Cap(), trials, lambda **row: logged.append(row))  # type: ignore[arg-type]
+    assert out["discarded"] == [{"trial_id": tid, "reason": recording.STAGED_NOT_STARTED}]
+    assert not recording.has_staged(tmp_path, tid) and logged == []
+
+    assert recording.journal_mismatch(rec1, {**rec1, "attempt": 2}) == "attempt 1 != 2"
+    assert recording.journal_mismatch(rec1, rec1) == ""
+    no_attempt = {k: v for k, v in rec1.items() if k != "attempt"}
+    assert recording.journal_mismatch(no_attempt, {**rec1, "attempt": 2}) == ""
+    assert recording.journal_mismatch(rec1, None) == ""
+
+
+def test_a_staged_journal_of_another_attempt_is_not_recovered_into_this_one(
+    tmp_path: Path, hard_timeout: None
+) -> None:
+    """End to end: the run was killed after trial 3's score, its journal staged. The journal is
+    made to name another attempt of the slot; the resume does NOT attach it: it is discarded
+    and trial 3 is flagged ``recording_missing`` (the export refuses a complete bundle)."""
+    runs, run_dir, _ = _killed_session(tmp_path, "after_record")
+    settings, before = ev.load_prior(run_dir)
+    third = before[-1]
+    capture_root = runs / settings["session_id"] / "capture"
+    index = recording.staged_path(capture_root, third["trial_id"]) / recording.STAGED_INDEX
+    meta = json.loads(index.read_text())
+    assert meta["record"] == {k: third.get(k) for k in recording.JOURNAL_KEYS}
+    meta["record"]["attempt"] = int(third["attempt"]) + 1
+    index.write_text(json.dumps(meta))
+
+    rec2 = _resume(runs, run_dir)
+    got = next(t for t in rec2["results"]["trials"] if t["trial_id"] == third["trial_id"])
+    assert got["capture"]["episode_index"] is None and got["capture"]["recording_missing"]
+    assert recording.STAGED_OTHER_ATTEMPT in got["capture"]["reason"]
+    assert not recording.has_staged(capture_root, third["trial_id"])
+    assert rec2["results"]["capture"]["reconciled"]["recording_missing"] == [third["trial_id"]]

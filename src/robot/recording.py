@@ -64,6 +64,14 @@ Evaluation capture (``EvalCapture``), one dataset per evaluation session, one ep
   whole (e.g. a transient save error) is NOT flagged: the journal stays and the next resume
   retries it (``recovery_failed``). A started trial that no policy write reached (frames 0, no
   capture error: the first write faulted) has no recording to miss (``recording_required``).
+* Retracted starts (PR #33, ``DeployLoop._first_goal_check``): an attempt whose first goal was
+  blocked after its ``trial_started`` marker never started (``not_started``): no policy write
+  reached the capture, nothing is staged (``stage`` needs a started record), ``finish`` discards
+  its open buffer and it never needs a recording. A journal records its attempt (cell,
+  trial_idx, start_utc, attempt): ``recover_staged`` discards one that names another attempt of
+  the slot (``STAGED_OTHER_ATTEMPT``), and the resume's reconcile discards any journal of a slot
+  none of whose attempts started (``STAGED_NOT_STARTED``), so a not-started attempt's frames can
+  never be attached to a later attempt of the same slot.
 """
 
 from __future__ import annotations
@@ -101,6 +109,9 @@ RECOVERED_FROM_STAGE = (
 
 NO_POLICY_WRITE = "no policy write was recorded"  # nothing reached the capture: no episode
 STAGED_UNREADABLE = "staged journal unreadable"  # damaged: flagged, never retried or guessed
+STAGED_OTHER_ATTEMPT = "staged journal of another attempt of the slot (discarded)"
+STAGED_NOT_STARTED = "staged journal of a slot no attempt of which started (discarded)"
+JOURNAL_KEYS = ("cell", "trial_idx", "start_utc", "attempt")  # the attempt a journal belongs to
 SCORED_OUTCOMES = ("success", "failure")
 
 
@@ -121,6 +132,20 @@ def recording_required(t: Mapping[str, Any]) -> bool:
         b.get("reason") == NO_POLICY_WRITE and not b.get("frames") and not b.get("error")
         for b in (cap, cap.get("stage") or {})
     )
+
+
+def journal_mismatch(journal: Mapping[str, Any], expect: Mapping[str, Any] | None) -> str:
+    """What differs between a staged journal's attempt (the ``JOURNAL_KEYS`` it records) and
+    ``expect``'s; empty when they match (a journal written before ``attempt`` was recorded is
+    matched on the rest)."""
+    if expect is None:
+        return ""
+    diff = [
+        f"{k} {journal[k]!r} != {expect.get(k)!r}"
+        for k in JOURNAL_KEYS
+        if k in journal and journal[k] != expect.get(k)
+    ]
+    return "; ".join(diff)
 
 
 def staged_name(trial_id: str) -> str:
@@ -678,7 +703,7 @@ class EvalCapture:
                     "t_last": cur["t_last"],
                     "end_state": "end_state" if isinstance(end, Mapping) else end,
                     "end_state_when": cur["end_state_when"],
-                    "record": {k: rec.get(k) for k in ("cell", "trial_idx", "start_utc")},
+                    "record": {k: rec.get(k) for k in JOURNAL_KEYS},
                     "staged_utc": _utc_stamp(),
                 },
             )
@@ -699,10 +724,13 @@ class EvalCapture:
     def drop_staged(self, trial_id: str) -> None:
         shutil.rmtree(staged_path(self.root, trial_id), ignore_errors=True)
 
-    def recover_staged(self, trial_id: str) -> dict[str, Any]:
+    def recover_staged(
+        self, trial_id: str, expect: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Rebuild and save a staged episode a kill left unsaved (module doc); its ``capture``
-        block (``episode_index`` None with the reason when it cannot be recovered). Never
-        raises."""
+        block (``episode_index`` None with the reason when it cannot be recovered). ``expect``:
+        the trial record it is recovered for; a journal of another attempt (``JOURNAL_KEYS``,
+        those the journal records) is discarded, never attached. Never raises."""
         d = staged_path(self.root, trial_id)
         if not (d / STAGED_INDEX).is_file():
             why = "no staged journal" if not d.exists() else "staged journal incomplete"
@@ -713,6 +741,15 @@ class EvalCapture:
             meta = json.loads((d / STAGED_INDEX).read_text())
             if meta.get("trial_id") != trial_id:
                 raise RuntimeError(f"journal names trial {meta.get('trial_id')!r}")
+            other = journal_mismatch(meta.get("record") or {}, expect)
+            if other:
+                self.drop_staged(trial_id)
+                return {
+                    "trial_id": trial_id,
+                    "episode_index": None,
+                    "reason": STAGED_OTHER_ATTEMPT,
+                    "error": other,
+                }
             n = int(meta["frames"])
             with np.load(d / STAGED_FRAMES) as z:
                 state, action, timing = z["state"], z["action"], z["timing"]
