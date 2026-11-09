@@ -92,8 +92,9 @@ whether the environment works, VRAM use, seconds per step and inference latency.
 Pod setup (Linux, in its own venv, not the project's lock; see decision D1):
 
 ```bash
+apt-get update && apt-get install -y ffmpeg   # torchcodec needs FFmpeg 4-7 shared libs
 uv venv /workspace/pi05-env --python 3.11 && source /workspace/pi05-env/bin/activate
-uv pip install "torch==2.6.0" \
+uv pip install "torch==2.6.0" "torchcodec==0.2.1" \
   "lerobot[pi] @ git+https://github.com/huggingface/lerobot.git@8fff0fde7c79f23a93d845d1a50e985de01f8b8a" \
   "transformers @ git+https://github.com/huggingface/transformers.git@dcddb970176382c0fcf4521b0c0e6fc15894dfe0" \
   "grpcio==1.73.1"                      # tag v0.4.4; fix/lerobot_openpi head (4.53.3); serve.py needs grpc
@@ -102,6 +103,11 @@ hf auth login                           # token whose account accepted google/pa
 hf download lerobot/pi05_base --revision 9e55186ad36e66b95cda57bc47818d9e6237ae30 \
   --local-dir /workspace/models/pi05_base@9e55186ad36e
 ```
+
+`torchcodec==0.2.1` is the project pin (`docs/ENVIRONMENT.md`). It is listed explicitly because
+torchcodec wheels do not declare their torch version: left unpinned, the resolver picks
+torchcodec 0.10.0 (resolved with `uv pip compile` for linux x86_64, 2026-11-08), which is built
+for a newer torch than 2.6.0 and fails to load.
 
 Probe (200 steps, nothing saved):
 
@@ -128,14 +134,68 @@ batch 32; the loss falls over 200 steps; and the median s/step is recorded (the 
 `predict_action_chunk` on the base weights in bf16 on the same GPU (10 flow steps, 20 calls,
 median ms). That timing decides `deploy.request_timeout_ms` (section 6).
 
-Full run: the same flags with `--dataset.repo_id=KudratSingh22/vla-rl-so101-real-pickplace`
-(25 real PickPlace demos from `wo06_teleop_record.py`, not yet recorded),
-`--steps=6000 --save_freq=3000 --log_freq=100`,
-`--output_dir=checkpoints/track-c/pi05-expert-25demo --job_name=pi05_expert_25demo`. Afterwards,
-upload the step-6000 `pretrained_model/` to a private Hub repo. Each fp32 checkpoint is about
-14.5 GB, so keep only the final one and the 3,000-step one. These are the paper's settings, kept
-unchanged so the result can be compared with its 28/40. 6,000 x 32 samples is about 26 passes
-over ~7,500 frames (25 demos x ~20 s x 15 Hz), consistent with the paper's fixed step count.
+Full run (25 real PickPlace demos from `wo06_teleop_record.py`, not yet recorded). It uses the
+probe's flags except for the dataset, the step and log counts, the output directory, and
+checkpoint saving, which the probe turns off and the full run turns on:
+
+```bash
+lerobot-train \
+  --dataset.repo_id=KudratSingh22/vla-rl-so101-real-pickplace \
+  --dataset.video_backend=torchcodec \
+  --policy.type=pi05 \
+  --policy.pretrained_path=/workspace/models/pi05_base@9e55186ad36e \
+  --policy.train_expert_only=true --policy.freeze_vision_encoder=true \
+  --policy.dtype=float32 --policy.gradient_checkpointing=true --policy.compile_model=false \
+  --policy.chunk_size=50 --policy.n_action_steps=50 \
+  --policy.optimizer_lr=2.5e-5 --policy.scheduler_warmup_steps=1000 \
+  --policy.scheduler_decay_steps=6000 --policy.scheduler_decay_lr=2.5e-6 \
+  --policy.device=cuda --policy.push_to_hub=false \
+  --batch_size=32 --num_workers=8 --seed=1000 --wandb.enable=false \
+  --steps=6000 --save_checkpoint=true --save_freq=3000 --log_freq=100 \
+  --output_dir=/workspace/checkpoints/track-c/pi05-expert-25demo --job_name=pi05_expert_25demo
+```
+
+`--output_dir` is absolute and sits on the `/workspace` volume, so checkpoints survive a pod stop
+and the paths below do not depend on the shell's working directory. It must not exist before the
+run: without `--resume`, 0.4.4 raises `FileExistsError`. With `steps=6000` and `save_freq=3000`,
+0.4.4 saves after step 3,000 and after the last step (`step % save_freq == 0 or step == steps`) to
+`<output_dir>/checkpoints/<step, 6 digits>/`, and points the `checkpoints/last` symlink at the
+newest one:
+
+```text
+/workspace/checkpoints/track-c/pi05-expert-25demo/checkpoints/
+  003000/{pretrained_model,training_state}/
+  006000/{pretrained_model,training_state}/
+  last -> 006000
+```
+
+Parsing these flags with the pinned 0.4.4 (`TrainPipelineConfig.validate()`, locally) gives
+exactly those two checkpoint directories. Each `pretrained_model/` holds the full fp32
+`model.safetensors` (about 14.5 GB) plus `config.json`, `train_config.json` and the
+pre/post-processor files. Each `training_state/` adds the AdamW state for the 693M trained
+weights (about 5.5 GB, estimated). That makes about 20 GB per checkpoint and about 40 GB for
+both, on top of the 14.5 GB base, so the volume needs at least about 60 GB free.
+
+If the pod is interrupted, resume from the newest checkpoint. 0.4.4 reloads the saved train
+config, so no other flags are needed:
+
+```bash
+lerobot-train --resume=true \
+  --config_path=/workspace/checkpoints/track-c/pi05-expert-25demo/checkpoints/last/pretrained_model/train_config.json
+```
+
+Afterwards, upload the step-6,000 `pretrained_model/`, not `training_state/`, to a private Hub
+repo (`hf upload` creates the repo as private if it does not exist):
+
+```bash
+hf upload KudratSingh22/vla-rl-so101-pi05-expert-25demo \
+  /workspace/checkpoints/track-c/pi05-expert-25demo/checkpoints/006000/pretrained_model . \
+  --repo-type=model --private
+```
+
+These are the paper's settings, kept unchanged so the result can be compared with its 28/40.
+6,000 x 32 samples is about 26 passes over ~7,500 frames (25 demos x ~20 s x 15 Hz), consistent
+with the paper's fixed step count.
 
 ## 5. Environment decision (rule 2)
 
