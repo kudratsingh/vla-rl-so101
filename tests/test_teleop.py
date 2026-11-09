@@ -49,11 +49,17 @@ class FakeCam:
         return Frame(np.zeros((480, 640, 3), np.uint8), time.perf_counter())
 
 
+def _input_reader(prompt: str, _timeout_s: float | None) -> str | None:
+    """The operator, faked per test through ``builtins.input``: the real reader
+    (``timed_input``) reads fd 0 directly, also with no timeout (review F1)."""
+    return input(prompt)
+
+
 def _session(leader: Any, cam: Any) -> tuple[Any, FakeFollower]:
     fol = FakeFollower()
     arm = So101Driver(fol, UnitMap(), make_safety(real_cfg(), toy_fk))
     arm.connect()
-    return teleop.Session(arm, leader, cam, UnitMap()), fol
+    return teleop.Session(arm, leader, cam, UnitMap(), read=_input_reader), fol
 
 
 def test_follower_eases_onto_leader_through_safety() -> None:
@@ -428,12 +434,19 @@ def test_teleop_refuses_a_non_tty_stdin_before_the_leader_or_the_follower(
     monkeypatch.setattr(teleop, "make_leader", no("leader"))
     monkeypatch.setattr(teleop.So101Driver, "from_config", no("follower"))
     monkeypatch.setattr(sys, "argv", ["wo06_teleop_record.py", "--preset", "real"])
+    from robot_fakes import tty_stdout
+
     r, w = os.pipe()
     piped = open(r, "r")  # noqa: SIM115 - closed below
     monkeypatch.setattr(sys, "stdin", piped)
     try:
-        with pytest.raises(SystemExit, match="interactive terminal(.|\n)*nothing was opened"):
-            teleop.main()
+        with tty_stdout() as tty_out:
+            # a terminal on stdout (review T29-R1: pytest's capture never is): only the piped
+            # stdin can refuse here
+            monkeypatch.setattr(sys, "stdout", tty_out)
+            with pytest.raises(SystemExit, match="stdin is not a tty(.|\n)*nothing was opened"):
+                teleop.main()
+            monkeypatch.undo()
     finally:
         piped.close()
         os.close(w)

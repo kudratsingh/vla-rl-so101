@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
+import os
+import pty
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -437,3 +440,26 @@ class FakeReader:
 
     def prompts(self) -> list[str]:
         return [c[0] for c in self.calls]
+
+
+@contextlib.contextmanager
+def tty_stdout() -> Iterator[Any]:
+    """A writable pty slave to stand in for a Terminal stdout (``isatty()`` is True). The master
+    side is drained in a thread, so a test that gets past a refusal it expected fails instead of
+    blocking on a full pty buffer."""
+    master, slave = pty.openpty()
+    out = open(slave, "w")  # noqa: SIM115 - closed below
+
+    def drain() -> None:
+        with contextlib.suppress(OSError):
+            while os.read(master, 4096):
+                pass
+
+    t = threading.Thread(target=drain, daemon=True)
+    t.start()
+    try:
+        yield out
+    finally:
+        out.close()  # last slave fd closed: the drain's read ends (EOF / EIO)
+        t.join(2.0)
+        os.close(master)

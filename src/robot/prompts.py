@@ -47,9 +47,11 @@ EOF). Either way no input is held in a private buffer between prompts. A partial
 deadline is a timeout and its bytes are dropped (on a tty the next prompt's ``tcflush`` drops
 anything typed before it appears); a partial line then EOF is EOF. ``sys.stdin``'s own buffered
 reader is
-not used by ``timed_input``; the remaining line reads (``prompt_input``: teleop's unbounded wait
-and torque-off prompts; ``input()`` for "type 'go'" and the resume check) read a tty in canonical
-mode, where one read returns at most one line, so they never leave bytes buffered either.
+not used by ``timed_input``, also with no deadline (teleop's null timeout: the same reader, no
+bound, so a partial line then EOF is EOF, not a truncated "confirmation"). The remaining line
+reads (``prompt_input``, torque-off prompts only; ``input()`` for "type 'go'" and the resume
+check) run with torque off and read a tty in canonical mode, where one read returns at most one
+line, so they never leave bytes buffered either.
 
 The hardware entry points (pilot, real eval, teleop) refuse to start unless stdin and stdout are
 a terminal (``require_terminal``), before any port is opened: the prompts need an operator who
@@ -209,9 +211,9 @@ def _write_prompt(prompt: str) -> None:
 
 def prompt_input(prompt: str) -> str:
     """``input()`` with Ctrl-C raising KeyboardInterrupt, also under ``operator_signals``; typed-
-    ahead input discarded first. Unbounded: it has no deadline to enforce (teleop's null
-    ``prompt_torque_timeout_s``, which waits forever by design, and its torque-off prompts; the
-    pilot and real eval refuse a null timeout)."""
+    ahead input discarded first. Unbounded, and only for prompts answered with torque OFF: every
+    prompt read while the arm may hold under torque goes through ``TorqueGuard`` ->
+    ``timed_input``, including teleop's null (wait forever) timeout."""
     with _reading():
         discard_typeahead()
         try:
@@ -221,34 +223,36 @@ def prompt_input(prompt: str) -> str:
 
 
 def timed_input(prompt: str, timeout_s: float | None) -> str | None:
-    """``prompt_input`` that gives up after ``timeout_s`` (None = never): None. The deadline covers
+    """A prompt read that gives up after ``timeout_s`` (None = never): None. The deadline covers
     the whole line (module doc): fd 0 is read with ``os.read``, each read after ``select()`` with
     the time left, in this thread (no reader thread; the servo bus is never touched here). A partial
     line at the deadline is a timeout (its bytes dropped); EOF, also after a partial line, raises
-    EOFError (``Hangup`` on a hang-up). Typed-ahead input is discarded first."""
-    if timeout_s is None:
-        return prompt_input(prompt)
+    EOFError (``Hangup`` on a hang-up). Typed-ahead input is discarded first. ``timeout_s`` None
+    (teleop's null ``prompt_torque_timeout_s``; ``TorqueGuard`` reads with torque already off)
+    goes through the same reader with no deadline, so a partial line then EOF is EOF there too,
+    never a truncated answer (review F1: it was ``input()``, which returned the partial line)."""
     with _reading():
         discard_typeahead()
         _write_prompt(prompt)
-        line = _read_line_by(time.monotonic() + max(0.0, timeout_s))
+        deadline = math.inf if timeout_s is None else time.monotonic() + max(0.0, timeout_s)
+        line = _read_line_by(deadline)
         if line is None:
             _write_prompt("\n")
         return line
 
 
 def _read_line_by(deadline: float) -> str | None:
-    """One line from fd 0 (no newline), or None once ``deadline`` (``time.monotonic``) passes,
-    also in mid-line. Never reads past the newline (``_read_size``). EOF -> EOFError; OSError
-    (EIO from a hung-up tty) and a closed / fd-less stdin -> EOFError. Ctrl-C and a hang-up raise
-    from ``select`` / ``os.read`` under ``_reading``."""
+    """One line from fd 0 (no newline), or None once ``deadline`` (``time.monotonic``; ``inf`` =
+    never) passes, also in mid-line. Never reads past the newline (``_read_size``). EOF ->
+    EOFError; OSError (EIO from a hung-up tty) and a closed / fd-less stdin -> EOFError. Ctrl-C
+    and a hang-up raise from ``select`` / ``os.read`` under ``_reading``."""
     got = bytearray()
     try:
         fd = sys.stdin.fileno()
         encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
         size = _read_size(fd)
         while (left := deadline - time.monotonic()) > 0:
-            if not select.select([fd], [], [], left)[0]:
+            if not select.select([fd], [], [], None if math.isinf(left) else left)[0]:
                 break  # the deadline passed, maybe in mid-line
             chunk = os.read(fd, size)  # readable: returns at once (bytes, or b"" at EOF)
             if not chunk:

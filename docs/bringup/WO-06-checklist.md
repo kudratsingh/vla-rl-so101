@@ -414,7 +414,10 @@ What happens and what you do:
    thread; nothing reads the servo bus in the background. The 60 s covers the whole line: a
    half-typed answer (or a Ctrl-D in mid-line) when the time runs out counts as no answer and
    is thrown away. Anything typed before a prompt appears is discarded, so press ENTER only
-   once the prompt is on screen. Teleop, the pilot and the real eval refuse to start unless
+   once the prompt is on screen. With `null` (no bound), a Ctrl-D still never confirms
+   support, also after a half-typed answer: only ENTER does. Do not press Ctrl-Z: it suspends
+   the session with the arm under torque and stops the 60 s clock (type `fg` at once if it
+   happens). Teleop, the pilot and the real eval refuse to start unless
    stdin and stdout are the Terminal itself (no `| tee`, no `< file`, no `yes |`): run them
    directly in Terminal; to keep a log use `script -q log.txt uv run ...`. `null` restores the
    old wait-forever behaviour for teleop only (not recommended; a closed stdin still gets the

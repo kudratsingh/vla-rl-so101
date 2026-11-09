@@ -373,6 +373,45 @@ def test_a_partial_line_on_a_tty_times_out_and_never_answers_the_next_prompt(
         os.close(master)
 
 
+def test_no_timeout_reads_the_same_way_a_partial_line_then_eof_never_confirms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review F1: with teleop's null timeout the support prompt went through input(), which
+    returned 'ab' + Ctrl-D, Ctrl-D as a truncated line: recorded as an ENTER ("supported")."""
+    import os
+    import pty
+    import threading
+
+    master, slave = pty.openpty()
+    f = _stdin_from(monkeypatch, slave)
+    try:
+        threading.Timer(0.1, os.write, (master, b"y\n")).start()
+        assert P.timed_input("score? ", None) == "y"  # unbounded: a whole line as before
+        threading.Timer(0.1, os.write, (master, b"ab\x04\x04")).start()
+        with pytest.raises(EOFError, match="mid-line"):
+            P.timed_input("support? ", None)
+        fol = FakeFollower()
+        arm = So101Driver(fol, UnitMap(), make_safety(real_cfg(), toy_fk))
+        arm.connect()
+        g = P.TorqueGuard(arm, P.TorqueWait(None, 0.0), say=lambda _m: None)  # real reader
+        threading.Timer(0.1, os.write, (master, b"ab\x04\x04")).start()
+        assert g.support("support it, ENTER: ") == P.EOF  # not ENTER: released unconfirmed
+        assert g.released is not None and g.released["cause"] == P.EOF
+        assert not fol.bus.torque_enabled
+    finally:
+        f.close()
+        os.close(master)
+    r, w = os.pipe()  # the same on a pipe: a partial line then EOF is EOF, not an answer
+    f = _stdin_from(monkeypatch, r)
+    try:
+        os.write(w, b"partial")
+        os.close(w)
+        with pytest.raises(EOFError, match="mid-line"):
+            P.timed_input("support? ", None)
+    finally:
+        f.close()
+
+
 def test_require_terminal_wants_a_tty_on_stdin_and_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
     import os
     import pty

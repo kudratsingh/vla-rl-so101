@@ -745,20 +745,26 @@ def test_hardware_refuses_a_non_tty_stdin_before_any_driver_or_port(
         raise AssertionError("the policy client was opened")
 
     monkeypatch.setattr("builtins.input", lambda msg="": opened.append(f"input {msg}") or "go")
+    from robot_fakes import tty_stdout
+
     r, w = os.pipe()
     piped = open(r, "r")  # noqa: SIM115 - closed below
     monkeypatch.setattr("sys.stdin", piped)  # e.g. `yes go | uv run ... --hardware`
     try:
-        for mod, argv in (
-            (ev, ["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"]),
-            (pilot, ["--preset", "real", "--hardware", "--i-am-present"]),
-        ):
-            monkeypatch.setattr(mod, "So101Driver", NoDriver)
-            monkeypatch.setattr(mod, "PolicyClient", no_client)
-            with pytest.raises(SystemExit, match="interactive terminal(.|\n)*nothing was opened"):
-                mod.main(argv)
-        assert opened == []  # no 'go' prompt, no client, no driver, no port
-        monkeypatch.undo()
+        with tty_stdout() as tty_out:
+            # stdout IS a terminal (review T29-R1: pytest's captured stdout never is, so without
+            # this the refusal could come from stdout alone): only the piped stdin can refuse
+            monkeypatch.setattr("sys.stdout", tty_out)
+            for mod, argv in (
+                (ev, ["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"]),
+                (pilot, ["--preset", "real", "--hardware", "--i-am-present"]),
+            ):
+                monkeypatch.setattr(mod, "So101Driver", NoDriver)
+                monkeypatch.setattr(mod, "PolicyClient", no_client)
+                with pytest.raises(SystemExit, match="stdin is not a tty(.|\n)*nothing was opened"):
+                    mod.main(argv)
+            assert opened == []  # no 'go' prompt, no client, no driver, no port
+            monkeypatch.undo()
         monkeypatch.setattr("sys.stdin", piped)  # still not a tty: mock runs need no terminal
         rec = pilot.main(
             ["--preset", "real", "--mock", "--fake-clock", "--trials", "1"]

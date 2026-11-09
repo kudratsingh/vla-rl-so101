@@ -393,8 +393,11 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
     time, so nothing past the newline is consumed; a canonical-mode tty a line per read, so a
     mid-line Ctrl-D is a partial line, not EOF). A partial line at the deadline is a timeout
     and its bytes are dropped; a partial line then EOF is EOF (no confirmation). Ctrl-C (also
-    in mid-line), the hang-up path and typed-ahead discard are unchanged. `prompt_input`
-    (teleop's unbounded `null` wait and torque-off prompts) has no deadline and keeps `input()`.
+    in mid-line), the hang-up path and typed-ahead discard are unchanged. Teleop's unbounded
+    `null` wait goes through the same fd reader with no deadline (review F1: it used
+    `input()`, which turned 'ab' + Ctrl-D, Ctrl-D at the support prompt into a truncated line
+    recorded as "supported"; now it is EOF: grace, torque off, unconfirmed). `prompt_input`
+    keeps `input()` for torque-off prompts only.
   - The hardware entry points (`wo07_pilot.py --hardware`, `wo07_real_eval.py --hardware`,
     `wo06_teleop_record.py`) refuse to start unless stdin and stdout are a tty
     (`require_terminal`), after the config checks and before the `type 'go'` prompt, the policy
@@ -404,9 +407,18 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
     (the pre-fix code hangs: checked by running the new tests against `817a0c7`), partial then
     newline = the whole line, the next line is never consumed, partial + EOF = EOF, Ctrl-C and
     SIGHUP in mid-line; a pty with a mid-line Ctrl-D times out and never answers the next
-    prompt; the tty check refuses a piped stdin before any driver / client / `go` prompt in the
-    pilot, the real eval and teleop. The timeout / Ctrl-C / EOF tests at the pilot and
-    real-eval prompts (fakes) pass unchanged.
+    prompt; the unbounded (`null`) read on a pty with 'ab' + Ctrl-D, Ctrl-D raises EOF and
+    `TorqueGuard.support` returns `eof`, not `enter` (fails with the old `input()` path); the
+    tty check refuses a piped stdin before any driver / client / `go` prompt in the pilot, the
+    real eval and teleop, with stdout on a pty so only the stdin can refuse (review T29-R1;
+    the tests fail if the check looks at stdout only). The timeout / Ctrl-C / EOF tests at the
+    pilot and real-eval prompts (fakes) pass unchanged.
+  - Not done, owner's call (review F2, predates round 4): Ctrl-Z (SIGTSTP) at a torque-on
+    prompt suspends the process, so the bounded wait cannot expire while it is stopped (the
+    arm holds under torque until `fg`). Best guess: ignore SIGTSTP / SIGTTIN / SIGTTOU inside
+    `operator_signals` with a "Ctrl-Z is disabled with torque on" message; left out because it
+    changes signal behaviour beyond the two approved fixes. Until then: never press Ctrl-Z
+    during a hardware session.
 Unverified on hardware: every item above. In particular: the thresholds, the read cost on the
 Mac's USB-serial link, whether the park pose rests safely with torque off, the refusal
 tolerances against a real calibration, the Homing_Offset read on the real servos, the
