@@ -12,10 +12,12 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 01 | done, merged | #7 (merged) | See benchmarks. Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). |
 | 02 | closed by owner decision, **below the original target band**; PR open | `wo-02-sft` | OpenVLA-OFT LoRA SFT, 4 attempts, all below the 20-60% band on seen positions (ADR-0001). Owner (2026-10-27): keep OFT, amend rule 3, close with the full protocol table of attempt 4 `step_004000` (25 demos/task): seen PickPlace 17.0%, Push 10.0%, Stack 2.7% (`docs/results.md`). |
 | 03 | done, merged after owner review | #4 (merged) | **Out of order** (started before WO-01/02). CPU only, toy env. |
-| 06 | part 1 merged, kit arrived, physical bring-up pending | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
+| 06 | part 1 merged, kit arrived, physical bring-up pending | #5 (merged), #24 (`wo-06-bringup`, PR open, merged into #29) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
 | 04 | **benchmark not met; next step waits for the owner**, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
-| 05, 07, 08, 09 | not started | | |
+| 07 | code only, **out of order** (started before WO-06 bring-up is verified): pilot client/server and real-eval harness on fakes, **unverified on hardware** | #23 (`wo-07-pilot`), #29 (`fix/robot-safety`), PRs open | Mock pilot, gRPC server, `scripts/wo07_real_eval.py` (protocol 0.2), placement grid. No real trials. |
+| 05, 08, 09 | not started | | |
 | pre-run hardening | PR open, **waits for owner review** (touches the RL loop) | `fix/pre-run-hardening` | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
+| robot safety (PR 2) | PR open against `wo-07-pilot`; merge after #23, #24 and #28 (it merges #24 and #28) | `fix/robot-safety` | Review 3.3 gaps 2, 3, 5 and 7, plus the owner's 2026-11-08 review changes (homing offsets, torque off unconfirmed, real-eval session fingerprint, parking off by default), $0, **unverified on hardware**. See "Robot safety hardening" below. |
 
 ## Benchmarks met
 
@@ -458,7 +460,8 @@ RL rollout action clip: see "Owner instructions 2026-11-08, round 3" below. **Ow
 only; PPO keeps the sampled tokens). The tiny preset and the code default stay null (off), as in
 WO-04.
 The robot items (servo temperature/current fault response, `park()` on healthy shutdown, camera
-timestamp, placement grid, `wo07_real_eval.py`) belong to PR 2, on PR #23's branch. The plan
+timestamp, placement grid, `wo07_real_eval.py`) are in PR 2 (`fix/robot-safety`, on PR #23's
+branch; see "Robot safety hardening" below). The plan
 revision for PR #25 is on `wo-recovery-sft`. PR #25's `configs/rl_pickplace_lr*.yaml` use the
 removed `early_stop_*` / `peak_stop_step` keys and need renaming when it merges, or they fail fast.
 
@@ -622,6 +625,365 @@ and every reported number are unchanged.
   (CUDA warm-up excluded).
 - No cost change: the planned stages, caps (5940 / 13800 / 12000 s) and $ above are unchanged.
 
+## Robot safety hardening (PR 2, branch `fix/robot-safety`, 2026-11-08, $0)
+
+Review 3.3 and section 9's robot item. The branch is PR #23's branch (`wo-07-pilot`) with #24
+(`wo-06-bringup`) and #28 (`fix/pre-run-hardening`) merged in. Tested only with
+`tests/robot_fakes.py`. **Nothing here has run on the arm or camera.**
+
+- Healthy shutdown can park (off by default since the owner's review, below). `So101Driver.park` drives to `robot.park.qpos` (`null` =
+  `deploy.home_qpos`, the sim REST_QPOS) through the full safety filter, then turns torque off.
+  It is wired into `scripts/wo07_pilot.py`, `scripts/wo07_real_eval.py` (`shutdown_session`:
+  session completed, `q`, or Ctrl-C at a prompt) and the healthy end of
+  `scripts/wo06_teleop_record.py`. It refuses once the deadman has tripped, so a fault path or
+  a Ctrl-C during motion never parks: those hold, then the support prompt, then torque off.
+- Servo temperature and current monitor (`src/robot/servo_health.py`). After each tick's write,
+  every 4th tick does one extra `sync_read` of `Present_Temperature` (addr 63, deg C) or
+  `Present_Current` (addr 69, 6.5 mA/count, bit 15 masked). Each register is read every 533 ms
+  at 15 Hz. Registers were checked in lerobot 0.4.4's `STS_SMS_SERIES_CONTROL_TABLE`. Read time
+  is logged against a 10 ms budget. A fault means torque off at once, the deadman latched
+  TORQUE_OFF, and a `SERVO FAULT` prompt to support the arm and cut the supply: not HOLD, not a
+  park. Thresholds are 55 C (the firmware cut-out is 70 C) and 1500 mA sustained for 1 s. They
+  are **placeholders that need the owner's confirmation on the arm**. It does not read while a
+  prompt waits. At every teleop prompt where the follower holds under torque (scene, keep,
+  resume) it reads both registers once before the wait and once after the answer, before the
+  follower moves; the final support prompt reads them once before its wait. A current found
+  over the limit by such an on-demand read is re-read after `current_trip_s` (1 s) before the
+  call returns. Over-current counts as sustained only over continuous monitoring (no gap
+  between current reads longer than max(2 × 533 ms, 1 s), at least two readings).
+- Torque-enable refusal. Every torque enable first runs `check_rest_pose` with torque off. It
+  refuses when a joint rests more than 1 deg outside its calibrated range (the calibration file
+  and the servo EEPROM must also agree) or more than 6 deg outside the safety limits. Covers
+  #24's not-done item.
+- Ctrl-C port-busy backstop. scservo_sdk's `txPacket` sets `port.is_using`, and only the receive
+  or TxOnly paths clear it, so a Ctrl-C mid-transaction would block the hold or torque-off that
+  follows. `release_port` (`clearPort()`, `is_using = False`, then drop the input buffer, as
+  lerobot's `disconnect` does) runs first in `hold`, `torque_off`, `trip` and `park`. Covers
+  #24's skipped finding.
+- Latency. LeRobot 0.4.4 stamps a frame after `VideoCapture.read()` returns, and OpenCV 4.11's
+  AVFoundation backend exposes no capture time. The metric is renamed
+  `frame_return_to_first_write_ms` and is never called end-to-end.
+  `docs/bringup/latency-measurement.md` gives the one-off optical measurement (screen clock
+  filmed by the robot camera). With `deploy.capture_offset_ms` set, the summary adds a labelled
+  `end_to_end_estimate_ms`.
+- `scripts/wo07_real_eval.py`: protocol cells × `eval.trials_per_cell` (50), placement-grid slots
+  from `src/eval/real_grid.py` (seeded by `eval.slot_seed`, so SFT and SFT+RL sessions are paired
+  trial by trial), and the judging rule `real-judge-2` (was `real-judge-1`; see the owner
+  decisions below): judged once after the arm stops, no success latch, doubt = n. Every trial record carries the protocol 0.2 hash, the 0.1-draft reference, and
+  the hashes of the rule, the grid and the PDF. The run record holds the Wilson table.
+  `--resume <run id>` retries slots whose policy never started, with the same placement, and
+  refuses if the evaluation changed. `--hardware` is gated like the pilot. `--mock` runs on the fakes.
+- `docs/assets/placement-grid-a3.pdf` (`scripts/make_placement_grid.py`, vector PDF written
+  directly, no new dependency): a 6 × 6 lattice of SHIFTED_REGION whose inner 4 × 4 is exactly
+  SEEN_REGION, slot ids A1-F6, the robot base outline from the URDF meshes, axes, and a 10 cm scale
+  bar. Print at 100% and measure the bar. `--check` fails if the committed PDF is stale.
+
+Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes only:
+
+- Homing offsets are checked before every torque enable. `check_rest_pose` compares each servo's
+  stored Homing_Offset (STS3215 EEPROM address 31, 2 bytes, sign bit 11; read and decoded by
+  lerobot 0.4.4 `FeetechMotorsBus.read_calibration`, checked in `.venv`) with the calibration
+  file's `homing_offset`. A mismatch refuses torque, even when the ranges match, and the message
+  says to redo calibration (checklist step 3). Regression test: ranges identical, one offset
+  differs, refused with no torque-enable or goal write.
+- Torque off unconfirmed. A failed torque-off write latches `So101Driver.torque_off_unconfirmed`
+  for the rest of the process. Nothing clears it: not a deadman reset, not a later torque-off
+  that succeeds. While it is set, every goal-position write (step, hold, move_to, park) and every
+  torque enable is refused. The operator message says to switch off the servo supply at the
+  inline power switch. Trial records get `torque_off_unconfirmed: true` and stop reason
+  `torque_off_unconfirmed` (the trial's own reason is kept as `stop_reason_before`). They are
+  stamped after every other field (since `real-judge-2`: a started trial is then a failure,
+  fault kind `torque_off_unconfirmed`; an unstarted attempt stays unscored). The shutdown result, `session_end` and the
+  summary keep the flag (`scripts/wo07_pilot.py`, `scripts/wo07_real_eval.py`). Tested with a
+  fake bus whose torque-off write raises.
+- Real-eval session fingerprint. Six components are hashed separately: protocol (0.2 hash, 0.1
+  reference, judging rule and grid hashes), policy (server policy_id,
+  `server.policy_checkpoint`), camera (`cameras` block), calibration (the motors' loaded
+  calibration incl. homing offsets, the file sha256, `robot.units`), safety (effective
+  SafetyConfig, `robot.safety`, `robot.servo_monitor`) and motion (control rate, deploy
+  settings incl. chunk execution and timeouts, trial steps, home/park incl. `enabled`, gripper
+  floor, settling interval). The fingerprint is stored in every trial record. `--resume` refuses
+  when it differs and names the component and the changed keys. The table refuses to pool
+  trials whose fingerprints differ. On hardware it is computed before the port opens.
+- Owner decisions applied:
+  - 55 C and 1500 mA for 1 s are kept and marked provisional (real.yaml, checklist).
+  - The -5 deg gripper floor is kept for the first rehearsal (documented).
+  - Automatic parking is OFF: `robot.park.enabled: false`. A healthy end now holds, prompts to
+    support the arm, then turns torque off. Checklist step 5 says how to enable parking after
+    the rest-pose and park-path checks.
+  - The placements are the same for SFT and SFT+RL. `--hardware` refuses any `--slot-seed`
+    other than `eval.slot_seed`. `sample_plan` is prefix-stable in the trial count (for any n
+    since the review fixes). Every
+    record carries `placement_plan_sha256`.
+  - Settling interval: `eval.settle_s` = 3 s. The arm holds still, the servos are read once,
+    then the operator scores the trial. The interval is part of judging rule `real-judge-1` (now `real-judge-2`)
+    (its text and hash) and of each trial's `settle` field.
+- PR #29 review fixes (2026-11-08, $0, fakes only):
+  - Torque off reaches every motor. `So101Driver.torque_off` no longer calls lerobot's
+    `disable_torque`, which stopped at the first motor whose write raised (lerobot's `write`
+    also raises on a status error bit such as overload/overheat, though the motor accepted the
+    write), leaving the servos after it energized. It broadcasts Torque_Enable=0, then writes it
+    to each motor in its own try (`bus._write(..., raise_on_error=False)`), then Lock=0. An
+    error bit counts as written (logged); motors with no reply are named in the
+    `torque_off_unconfirmed` latch. The disconnect path uses it too. Checked against lerobot
+    0.4.4's real `FeetechMotorsBus` with the packet I/O stubbed (no port).
+  - A connect that fails before the port opens no longer raises the "unconfirmed" alarm.
+  - Teleop: any other exception holds the follower, discards the episode and shows the bounded
+    support prompt before torque goes off.
+  - Real eval: an unexpected exception is never a healthy end (no park; hold + support;
+    `session_end` "error: ..."); a client bug in the move home trips the deadman.
+    `record.json` is written when the session is bound and after each trial, so a killed run
+    resumes itself. `--resume` refuses a run that a later run of the session continued. A
+    TORQUE OFF UNCONFIRMED at an earlier run's shutdown is warned about on resume (hardware:
+    type `checked`) and carried forward. The policy fingerprint includes the server's
+    `adapter_sha256` (content of the adapter files) and Hub revision; `--hardware` refuses a
+    server without it. The placement plan is prefix-stable for any n (independent RNG streams;
+    the plan, and so `grid_sha256`, changed: no session has run yet).
+  - Scoring (superseded by `real-judge-2`, below; judging rule `real-judge-1` text, so its hash, changed): a trial that ran and
+    then faulted (servo / serial fault in the trial or at the settle read) skips the settle,
+    the operator supports the arm first, then scores it; it is never a free redo. Ctrl-C (or
+    EOF) at the score prompt records the trial as a failure (`score_interrupted`), so a resume
+    cannot re-roll it. **Owner check:** this applies "doubt counts as fail" to both cases; the
+    alternative (abort and redo) was rejected because it turns policy-caused faults into redos.
+  - `scripts/make_placement_grid.py` takes `--config/--preset` (only `real`).
+- Owner decisions of 2026-11-08 (second review round, same PR, $0, fakes only). **Powered
+  bring-up steps 9-10 stay on hold until this revision of #29 lands.**
+  - Bounded torque-on waits in the pilot and the real eval (the former accepted gap is closed).
+    Teleop's helpers moved into `src/robot/prompts.py` (`TorqueWait`, `TorqueGuard`,
+    `timed_input`; mypy-strict) and teleop imports them. Every pilot / real-eval prompt answered
+    while the arm holds under torque (home, placement, score, `resume` after a HOLD stop, the
+    final support prompt) reads servo health before the wait and after the answer and waits at
+    most `deploy.prompt_torque_timeout_s` (60 s). No answer: "SUPPORT THE ARM NOW",
+    `deploy.prompt_support_grace_s` (10 s, ENTER = now), deadman TORQUE_OFF, torque off, the
+    session ends (`prompt_timeout: ...`, no park). `--hardware` refuses a null or non-positive
+    timeout before anything opens; mock runs keep the instant `ScriptedOperator`. Prompts with
+    torque off (before connect, `type 'go'`) are not bounded.
+  - Shutdown honesty. `safe_shutdown` returns a `Shutdown` (end, `support_confirmed`, cause,
+    ack). `supported` only after an explicit ENTER at the support prompt. Ctrl-C there is
+    ignored with a message (the arm keeps holding, the bounded wait keeps running, its deadline
+    not reset); a closed stdin prints a loud warning, waits the grace without stdin, then torque
+    off; a timeout releases as above. Those ends are `released_unconfirmed` with the cause
+    (`timeout` / `eof`) and `support_confirmed: false`. The acknowledgement waits after a fault
+    (`_support_after_fault`, `_torque_already_off`, `_torque_off_unconfirmed`) record whether
+    it was given and how (`enter` / `ctrl_c` / `eof` / `timeout`; bounded by the same timeout so
+    the record is always written). Teleop's `end_session` now returns its end and writes
+    `session_end` and `support_confirmed` into `meta/vla_rl_so101.json`; it never claimed
+    support before either (it printed only), but a closed stdin used to drop torque at once
+    without the grace.
+  - Trial scoring (judging rule bumped to `real-judge-2`, so a `real-judge-1` session cannot be
+    resumed or pooled). `policy_started` (+ UTC time) = the trial's first action from the
+    policy server was handed to `So101Driver.step` (the safety filter). A fault after that is
+    a failure in the primary metric, recorded separately as `fault: {kind, stop_reason, reason,
+    where}` (kinds: servo, serial, safety = joint/workspace stop, lost frame, stall, stale
+    chunk; server; operator_abort = Ctrl-C during motion; client_error; torque_off_unconfirmed,
+    also when torque off is unconfirmed). The operator is not asked to judge it; the support
+    prompt comes with the shutdown that follows (a torque-off fault always ends the session). A
+    later `resume` does not change it. A score prompt ending without a judgement (Ctrl-C, EOF,
+    timeout) is a failure with `outcome_source: unjudged` (doubt = n; **owner check: flagged
+    choice**). Attempts whose policy never started are `not_started`: kept in the log, never
+    scored, retried with the same placement on a resume; a slot with a started attempt is never
+    re-run. Primary metric = successes / started trials (Wilson); a labelled secondary
+    diagnostic gives the rate excluding faulted trials and the fault counts by kind.
+    **Behaviour change to note:** a Ctrl-C during the trial after the policy started used to be
+    an unscored redo; it is now a failure (fault kind `operator_abort`), per "slots with any
+    started attempt are done".
+  - Review fixes on that round ($0, fakes only):
+    - Ctrl-C outside a prompt is a flag. The hardware pilot and real eval run under
+      `operator_signals` (`src/robot/prompts.py`; teleop's `ctrl_c_as_flag` uses it too):
+      SIGINT only sets a flag; `DeployLoop` checks it between ticks (trial and move home), so a
+      press never lands inside a bus transfer, a grace sleep, the hold or the servo read of the
+      shutdown. Prompt reads switch Ctrl-C back to KeyboardInterrupt for the read itself. As a
+      fallback (no handler), a Ctrl-C inside the shutdown's hold, servo read, torque-off or the
+      closed-stdin grace is ignored with a message (the port is released and the call retried),
+      so the shutdown always finishes and is recorded.
+    - Typed-ahead input is discarded (`termios.tcflush` on a tty before every prompt): an ENTER
+      pressed during motion or a double ENTER can no longer confirm support or start a trial.
+    - A closed Terminal / dropped ssh (SIGHUP, also SIGTERM) no longer kills the process with
+      the arm held under torque: motion stops at the next tick (trial fault kind `hangup`),
+      stdout/stderr are detached, every later prompt ends as `hangup` and takes the closed-stdin
+      path (grace without stdin, deadman TORQUE_OFF, torque off, `released_unconfirmed`, cause
+      `hangup`, record written). Teleop likewise.
+    - Durable start: the moment a trial's policy starts, a `trial_started` row goes to
+      metrics.jsonl. A resume turns one without its trial row (SIGKILL, crash, power loss) into
+      a failure, fault kind `session_lost`, so a started slot is never re-rolled; an exception
+      between the start and the record appends that failure before it propagates. Decision rows
+      carry the cell.
+    - Placement-prompt ends (q, timeout, Ctrl-C, EOF, a servo / serial fault from its health
+      reads) after the arm went home are kept as `not_started` attempts (stop reason and fault
+      recorded).
+    - The pilot keeps its trials in the record even if the shutdown raises; both scripts record
+      `shutdown: "error: ..."`, `support_confirmed: false` then.
+    - Teleop with `prompt_torque_timeout_s: null` keeps the grace period on a closed stdin
+      (`TorqueWait(None, grace)`); its provenance file records `support_release` (cause).
+- Owner review of 2026-11-08, round 4 (#29, $0, fakes only): the owner reproduced
+  `timed_input()` blocking past its deadline on an open stdin pipe holding a partial line
+  (`select()` said readable, `sys.stdin.readline()` then waited for the newline; a mid-line
+  Ctrl-D on a tty does the same). Both remedies are in:
+  - The deadline covers the whole line: `timed_input` reads fd 0 with `os.read`, each read after
+    `select()` with the time left, until the newline, the deadline or EOF (a pipe one byte at a
+    time, so nothing past the newline is consumed; a canonical-mode tty a line per read, so a
+    mid-line Ctrl-D is a partial line, not EOF). A partial line at the deadline is a timeout
+    and its bytes are dropped; a partial line then EOF is EOF (no confirmation). Ctrl-C (also
+    in mid-line), the hang-up path and typed-ahead discard are unchanged. Teleop's unbounded
+    `null` wait goes through the same fd reader with no deadline (review F1: it used
+    `input()`, which turned 'ab' + Ctrl-D, Ctrl-D at the support prompt into a truncated line
+    recorded as "supported"; now it is EOF: grace, torque off, unconfirmed). `prompt_input`
+    keeps `input()` for torque-off prompts only.
+  - The hardware entry points (`wo07_pilot.py --hardware`, `wo07_real_eval.py --hardware`,
+    `wo06_teleop_record.py`) refuse to start unless stdin and stdout are a tty
+    (`require_terminal`), after the config checks and before the `type 'go'` prompt, the policy
+    client, the leader or the follower. Mock runs need no terminal. A log needs `script -q`,
+    not `| tee` (stdout must be the terminal so the SUPPORT THE ARM prompts are seen).
+  - Regression tests: a real pipe with a partial line times out within the deadline + 0.5 s
+    (the pre-fix code hangs: checked by running the new tests against `817a0c7`), partial then
+    newline = the whole line, the next line is never consumed, partial + EOF = EOF, Ctrl-C and
+    SIGHUP in mid-line; a pty with a mid-line Ctrl-D times out and never answers the next
+    prompt; the unbounded (`null`) read on a pty with 'ab' + Ctrl-D, Ctrl-D raises EOF and
+    `TorqueGuard.support` returns `eof`, not `enter` (fails with the old `input()` path); the
+    tty check refuses a piped stdin before any driver / client / `go` prompt in the pilot, the
+    real eval and teleop, with stdout on a pty so only the stdin can refuse (review T29-R1;
+    the tests fail if the check looks at stdout only). The timeout / Ctrl-C / EOF tests at the
+    pilot and real-eval prompts (fakes) pass unchanged.
+  - Ctrl-Z (review F2) was left out of round 4 and is fixed in round 5 below.
+- Owner decision of 2026-11-08, round 5 (#29, $0, fakes and a pseudo-terminal only): job
+  control. Before it, Ctrl-Z (SIGTSTP) at a torque-on prompt or during motion suspended the
+  process with the arm holding under torque, and the bounded wait could not expire while it
+  was stopped.
+  - Ctrl-Z never suspends the pilot, the real eval or teleop: `prompts.job_control` (entered by
+    `operator_signals`; teleop also wraps its whole torque-on `with` block in it) handles
+    SIGTSTP with a one-line notice (`Ctrl-Z ignored: the arm session is running ...; use
+    Ctrl-C to stop motion`) and nothing else: motion keeps ticking, an open prompt keeps
+    waiting, its deadline is not reset. Scope: the whole hardware session, from before torque
+    is enabled to after the final torque-off, torque-off windows inside it included (a session
+    stopped there would still hold the port with its record unwritten, and `bg` would resume it
+    in the background). Before the session (`type 'go'`, the config checks) Ctrl-Z behaves as
+    usual: torque is off and no port is open.
+  - Foreground required: `require_terminal` now also refuses a process that is not in its
+    terminal's foreground process group (`os.tcgetpgrp(stdin) == os.getpgrp()`, and stdout
+    when it is the same terminal): started with `&` or resumed with `bg`. It runs before the
+    `type 'go'` prompt and anything is opened; `job_control` checks again on entry, before the
+    camera and the arm. Mock runs are unaffected.
+  - Losing the foreground during the session (SIGTTIN / SIGTTOU, which the kernel sends only to
+    a background group that touches the terminal; `tcgetpgrp` polled every motion tick, at
+    every prompt read and every 0.25 s inside a prompt wait; EIO on a background read) takes
+    the existing hang-up path, no new shutdown path: motion stops at the next tick (a started
+    trial is a failure, fault kind `lost_foreground`), every later prompt ends as
+    `lost_foreground` (grace period without stdin, deadman TORQUE_OFF, torque off,
+    `released_unconfirmed` with cause `lost_foreground`, never "supported"). Unlike a hang-up,
+    stdout is not detached (the terminal still exists). SIGTTIN / SIGTTOU are ignored after the
+    first, so the kernel can never stop the process on a background read or write.
+  - Every handler the session touches (SIGINT, SIGHUP, SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU) is
+    restored when it ends, also on an exception.
+  - **Found while testing, owner's call:** under `uv run` (the documented command) Ctrl-Z goes
+    to the whole foreground job, and `uv` itself does not handle it: probed on this Mac (uv
+    0.13.5, same pty shell) the `uv` process stops while its Python child keeps running. zsh
+    then reports the job "suspended" and takes the terminal back, so the session loses the
+    foreground and ends through the controlled shutdown above (motion stops, SUPPORT THE ARM
+    NOW, torque off after the grace, `released_unconfirmed` cause `lost_foreground`): never a
+    process stopped with torque on, but the session ends instead of continuing (covered by a
+    pty test with a uv-like launcher). Best guess: run the three hardware scripts with the
+    project's interpreter directly (`.venv/bin/python scripts/wo07_pilot.py ...`), where
+    Ctrl-Z is only a notice; alternatives: disable the terminal's suspend character for the
+    session (`termios` VSUSP, restored at the end; then ^Z reaches no process, but becomes an
+    input byte the prompt reader must drop), or accept the session end. Not changed here (the
+    approved scope). Superseded by the review round below: the docs now launch the hardware
+    scripts as `.venv/bin/python scripts/...` and the scripts warn under a launcher.
+  - Tests: `tests/test_job_control.py` runs the real `--hardware` code of the pilot and the real
+    eval (fakes for the follower, camera, FK and policy; `tests/pty_arm_child.py`) under a
+    minimal job-control shell on a pseudo-terminal (`tests/pty_shell.py`; the child's process
+    group is not orphaned, so the kernel really stops it on an unhandled Ctrl-Z: the negative
+    control shows a plain child stopped). Ctrl-Z typed during motion, at the move-home,
+    placement, score and support prompts: the child is never stopped (no WUNTRACED stop, `ps`
+    state), keeps writing goals, answers the next ENTER / `y`, and the support prompt's 8 s
+    timeout still fires on time after a Ctrl-Z inside it (then grace, torque off,
+    `released_unconfirmed` cause `timeout`); in the real eval ENTER after a Ctrl-Z at the
+    support prompt still confirms (`supported`). A background child is refused before the fake
+    follower connects and before `type 'go'`. The shell taking the terminal back during motion
+    stops motion within a tick, and at a torque-on prompt ends the wait within 3 s instead of
+    the 8 s timeout, both with `lost_foreground` records as above. All five fail against the
+    round-4 code. A uv-like launcher stopped by Ctrl-Z: the pilot ignores it, loses the
+    foreground and ends through the controlled shutdown. In-process: handler restoration (also on an exception, nested teleop shape),
+    SIGTSTP / SIGTTOU in-process, the prompt poll, the entry re-check, the polled loss in
+    `DeployLoop` through `pilot.session`, and in teleop (Ctrl-Z mid-episode, then a lost
+    foreground). The existing timeout / Ctrl-C / EOF / hang-up / partial-line tests pass
+    unchanged; `test_require_terminal_wants_a_tty_on_stdin_and_stdout` now fakes the
+    foreground for its passing case (a bare pty is not the test's controlling terminal).
+  - Review of round 5 (same approval, $0, fakes and a pty only):
+    - Ctrl-Z no longer throws away a half-typed answer (F2): the terminal's line discipline
+      flushed the line on Ctrl-Z, so `q`, Ctrl-Z, ENTER at `ENTER starts [ENTER / q]` started a
+      trial. `job_control` now sets NOFLSH on stdin's terminal for the session (the previous
+      bit restored on exit, skipped once the foreground is lost: the terminal is the shell's
+      again). Every prompt read still starts with `tcflush`, so nothing typed between prompts
+      (also around a Ctrl-C) answers the next one. The notice says the typed line is kept.
+    - `uv run` (F1): the checklist and the three scripts' usage lines now start the hardware
+      sessions as `.venv/bin/python scripts/...`, where Ctrl-Z is only the notice;
+      `require_terminal` prints `WARNING: this process ... shares its job with a launcher`
+      when the process is not its job's leader (e.g. `uv run`), before torque on. Not done:
+      disabling the terminal's suspend character (owner's call if wanted).
+    - Teleop: `job_control` now wraps `main`'s whole `try / finally`, so the TORQUE OFF
+      UNCONFIRMED message and the provenance write also run under it (F3); the foreground poll
+      runs before each tick (`Session.stop_requested`), so the tick that sees the loss no
+      longer sends one more goal (F3, test now expects 5 frames, not 6); a lost foreground
+      stops the end-of-session park before its first step, as in the pilot and real eval (F4).
+      The hang-up gap noted here (teleop's park still ran after SIGHUP / SIGTERM) is closed in
+      round 7 below.
+    - Tests: the pty test sends its Ctrl-Z 4 s into the 8 s support wait and bounds the timeout
+      at 10.5 s (a reset deadline would give about 12 s); an in-process test sends SIGTSTP
+      mid-wait from a thread and checks the original deadline; a pty test types `q`, Ctrl-Z,
+      ENTER at the placement prompt and gets `operator_quit` with no policy motion (fails
+      without NOFLSH); NOFLSH set / restored in-process; teleop's `main` runs on fakes with
+      the session handlers checked at torque on, in the session and at the record write, and
+      restored after; the uv-like launcher test checks the warning; the pty harness kills its
+      shell and child also when its own start fails (F5).
+- Owner decision of 2026-11-08, round 7 (#29, $0, fakes only): no teleop park after a hang-up
+  or a lost foreground.
+  - `end_session` (`scripts/wo06_teleop_record.py`, `_park`) no longer starts the park when a
+    SIGHUP / SIGTERM (`INTERRUPTS.hangup`) or a lost foreground (`INTERRUPTS.lost_foreground`,
+    or the `tcgetpgrp` poll) has been recorded. The recorded signal decides, also while the
+    terminal still reports the process as its foreground. Before, `end_session` cleared
+    `sess.stop` and the stop check looked at the foreground and `stop` only, so a hang-up
+    recorded before the park let it run to the end. The session goes straight to the hold,
+    the support prompt (it ends at once as `hangup` / `lost_foreground`), the grace period
+    without stdin and torque off.
+  - During the park, `Session.stop_requested` (now `Interrupts.terminal_gone()` or `stop`)
+    runs before every goal write (`So101Driver.move_to`: one write per tick, the check first).
+    A hang-up or a lost foreground stops the park before its next write; a write already under
+    way when the signal arrives completes. `So101Driver.park` also checks `stop_fn` once more
+    after the pose is reached, before its torque-off, so a stop during the last write ends in
+    the hold (Goal := measured, no motion) too. That check also applies to the pilot and the
+    real eval, whose `stop_fn` already covers Ctrl-C, hang-up and lost foreground.
+  - Records (`meta/vla_rl_so101.json`, `session_record`): `session_end: released_unconfirmed`,
+    `support_confirmed: false`, `support_release.cause` `hangup` | `lost_foreground` (the
+    existing names; SIGHUP and SIGTERM share `hangup`), and new `park` (`parked`,
+    `skipped_after_hangup`, `skipped_after_lost_foreground`, `interrupted_by_hangup`,
+    `interrupted_by_lost_foreground`, `stopped_by_ctrl_c`, `not_completed`, or null when no park
+    was due), `hangup_signal` (`SIGHUP` | `SIGTERM`) and `lost_foreground` (why). A healthy end
+    still parks to the end and records `parked`.
+  - Tests (`tests/test_teleop.py`; parking on, a fake follower that logs every goal write as
+    motion / hold and every park stop check, in order; real `os.kill` signals through the
+    session's own handlers; the real `end_session`, driver park and `timed_input`; a 30 s
+    SIGALRM hard timeout per test): SIGHUP and SIGTERM before the park, with no terminal and
+    with the terminal still reporting the process as foreground (`tcgetpgrp == getpgrp`): no
+    park goal, no park stop check, hold, `hangup` at the support prompt, the 10 s grace, torque
+    off, unconfirmed. The same four during the park (the signal sent from the fake's write hook
+    after the 3rd park goal): the next stop check sees it, no goal after it but the hold, then
+    the same path. A SIGHUP during the last (converging) write is caught by the driver's new
+    check before torque-off. Lost foreground before the park (`tcgetpgrp` names another group)
+    and during it (a real SIGTTOU, or the poll): the same path, cause `lost_foreground`. A
+    healthy end writes all 8 park goals, each after a stop check, records `parked`, with no
+    prompt. A SIGHUP at the scene prompt runs the whole `record_session` without a park. The
+    before-park and last-write tests fail against `a041e46`. The documented hardware launch
+    command stays `.venv/bin/python scripts/...`.
+Unverified on hardware: every item above. In particular: the thresholds, the read cost on the
+Mac's USB-serial link, whether the park pose rests safely with torque off, the refusal
+tolerances against a real calibration, the Homing_Offset read on the real servos, the
+behaviour of a real failed torque-off write, `select()` + `os.read` on the Mac terminal for
+the bounded waits (teleop, pilot, real eval; a macOS pty passes in the tests), the terminal
+and foreground checks under `uv run` in Terminal (is `uv`'s Python child in the foreground
+process group?), Ctrl-Z in the Mac Terminal during motion and at a prompt (and NOFLSH keeping a half-typed line there), `tcflush` of typed-ahead input on the Mac terminal, SIGHUP
+delivery to the Python child under `uv run` when the Terminal window closes, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
+grid's scale and alignment with the real base.
+
 ## Blockers and decisions pending the owner
 
 - WO-04: GRPO has not produced a clear gain (PickPlace seen +3.7 to +5.7 points across four
@@ -658,6 +1020,20 @@ and every reported number are unchanged.
   groups and projects <= $60; otherwise stop and report. Seeds 1-2 only after seed 0 passes the
   step-38 check.
 
+- 2026-11-08 Robot safety (PR #29 review): check homing offsets before any torque enable;
+  a failed torque-off is reported as "torque off unconfirmed" with motion blocked for the rest
+  of the process and the flag kept in records; real-eval resume and pooling bound to the
+  effective camera, calibration, safety and motion settings plus protocol and checkpoint;
+  servo thresholds 55 C / 1500 mA for 1 s kept as provisional; -5 deg gripper floor kept for
+  the first rehearsal; automatic parking off (`robot.park.enabled: false`) until a supported
+  rest pose and a clear park path are verified after WO-06 step 5; single owner of the serial
+  bus (no background reader); fixed placement grid and doubt = fail approved; the same slot
+  sequence for SFT and SFT+RL; a settling interval before scoring.
+- 2026-11-08 Robot safety (second round): bound the pilot / real-eval torque-on prompts (60 s +
+  10 s grace, servo reads around each wait; real arm refuses null); "supported" only after an
+  explicit ENTER; faults after the policy started count as failures with the fault recorded,
+  unstarted attempts retried on resume; powered steps 9-10 on hold until the revised #29 lands.
+
 - 2026-10-28 WO-04 follow-up (ADR-0002 amendment 2): no per-task advantage normalization; kill
   switch passes if ANY trained task is +3 at step 38; PickPlace-only run, success = final protocol
   eval, seen, PickPlace, 300 episodes, >= 27.0% (missed: 20.7%); stratified multi-task only if it
@@ -671,6 +1047,11 @@ and every reported number are unchanged.
 
 ## Decisions taken by the agent (one line each, link ADR if any)
 
+- 2026-11-08 Servo fault thresholds 55 C / 1500 mA for 1 s, read every 4th tick (firmware Max_Temperature_Limit 70 C; lerobot sets the gripper's Protection_Current to 250 counts = 1625 mA); kept by the owner as provisional, to confirm with rehearsal temperatures.
+- 2026-11-08 Settling interval 3 s (`eval.settle_s`) before a real trial is scored; bounded torque-on teleop prompt wait 60 s + 10 s grace (`teleop.prompt_torque_timeout_s`, `prompt_support_grace_s`), the owner's proposal implemented on by default.
+- 2026-11-08 Real judging rule `real-judge-1`: judged once after the arm stops, all success conditions true at that moment, doubt = n (stricter than the sim's latched success).
+- 2026-11-08 Real judging rule `real-judge-2` (owner's trial-scoring decision): a trial counts once its policy started; a fault after the start is a failure (fault recorded); an unjudged score prompt is a failure (doubt = n, agent's reading, flagged to the owner); unstarted attempts are retried, never scored. Faulted-trial support moved from a trial-level prompt to the shutdown that always follows such a fault (one acknowledgement, recorded with how it was given).
+- 2026-11-08 Real placement: a stratified 6 x 6 slot lattice of SHIFTED_REGION (seen = inner 4 x 4) instead of continuous positions, so an operator can place objects by hand; one slot seed pairs the SFT and SFT+RL sessions.
 - 2026-10-26 Python 3.11 kept; LeRobot pinned to 0.4.4, the last release supporting 3.11 (0.5+ needs ≥3.12).
 - 2026-10-26 PyTorch 2.6.0 instead of 2.5.x: every LeRobot ≥0.3 needs torchcodec ≥0.2.1, which pairs with torch 2.6.
 - 2026-10-26 ManiSkill 3.0.1 (stable) instead of a 3.0.0bX beta; SAPIEN 3.0.3 (macOS wheels).

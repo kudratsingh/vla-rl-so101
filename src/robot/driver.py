@@ -3,28 +3,81 @@
     with So101Driver.from_config(cfg, fk=load_sim_fk()) as arm:
         frame = camera.read()
         out = arm.step(policy_action_rad, frame_time=frame.capture_time)
+        ...
+        arm.park(ParkSettings.from_config(cfg), frame_time_fn)   # healthy end only
 
-* ``step`` = deadman frame check -> read joints -> ``SafetyFilter`` -> bus write. The only way a
-  policy action reaches the bus.
+* ``step`` = deadman frame check -> read joints -> ``SafetyFilter`` -> bus write (-> scheduled
+  servo-health read). The only way a policy action reaches the bus.
 * On a deadman trip it performs the response (HOLD: write the measured pose as the goal, so the
   servos stop pushing; TORQUE_OFF: disable torque) and raises ``DeadmanTripped``: the loop stops.
   A caller may catch it, ask the operator, ``deadman.reset(...)`` and continue.
 * Any exception from the bus is a serial fault: deadman TORQUE_OFF, then ``SerialFault`` is raised.
 * ``check_frame`` (camera liveness without a write) and ``trip`` (any other failure, e.g. the
   policy server) end the same way: response carried out, ``DeadmanTripped``.
-* Leaving the ``with`` block always disables torque (LeRobot's ``disable_torque_on_disconnect``;
-  explicitly first if leaving on an exception). The arm then goes limp and drops onto the table:
-  keep it low, or support it, when a session ends.
+* Servo health (``src/robot/servo_health.py``): with a ``ServoMonitor``, ``step`` reads
+  Present_Temperature / Present_Current on a schedule after its write. Over a threshold: torque
+  OFF at once (not HOLD, which keeps the hot servo energized; not a park, which adds motion),
+  deadman latched TORQUE_OFF, ``ServoFault`` raised carrying ``SERVO_FAULT_PROMPT`` for the
+  operator (support the arm).
+* Healthy shutdown: ``park(settings, ...)`` drives to the park pose through the full safety
+  filter, then disables torque. It refuses (returns False, nothing moves) once the deadman has
+  tripped, so a fault path never parks; the caller then falls back to hold + "support the arm".
+  Parking is OFF by default (``robot.park.enabled: false``, owner 2026-11-08) until the owner has
+  verified a supported rest pose and a clear park path (WO-06 checklist step 5):
+  ``park_from_config`` returns None and every session ends with hold + "support the arm" +
+  torque off.
+* Torque off unconfirmed: when a torque-off write fails, the driver latches
+  ``torque_off_unconfirmed`` (the first failure's detail) for the rest of the process. It is
+  never cleared (not by ``Deadman.reset``, not by a later torque-off that succeeds). While it is
+  set, every Goal_Position write (``step``, ``hold``, ``move_to``, ``park``) and every torque
+  enable is refused, and the operator is told ``TORQUE_OFF_UNCONFIRMED_MSG``: switch off the
+  servo supply at the inline power switch. Session code copies the latch into trial records,
+  the shutdown result and the session end (``src/robot/client.py``).
+* Leaving the ``with`` block always disables torque (``torque_off``, then the port is closed
+  with lerobot's ``disconnect(disable_torque=False)``). Without a park first the arm goes limp
+  and drops onto the table: keep it low, or support it.
+* ``torque_off`` writes Torque_Enable = 0 to EVERY motor, each in its own try (after a broadcast),
+  so one servo that fails (a status error bit such as overload/overheat, which lerobot's
+  ``write`` raises on, or a comm failure on a loose daisy-chain cable) never leaves the servos
+  after it energized. A write whose status reply carries an error bit counts as written (the
+  motor accepted it; the bit is logged). Motors whose write got no reply are named in the latch.
+* A ``connect`` that fails before the serial port opened (wrong ``robot.port``, USB unplugged)
+  wrote nothing: no torque-off and no "unconfirmed" alarm. Once the port is open, a failed
+  connect turns torque off (and latches on failure) before closing it.
 * ``connect`` never calibrates (calibration is interactive: ``scripts/wo06_calibrate.py``) and
   refuses an arm whose motors do not match the calibration file. Every torque enable (LeRobot's
-  ``configure()`` re-enables torque at the end of ``connect``) is preceded by
-  Goal_Position := Present_Position, so a servo never drives towards a stale goal register.
+  ``configure()`` re-enables torque at the end of ``connect``) is preceded by the rest-pose check
+  below, then Goal_Position := Present_Position, so a servo never drives towards a stale goal.
+* Torque-enable refusal (``check_rest_pose``): with torque still off, each servo's stored
+  Homing_Offset must equal the calibration file's ``homing_offset`` (STS3215 EEPROM address 31,
+  2 bytes, sign-magnitude with the sign in bit 11: lerobot 0.4.4
+  ``motors/feetech/tables.py`` ``STS_SMS_SERIES_CONTROL_TABLE`` / ``STS_SMS_SERIES_ENCODINGS_TABLE``;
+  read and sign-decoded by ``FeetechMotorsBus.read_calibration``, ``motors/feetech/feetech.py:251-270``).
+  Present_Position = actual position - Homing_Offset, so a different offset shifts every reading
+  and the range and safety checks below would pass on wrong angles. LeRobot's own
+  ``is_calibrated`` compares offsets too, but only after ``connect`` has enabled torque. Then every
+  joint's resting position is checked against (a) its calibrated range in raw ticks, from BOTH the
+  calibration file and the servo EEPROM (Min/Max_Position_Limit, which must agree), and (b) the safety joint
+  limits (``src/robot/safety.py``) widened by ``RestTolerance.safety_limits_deg`` (6 deg: those
+  limits sit 5 deg inside the calibrated range, so a gripper resting closed or a joint resting
+  on its stop passes). Outside either: ``TorqueEnableRefused`` with an operator message, torque
+  stays OFF. A servo outside its EEPROM limits can be driven to the limit when torque comes on;
+  a pose far outside the safety limits means the calibration or ``robot.units`` is wrong.
+* Port-busy backstop (``release_port``): a Ctrl-C (KeyboardInterrupt) that lands inside
+  scservo_sdk's packet loop leaves ``port_handler.is_using`` True, and every later transaction
+  then fails with "[TxRxResult] Port is in use!" (``scservo_sdk/protocol_packet_handler.py:73-75``
+  sets the flag in ``txPacket``; only ``rxPacket`` / the TxOnly paths clear it), so the hold or
+  torque-off that should follow the Ctrl-C never reaches the servos. ``hold``, ``torque_off``,
+  ``trip`` and ``park`` clear it first, as lerobot's own ``disconnect(disable_torque=True)`` does
+  (``lerobot/motors/motors_bus.py:543-545``: ``clearPort()``, ``is_using = False``), and drop a
+  half-read status packet from the serial input buffer.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -37,7 +90,14 @@ import numpy.typing as npt
 
 from src.config import Config
 from src.robot.safety import DeadmanResponse, FkFn, SafetyFilter, SafetyResult, make_safety
-from src.robot.units import FloatArray, UnitMap
+from src.robot.servo_health import CURRENT, REGISTERS, ServoMonitor, monitor_from_config
+from src.robot.units import (
+    JOINT_NAMES,
+    LEROBOT_DEG_PER_TICK,
+    FloatArray,
+    UnitMap,
+    raw_to_canonical,
+)
 
 log = logging.getLogger(__name__)
 
@@ -74,10 +134,114 @@ class NotCalibrated(RuntimeError):
     pass
 
 
+class ServoFault(DeadmanTripped):
+    """Over-temperature / over-current: torque is already OFF (deadman latched TORQUE_OFF)."""
+
+
+class TorqueEnableRefused(RuntimeError):
+    """A joint rests outside its calibrated range or the safety limits, a servo's Homing_Offset
+    differs from the calibration file, or torque off is unconfirmed: torque was not enabled."""
+
+
+class TorqueOffUnconfirmed(SerialFault):
+    """A motion command was refused: an earlier torque-off write failed (``torque_off_unconfirmed``)."""
+
+
+TORQUE_OFF_UNCONFIRMED = "torque_off_unconfirmed"  # stop reason / shutdown result / session end
+
+TORQUE_OFF_UNCONFIRMED_MSG = (
+    "TORQUE OFF UNCONFIRMED ({detail}). The servos may still be energized and holding. Switch "
+    "OFF the servo supply NOW at the inline power switch (the independent power cutoff), with a "
+    "hand ready under the arm: it goes limp when the power goes. This process sends no further "
+    "motion: every goal-position and torque-enable write is blocked until it exits. Leave the "
+    "supply off until the cause (USB cable, bus, a servo) is found."
+)
+
+
+SERVO_FAULT_PROMPT = (
+    "SERVO FAULT ({reason}). Torque is OFF on every motor: the arm is limp and may have dropped. "
+    "Support it / lower it onto the table, switch off the servo supply, let the servos cool for "
+    "at least 10 minutes, and find the cause (blocked joint, squeezing gripper, long hold) "
+    "before the next session."
+)
+
+TORQUE_REFUSAL_MSG = (
+    "TORQUE ENABLE REFUSED: torque stays OFF. {problems}\nWith torque off, move the joint(s) by "
+    "hand back inside the range (support the arm), then reconnect. If a joint is inside its "
+    "physical range but reported outside, the calibration is wrong: re-run `uv run "
+    "scripts/wo06_calibrate.py --preset real calibrate --device follower`, then `check "
+    "--write-limits`."
+)
+
+HOMING_OFFSET_MSG = (
+    "{name}: servo Homing_Offset {servo} differs from the calibration file's homing_offset "
+    "{file}. Every position reading of this servo is shifted, so the range and safety checks "
+    "cannot be trusted. Do not move the arm under power: the servo was recalibrated, swapped or "
+    "written by another tool (e.g. lerobot-calibrate) since this file was made. Re-run step 3 "
+    "of docs/bringup/WO-06-checklist.md (`uv run scripts/wo06_calibrate.py --preset real "
+    "calibrate --device follower`), then step 4 `check --write-limits`"
+)
+
+
 @dataclass(frozen=True)
 class StepResult:
     measured: FloatArray  # (6,) rad, read just before the command
     safety: SafetyResult  # .command is what was written to the bus
+
+
+@dataclass(frozen=True)
+class RestTolerance:
+    """How far (deg) a joint may rest outside a range at torque enable before it is refused."""
+
+    calibrated_range_deg: float = 1.0
+    safety_limits_deg: float = 6.0
+
+    @classmethod
+    def from_config(cls, cfg: Config) -> RestTolerance:
+        t = cfg["robot"]["safety"].get("torque_enable_tol_deg") or {}
+        d = cls()
+        return cls(
+            calibrated_range_deg=float(t.get("calibrated_range", d.calibrated_range_deg)),
+            safety_limits_deg=float(t.get("safety_limits", d.safety_limits_deg)),
+        )
+
+
+@dataclass(frozen=True)
+class ParkSettings:
+    """Healthy-shutdown park pose and tolerance (``robot.park`` in configs/real.yaml). Built only
+    when ``robot.park.enabled`` is true: see ``park_from_config``."""
+
+    qpos: tuple[float, ...]
+    tol_rad: float
+    timeout_s: float
+
+    def __post_init__(self) -> None:
+        if len(self.qpos) != len(JOINT_NAMES) or not all(map(math.isfinite, self.qpos)):
+            raise ValueError(f"robot.park.qpos must be {len(JOINT_NAMES)} finite radians")
+        if not (self.tol_rad > 0 and self.timeout_s > 0):
+            raise ValueError("robot.park tol_deg and timeout_s must be > 0")
+
+    @classmethod
+    def from_config(cls, cfg: Config) -> ParkSettings:
+        """``robot.park``; ``qpos: null`` means ``deploy.home_qpos`` (sim REST_QPOS)."""
+        p = cfg["robot"].get("park") or {}
+        q = p.get("qpos")
+        qpos = cfg["deploy"]["home_qpos"] if q is None else q
+        return cls(
+            qpos=tuple(float(v) for v in qpos),
+            tol_rad=math.radians(float(p.get("tol_deg", 3.0))),
+            timeout_s=float(p.get("timeout_s", 20.0)),
+        )
+
+
+def park_from_config(cfg: Config) -> ParkSettings | None:
+    """``ParkSettings`` when ``robot.park.enabled`` is true, else None (the default: no automatic
+    park; sessions end with hold + "support the arm" + torque off). The owner enables it after
+    verifying a supported rest pose and a clear park path (WO-06 checklist step 5)."""
+    p = cfg["robot"].get("park") or {}
+    if not bool(p.get("enabled", False)):
+        return None
+    return ParkSettings.from_config(cfg)
 
 
 def follower_from_config(cfg: Config) -> Any:
@@ -108,18 +272,95 @@ def follower_from_config(cfg: Config) -> Any:
     return SO101Follower(fcfg)
 
 
-def install_hold_on_torque_enable(bus: Any) -> None:
-    """Make every ``bus.enable_torque`` first write Goal_Position := Present_Position (raw ticks).
+def release_port(bus: Any) -> bool:
+    """Clear a servo port left busy by an interrupted transaction (module doc). True if it was
+    busy. Safe between transactions: the control loop is single-threaded, so ``is_using`` can only
+    still be True here when a transaction was interrupted."""
+    ph = getattr(bus, "port_handler", None)
+    if ph is None or not getattr(ph, "is_using", False):
+        return False
+    log.critical("servo port was left busy by an interrupted transaction: clearing it")
+    try:
+        ph.clearPort()  # flush pending output, as lerobot's disconnect does
+    except Exception as e:  # noqa: BLE001 - best effort; is_using must be cleared regardless
+        log.warning("clearPort failed: %s", e)
+    ph.is_using = False
+    ser = getattr(ph, "ser", None)
+    if ser is not None:
+        try:
+            ser.reset_input_buffer()  # drop a half-read status packet
+        except Exception as e:  # noqa: BLE001
+            log.warning("reset_input_buffer failed: %s", e)
+    return True
+
+
+TORQUE_ENABLE, LOCK = "Torque_Enable", "Lock"
+BROADCAST_ID = 0xFE  # scservo_sdk BROADCAST_ID
+
+
+def _bus_write(bus: Any, model: str, motor_id: int, register: str) -> str | None:
+    """One status-checked write of 0 to ``register``. None when the motor received it (a status
+    packet that carries a hardware error bit still means it was written: logged), else why not."""
+    addr, length = bus.model_ctrl_table[model][register]  # lerobot get_address
+    try:
+        comm, err = bus._write(addr, length, motor_id, 0, num_retry=5, raise_on_error=False)
+    except Exception as e:  # noqa: BLE001 - e.g. a serial exception on an unplugged USB cable
+        return f"{type(e).__name__}: {e}"
+    if not bus._is_comm_success(comm):
+        return f"no status reply: {bus.packet_handler.getTxRxResult(comm)}"
+    if bus._is_error(err):
+        log.critical(
+            "servo id %d accepted %s=0 but reports %s",
+            motor_id,
+            register,
+            bus.packet_handler.getRxPacketError(err),
+        )
+    return None
+
+
+def disable_torque_every_motor(bus: Any) -> dict[str, str]:
+    """Torque_Enable := 0 on EVERY motor of a lerobot ``FeetechMotorsBus``, then Lock := 0, each
+    motor in its own try so one failure never skips the motors after it. A broadcast
+    Torque_Enable=0 goes out first (no reply; best effort). Returns {motor: why} for the motors
+    whose Torque_Enable write was not confirmed (empty = all confirmed). Lock failures are logged
+    only: Lock guards the EEPROM, not the torque."""
+    motors = bus.motors
+    try:
+        addr = bus.model_ctrl_table[next(iter(motors.values())).model][TORQUE_ENABLE][0]
+        bus.packet_handler.write1ByteTxOnly(bus.port_handler, BROADCAST_ID, addr, 0)
+    except Exception as e:  # noqa: BLE001 - the per-motor writes below are what count
+        log.warning("broadcast torque-off failed: %s", e)
+    failed: dict[str, str] = {}
+    for name, m in motors.items():
+        why = _bus_write(bus, m.model, int(m.id), TORQUE_ENABLE)
+        if why is not None:
+            failed[name] = f"id {int(m.id)}: {why}"
+    for name, m in motors.items():
+        why = _bus_write(bus, m.model, int(m.id), LOCK)
+        if why is not None:
+            log.warning("%s: Lock=0 write not confirmed (%s)", name, why)
+    for name, why in failed.items():
+        log.critical("%s: torque-off write NOT confirmed (%s)", name, why)
+    return failed
+
+
+def install_hold_on_torque_enable(bus: Any, guard: Callable[[Any], None] | None = None) -> None:
+    """Make every ``bus.enable_torque`` first run ``guard(motors)`` (which raises to refuse, torque
+    still off), then write Goal_Position := Present_Position (raw ticks).
 
     A Feetech servo drives to its Goal_Position register the moment torque is enabled; LeRobot's
     connect()/configure() enable torque without touching that register. Instance-level wrap of
-    lerobot 0.4.4's ``FeetechMotorsBus.enable_torque``; idempotent.
+    lerobot 0.4.4's ``FeetechMotorsBus.enable_torque``; idempotent (a later call replaces the guard).
     """
+    bus._vla_torque_guard = guard
     if getattr(bus, "_vla_hold_on_enable", False):
         return
     original = bus.enable_torque
 
     def enable_torque(motors: Any = None, num_retry: int = 0) -> None:
+        check = getattr(bus, "_vla_torque_guard", None)
+        if check is not None:
+            check(motors)
         present = bus.sync_read("Present_Position", motors, normalize=False)
         bus.sync_write("Goal_Position", present, normalize=False)
         original(motors, num_retry=num_retry)
@@ -135,17 +376,33 @@ class So101Driver:
         units: UnitMap,
         safety: SafetyFilter,
         clock: Callable[[], float] = time.perf_counter,
+        *,
+        monitor: ServoMonitor | None = None,
+        rest_tol: RestTolerance | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.follower = follower
         self.units = units
         self.safety = safety
         self.deadman = safety.deadman
         self.clock = clock
+        self.sleep = sleep
+        self.monitor = monitor
+        self.rest_tol = rest_tol or RestTolerance()
+        self.servo_fault: str | None = None  # reason of the latest ServoFault
+        # first failed torque-off write; latched for the life of the process (module doc)
+        self.torque_off_unconfirmed: str | None = None
         self._connected = False
 
     @classmethod
     def from_config(cls, cfg: Config, fk: FkFn) -> So101Driver:
-        return cls(follower_from_config(cfg), UnitMap.from_config(cfg), make_safety(cfg, fk))
+        return cls(
+            follower_from_config(cfg),
+            UnitMap.from_config(cfg),
+            make_safety(cfg, fk),
+            monitor=monitor_from_config(cfg),
+            rest_tol=RestTolerance.from_config(cfg),
+        )
 
     # -- lifecycle ------------------------------------------------------------------------------
     def connect(self) -> None:
@@ -155,10 +412,18 @@ class So101Driver:
                 "no calibration file for this arm id; run `uv run scripts/wo06_calibrate.py "
                 "--preset real calibrate --device follower`"
             )
-        install_hold_on_torque_enable(self.follower.bus)
+        install_hold_on_torque_enable(self.follower.bus, guard=self.torque_enable_guard)
         try:
             self.follower.connect(calibrate=False)
         except BaseException:
+            if not getattr(self.follower.bus, "is_connected", True):
+                # the serial port never opened (wrong robot.port, USB unplugged): nothing was
+                # written, so there is no torque to switch off and no alarm to raise
+                log.error(
+                    "follower connect failed before the serial port opened: nothing was "
+                    "written to the servos"
+                )
+                raise
             log.critical("follower connect failed: torque off, closing the port")
             self.torque_off()
             try:
@@ -175,17 +440,20 @@ class So101Driver:
                 "`uv run scripts/wo06_calibrate.py --preset real calibrate --device follower`"
             )
         self.safety.reset_reference()
+        self._log_firmware_limits()
         log.info("SO-101 follower connected")
 
     def disconnect(self) -> None:
         if not self._connected:
             return
         self._connected = False
+        # torque off motor by motor first (torque_off), not lerobot's disconnect(disable_torque=
+        # True): that stops at the first motor whose write fails and never closes the port
+        self.torque_off()
         try:
-            self.follower.disconnect()  # disables torque (disable_torque_on_disconnect=True)
-        except Exception as e:  # noqa: BLE001 - must fall through to a direct torque-off
-            log.critical("disconnect failed (%s); attempting torque off directly", e)
-            self.torque_off()
+            self.follower.bus.disconnect(disable_torque=False)  # close the port (no cameras)
+        except Exception as e:  # noqa: BLE001 - torque is already handled above
+            log.warning("closing the servo port failed: %s", e)
 
     def __enter__(self) -> Self:
         self.connect()
@@ -202,16 +470,152 @@ class So101Driver:
             self.torque_off()
         self.disconnect()
 
+    # -- torque-enable refusal ------------------------------------------------------------------
+    def torque_enable_guard(self, motors: Any = None) -> None:
+        """Runs before every torque enable: refuses while torque off is unconfirmed, then
+        ``check_rest_pose``."""
+        if self.torque_off_unconfirmed is not None:
+            msg = TORQUE_REFUSAL_MSG.format(
+                problems="An earlier torque-off write failed: "
+                + TORQUE_OFF_UNCONFIRMED_MSG.format(detail=self.torque_off_unconfirmed)
+            )
+            log.critical(msg)
+            raise TorqueEnableRefused(msg)
+        self.check_rest_pose(motors)
+
+    def check_rest_pose(self, motors: Any = None) -> None:
+        """Torque-enable guard; runs with torque off. Raises TorqueEnableRefused when a servo's
+        stored Homing_Offset differs from the calibration file's, or a joint rests outside its
+        calibrated range (file and EEPROM, raw ticks) by more than
+        ``rest_tol.calibrated_range_deg``, or outside the safety joint limits by more than
+        ``rest_tol.safety_limits_deg``. Always checks all six motors, whatever ``motors`` is."""
+        bus = self.follower.bus
+        protocol_version = int(getattr(bus, "protocol_version", 0))
+        if protocol_version != 0:  # read_calibration returns offset 0 on protocol 1
+            msg = TORQUE_REFUSAL_MSG.format(
+                problems=f"Servo bus protocol {protocol_version}: Homing_Offset cannot be read, "
+                "only protocol 0 (STS3215, the SO-101) is supported."
+            )
+            log.critical(msg)
+            raise TorqueEnableRefused(msg)
+        file_cal = getattr(bus, "calibration", None) or {}
+        try:
+            eeprom = bus.read_calibration()
+            raw = bus.sync_read("Present_Position", None, normalize=False)
+        except Exception as e:
+            msg = TORQUE_REFUSAL_MSG.format(problems=f"Could not read the servos: {e}.")
+            log.critical(msg)
+            raise TorqueEnableRefused(msg) from e
+        problems: list[str] = []
+        tol_ticks = self.rest_tol.calibrated_range_deg / LEROBOT_DEG_PER_TICK
+        for name in JOINT_NAMES:
+            fc, ec = file_cal.get(name), eeprom.get(name)
+            if fc is None or ec is None or name not in raw:
+                problems.append(f"{name}: no calibration or no position reading")
+                continue
+            if int(fc.homing_offset) != int(ec.homing_offset):
+                problems.append(
+                    HOMING_OFFSET_MSG.format(
+                        name=name, servo=int(ec.homing_offset), file=int(fc.homing_offset)
+                    )
+                )
+            f_rng = (int(fc.range_min), int(fc.range_max))
+            e_rng = (int(ec.range_min), int(ec.range_max))
+            if f_rng != e_rng:
+                problems.append(
+                    f"{name}: servo EEPROM limits {e_rng} differ from the calibration file {f_rng}"
+                )
+            lo, hi = max(f_rng[0], e_rng[0]), min(f_rng[1], e_rng[1])
+            r = int(raw[name])
+            out = max(lo - r, r - hi, 0)
+            if out > tol_ticks:
+                problems.append(
+                    f"{name} rests at raw {r}, {out * LEROBOT_DEG_PER_TICK:.1f} deg outside its "
+                    f"calibrated range [{lo}, {hi}] ticks"
+                )
+        if not problems:
+            q = raw_to_canonical(self.units, raw, file_cal)
+            sc = self.safety.config
+            tol = math.radians(self.rest_tol.safety_limits_deg)
+            for j, name in enumerate(JOINT_NAMES):
+                lo_r, hi_r = sc.lower_rad[j], sc.upper_rad[j]
+                out_r = max(lo_r - float(q[j]), float(q[j]) - hi_r, 0.0)
+                if out_r > tol:
+                    problems.append(
+                        f"{name} rests at {math.degrees(q[j]):.1f} deg, "
+                        f"{math.degrees(out_r):.1f} deg outside the safety limits "
+                        f"[{math.degrees(lo_r):.1f}, {math.degrees(hi_r):.1f}] deg (tolerance "
+                        f"{self.rest_tol.safety_limits_deg:.1f} deg)"
+                    )
+        if problems:
+            msg = TORQUE_REFUSAL_MSG.format(problems="; ".join(problems) + ".")
+            log.critical(msg)
+            raise TorqueEnableRefused(msg)
+
+    def _log_firmware_limits(self) -> None:
+        """Log the firmware's own temperature cut-out next to the monitor threshold (best effort)."""
+        if self.monitor is None:
+            return
+        try:
+            limit = self.follower.bus.sync_read("Max_Temperature_Limit", None, normalize=False)
+        except Exception as e:  # noqa: BLE001 - informational only
+            log.warning("could not read Max_Temperature_Limit: %s", e)
+            return
+        trip = self.monitor.config.max_temperature_c
+        log.warning(
+            "servo firmware Max_Temperature_Limit (C): %s; monitor trips at %.0f C", limit, trip
+        )
+        if limit and trip >= min(float(v) for v in limit.values()):
+            log.critical(
+                "servo_monitor.max_temperature_c is not below the firmware limit: lower it"
+            )
+
     # -- bus primitives -------------------------------------------------------------------------
     def torque_off(self) -> bool:
-        """Disable torque on every motor. True on success; on failure the operator must cut power."""
-        try:
-            self.follower.bus.disable_torque(num_retry=5)
-            log.warning("torque disabled on all motors")
-            return True
-        except Exception as e:  # noqa: BLE001 - report every failure as "cut power"
-            log.critical("TORQUE OFF FAILED (%s: %s): CUT THE ARM'S POWER NOW", type(e).__name__, e)
+        """Disable torque on every motor. True if THIS attempt reached every motor. On failure the
+        driver latches ``torque_off_unconfirmed`` (never cleared; later motion is refused), naming
+        the motors not confirmed, and tells the operator to cut power at the inline switch. A
+        later success does not clear it.
+
+        Not lerobot's ``disable_torque``: that writes one motor at a time and stops at the first
+        exception, and its ``write`` also raises on a status packet carrying a hardware error bit
+        (overload / overheat / voltage) although that motor accepted the write, so one hot or
+        unplugged servo left every servo after it energized (``disable_torque_every_motor``)."""
+        bus = self.follower.bus
+        release_port(bus)
+        failed = disable_torque_every_motor(bus)
+        if failed:
+            self._latch_torque_off_unconfirmed(
+                "Torque_Enable=0 not confirmed on "
+                + "; ".join(f"{m} ({d})" for m, d in failed.items())
+            )
             return False
+        if self.torque_off_unconfirmed is not None:
+            log.critical(
+                "torque-off write succeeded on a retry, but the earlier failure (%s) stands: "
+                "keep the servo supply OFF at the inline power switch",
+                self.torque_off_unconfirmed,
+            )
+        else:
+            log.warning("torque disabled on all motors")
+        return True
+
+    def _latch_torque_off_unconfirmed(self, detail: str) -> None:
+        first = self.torque_off_unconfirmed is None
+        if first:
+            self.torque_off_unconfirmed = detail
+        self.deadman.trip(f"torque off unconfirmed: {detail}", DeadmanResponse.TORQUE_OFF)
+        msg = TORQUE_OFF_UNCONFIRMED_MSG.format(detail=self.torque_off_unconfirmed)
+        log.critical("TORQUE OFF FAILED (%s): %s", detail, msg)
+        if first:  # loud even when logging is not configured
+            print(f"\n!!! {msg}\n", file=sys.stderr, flush=True)
+
+    def _refuse_motion(self, what: str) -> TorqueOffUnconfirmed:
+        msg = f"{what} refused: " + TORQUE_OFF_UNCONFIRMED_MSG.format(
+            detail=self.torque_off_unconfirmed
+        )
+        log.critical(msg)
+        return TorqueOffUnconfirmed(msg)
 
     def _serial_fault(self, what: str, e: BaseException) -> SerialFault:
         self.deadman.serial_error(e)
@@ -227,6 +631,8 @@ class So101Driver:
             raise self._serial_fault("joint read", e) from e
 
     def _write(self, q: FloatArray) -> None:
+        if self.torque_off_unconfirmed is not None:
+            raise self._refuse_motion("goal-position write")
         try:
             self.follower.send_action(self.units.to_lerobot(q))
         except Exception as e:
@@ -236,9 +642,13 @@ class So101Driver:
         """Goal := measured pose (zero position error, servos stop pushing). Bypasses the filter:
         holding where the arm already is cannot move it. Refused (nothing read or written) while
         the deadman is latched TORQUE_OFF: the bus is suspect and torque must stay off."""
+        if self.torque_off_unconfirmed is not None:
+            log.critical("hold refused: torque off unconfirmed (%s)", self.torque_off_unconfirmed)
+            return
         if self.deadman.tripped and self.deadman.response is DeadmanResponse.TORQUE_OFF:
             log.critical("hold refused: torque is OFF after %s", self.deadman.reason)
             return
+        release_port(self.follower.bus)
         q = self.read_state() if measured is None else measured
         self._write(q)
         self.safety.reset_reference()
@@ -260,7 +670,9 @@ class So101Driver:
     def trip(self, reason: str, response: DeadmanResponse = DeadmanResponse.HOLD) -> DeadmanTripped:
         """Latch the deadman for a failure outside the bus and camera (policy server, operator
         Ctrl-C, client bug), carry out its response, and return the exception for the caller to
-        raise: ``raise arm.trip("server timeout")``."""
+        raise: ``raise arm.trip("server timeout")``. A Ctrl-C may have interrupted a bus
+        transaction, so the port is released before the response is written."""
+        release_port(self.follower.bus)
         self.deadman.trip(reason, response)
         return self._respond_to_deadman(None)
 
@@ -274,12 +686,58 @@ class So101Driver:
         if not self.deadman.check_frame(frame_time, self.clock() if now is None else now):
             raise self._respond_to_deadman(None)
 
+    # -- servo health ---------------------------------------------------------------------------
+    def _raise_servo_fault(self, reason: str) -> ServoFault:
+        """Torque off at once (no hold, no park), latch TORQUE_OFF, tell the operator."""
+        self.servo_fault = reason
+        self.deadman.trip(f"servo fault: {reason}", DeadmanResponse.TORQUE_OFF)
+        self.torque_off()
+        msg = SERVO_FAULT_PROMPT.format(reason=reason)
+        if self.torque_off_unconfirmed is not None:  # the prompt's "torque is OFF" is not known
+            msg += " " + TORQUE_OFF_UNCONFIRMED_MSG.format(detail=self.torque_off_unconfirmed)
+        log.critical(msg)
+        return ServoFault(msg)
+
+    def _read_health(self, register: str) -> None:
+        assert self.monitor is not None
+        t0 = self.clock()
+        try:
+            raw = self.follower.bus.sync_read(register, None, normalize=False)
+        except Exception as e:
+            raise self._serial_fault(f"{register} read", e) from e
+        t1 = self.clock()
+        self.monitor.note_read_ms((t1 - t0) * 1e3)
+        fault = self.monitor.update(register, raw, t1)
+        if fault is not None:
+            raise self._raise_servo_fault(fault)
+
+    def check_servos(self) -> None:
+        """Read temperature and current now (before a park, or while holding at a prompt).
+        Raises ServoFault (torque already off) or SerialFault. No-op without a monitor, before
+        connect, or once torque is off.
+
+        A motor over the current threshold is re-read after ``current_trip_s`` (same thread, the
+        driver's sleep) before this returns, so a sustained over-current trips here, within about
+        ``current_trip_s``, and not only at the next read after a prompt's whole wait."""
+        if self.monitor is None or not self._connected or self.torque_off_unconfirmed is not None:
+            return
+        if self.deadman.tripped and self.deadman.response is DeadmanResponse.TORQUE_OFF:
+            return
+        for reg in REGISTERS:
+            self._read_health(reg)
+        if self.monitor.pending_over_current():
+            self.sleep(self.monitor.config.current_trip_s)
+            self._read_health(CURRENT)
+
     # -- control --------------------------------------------------------------------------------
     def step(
         self, action: npt.ArrayLike, *, frame_time: float | None, now: float | None = None
     ) -> StepResult:
         """One control tick. ``frame_time``: perf_counter stamp of the frame the action came from
-        (None = no frame -> deadman). Raises DeadmanTripped / SerialFault; never sends unsafely."""
+        (None = no frame -> deadman). Raises DeadmanTripped (ServoFault included) / SerialFault;
+        never sends unsafely."""
+        if self.torque_off_unconfirmed is not None:
+            raise self._refuse_motion("step")
         if not self._connected:
             raise RuntimeError("driver not connected")
         t = self.clock() if now is None else now
@@ -292,6 +750,10 @@ class So101Driver:
         if result.command is None:
             raise self._respond_to_deadman(measured)
         self._write(result.command)
+        if self.monitor is not None:
+            reg = self.monitor.due()
+            if reg is not None:  # after the write: the read never delays this tick's command
+                self._read_health(reg)
         return StepResult(measured=measured, safety=result)
 
     def move_to(
@@ -300,13 +762,21 @@ class So101Driver:
         frame_time_fn: Callable[[], float | None],
         tol_rad: float = math.radians(1.0),
         timeout_s: float = 20.0,
+        stop_fn: Callable[[], bool] | None = None,
     ) -> bool:
         """Drive to ``target`` through the full safety filter at control_hz (e.g. a home pose).
-        True when every joint is within ``tol_rad``. Stops (False) on a rejection or timeout."""
+        True when every joint is within ``tol_rad``. Stops (False) on a rejection, a timeout or
+        ``stop_fn()`` returning True. ``stop_fn`` is checked before every tick, and every tick
+        (``step``) writes at most one goal, so once it returns True no further goal is written
+        here; a goal already being written when the stop arrives (between the check and the
+        write) completes."""
         q = np.asarray(target, dtype=np.float64)
         period = 1.0 / self.safety.config.control_hz
         t_end = self.clock() + timeout_s
         while self.clock() < t_end:
+            if stop_fn is not None and stop_fn():
+                log.warning("move_to stopped by the operator")
+                return False
             t0 = self.clock()
             out = self.step(q, frame_time=frame_time_fn())
             if out.safety.status == "rejected":
@@ -314,5 +784,60 @@ class So101Driver:
                 return False
             if np.all(np.abs(out.measured - q) <= tol_rad):
                 return True
-            time.sleep(max(0.0, period - (self.clock() - t0)))
+            self.sleep(max(0.0, period - (self.clock() - t0)))
         return False
+
+    # -- healthy shutdown -----------------------------------------------------------------------
+    def park(
+        self,
+        settings: ParkSettings,
+        frame_time_fn: Callable[[], float | None],
+        stop_fn: Callable[[], bool] | None = None,
+    ) -> bool:
+        """HEALTHY SHUTDOWN ONLY: drive to ``settings.qpos`` through the full safety filter at
+        control_hz, then disable torque. MOVES THE ARM. True when parked with torque off.
+
+        Refuses (False, nothing written) when the deadman has tripped: a fault path never parks.
+        Reads servo temperature/current first. False on a rejection, a timeout, ``stop_fn()``
+        becoming True or a Ctrl-C; the arm is then holding (or limp after a fault) and the caller
+        falls back to hold + "support the arm" + torque off. ``stop_fn`` is checked before every
+        goal write of the park (``move_to``) and once more after the pose is reached, before the
+        torque-off: a stop that arrived during the last write also ends in the hold (Goal :=
+        the measured pose, no motion) instead of a park.
+        """
+        if not self._connected or self.torque_off_unconfirmed is not None:
+            return False
+        if self.deadman.tripped:
+            log.warning("park refused: deadman latched (%s)", self.deadman.reason)
+            return False
+        release_port(self.follower.bus)
+        try:
+            self.check_servos()
+            self.safety.reset_reference()  # first step measured from the pose the arm holds
+            reached = self.move_to(
+                settings.qpos,
+                frame_time_fn,
+                tol_rad=settings.tol_rad,
+                timeout_s=settings.timeout_s,
+                stop_fn=stop_fn,
+            )
+        except (DeadmanTripped, SerialFault) as e:
+            log.critical("park stopped: %s", e)
+            return False
+        except KeyboardInterrupt:
+            self.trip("operator Ctrl-C during park")
+            return False
+        try:
+            if reached and stop_fn is not None and stop_fn():
+                log.warning("park stopped after the last goal write: holding")
+                reached = False
+            if not reached:
+                log.warning("park pose not reached: holding")
+                self.hold()
+                return False
+            q = self.read_state()
+        except SerialFault as e:  # torque already off
+            log.critical("park ended on a serial fault: %s", e)
+            return False
+        log.warning("parked (deg): %s; torque off", [round(math.degrees(float(v)), 1) for v in q])
+        return self.torque_off()

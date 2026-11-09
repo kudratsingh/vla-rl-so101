@@ -13,7 +13,8 @@ Service ``vla_rl_so101.Policy``, two unary RPCs, generic handlers with raw-bytes
 
 * ``Info`` -> chunk_len, action_dim, image_size, protocol_version / protocol_hash (of the server's
   checkout), policy_id (the loaded adapter id or a mock name, never empty), the policy's
-  ``describe()`` and ``server_run`` (the server's run id and device). The client refuses to run
+  ``describe()``, ``server_run`` (the server's run id and device), and ``adapter_sha256`` /
+  ``adapter_revision``: the served adapter's content hash (``adapter_identity``) and Hub commit. The client refuses to run
   on any mismatch, and on a policy_id other than ``server.policy_checkpoint`` when that is set.
 
 ``main`` keeps a run record (``runs/<id>/record.json``) for the server's whole uptime: on the pod
@@ -31,6 +32,7 @@ Inference is serialised (one worker, one lock): a single arm makes one request a
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import signal
@@ -226,6 +228,50 @@ class OFTServed:
         return d
 
 
+ADAPTER_FILES = (  # what make_policy loads from an adapter dir (norm stats: NORM_STATS_FILE)
+    "adapter_config.json",
+    "adapter_model.safetensors",
+    "adapter_model.bin",
+    "norm_stats.json",
+)
+
+
+def adapter_identity(adapter_dir: Path) -> dict[str, Any]:
+    """Content identity of a resolved adapter dir: ``adapter_sha256`` over the files make_policy
+    loads (name + sha256 of each one present), and ``adapter_revision``, the Hub snapshot commit
+    when the dir is a ``snapshots/<sha>/...`` download (None for a local dir). A re-pushed or
+    overwritten adapter under the same name gets a different hash."""
+    h = hashlib.sha256()
+    found = []
+    for name in ADAPTER_FILES:
+        f = adapter_dir / name
+        if f.is_file():
+            found.append(name)
+            digest = hashlib.sha256()
+            with f.open("rb") as fh:
+                for block in iter(lambda: fh.read(1 << 20), b""):
+                    digest.update(block)
+            h.update(f"{name}:{digest.hexdigest()}\n".encode())
+    if "adapter_config.json" not in found:
+        raise FileNotFoundError(f"no adapter_config.json in {adapter_dir}")
+    parts = adapter_dir.resolve().parts
+    rev = parts[parts.index("snapshots") + 1] if "snapshots" in parts[:-1] else None
+    return {"adapter_sha256": h.hexdigest(), "adapter_revision": rev, "adapter_files": found}
+
+
+def served_adapter_identity(adapter: str | None) -> dict[str, Any]:
+    """``adapter_identity`` of what ``load_oft`` loaded (a Hub spec resolves to the snapshot the
+    load just cached); a fixed marker for the tiny-random policy (no adapter)."""
+    if adapter is None:
+        return {"adapter_sha256": "tiny-random:no-adapter", "adapter_revision": None}
+    from src.policy.openvla_oft import resolve_adapter
+
+    adapter_dir = resolve_adapter(adapter)
+    if adapter_dir is None:
+        raise FileNotFoundError(f"adapter {adapter!r} did not resolve to a directory")
+    return adapter_identity(adapter_dir)
+
+
 def load_oft(cfg: Config, device: str, adapter: str | None) -> OFTServed:
     """GPU box only (not exercised by the CPU tests): base + LoRA adapter, as the sim eval runs it.
     ``make_policy`` does not switch to eval mode, so it is done here."""
@@ -248,10 +294,13 @@ class PolicyServer:
         policy_id: str,
         clock: Callable[[], float] = time.perf_counter,
         server_run: Mapping[str, Any] | None = None,
+        adapter: Mapping[str, Any] | None = None,
     ):
         if not policy_id or policy_id.strip().lower() in ("none", "null"):
             raise ValueError(f"policy_id must name the served checkpoint, got {policy_id!r}")
         self.policy = policy
+        # content identity of the served weights (``adapter_identity``); None = not known
+        self.adapter = dict(adapter) if adapter is not None else {}
         self.image_size = int(image_size)
         self.policy_id = policy_id
         self.clock = clock
@@ -270,6 +319,8 @@ class PolicyServer:
             "policy_id": self.policy_id,
             "describe": self.policy.describe(),
             "server_run": self.server_run,  # run_id + device of the server's own run record
+            "adapter_sha256": self.adapter.get("adapter_sha256"),
+            "adapter_revision": self.adapter.get("adapter_revision"),
         }
 
     def handle_info(self, request: bytes, context: Any) -> bytes:
@@ -375,11 +426,16 @@ def main(argv: Sequence[str] | None = None) -> Path:
         server_run = {"run_id": run.id} | {
             k: dev.get(k) for k in ("device", "name", "runpod_pod_id")
         }
-        run.results.update(policy_id=policy_id, adapter=adapter, host=args.host)
         policy = load_oft(cfg, args.device, adapter)
+        identity = served_adapter_identity(adapter)
+        run.results.update(policy_id=policy_id, adapter=adapter, host=args.host, **identity)
         image_size = int((cfg.get("env") or {}).get("image_size", 224))
         servicer = PolicyServer(
-            policy, image_size=image_size, policy_id=policy_id, server_run=server_run
+            policy,
+            image_size=image_size,
+            policy_id=policy_id,
+            server_run=server_run,
+            adapter=identity,
         )
         server, port = build_server(servicer, args.host, args.port)
         run.results["port"] = port
