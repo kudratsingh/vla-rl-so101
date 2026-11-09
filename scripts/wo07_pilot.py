@@ -20,8 +20,10 @@
             motion holds it (Ctrl-C is a flag outside prompts: it stops motion between ticks and
             never interrupts a bus transfer or the shutdown); closing the Terminal (SIGHUP /
             SIGTERM) takes the closed-stdin path (grace period, torque off,
-            released_unconfirmed, cause hangup). A servo over-temperature / over-current fault
-            cuts torque at once.
+            released_unconfirmed, cause hangup). Ctrl-Z never suspends the session (it is
+            ignored with a message); it must run in the terminal's foreground, and losing the
+            foreground takes the same path (cause lost_foreground). A servo
+            over-temperature / over-current fault cuts torque at once.
             A failed torque-off ("torque off unconfirmed") blocks all further motion and says to
             switch off the inline power switch; the trial records and the session end keep it.
 
@@ -312,7 +314,8 @@ def run_hardware(cfg: Config, args: argparse.Namespace) -> Path:
             print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
         arm = So101Driver.from_config(cfg, fk)  # builds the follower; no port is opened yet
         operator = ConsoleOperator(TorqueGuard(arm, torque_wait))
-        # Ctrl-C a flag outside prompts, SIGHUP / SIGTERM the closed-stdin path (prompts.py)
+        # Ctrl-C a flag outside prompts, SIGHUP / SIGTERM / a lost foreground the closed-stdin
+        # path, Ctrl-Z ignored: from before torque on to after the final torque off (prompts.py)
         with operator_signals() as interrupts, OpenCVFrameSource(cam_cfg) as cam, arm:
             loop = DeployLoop(arm, cam, pipe, client, dcfg, interrupts=interrupts)
             return session(

@@ -35,6 +35,8 @@ waits ``teleop.prompt_support_grace_s`` (default 10 s; ENTER = now), turns torqu
 session (saved episodes are kept; an unsaved one is discarded). At the final support prompt only
 ENTER confirms: Ctrl-C is ignored (the follower keeps holding, the bounded wait keeps running); a
 closed stdin prints a loud warning, waits the grace period without stdin, then turns torque off.
+Ctrl-Z never suspends the session (it prints that it was ignored); losing the terminal's
+foreground (the process resumed with ``bg``) is handled like a closed Terminal, ``lost_foreground``.
 Those ends are recorded as ``released_unconfirmed`` (``session_end`` and ``support_confirmed:
 false`` in ``meta/vla_rl_so101.json``), never as supported. The wait is ``select()`` on stdin in
 this one thread: the servo bus keeps a single owner, and nothing reads it in the background.
@@ -100,11 +102,13 @@ from src.robot.driver import (
 from src.robot.prompts import (
     CTRL_C,
     ENTER,
+    INTERRUPTS,
     STDIN_GONE,
     TIMEOUT,
     LineReader,
     TorqueGuard,
     TorqueWait,
+    job_control,
     operator_signals,
     prompt_input,
     require_terminal,
@@ -216,7 +220,10 @@ class Session:
             return None
 
     def tick(self) -> tuple[Any, StepResult]:
-        """One control step. Returns (camera frame or None, step result)."""
+        """One control step. Returns (camera frame or None, step result). Polls the terminal's
+        foreground first (``Interrupts.check_foreground``; on a loss ``ctrl_c_as_flag`` sets
+        ``stop``, as for a hang-up)."""
+        INTERRUPTS.check_foreground()
         try:
             frame = self.cam.read()
         except CameraFault as e:
@@ -291,7 +298,10 @@ def ctrl_c_as_flag(sess: Session) -> Iterator[None]:
     or inside ``add_frame``, which leaves the episode buffer ragged (``save_episode`` raises).
     SIGHUP / SIGTERM (the Terminal closed) also set ``sess.stop``, and every later prompt ends
     as ``hangup``: the closed-stdin path (grace period, torque off, ``released_unconfirmed``)
-    instead of the process dying with the arm held under torque (``operator_signals``).
+    instead of the process dying with the arm held under torque (``operator_signals``). A lost
+    terminal foreground (SIGTTIN / SIGTTOU, or ``tcgetpgrp`` polled every tick) does the same,
+    as ``lost_foreground``. Ctrl-Z is ignored (``job_control``, which ``main`` also enters
+    around the whole torque-on block).
     """
 
     def on_signal() -> None:
@@ -611,6 +621,7 @@ def main() -> None:
         sess: Session | None = None
         try:
             with (
+                job_control(),  # Ctrl-Z ignored, foreground watched: torque on to torque off
                 OpenCVFrameSource(cfg["cameras"]["front"]) as cam,
                 arm,  # torque ON from here, holding the pose
             ):

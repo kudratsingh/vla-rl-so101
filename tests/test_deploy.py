@@ -1132,6 +1132,54 @@ def test_hangup_during_motion_takes_the_closed_stdin_path_and_records_it(tmp_pat
         assert r.arm.deadman.response is DeadmanResponse.TORQUE_OFF
 
 
+def test_lost_foreground_during_motion_is_polled_per_tick_and_takes_the_hangup_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Job control (owner 2026-11-08): the process group loses the terminal's foreground while
+    the arm moves (``tcgetpgrp`` polled by ``DeployLoop`` every tick; faked here). Motion stops
+    at the next tick, the started trial is a failure (fault kind ``lost_foreground``), then the
+    grace period, torque off, ``released_unconfirmed`` with cause ``lost_foreground``. The real
+    prompt reader and a real terminal are exercised in tests/test_job_control.py."""
+    from src.robot import prompts as P
+
+    lost = [False]
+    monkeypatch.setattr(P, "not_foreground", lambda _fd: "pgrp 1 != 2" if lost[0] else None)
+    with rig() as r, P.job_control():
+        P.INTERRUPTS.tty_fd = 0  # as with stdin on the terminal
+        r.loop.interrupts = P.INTERRUPTS
+        op, reader = _console(r, ["", ""])  # home, placement; then the foreground is lost
+        fake = op.guard.read_line
+
+        def read(prompt: str, timeout_s: float | None) -> str | None:
+            with P._reading():  # the real check timed_input makes before every read
+                return fake(prompt, timeout_s)
+
+        op.guard.read_line = read
+        writes: list[int] = []
+
+        def lose() -> None:
+            lost[0] = True
+            writes.append(len(r.fol.sent))
+
+        hook = _after_first_action(r, lose)
+        t0 = op.guard.clock()
+        pilot.session(
+            real_cfg(), r.loop, op, r.server_info, **_pilot_kw(tmp_path), on_trial_start=hook
+        )
+        res = _record(tmp_path)
+        (t,) = res["trials"]
+        assert t["policy_started"] and t["outcome"] == "failure"
+        assert t["stop_reason"] == "lost_foreground" and t["fault"]["kind"] == "lost_foreground"
+        assert res["session_end"].startswith("lost_foreground: lost the terminal's foreground")
+        assert res["shutdown"] == "released_unconfirmed" and res["support_confirmed"] is False
+        assert res["shutdown_detail"]["cause"] == "lost_foreground"
+        assert op.guard.clock() - t0 == pytest.approx(10.0)  # the grace period, then torque off
+        assert not r.fol.bus.torque_enabled
+        assert r.arm.deadman.response is DeadmanResponse.TORQUE_OFF
+        assert len(r.fol.sent) - writes[0] <= 2  # the next tick's check stopped it (+ the hold)
+        assert len(reader.calls) == 2  # the support prompt was never read from the terminal
+
+
 @pytest.mark.parametrize("where", ["servo_read", "eof_grace"])
 def test_ctrl_c_in_the_shutdown_never_skips_it(tmp_path: Path, where: str) -> None:
     """Without the flag handler (a fallback): a Ctrl-C at the home prompt ends the session, then

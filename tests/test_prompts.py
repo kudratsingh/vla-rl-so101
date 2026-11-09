@@ -3,7 +3,9 @@ scripted stdin (tests/robot_fakes.FakeReader). No serial port, no terminal."""
 
 from __future__ import annotations
 
+import contextlib
 import math
+import sys
 from typing import Any
 
 import pytest
@@ -425,7 +427,14 @@ def test_require_terminal_wants_a_tty_on_stdin_and_stdout(monkeypatch: pytest.Mo
         monkeypatch.setattr(P.sys, "stdin", tty_in)
         monkeypatch.setattr(P.sys, "stdout", tty_out)
         assert P.not_a_terminal() is None
+        # a tty, but not this process's controlling terminal: not in its foreground (job control)
+        with pytest.raises(SystemExit, match="not in its terminal's foreground"):
+            P.require_terminal("x")
+        monkeypatch.setattr(P.os, "tcgetpgrp", lambda _fd: os.getpgrp())  # the foreground job
         P.require_terminal("x")  # passes
+        monkeypatch.setattr(P.os, "tcgetpgrp", lambda _fd: os.getpgrp() + 1)  # `cmd &` / `bg`
+        with pytest.raises(SystemExit, match="foreground process group is(.|\n)*nothing was op"):
+            P.require_terminal("wo07_pilot --hardware")
         monkeypatch.setattr(P.sys, "stdout", pipe_out)  # e.g. `| tee log`: prompts may be unseen
         assert P.not_a_terminal() == "stdout"
         monkeypatch.setattr(P.sys, "stdin", pipe_in)
@@ -436,5 +445,165 @@ def test_require_terminal_wants_a_tty_on_stdin_and_stdout(monkeypatch: pytest.Mo
     finally:
         for fh in (tty_in, tty_out, pipe_in, pipe_out):
             fh.close()
+        os.close(slave)
+        os.close(master)
+
+
+# -- job control (owner decision 2026-11-08): Ctrl-Z ignored, foreground required --------------
+# The pty end-to-end tests (a real Ctrl-Z typed on a terminal) are in tests/test_job_control.py.
+SESSION_SIGNALS = ("SIGINT", "SIGHUP", "SIGTERM", "SIGTSTP", "SIGTTIN", "SIGTTOU")
+
+
+def _sentinels() -> dict[Any, Any]:
+    """A distinct Python handler on every signal the session touches."""
+    import signal
+
+    out: dict[Any, Any] = {}
+    for name in SESSION_SIGNALS:
+        sig = getattr(signal, name)
+
+        def h(signum: int, frame: Any, name: str = name) -> None:
+            raise AssertionError(f"sentinel {name} called")
+
+        out[sig] = h
+    return out
+
+
+@pytest.mark.parametrize("shape", ["operator_signals", "job_control", "nested"])
+def test_every_session_signal_handler_is_restored_also_on_an_exception(shape: str) -> None:
+    import signal
+
+    sentinels = _sentinels()
+    before = {s: signal.signal(s, h) for s, h in sentinels.items()}
+    try:
+        for fail in (False, True):
+            with contextlib.suppress(RuntimeError):
+                if shape == "operator_signals":
+                    cm: Any = P.operator_signals()
+                elif shape == "job_control":
+                    cm = P.job_control()
+                else:  # teleop: job_control around the arm, operator_signals inside it
+                    cm = contextlib.ExitStack()
+                    cm.enter_context(P.job_control())
+                    cm.enter_context(P.operator_signals())
+                with cm:
+                    assert P.INTERRUPTS.job_control
+                    for name in ("SIGTSTP", "SIGTTIN", "SIGTTOU"):
+                        h = signal.getsignal(getattr(signal, name))
+                        assert callable(h) and h is not sentinels[getattr(signal, name)]
+                    if shape != "job_control":
+                        assert signal.getsignal(signal.SIGINT) is not sentinels[signal.SIGINT]
+                    if fail:
+                        raise RuntimeError("bug inside the session")
+            for sig, h in sentinels.items():
+                assert signal.getsignal(sig) is h, signal.Signals(sig).name
+            assert not P.INTERRUPTS.job_control and P.INTERRUPTS.tty_fd is None
+            assert P.INTERRUPTS.on_lost is None
+    finally:
+        for s, h in before.items():
+            signal.signal(s, h)
+
+
+def test_ctrl_z_is_a_notice_and_a_background_read_or_write_is_a_lost_foreground(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In-process: SIGTSTP leaves the session running (the handler is checked to be installed
+    before the signal is sent); SIGTTOU (a background write / tcflush) marks the foreground
+    lost, calls on_signal like a hang-up and is ignored from then on; every later prompt takes
+    the closed-stdin path with cause lost_foreground; stdio is not detached."""
+    import os
+    import signal
+
+    detached: list[int] = []
+    monkeypatch.setattr(P, "_detach_stdio", lambda: detached.append(1))
+    seen: list[int] = []
+    r, w = os.pipe()
+    f = _stdin_from(monkeypatch, r)
+    try:
+        with P.operator_signals(lambda: seen.append(1)) as flags:
+            assert callable(signal.getsignal(signal.SIGTSTP))  # else the kill would stop pytest
+            os.kill(os.getpid(), signal.SIGTSTP)
+            assert flags.lost_foreground is None and not flags.ctrl_c and not seen
+            assert P.timed_input("p? ", 0.05) is None  # prompts still work after a Ctrl-Z
+            assert callable(signal.getsignal(signal.SIGTTOU))
+            os.kill(os.getpid(), signal.SIGTTOU)
+            assert flags.lost_foreground is not None and flags.lost_foreground.startswith("SIGTTOU")
+            assert seen == [1] and flags.hangup is None and not detached
+            assert signal.getsignal(signal.SIGTTIN) is signal.SIG_IGN  # never signalled again
+            assert signal.getsignal(signal.SIGTTOU) is signal.SIG_IGN
+            os.write(w, b"y\n")  # nothing typed now can answer: the terminal is not ours
+            with pytest.raises(P.LostForeground):
+                P.timed_input("p? ", 5.0)
+            g, _, fol, said, clock = _guard([], wait=WAIT)
+            g.read_line = P.timed_input
+            t0 = clock()
+            assert g.support("support it, ENTER: ") == P.LOST_FOREGROUND
+            assert clock() - t0 == pytest.approx(10.0)  # the grace, without stdin
+            assert any("LOST THE TERMINAL'S FOREGROUND" in m for m in said)
+            assert g.released is not None and g.released["cause"] == P.LOST_FOREGROUND
+            assert not fol.bus.torque_enabled and "foreground" in g.arm.deadman.reason
+        assert signal.getsignal(signal.SIGTTOU) is signal.SIG_DFL  # restored, not left ignored
+    finally:
+        f.close()
+        os.close(w)
+
+
+def test_a_lost_foreground_ends_a_prompt_wait_at_the_next_poll_not_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import time
+
+    r, w = os.pipe()
+    f = _stdin_from(monkeypatch, r)
+    lost_at = [math.inf]
+    monkeypatch.setattr(
+        P, "not_foreground", lambda _fd: "bg" if time.monotonic() >= lost_at[0] else None
+    )
+    try:
+        with P.job_control() as flags:
+            flags.tty_fd = r  # as with stdin on the terminal
+            line, elapsed = _timed("p? ", 0.6)  # still in the foreground: the deadline as before
+            assert line is None and 0.6 <= elapsed < 0.6 + SLACK_S
+            lost_at[0] = time.monotonic() + 0.3
+            t0 = time.monotonic()
+            with pytest.raises(P.LostForeground, match="foreground"):
+                P.timed_input("support? ", 30.0)
+            assert time.monotonic() - t0 < 0.3 + P.FOREGROUND_POLL_S + SLACK_S
+            assert flags.lost_foreground == "bg" and flags.check_foreground()
+            with pytest.raises(P.LostForeground):  # every later prompt, at once
+                P.prompt_input("type 'go': ")
+    finally:
+        f.close()
+        os.close(w)
+
+
+def test_job_control_refuses_a_session_out_of_the_foreground_before_its_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The re-check on entry (Ctrl-Z before the session started, then ``bg``): nothing inside
+    the ``with`` (the camera, the arm's torque on) runs, and no handler is left installed."""
+    import os
+    import signal
+
+    from robot_fakes import tty_stdout
+
+    master, slave = os.openpty()
+    tty_in = open(slave, "r", closefd=False)  # noqa: SIM115 - closed below
+    before = {s: signal.getsignal(s) for s in (signal.SIGTSTP, signal.SIGINT)}
+    monkeypatch.setattr(P.sys, "stdin", tty_in)
+    monkeypatch.setattr(P.os, "tcgetpgrp", lambda _fd: os.getpgrp() + 1)
+    ran: list[int] = []
+    try:
+        with tty_stdout() as out:
+            monkeypatch.setattr(P.sys, "stdout", out)
+            refused = pytest.raises(SystemExit, match="not in its terminal's foreground")
+            with refused, P.operator_signals():
+                ran.append(1)
+            monkeypatch.setattr(P.sys, "stdout", sys.__stdout__)
+        assert ran == [] and not P.INTERRUPTS.job_control
+        assert {s: signal.getsignal(s) for s in before} == before
+    finally:
+        tty_in.close()
         os.close(slave)
         os.close(master)

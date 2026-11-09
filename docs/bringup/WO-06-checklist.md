@@ -415,11 +415,21 @@ What happens and what you do:
    half-typed answer (or a Ctrl-D in mid-line) when the time runs out counts as no answer and
    is thrown away. Anything typed before a prompt appears is discarded, so press ENTER only
    once the prompt is on screen. With `null` (no bound), a Ctrl-D still never confirms
-   support, also after a half-typed answer: only ENTER does. Do not press Ctrl-Z: it suspends
-   the session with the arm under torque and stops the 60 s clock (type `fg` at once if it
-   happens). Teleop, the pilot and the real eval refuse to start unless
-   stdin and stdout are the Terminal itself (no `| tee`, no `< file`, no `yes |`): run them
-   directly in Terminal; to keep a log use `script -q log.txt uv run ...`. `null` restores the
+   support, also after a half-typed answer: only ENTER does. Ctrl-Z does not suspend the
+   session: it prints `Ctrl-Z ignored: the arm session is running (torque may be on); use
+   Ctrl-C to stop motion ...` and nothing else (motion goes on, the prompt keeps waiting and its
+   60 s keep running). Under `uv run` Ctrl-Z also reaches `uv`, which stops: Terminal says
+   "suspended", the session loses the foreground and ends as described below (support the
+   arm; torque off after 10 s). So still do not press Ctrl-Z there; started as
+   `.venv/bin/python scripts/...` it is only the notice. Ctrl-C stops motion; the hard stop
+   is still the inline power switch (Ctrl-\ kills the process at once and leaves the servos
+   holding their last goal under torque until the switch is off). Teleop, the pilot and the real eval refuse to start unless
+   stdin and stdout are the Terminal itself (no `| tee`, no `< file`, no `yes |`) and the
+   process is the Terminal's foreground job (no trailing `&`, not resumed with `bg`): run them
+   directly in Terminal; to keep a log use `script -q log.txt uv run ...`. If the session ever
+   loses the foreground (e.g. another program takes the Terminal), it ends like a closed
+   Terminal: motion stops, `LOST THE TERMINAL'S FOREGROUND ... SUPPORT THE ARM NOW`, torque off
+   after 10 s, recorded as `released_unconfirmed` (cause `lost_foreground`). `null` restores the
    old wait-forever behaviour for teleop only (not recommended; a closed stdin still gets the
    10 s grace); the pilot and real eval refuse it.
 3. **Sync (not recorded):** the follower eases onto the leader's pose, clipped to the safety limits,

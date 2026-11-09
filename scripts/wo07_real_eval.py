@@ -73,7 +73,9 @@ Each invocation is its own run record, holding every trial of the session so far
 written when the session is bound and after every trial, so a run killed without exiting
 (SIGKILL, power loss) can be resumed itself. Closing the Terminal (SIGHUP / SIGTERM) is not a
 kill: the session takes the closed-stdin path (grace period, torque off, released_unconfirmed,
-cause hangup) and writes its record.
+cause hangup) and writes its record. Ctrl-Z never suspends a hardware session (ignored with a
+message); the session must run in the terminal's foreground, and losing it takes the same path
+(cause lost_foreground).
 ``--resume`` refuses a run that a later run of its session continued (a resume of an older
 run would fork the session and drop the newer runs' scored trials), and warns (``--hardware``: asks for
 'checked') when an earlier run ended with TORQUE OFF UNCONFIRMED, in a trial or at shutdown.
@@ -961,7 +963,8 @@ def run_hardware(
             print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
         guard = TorqueGuard(arm, torque_wait)
         operator = JudgeOperator(guard, str(settings["task"]), settle_s_from_config(cfg))
-        # Ctrl-C a flag outside prompts, SIGHUP / SIGTERM the closed-stdin path (prompts.py)
+        # Ctrl-C a flag outside prompts, SIGHUP / SIGTERM / a lost foreground the closed-stdin
+        # path, Ctrl-Z ignored: from before torque on to after the final torque off (prompts.py)
         with operator_signals() as interrupts, OpenCVFrameSource(cam_cfg) as cam, arm:
             loop = DeployLoop(arm, cam, pipe, client, dcfg, interrupts=interrupts)
             return session(

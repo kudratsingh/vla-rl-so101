@@ -33,6 +33,27 @@ Shared by the teleop recorder (scripts/wo06_teleop_record.py), the WO-07 pilot
   is gone), stop motion at the next tick, and make every later prompt end as ``hangup`` (the
   closed-stdin path above), so torque goes off after the grace period instead of the process
   dying with the arm held under torque.
+* Job control (owner decision 2026-11-08, ``job_control``, entered by ``operator_signals`` and,
+  in teleop, around the whole torque-on block): Ctrl-Z (SIGTSTP) never suspends a hardware
+  session. It prints ``CTRL_Z_IGNORED`` and does nothing else: motion and prompts continue, a
+  bounded wait keeps its deadline. The scope is the whole hardware session, from before torque
+  is enabled to after the final torque-off, torque-off windows inside it included (a session
+  stopped there still holds the port, has not written its record, and ``bg`` would resume it
+  in the background). A session needs the terminal's foreground: ``require_terminal`` refuses
+  a process that is not in its terminal's foreground process group (started with ``&``,
+  resumed with ``bg``) before any port is opened, and ``job_control`` checks again on entry.
+  Losing the foreground during the session (SIGTTIN / SIGTTOU, sent only to a background
+  process group that reads or writes the terminal; an ``os.tcgetpgrp`` that no longer names
+  this process group, polled at every prompt read, every 0.25 s inside a wait and every motion
+  tick; an EIO read from the background) sets ``INTERRUPTS.lost_foreground`` and goes down the
+  hang-up path above: motion stops at the next tick (fault kind ``lost_foreground``), every
+  later prompt ends as ``lost_foreground`` (grace period without stdin, torque off,
+  ``released_unconfirmed`` with cause ``lost_foreground``), stdio is NOT detached (the terminal
+  still exists). SIGTTIN / SIGTTOU are ignored after the first one, so a retried background
+  read fails with EIO and a background write goes through instead of signalling again: the
+  kernel never stops the process. Every handler touched (SIGINT, SIGHUP, SIGTERM, SIGTSTP,
+  SIGTTIN, SIGTTOU) is restored when the session ends, also on an exception. SIGSTOP (``kill
+  -STOP``) cannot be caught: the inline power switch remains the hard stop.
 
 The wait is ``select()`` on stdin's file descriptor in the calling thread (``timed_input``): no
 reader thread, and the servo bus keeps a single owner (the health reads happen in this thread,
@@ -54,8 +75,9 @@ check) run with torque off and read a tty in canonical mode, where one read retu
 line, so they never leave bytes buffered either.
 
 The hardware entry points (pilot, real eval, teleop) refuse to start unless stdin and stdout are
-a terminal (``require_terminal``), before any port is opened: the prompts need an operator who
-can see them and answer them. Mock / scripted runs need no terminal.
+a terminal and the process is in that terminal's foreground (``require_terminal``), before any
+port is opened: the prompts need an operator who can see them and answer them. Mock / scripted
+runs need no terminal.
 """
 
 from __future__ import annotations
@@ -84,8 +106,13 @@ LineReader = Callable[[str, float | None], str | None]
 Raises KeyboardInterrupt on Ctrl-C and EOFError on a closed stdin (``Hangup`` on a hang-up)."""
 
 ENTER, CTRL_C, EOF, HANGUP, TIMEOUT = "enter", "ctrl_c", "eof", "hangup", "timeout"
-STDIN_GONE = (EOF, HANGUP)
+LOST_FOREGROUND = "lost_foreground"
+TERMINAL_GONE = (HANGUP, LOST_FOREGROUND)
+"""The operator's terminal is gone (hang-up) or no longer this session's (lost foreground)."""
+STDIN_GONE = (EOF, *TERMINAL_GONE)
 """Prompt ends where nobody can answer any more: the closed-stdin path."""
+FOREGROUND_POLL_S = 0.25
+"""How often a prompt wait on the terminal re-checks that the session still has its foreground."""
 
 TORQUE_WAIT_EXPIRED = (
     "\nNo answer for {timeout:.0f} s with torque ON. SUPPORT THE ARM NOW: put a hand under the "
@@ -101,12 +128,44 @@ CTRL_C_IGNORED = (
     "switch off the servo supply)."
 )
 CTRL_C_IGNORED_GRACE = "\nCtrl-C ignored: torque goes OFF when the grace period ends (ENTER = now)."
+CTRL_Z_IGNORED = (
+    "\nCtrl-Z ignored: the arm session is running (torque may be on); use Ctrl-C to stop motion. "
+    "An open prompt is still waiting for its answer.\n"
+)
 
 T = TypeVar("T")
 
 
 class Hangup(EOFError):
     """The operator's terminal went away (SIGHUP / SIGTERM): handled as a closed stdin."""
+
+    how = HANGUP
+
+
+class LostForeground(Hangup):
+    """The session's process group lost the terminal's foreground: handled as a hang-up."""
+
+    how = LOST_FOREGROUND
+
+
+def gone_error(how: str, reason: str) -> Hangup:
+    """The exception for a terminal that is gone (``TERMINAL_GONE``): ``Hangup`` or
+    ``LostForeground``."""
+    return LostForeground(reason) if how == LOST_FOREGROUND else Hangup(reason)
+
+
+def not_foreground(fd: int) -> str | None:
+    """Why this process is not in the foreground process group of the terminal on ``fd``, or
+    None when it is. A terminal that is not this process's controlling terminal, or is gone,
+    fails ``tcgetpgrp`` and counts as not in the foreground."""
+    try:
+        fg = os.tcgetpgrp(fd)
+    except OSError as e:
+        return f"tcgetpgrp: {e.strerror or e}"
+    pgrp = os.getpgrp()
+    if fg == pgrp:
+        return None
+    return f"the terminal's foreground process group is {fg}, this process's is {pgrp}"
 
 
 class Interrupts:
@@ -115,9 +174,40 @@ class Interrupts:
     def __init__(self) -> None:
         self.ctrl_c = False  # SIGINT outside a prompt read
         self.hangup: str | None = None  # "SIGHUP" | "SIGTERM" once received; never cleared
+        # why the session lost its terminal's foreground, once it did; never cleared
+        self.lost_foreground: str | None = None
+        self.tty_fd: int | None = None  # the terminal ``job_control`` watches (None: no tty)
+        self.on_lost: Callable[[], None] | None = None  # operator_signals' on_signal
+        self.job_control = False  # inside ``job_control``
 
     def reset(self) -> None:
-        self.ctrl_c, self.hangup = False, None
+        self.ctrl_c, self.hangup, self.lost_foreground = False, None, None
+
+    def lose_foreground(self, why: str) -> None:
+        """Record the loss of the terminal's foreground (once) and tell the session
+        (``on_lost``, like a hang-up)."""
+        if self.lost_foreground is None:
+            self.lost_foreground = why
+            if self.on_lost is not None:
+                self.on_lost()
+
+    def check_foreground(self) -> bool:
+        """True once the session lost its terminal's foreground; polls ``tcgetpgrp`` on the
+        watched terminal (``job_control`` with a tty only; cheap: one ioctl)."""
+        if self.lost_foreground is None and self.tty_fd is not None:
+            why = not_foreground(self.tty_fd)
+            if why is not None:
+                self.lose_foreground(why)
+        return self.lost_foreground is not None
+
+    def terminal_gone(self) -> tuple[str, str] | None:
+        """(how, why) once the operator's terminal is gone: a hang-up first (the tty is gone,
+        so its foreground is too), then a lost foreground. None while it is there."""
+        if self.hangup is not None:
+            return HANGUP, f"{self.hangup}: the operator's terminal closed"
+        if self.check_foreground():
+            return LOST_FOREGROUND, f"lost the terminal's foreground ({self.lost_foreground})"
+        return None
 
 
 INTERRUPTS = Interrupts()
@@ -145,12 +235,79 @@ def _raise_hangup(signum: int, frame: FrameType | None) -> None:
 HANGUP_SIGNALS = (signal.SIGHUP, signal.SIGTERM)
 
 
+def _tty_fd(stream: Any) -> int | None:
+    try:
+        return int(stream.fileno()) if stream is not None and stream.isatty() else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+@contextlib.contextmanager
+def job_control() -> Iterator[Interrupts]:
+    """For the whole of a real-arm session (module doc), from before torque is enabled to after
+    the final torque-off: SIGTSTP (Ctrl-Z) prints ``CTRL_Z_IGNORED`` and nothing else; SIGTTIN /
+    SIGTTOU mark the loss of the foreground (``Interrupts.lose_foreground``) and are ignored from
+    then on, so neither can stop the process. With stdin on a terminal it is watched for the
+    foreground (``Interrupts.check_foreground``), and a process already out of the foreground
+    exits here (``NOT_FOREGROUND``) before anything inside the ``with`` is opened. Nested entries
+    (teleop's ``operator_signals`` inside its own ``job_control``) change nothing. The previous
+    handlers are restored on exit, also on an exception."""
+    if INTERRUPTS.job_control:
+        yield INTERRUPTS
+        return
+    INTERRUPTS.reset()
+    tty = _tty_fd(sys.stdin)
+    if tty is not None and (why := not_foreground(tty)) is not None:
+        sys.exit(NOT_FOREGROUND.format(what="the arm session", why=why))
+    notice = _tty_fd(sys.stdout)
+    message = CTRL_Z_IGNORED.encode()
+
+    def on_tstp(signum: int, frame: FrameType | None) -> None:
+        # os.write, not print: a print here could re-enter a print the session was doing
+        if notice is not None and INTERRUPTS.hangup is None:
+            with contextlib.suppress(OSError):
+                os.write(notice, message)
+
+    def on_background_io(signum: int, frame: FrameType | None) -> None:
+        # ignored from now on: the retried read fails with EIO, a write or tcflush proceeds,
+        # instead of the kernel signalling (or stopping) again
+        for s in (signal.SIGTTIN, signal.SIGTTOU):
+            signal.signal(s, signal.SIG_IGN)
+        INTERRUPTS.lose_foreground(
+            f"{signal.Signals(signum).name}: terminal I/O from the background"
+        )
+
+    handlers = {
+        signal.SIGTSTP: on_tstp,
+        signal.SIGTTIN: on_background_io,
+        signal.SIGTTOU: on_background_io,
+    }
+    prev: dict[signal.Signals, Any] = {}
+    try:
+        for s, h in handlers.items():
+            prev[s] = signal.signal(s, h)
+        INTERRUPTS.tty_fd, INTERRUPTS.job_control = tty, True
+        yield INTERRUPTS
+    finally:
+        for s, h in prev.items():
+            signal.signal(s, h)
+        INTERRUPTS.tty_fd, INTERRUPTS.job_control = None, False
+
+
 @contextlib.contextmanager
 def operator_signals(on_signal: Callable[[], None] | None = None) -> Iterator[Interrupts]:
     """For a real-arm session (module doc): SIGINT only sets ``INTERRUPTS.ctrl_c``; SIGHUP and
-    SIGTERM set ``INTERRUPTS.hangup`` and detach stdio. ``on_signal()`` runs after either (teleop
-    sets its loop-stop flag). The previous handlers are restored on exit."""
-    INTERRUPTS.reset()
+    SIGTERM set ``INTERRUPTS.hangup`` and detach stdio; ``job_control`` (Ctrl-Z ignored, the
+    foreground watched). ``on_signal()`` runs after any of them and after a lost foreground
+    (teleop sets its loop-stop flag). The previous handlers are restored on exit, also on an
+    exception."""
+    with job_control(), _operator_handlers(on_signal):
+        yield INTERRUPTS
+
+
+@contextlib.contextmanager
+def _operator_handlers(on_signal: Callable[[], None] | None) -> Iterator[None]:
+    INTERRUPTS.ctrl_c, INTERRUPTS.hangup = False, None
 
     def on_sigint(signum: int, frame: FrameType | None) -> None:
         INTERRUPTS.ctrl_c = True
@@ -162,21 +319,27 @@ def operator_signals(on_signal: Callable[[], None] | None = None) -> Iterator[In
         if on_signal is not None:
             on_signal()
 
-    prev: dict[signal.Signals, Any] = {signal.SIGINT: signal.signal(signal.SIGINT, on_sigint)}
-    for s in HANGUP_SIGNALS:
-        prev[s] = signal.signal(s, on_hup)
+    prev_lost = INTERRUPTS.on_lost
+    prev: dict[signal.Signals, Any] = {}
     try:
-        yield INTERRUPTS
+        prev[signal.SIGINT] = signal.signal(signal.SIGINT, on_sigint)
+        for s in HANGUP_SIGNALS:
+            prev[s] = signal.signal(s, on_hup)
+        INTERRUPTS.on_lost = on_signal
+        yield
     finally:
         for s, h in prev.items():
             signal.signal(s, h)
+        INTERRUPTS.on_lost = prev_lost
 
 
 @contextlib.contextmanager
 def _reading() -> Iterator[None]:
-    """During a prompt read only: Ctrl-C raises KeyboardInterrupt, a hang-up raises ``Hangup``."""
-    if INTERRUPTS.hangup is not None:
-        raise Hangup(f"{INTERRUPTS.hangup}: the operator's terminal closed")
+    """During a prompt read only: Ctrl-C raises KeyboardInterrupt, a hang-up raises ``Hangup``,
+    a lost foreground (before the read, or an EOF / EIO from the background) ``LostForeground``."""
+    gone = INTERRUPTS.terminal_gone()
+    if gone is not None:
+        raise gone_error(*gone)
     prev: dict[signal.Signals, Any] = {
         signal.SIGINT: signal.signal(signal.SIGINT, signal.default_int_handler)
     }
@@ -184,6 +347,11 @@ def _reading() -> Iterator[None]:
         prev[s] = signal.signal(s, _raise_hangup)
     try:
         yield
+    except EOFError as e:
+        gone = None if isinstance(e, Hangup) else INTERRUPTS.terminal_gone()
+        if gone is not None:
+            raise gone_error(*gone) from e
+        raise
     finally:
         for s, h in prev.items():
             signal.signal(s, h)
@@ -245,15 +413,22 @@ def _read_line_by(deadline: float) -> str | None:
     """One line from fd 0 (no newline), or None once ``deadline`` (``time.monotonic``; ``inf`` =
     never) passes, also in mid-line. Never reads past the newline (``_read_size``). EOF ->
     EOFError; OSError (EIO from a hung-up tty) and a closed / fd-less stdin -> EOFError. Ctrl-C
-    and a hang-up raise from ``select`` / ``os.read`` under ``_reading``."""
+    and a hang-up raise from ``select`` / ``os.read`` under ``_reading``. On a watched terminal
+    (``job_control``) the wait wakes every ``FOREGROUND_POLL_S`` to check the foreground (the
+    deadline is unchanged): ``LostForeground`` once it is lost."""
     got = bytearray()
+    poll = math.inf if INTERRUPTS.tty_fd is None else FOREGROUND_POLL_S
     try:
         fd = sys.stdin.fileno()
         encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
         size = _read_size(fd)
         while (left := deadline - time.monotonic()) > 0:
-            if not select.select([fd], [], [], None if math.isinf(left) else left)[0]:
-                break  # the deadline passed, maybe in mid-line
+            wait = min(left, poll)
+            if not select.select([fd], [], [], None if math.isinf(wait) else wait)[0]:
+                gone = INTERRUPTS.terminal_gone()
+                if gone is not None:
+                    raise gone_error(*gone)
+                continue  # the deadline is checked above, maybe in mid-line
             chunk = os.read(fd, size)  # readable: returns at once (bytes, or b"" at EOF)
             if not chunk:
                 raise EOFError("stdin closed" + (" in mid-line" if got else ""))
@@ -280,6 +455,11 @@ def _read_size(fd: int) -> int:
     return 1
 
 
+NOT_FOREGROUND = (
+    "{what}: this process is not in its terminal's foreground ({why}): Ctrl-C and the "
+    "torque-on prompts would not reach it. Run it in the foreground (no '&', not resumed with "
+    "'bg'); nothing was opened"
+)
 NOT_A_TERMINAL = (
     "{what}: stdin and stdout must be an interactive terminal for the real arm ({bad} is not a "
     "tty): the torque-on prompts need an operator who sees them and answers them. Run it "
@@ -299,12 +479,34 @@ def not_a_terminal() -> str | None:
     return None
 
 
+def foreground_problem() -> str | None:
+    """Why this process is not in the foreground of its terminal (stdin's, and stdout's when it
+    is the same terminal), or None when it is."""
+    fds = [fd for fd in (_tty_fd(sys.stdin), _tty_fd(sys.stdout)) if fd is not None]
+    if len(fds) == 2:
+        try:
+            a, b = os.fstat(fds[0]), os.fstat(fds[1])
+            if a.st_rdev != b.st_rdev:
+                fds = fds[:1]  # another terminal on stdout: stdin's foreground is the one read
+        except OSError:
+            pass
+    for fd in fds:
+        why = not_foreground(fd)
+        if why is not None:
+            return why
+    return None if fds else "stdin is not a tty"
+
+
 def require_terminal(what: str) -> None:
-    """Exit (``NOT_A_TERMINAL``) unless stdin and stdout are a tty. The hardware entry points call
-    it before any port is opened or torque enabled."""
+    """Exit (``NOT_A_TERMINAL``) unless stdin and stdout are a tty, and (``NOT_FOREGROUND``)
+    unless this process is in that terminal's foreground process group. The hardware entry
+    points call it before any port is opened or torque enabled."""
     bad = not_a_terminal()
     if bad is not None:
         sys.exit(NOT_A_TERMINAL.format(what=what, bad=bad))
+    why = foreground_problem()
+    if why is not None:
+        sys.exit(NOT_FOREGROUND.format(what=what, why=why))
 
 
 @dataclass(frozen=True)
@@ -349,7 +551,7 @@ class TorqueWait:
 @dataclass(frozen=True)
 class Reply:
     """How a prompt ended: ``enter`` (``text`` = the line typed), ``ctrl_c``, ``eof``, ``hangup``,
-    ``timeout``."""
+    ``lost_foreground``, ``timeout``."""
 
     how: str
     text: str = ""
@@ -417,8 +619,11 @@ class TorqueGuard:
         except KeyboardInterrupt:
             return Reply(CTRL_C)
         except EOFError as e:
-            gone = isinstance(e, Hangup) or INTERRUPTS.hangup is not None
-            return Reply(HANGUP if gone else EOF)
+            if INTERRUPTS.hangup is not None:
+                return Reply(HANGUP)
+            if isinstance(e, Hangup):
+                return Reply(e.how)
+            return Reply(LOST_FOREGROUND if INTERRUPTS.lost_foreground is not None else EOF)
         return Reply(TIMEOUT) if line is None else Reply(ENTER, line)
 
     def _check_servos(self) -> None:
@@ -478,20 +683,24 @@ class TorqueGuard:
             return reply.how
 
     def release(self, cause: str, prompt: str) -> None:
-        """Nobody answered (``timeout``) or nobody can (``eof`` / ``hangup``): tell the operator to
+        """Nobody answered (``timeout``) or nobody can (``STDIN_GONE``): tell the operator to
         support the arm, wait the grace period (ENTER = now; Ctrl-C ignored; without stdin after
-        an EOF or a hang-up), trip the deadman TORQUE_OFF and turn torque off."""
+        an EOF, a hang-up or a lost foreground), trip the deadman TORQUE_OFF and turn torque off."""
         grace = self.wait.grace_s
         if cause in STDIN_GONE:
-            what = "TERMINAL HUNG UP" if cause == HANGUP else "STDIN CLOSED"
-            self.say(STDIN_CLOSED.format(what=what, grace=grace))
+            loud = {HANGUP: "TERMINAL HUNG UP", LOST_FOREGROUND: "LOST THE TERMINAL'S FOREGROUND"}
+            self.say(STDIN_CLOSED.format(what=loud.get(cause, "STDIN CLOSED"), grace=grace))
             self._sleep_until(self.clock() + grace)
         else:
             timeout = self.wait.timeout_s or 0.0
             self.say(TORQUE_WAIT_EXPIRED.format(timeout=timeout, grace=grace))
             if grace > 0:
                 self._grace(grace)
-        what = {EOF: "stdin closed", HANGUP: "terminal hung up"}.get(cause, "no answer in time")
+        what = {
+            EOF: "stdin closed",
+            HANGUP: "terminal hung up",
+            LOST_FOREGROUND: "lost the terminal's foreground",
+        }.get(cause, "no answer in time")
         self.arm.deadman.trip(
             f"{what} at a prompt with torque on ({prompt.strip()[:80]!r})",
             DeadmanResponse.TORQUE_OFF,

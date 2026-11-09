@@ -45,8 +45,11 @@ the move home) holds (a deadman trip). On the real arm the session runs under
 ``prompts.operator_signals``: Ctrl-C outside a prompt only sets a flag that ``DeployLoop`` checks
 between ticks (``SessionStop``), so it never lands inside a bus transaction; a hang-up (SIGHUP /
 SIGTERM: the Terminal closed) stops motion the same way (stop reason ``hangup``) and every later
-prompt takes the closed-stdin path. Without the handler (mock) a Ctrl-C mid-tick still holds; the
-port is released first in case it landed inside a bus transaction.
+prompt takes the closed-stdin path. Losing the terminal's foreground (``prompts.job_control``:
+SIGTTIN / SIGTTOU, or ``tcgetpgrp`` polled every tick) is handled exactly like a hang-up, with
+stop reason, fault kind and shutdown cause ``lost_foreground``; Ctrl-Z never suspends the
+session. Without the handler (mock) a Ctrl-C mid-tick still holds; the port is released first in
+case it landed inside a bus transaction.
 
 Prompts with torque on (``ConsoleOperator`` through ``src/robot/prompts.py``'s ``TorqueGuard``,
 owner 2026-11-08): every prompt answered while the arm holds under torque (between trials, the
@@ -135,11 +138,13 @@ from src.robot.prompts import (
     ENTER,
     EOF,
     HANGUP,
+    TERMINAL_GONE,
     TIMEOUT,
     Hangup,
     Interrupts,
     TorqueGuard,
     ack_record,
+    gone_error,
     ignoring_ctrl_c,
 )
 from src.robot.safety import DeadmanResponse
@@ -373,7 +378,8 @@ class FrameSource(Protocol):
 class TrialResult:
     stop_reason: str = ""  # max_steps | safety_reject | deadman | stale_chunk | serial_fault |
     # servo_fault | home_failed | torque_off_unconfirmed (set by run_trials, from the driver) |
-    # server_{timeout,unavailable,error,bad_reply} | operator_abort | hangup | client_error |
+    # server_{timeout,unavailable,error,bad_reply} | operator_abort | hangup | lost_foreground |
+    # client_error |
     # session_lost | operator_quit / prompt_timeout / stdin_closed (placement-prompt attempts)
     stop_detail: str = ""
     deadman_response: str | None = None
@@ -423,7 +429,8 @@ def _say(msg: str) -> None:
 
 
 class SessionStop(Exception):
-    """A Ctrl-C (flag) or a hang-up seen between ticks (``DeployLoop.stop_requested``)."""
+    """A Ctrl-C (flag), a hang-up or a lost foreground seen between ticks
+    (``DeployLoop.stop_requested``)."""
 
     def __init__(self, kind: str, reason: str):
         super().__init__(reason)
@@ -456,12 +463,14 @@ class DeployLoop:
         self.period = 1.0 / dcfg.control_hz
 
     def stop_requested(self) -> SessionStop | None:
-        """A Ctrl-C (flag) or a hang-up since the last prompt answer, as the stop to raise."""
+        """A Ctrl-C (flag) since the last prompt answer, a hang-up or a lost foreground (polled
+        here: ``Interrupts.terminal_gone``), as the stop to raise."""
         i = self.interrupts
         if i is None:
             return None
-        if i.hangup is not None:
-            return SessionStop("hangup", f"{i.hangup}: the operator's terminal closed")
+        gone = i.terminal_gone()
+        if gone is not None:  # kind "hangup" | "lost_foreground"
+            return SessionStop(*gone)
         if i.ctrl_c:
             return SessionStop("operator_abort", "operator Ctrl-C")
         return None
@@ -902,8 +911,9 @@ class ConsoleOperator:
         reply = self.guard.ask(prompt)
         if reply.how == CTRL_C:
             raise KeyboardInterrupt
-        if reply.how == HANGUP:
-            raise Hangup(f"terminal hung up at {prompt.strip()!r}")
+        if reply.how in TERMINAL_GONE:
+            what = "terminal hung up" if reply.how == HANGUP else "lost the terminal's foreground"
+            raise gone_error(reply.how, f"{what} at {prompt.strip()!r}")
         if reply.how == EOF:
             raise EOFError(f"stdin closed at {prompt.strip()!r}")
         if reply.how == TIMEOUT:
@@ -978,6 +988,7 @@ FAULT_KIND = {
     "operator_abort": "operator_abort",  # Ctrl-C while the arm moved: HOLD
     "client_error": "client_error",  # a bug in the client: HOLD
     "hangup": "hangup",  # SIGHUP / SIGTERM (the terminal closed) during motion: HOLD
+    "lost_foreground": "lost_foreground",  # the terminal's foreground lost during motion: HOLD
     "session_lost": "session_lost",  # the process ended before the trial was recorded
     "prompt_timeout": "prompt_timeout",  # a torque-on prompt timed out (not-started attempts)
     TORQUE_OFF_UNCONFIRMED: TORQUE_OFF_UNCONFIRMED,
@@ -1054,8 +1065,8 @@ def _score(
             loop.sleep(float(settle["settle_s"]))  # hold still before scoring
             settle["measured_s"] = round(loop.clock() - t_settle, 3)
             stop = loop.stop_requested()  # a Ctrl-C (flag) / hang-up during the settle
-            if stop is not None and stop.kind == "hangup":
-                raise Hangup(stop.reason)
+            if stop is not None and stop.kind in TERMINAL_GONE:
+                raise gone_error(stop.kind, stop.reason)
             if stop is not None:
                 raise KeyboardInterrupt
             try:
@@ -1071,7 +1082,8 @@ def _score(
         how, why = CTRL_C, f"operator Ctrl-C during {stage}"
     except EOFError as e:
         if isinstance(e, Hangup):
-            how, why = HANGUP, f"terminal hung up during {stage}"
+            what = "terminal hung up" if e.how == HANGUP else "lost the terminal's foreground"
+            how, why = e.how, f"{what} during {stage}"
         else:
             how, why = EOF, f"stdin closed (EOF) during {stage}"
     except PromptTimeout as e:
@@ -1280,8 +1292,8 @@ def run_trials(
         unjudged = scored[3]
         log.info("%s %s: %s (%d steps)", tag, rec["outcome"], rec["stop_reason"], result.steps)
         if unjudged is not None:
-            if unjudged["how"] == HANGUP:  # not an operator choice: the session ends as an error
-                raise Hangup(unjudged["reason"])
+            if unjudged["how"] in TERMINAL_GONE:  # not an operator choice: ends as an error
+                raise gone_error(unjudged["how"], unjudged["reason"])
             if unjudged["how"] == EOF:
                 raise EOFError(unjudged["reason"])
             if unjudged["how"] == CTRL_C:
@@ -1292,8 +1304,8 @@ def run_trials(
             return trials, _torque_off_end(arm)
         if result.stop_reason == "operator_abort":
             return trials, "operator_abort"
-        if result.stop_reason == "hangup":
-            return trials, f"hangup: {result.stop_detail}"
+        if result.stop_reason in TERMINAL_GONE:  # hangup | lost_foreground
+            return trials, f"{result.stop_reason}: {result.stop_detail}"
         if arm.deadman.tripped:
             if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
                 return trials, _torque_off_end(arm)
@@ -1340,7 +1352,7 @@ def _placement(
         attempt("operator_ctrl_c", "operator Ctrl-C")
         raise
     except EOFError as e:
-        attempt("hangup" if isinstance(e, Hangup) else "stdin_closed", str(e) or "EOF")
+        attempt(e.how if isinstance(e, Hangup) else "stdin_closed", str(e) or "EOF")
         raise
     if end is None:
         return None
@@ -1411,7 +1423,8 @@ class Shutdown:
     to support the arm or check it rests safely (``supported``; ``torque_was_off`` acknowledged);
     None after a completed park (the arm rests at the verified park pose; nobody was asked).
     ``released_unconfirmed``: torque went off after a torque-on prompt timed out, stdin closed or
-    the terminal hung up, with ``cause`` timeout | eof | hangup; nobody confirmed support.
+    the terminal hung up or lost its foreground, with ``cause`` timeout | eof | hangup |
+    lost_foreground; nobody confirmed support.
     ``ack``: the acknowledgement wait at the end, {prompt, given, how}. A shutdown that raised
     is recorded by the scripts as ``shutdown: "error: ..."`` with support_confirmed false."""
 
@@ -1544,7 +1557,7 @@ def safe_shutdown(
         how = operator.support(SUPPORT_PROMPT)  # servo health read before the wait
     except (ServoFault, SerialFault):  # torque is now off (or not confirmed off)
         return _torque_already_off(arm, arm.deadman.reason, operator)
-    if how != ENTER:  # eof / hangup / timeout: torque was released after the grace period
+    if how != ENTER:  # eof / hangup / lost_foreground / timeout: torque released after grace
         if arm.torque_off_unconfirmed is not None or not arm.torque_off():
             return _torque_off_unconfirmed(arm, operator)
         return Shutdown(

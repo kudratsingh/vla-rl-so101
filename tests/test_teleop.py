@@ -451,3 +451,54 @@ def test_teleop_refuses_a_non_tty_stdin_before_the_leader_or_the_follower(
         piped.close()
         os.close(w)
     assert opened == []
+
+
+def test_teleop_ctrl_z_mid_episode_continues_and_a_lost_foreground_ends_like_a_hangup(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Job control in teleop (owner 2026-11-08). A Ctrl-Z (SIGTSTP) inside an episode leaves
+    the recording running; the terminal's foreground lost mid-episode (``Session.tick`` polls
+    it; faked here) ends the episode like a hang-up: every later prompt is ``lost_foreground``,
+    the support is never confirmed, torque goes off after the grace (``released_unconfirmed``)."""
+    from robot_fakes import FakeClock, FakeReader
+
+    from src.robot import prompts as P
+
+    lost = [False]
+    monkeypatch.setattr(P, "not_foreground", lambda _fd: "pgrp 1 != 2" if lost[0] else None)
+
+    class JobControlDataset(FakeDataset):
+        frames = 0
+
+        def add_frame(self, frame: dict[str, Any]) -> None:
+            super().add_frame(frame)
+            n = self.frames = self.episode_buffer["size"]
+            if n == 2:
+                assert callable(signal.getsignal(signal.SIGTSTP))  # else this would stop pytest
+                signal.raise_signal(signal.SIGTSTP)  # Ctrl-Z mid-episode: ignored
+            if n == 5:
+                lost[0] = True
+
+    sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
+    clock = FakeClock()
+    reader = FakeReader([""], clock, fol.bus)  # ENTER at the scene prompt, nothing after
+
+    def read(prompt: str, timeout_s: float | None) -> str | None:
+        with P._reading():  # the real check timed_input makes before every read
+            return reader(prompt, timeout_s)
+
+    sess.guard = teleop.TorqueGuard(
+        sess.arm, teleop.TorqueWait(60.0, 10.0), read=read, clock=clock, sleep=clock.sleep
+    )
+    data = JobControlDataset()
+    instr = teleop.protocol_instructions(["Push"])
+    with P.job_control():
+        P.INTERRUPTS.tty_fd = 0  # as with stdin on the terminal (teleop.main's job_control)
+        saved = teleop.record_session(sess, data, ["Push"], instr, 1, 30.0, lambda im: im)
+    out = capsys.readouterr().out
+    assert saved == 0 and data.saved == 0  # the unsaved episode was discarded
+    assert data.frames == 6  # the Ctrl-Z did not stop it; the tick after the loss did
+    assert "episode ended" in out and "LOST THE TERMINAL'S FOREGROUND" in out
+    assert sess.session_end == "released_unconfirmed" and sess.guard.released is not None
+    assert sess.guard.released["cause"] == "lost_foreground"
+    assert not fol.bus.torque_enabled and len(reader.calls) == 1  # only the scene prompt read
