@@ -7,13 +7,16 @@
 # the pod's start command) and /root/.hf_token. The pod also has a hard self-delete timer at the cap.
 set -uo pipefail
 source /root/runpod.env
+# shellcheck source=scripts/pod/approval_lib.sh
+. "$(dirname "$0")/approval_lib.sh"  # this pod's approval file only
 # Containers see every host core (128 on some A100 hosts) but get a cgroup CPU quota (~14);
 # size torch/OpenMP thread pools to the quota or CPU-side work (IK, data loading) crawls.
 if [ -z "${OMP_NUM_THREADS:-}" ] && read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null && [ "$q" != max ]; then
   export OMP_NUM_THREADS=$(( (q + p - 1) / p )) MKL_NUM_THREADS=$(( (q + p - 1) / p ))
 fi
 export PATH="$HOME/.local/bin:$PATH"
-export HF_TOKEN="$(cat /root/.hf_token)"
+HF_TOKEN="$(cat /root/.hf_token)"
+export HF_TOKEN
 export HUB_REPO="${HUB_REPO:-KudratSingh22/vla-rl-so101-sft}"
 CFG="${SFT_CFG:-configs/sft.yaml}"
 STAGE_FILE=/workspace/stage
@@ -118,20 +121,12 @@ stage probe
 run_until_deadline uv run scripts/wo02_sft.py --preset sim --config "$CFG" --probe-steps 20 || exit 20
 
 # Probe -> owner approval gate (owner rule, 2026-10-26): no full run without an explicit go given
-# AFTER the probe numbers are posted. The agent posts them and, on the owner's go, creates
-# /workspace/APPROVED over SSH. No approval within APPROVAL_WAIT_S -> exit (upload + self-delete).
+# AFTER the probe numbers are posted. The agent posts them and, on the owner's go, writes
+# this pod's approval file over SSH (`approval_write`, scripts/pod/approval_lib.sh). No approval
+# within APPROVAL_WAIT_S -> exit (upload + self-delete).
 stage await-approval
 grep "full run .* extrapolated" /workspace/job.log | tail -1
-APPROVAL_WAIT_S="${APPROVAL_WAIT_S:-1800}"
-t0=$(date +%s)
-until [ -f /workspace/APPROVED ]; do
-  if [ $(( $(date +%s) - t0 )) -ge "$APPROVAL_WAIT_S" ]; then
-    echo "[job] no owner approval within $((APPROVAL_WAIT_S / 60)) min; stopping"
-    exit 21
-  fi
-  sleep 15
-done
-echo "[job] approved: $(cat /workspace/APPROVED)"
+await_approval "${APPROVAL_WAIT_S:-1800}" || exit 21
 
 stage sft
 run_until_deadline uv run scripts/wo02_sft.py --preset sim --config "$CFG" || exit 30
@@ -177,7 +172,7 @@ EOF
 if [ -z "$BEST" ]; then
   echo "none" > "$RUN/selected_checkpoint.txt"
   echo "[job] no checkpoint in the 20-60% band; skipping the full eval"
-  stage done
+  stage "done"
   exit 0
 fi
 echo "$BEST" > "$RUN/selected_checkpoint.txt"
@@ -187,4 +182,4 @@ stage full-eval
 run_until_deadline uv run scripts/wo02_eval.py --preset sim --config "$CFG" --adapter "$BEST" \
   --num-envs "$EVAL_ENVS" --sim-device "$SIM_DEVICE" || exit 60
 
-stage done
+stage "done"

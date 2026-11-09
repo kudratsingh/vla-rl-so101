@@ -1,0 +1,660 @@
+#!/usr/bin/env python
+"""WO-01r: rebuild the 25 demos/task on the GPU renderer, and measure the Mac-vs-GPU render gap.
+
+Review 2026-11-07 section 3.2 / fix list: every 0.1-era demo was rendered on the Mac CPU renderer
+(MoltenVK), truncated at the success step and recorded with the fast v1 oracle, while every eval
+and RL rollout renders on the NVIDIA GPU sim. Two modes:
+
+  build       scripts/wo01_build_env.py with the fixed recorder (release + retreat recorded) and the
+              v2 oracle (configs/demos_v2.yaml), then a tail check of the written dataset (every
+              PickPlace/Stack demo ends at the release target, every demo's oracle script ran to
+              its end, TCP rise after success). `--push` uploads it (private) only if that passes.
+              An unfinished episode is rejected ON ITS OWN while recording (data.require_tail_
+              finished, wo01_build_env.py tail_problems; reported per seed) and the next seed is
+              recorded instead, so one bad episode does not block the valid ones; the tail check
+              is the safety net and still blocks a push that is short of demos_per_task.
+  render-gap  re-render the stored demos on this machine's backend: reset each demo's seed, replay
+              its recorded actions open loop, and diff every fresh frame against the stored
+              (AV1-decoded) frame; the stored-vs-replayed joint state shows where physics diverges.
+              Then compare the SFT policy's greedy action tokens on stored vs fresh frames (same
+              stored joint state, so only the image differs). A codec floor -- the first
+              `--floor-episodes` fresh episodes per task written through the same AV1 recorder and
+              decoded again -- gives the pixel and token differences that are codec noise alone.
+              HEADLINE = t = 0 (owner 2026-11-08): the first frame of each episode, rendered from
+              the reset state before any replay physics, so only the renderer (and codec) differ:
+              pixels_t0, tokens_stored_vs_fresh_t0, state_max_abs_diff_t0_rad. The POOLED
+              all-frame numbers (pixels_all, tokens_stored_vs_fresh_all) are reported separately:
+              open-loop replay physics drift (state_mean_max_abs_diff_rad) contributes to them, so
+              they are not a pure renderer gap. `comparison` labels the run by the RENDERER
+              (macOS = Mac MoltenVK, Linux + CUDA = NVIDIA GPU; --device only moves physics):
+              a Mac run against a 0.1 set, or the rebuilt set re-rendered on the GPU, is a
+              SAME-RENDERER PIPELINE CHECK, not a Mac-vs-GPU gap; a GPU-pod run against a 0.1
+              set (with --device cpu too) is the Mac-vs-GPU renderer gap.
+  dry-run     (tiny default) build, then render-gap against the dataset just built: CPU on both
+              sides, so the gap must be codec noise only.
+
+    uv run scripts/wo01r_rebuild_demos.py --preset tiny                           # CPU, < 2 min
+    uv run scripts/wo01r_rebuild_demos.py --preset sim --mode render-gap          # GPU box (~5 min)
+    uv run scripts/wo01r_rebuild_demos.py --preset sim --mode build --push        # GPU box
+    uv run scripts/wo01r_rebuild_demos.py --preset sim --device cpu --mode render-gap \
+        --skip-tokens --gap-episodes 3                                            # Mac: pipeline check
+
+Non-tiny presets default to configs/demos_v2.yaml (render_gap.* there: the 0.1 dataset and the
+WO-02 attempt-4 adapter, a Hub path). tiny uses configs/demos_v2_tiny.yaml (tiny + the v2 data
+opt-ins) and the tiny random OFT policy (configs/sft_tiny.yaml). Writes runs/<id>/record.json and
+runs/<id>/render_gap.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import importlib.util
+import json
+import math
+import platform
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.config import Config, add_config_args, load_config
+from src.runs import Run
+
+RELEASE_TOL = 1e-3  # rad: last gripper command counts as "at the release target"
+HEADLINE_NOTE = (
+    "headline = t0: the first frame of each episode, rendered from the reset state before any "
+    "replay physics (pixels_t0, tokens_stored_vs_fresh_t0, state_max_abs_diff_t0_rad)"
+)
+POOLED_NOTE = (
+    "pooled = every frame of the open-loop replay (pixels_all, tokens_stored_vs_fresh_all): replay "
+    "physics drift (state_mean_max_abs_diff_rad) contributes to this gap, so it is not a pure "
+    "renderer difference; reported separately from the t0 headline"
+)
+SAME_RENDERER = "same-renderer pipeline check"
+PIXEL_THRESH = 16  # |diff| (0-255) above which a pixel counts as changed
+MODES = ("build", "render-gap", "dry-run")
+
+
+def default_config(preset: str) -> Path:
+    return REPO_ROOT / "configs" / ("demos_v2_tiny.yaml" if preset == "tiny" else "demos_v2.yaml")
+
+
+def _build_env_module() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "wo01_build_env", REPO_ROOT / "scripts" / "wo01_build_env.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod  # dataclasses resolve annotations through sys.modules
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# --------------------------------------------------------------------------- dataset reading
+def read_episodes(root: Path) -> dict[int, dict[str, np.ndarray[Any, Any]]]:
+    """{episode_index: {"state": (T, 6), "action": (T, 6)}} from the parquet files (no video)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    files = sorted(glob.glob(str(root / "data" / "chunk-*" / "file-*.parquet")))
+    if not files:
+        raise FileNotFoundError(f"no parquet data under {root / 'data'}")
+    table = pa.concat_tables([pq.read_table(f) for f in files])
+    ep = table.column("episode_index").to_numpy()
+    fi = table.column("frame_index").to_numpy()
+    state = np.asarray(table.column("observation.state").to_pylist(), dtype=np.float32)
+    action = np.asarray(table.column("action").to_pylist(), dtype=np.float32)
+    out: dict[int, dict[str, np.ndarray[Any, Any]]] = {}
+    for e in np.unique(ep):
+        rows = np.flatnonzero(ep == e)
+        rows = rows[np.argsort(fi[rows])]
+        out[int(e)] = {"state": state[rows], "action": action[rows]}
+    return out
+
+
+def tail_report(root: Path, tasks: list[str]) -> dict[str, dict[str, Any]]:
+    """Per task: how the successful demos end (last gripper command, oracle finished, TCP rise)."""
+    from src.data.oracle import GRIPPER_RELEASE
+    from src.data.recorder import read_sidecar
+    from src.env.kinematics import ArmKinematics
+
+    kin = ArmKinematics.from_urdf()
+    eps = read_episodes(root)
+    side = [r for r in read_sidecar(root) if r["oracle_success"]]
+    out: dict[str, dict[str, Any]] = {}
+    for task in tasks:
+        rows = [r for r in side if r["task_family"] == task]
+        last_grip, rise, finished, tails = [], [], [], []
+        for r in rows:
+            e = eps[int(r["episode_index"])]
+            last_grip.append(float(e["action"][-1, 5]))
+            finished.append(bool(r.get("oracle_finished", False)))
+            tails.append(int(r.get("post_success_frames", 0)))
+            k = int(r.get("success_step", len(e["state"]))) - 1
+            z = kin.fk(torch.as_tensor(e["state"][[k, -1]], dtype=torch.float32))[:, 2, 3]
+            rise.append(100.0 * float(z[1] - z[0]))
+        grasp = task != "Push"  # Push keeps the gripper closed throughout
+        at_release = [abs(g - GRIPPER_RELEASE) < RELEASE_TOL for g in last_grip]
+        out[task] = {
+            "demos": len(rows),
+            "end_below_release": (
+                sum(g < GRIPPER_RELEASE - RELEASE_TOL for g in last_grip) if grasp else None
+            ),
+            "end_at_release": sum(at_release) if grasp else None,
+            "oracle_finished": sum(finished),
+            "mean_post_success_frames": round(float(np.mean(tails)), 2) if tails else 0.0,
+            "mean_tcp_rise_after_success_cm": round(float(np.mean(rise)), 2) if rise else 0.0,
+            "min_tcp_rise_after_success_cm": round(float(np.min(rise)), 2) if rise else 0.0,
+        }
+    return out
+
+
+def tail_ok(report: dict[str, dict[str, Any]], demos: int) -> list[str]:
+    """Problems that block a push: missing demos, unfinished release/retreat. With
+    data.require_tail_finished the build already rejected unfinished episodes one by one (and
+    replaced them), so only a shortfall should remain here."""
+    bad = []
+    for task, r in report.items():
+        if r["demos"] < demos:
+            bad.append(f"{task}: {r['demos']} demos < {demos}")
+        if r["end_at_release"] is not None and r["end_at_release"] < r["demos"]:
+            bad.append(
+                f"{task}: {r['demos'] - r['end_at_release']} demos end off the release target"
+            )
+        if r["oracle_finished"] < r["demos"]:
+            bad.append(
+                f"{task}: {r['demos'] - r['oracle_finished']} demos stop before retreat ends"
+            )
+    return bad
+
+
+# ------------------------------------------------------------------------------ render gap
+def _to_uint8_hwc(chw: torch.Tensor) -> torch.Tensor:
+    """LeRobot decoded frame (3, H, W) float in [0, 1] -> (H, W, 3) uint8."""
+    return (chw.float() * 255.0).round().clamp(0, 255).to(torch.uint8).permute(1, 2, 0)
+
+
+def _pixel_stats(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float]:
+    """(mean |diff| in 0-255, PSNR dB, fraction of pixels with any channel |diff| > threshold)."""
+    d = (a.float() - b.float()).abs()
+    mse = float((d**2).mean())
+    psnr = 99.0 if mse == 0 else 10 * math.log10(255.0**2 / mse)
+    return float(d.mean()), psnr, float((d.amax(-1) > PIXEL_THRESH).float().mean())
+
+
+@torch.no_grad()
+def _greedy(
+    policy: Any, images: torch.Tensor, states: torch.Tensor, instr: list[str], batch: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    toks, acts = [], []
+    for i in range(0, len(images), batch):
+        s = policy.sample(
+            {"image": images[i : i + batch], "state": states[i : i + batch]},
+            instr[i : i + batch],
+            temperature=0.0,
+        )
+        toks.append(s.tokens.cpu())
+        acts.append(s.actions.cpu())
+    return torch.cat(toks), torch.cat(acts)
+
+
+def _token_stats(
+    policy: Any,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    states: torch.Tensor,
+    instr: list[str],
+    batch: int,
+) -> dict[str, float]:
+    ta, aa = _greedy(policy, a, states, instr, batch)
+    tb, ab = _greedy(policy, b, states, instr, batch)
+    return {
+        "frames": len(a),
+        "token_agreement": round(float((ta == tb).float().mean()), 4),
+        "first_action_token_agreement": round(float((ta[:, 0] == tb[:, 0]).float().mean()), 4),
+        "chunk_identical": round(float((ta == tb).flatten(1).all(-1).float().mean()), 4),
+        "mean_abs_bin_diff": round(float((ta - tb).abs().float().mean()), 3),
+        "mean_abs_action_diff_rad": round(float((aa - ab).abs().mean()), 5),
+    }
+
+
+def _summary(rows: list[tuple[float, float, float]]) -> dict[str, float | None]:
+    if not rows:
+        return {"frames": 0, "mean_abs": None, "psnr_db": None, "frac_pixels_changed": None}
+    arr = np.asarray(rows)
+    return {
+        "frames": len(rows),
+        "mean_abs": round(float(arr[:, 0].mean()), 3),
+        "psnr_db": round(float(arr[:, 1].mean()), 2),
+        "frac_pixels_changed": round(float(arr[:, 2].mean()), 5),
+    }
+
+
+def render_gap(
+    cfg: Config,
+    repo_id: str,
+    root: Path,
+    policy: Any | None,
+    *,
+    episodes_per_task: int | None,
+    token_stride: int,
+    floor_episodes: int,
+    work_dir: Path,
+    batch: int = 16,
+) -> dict[str, Any]:
+    """Per task: pixel diffs (t = 0 and all frames), joint-state divergence, token agreement, and
+    the codec floor of the same quantities. See the module docstring."""
+    from src.data.recorder import IMAGE_KEY, load_demo_dataset, read_sidecar
+    from src.env import make_env, policy_obs
+
+    ds = load_demo_dataset(repo_id, root)
+    eps = read_episodes(root)
+    side = [r for r in read_sidecar(root) if r["oracle_success"]]
+    start = {
+        int(e): int(s)
+        for e, s in zip(
+            ds.meta.episodes["episode_index"], ds.meta.episodes["dataset_from_index"], strict=True
+        )
+    }
+    cuda = str(cfg.get("device", "cpu")).startswith("cuda")
+    floor: list[dict[str, Any]] = []  # fresh episodes to push through the codec afterwards
+    out: dict[str, Any] = {
+        "dataset": repo_id,
+        "headline": HEADLINE_NOTE,
+        "pooled_note": POOLED_NOTE,
+        "tasks": {},
+    }
+    for task in cfg["env"]["tasks"]:
+        rows = [r for r in side if r["task_family"] == task][:episodes_per_task]
+        if not rows:
+            continue
+        floor_ids = {int(r["episode_index"]) for r in rows[:floor_episodes]}
+        t0 = time.monotonic()
+        pix_t0: list[tuple[float, float, float]] = []
+        pix_all: list[tuple[float, float, float]] = []
+        dq_t0: list[float] = []
+        dq_all: list[float] = []
+        tok: dict[str, list[Any]] = {"stored": [], "fresh": [], "state": [], "instr": []}
+        tok0: dict[str, list[Any]] = {"stored": [], "fresh": [], "state": [], "instr": []}
+        for cell in sorted({str(r["cell"]) for r in rows}):
+            todo = [r for r in rows if str(r["cell"]) == cell]
+            n = len(todo) if cuda else 1
+            env = make_env(cfg, task, num_envs=n, cell=cell, render=True)
+            env_device = getattr(env.unwrapped, "device", "cpu")
+            for b0 in range(0, len(todo), n):
+                group = todo[b0 : b0 + n]
+                real = len(group)
+                group = group + [group[-1]] * (n - real)  # pad the last batch (results unused)
+                seeds = [int(r["seed"]) for r in group]
+                obs, _ = env.reset(seed=seeds if n > 1 else seeds[0])
+                instr = [str(r["instruction"]) for r in group]  # what SFT trained with
+                ep_ids = [int(r["episode_index"]) for r in group]
+                lens = [len(eps[e]["action"]) for e in ep_ids]
+                buf = {
+                    i: {
+                        "task": task,
+                        "seed": seeds[i],
+                        "cell": cell,
+                        "instr": instr[i],
+                        "frames": [],
+                    }
+                    for i in range(real)
+                    if ep_ids[i] in floor_ids
+                }
+                for t in range(max(lens[:real])):
+                    po = policy_obs(obs)
+                    fresh, fstate = po["image"].cpu(), po["state"].cpu()
+                    for i in range(real):
+                        if t >= lens[i]:
+                            continue
+                        e = ep_ids[i]
+                        stored = _to_uint8_hwc(ds[start[e] + t][IMAGE_KEY])
+                        st = torch.as_tensor(eps[e]["state"][t])
+                        stats = _pixel_stats(stored, fresh[i])
+                        dq = float((fstate[i] - st).abs().max())
+                        pix_all.append(stats)
+                        dq_all.append(dq)
+                        if t == 0:
+                            pix_t0.append(stats)
+                            dq_t0.append(dq)
+                            if policy is not None:  # every episode's t0 frame, whatever the stride
+                                tok0["stored"].append(stored)
+                                tok0["fresh"].append(fresh[i].clone())
+                                tok0["state"].append(st)
+                                tok0["instr"].append(instr[i])
+                        if policy is not None and t % token_stride == 0:
+                            tok["stored"].append(stored)
+                            tok["fresh"].append(fresh[i].clone())
+                            tok["state"].append(st)
+                            tok["instr"].append(instr[i])
+                        if i in buf:
+                            buf[i]["frames"].append((fresh[i].clone(), st, eps[e]["action"][t], t))
+                    act = np.stack(
+                        [eps[e]["action"][min(t, ln - 1)] for e, ln in zip(ep_ids, lens)]
+                    )
+                    obs, *_ = env.step(torch.as_tensor(act, device=env_device))
+                floor += list(buf.values())
+            env.close()
+        res: dict[str, Any] = {
+            "episodes": len(rows),
+            # HEADLINE (t0: reset state, before any replay physics)
+            "pixels_t0": _summary(pix_t0),
+            "state_max_abs_diff_t0_rad": round(max(dq_t0), 6) if dq_t0 else None,
+            # POOLED all frames: replay physics drift contributes (POOLED_NOTE)
+            "pixels_all": _summary(pix_all),
+            "state_mean_max_abs_diff_rad": round(float(np.mean(dq_all)), 6) if dq_all else None,
+        }
+        for key, buf in (("tokens_stored_vs_fresh_t0", tok0), ("tokens_stored_vs_fresh_all", tok)):
+            if policy is not None and buf["stored"]:
+                res[key] = _token_stats(
+                    policy,
+                    torch.stack(buf["stored"]),
+                    torch.stack(buf["fresh"]),
+                    torch.stack(buf["state"]),
+                    buf["instr"],
+                    batch,
+                )
+        res["seconds"] = round(time.monotonic() - t0, 1)
+        out["tasks"][task] = res
+    if floor:
+        for task, fl in codec_floor(floor, policy, token_stride, work_dir, batch).items():
+            out["tasks"][task]["codec_floor"] = fl
+    return out
+
+
+def codec_floor(
+    floor: list[dict[str, Any]], policy: Any | None, token_stride: int, work_dir: Path, batch: int
+) -> dict[str, dict[str, Any]]:
+    """Write fresh episodes through the demo recorder's AV1 path, decode them, and diff against
+    the raw frames: the pixel / token differences that are codec noise alone."""
+    from src.data.recorder import IMAGE_KEY, DemoRecorder, load_demo_dataset
+
+    h, w = (int(x) for x in floor[0]["frames"][0][0].shape[:2])
+    rec = DemoRecorder("local/render-gap-floor", work_dir / "codec_floor", image_hw=(h, w))
+    for ep in floor:
+        for img, st, act, _ in ep["frames"]:
+            rec.add_frame(img, st, act, ep["instr"])
+        rec.save_episode(
+            {
+                "task_family": ep["task"],
+                "seed": ep["seed"],
+                "cell": ep["cell"],
+                "oracle_success": True,
+            }
+        )
+    rec.finalize()
+    dec = load_demo_dataset("local/render-gap-floor", work_dir / "codec_floor")
+    out: dict[str, dict[str, Any]] = {}
+    k = 0
+    for task in dict.fromkeys(ep["task"] for ep in floor):
+        pix: list[tuple[float, float, float]] = []
+        pix0: list[tuple[float, float, float]] = []
+        tok: dict[str, list[Any]] = {"raw": [], "dec": [], "state": [], "instr": []}
+        tok0: dict[str, list[Any]] = {"raw": [], "dec": [], "state": [], "instr": []}
+        for ep in (e for e in floor if e["task"] == task):
+            for img, st, _, t in ep["frames"]:
+                d = _to_uint8_hwc(dec[k][IMAGE_KEY])
+                k += 1
+                stats = _pixel_stats(img, d)
+                pix.append(stats)
+                bufs = [tok] if t % token_stride == 0 else []
+                if t == 0:
+                    pix0.append(stats)
+                    bufs.append(tok0)
+                if policy is not None:
+                    for b in bufs:
+                        b["raw"].append(img)
+                        b["dec"].append(d)
+                        b["state"].append(st)
+                        b["instr"].append(ep["instr"])
+        # "pixels" / "tokens_raw_vs_decoded" pool every floor frame; *_t0 the first frames only
+        res: dict[str, Any] = {"pixels_t0": _summary(pix0), "pixels": _summary(pix)}
+        for key, buf in (("tokens_raw_vs_decoded_t0", tok0), ("tokens_raw_vs_decoded", tok)):
+            if policy is not None and buf["raw"]:
+                res[key] = _token_stats(
+                    policy,
+                    torch.stack(buf["raw"]),
+                    torch.stack(buf["dec"]),
+                    torch.stack(buf["state"]),
+                    buf["instr"],
+                    batch,
+                )
+        out[task] = res
+    return out
+
+
+def _f(x: Any, spec: str) -> str:
+    return "-" if x is None else format(x, spec)
+
+
+def _pct(frac: float | None) -> str:
+    return _f(None if frac is None else 100 * frac, "6.2f")
+
+
+def print_gap(gap: dict[str, Any]) -> None:
+    """Two tables: the t = 0 HEADLINE (renderer + codec only), then the POOLED all-frame numbers,
+    to which replay physics drift contributes."""
+    print(f"comparison: {gap.get('comparison', '?')}")
+    print("HEADLINE, t = 0 (first frame of each episode, reset state, before any replay physics)")
+    head = (
+        f"{'task':<10} {'eps':>4} {'t0 |d|':>7} {'PSNR':>6} {'chg%':>6} {'dq0':>8}"
+        f" {'tok0=':>6} {'chunk0=':>7} {'floor0 |d|':>10} {'floor0 tok=':>11}"
+    )
+    print(head)
+    print("-" * len(head))
+    for task, r in gap["tasks"].items():
+        p0, tk0 = r["pixels_t0"], r.get("tokens_stored_vs_fresh_t0", {})
+        fl = r.get("codec_floor", {})
+        print(
+            f"{task:<10} {r['episodes']:>4} {_f(p0['mean_abs'], '7.3f')}"
+            f" {_f(p0['psnr_db'], '6.1f')}"
+            f" {_pct(p0['frac_pixels_changed'])}"
+            f" {_f(r['state_max_abs_diff_t0_rad'], '8.1e')}"
+            f" {_f(tk0.get('token_agreement'), '6.3f')} {_f(tk0.get('chunk_identical'), '7.3f')}"
+            f" {_f(fl.get('pixels_t0', {}).get('mean_abs'), '10.3f')}"
+            f" {_f(fl.get('tokens_raw_vs_decoded_t0', {}).get('token_agreement'), '11.3f')}"
+        )
+    print("\nPOOLED, all frames (replay physics drift contributes: NOT a pure renderer gap)")
+    head = (
+        f"{'task':<10} {'eps':>4} {'all |d|':>8} {'PSNR':>6} {'chg%':>6} {'dq mean':>8}"
+        f" {'tok=':>6} {'tok first=':>10} {'floor |d|':>9} {'floor tok=':>10}"
+    )
+    print(head)
+    print("-" * len(head))
+    for task, r in gap["tasks"].items():
+        pa, tk = r["pixels_all"], r.get("tokens_stored_vs_fresh_all", {})
+        fl = r.get("codec_floor", {})
+        print(
+            f"{task:<10} {r['episodes']:>4} {_f(pa['mean_abs'], '8.3f')}"
+            f" {_f(pa['psnr_db'], '6.1f')}"
+            f" {_pct(pa['frac_pixels_changed'])}"
+            f" {_f(r['state_mean_max_abs_diff_rad'], '8.1e')}"
+            f" {_f(tk.get('token_agreement'), '6.3f')}"
+            f" {_f(tk.get('first_action_token_agreement'), '10.3f')}"
+            f" {_f(fl.get('pixels', {}).get('mean_abs'), '9.3f')}"
+            f" {_f(fl.get('tokens_raw_vs_decoded', {}).get('token_agreement'), '10.3f')}"
+        )
+
+
+def render_backend(system: str | None = None, cuda: bool | None = None) -> str:
+    """The renderer this machine uses, independent of the sim (physics) device: SAPIEN renders
+    through MoltenVK on macOS ("mac") and through NVIDIA Vulkan on a Linux GPU box ("gpu") even
+    when physics runs on the CPU (--device cpu). Anything else is "unknown"."""
+    system = platform.system() if system is None else system
+    if system == "Darwin":
+        return "mac"
+    cuda = torch.cuda.is_available() if cuda is None else cuda
+    return "gpu" if system == "Linux" and cuda else "unknown"
+
+
+def comparison_label(cfg: Config, repo_id: str, mode: str, backend: str, device: str) -> str:
+    """What a render-gap run compares. Keyed on the RENDERER (render_backend()), not the sim
+    device (review 2026-11-08: a --device cpu run on the GPU pod still renders on the GPU).
+    Assumes the 0.1 sets were rendered on the Mac (MoltenVK) and the rebuilt set (data.hub_repo)
+    on the GPU renderer."""
+    if mode == "dry-run":
+        return f"{SAME_RENDERER} (the set just built, re-rendered on the renderer that recorded it)"
+    recorded = "gpu" if repo_id == str(cfg.get("data", {}).get("hub_repo", "")) else "mac"
+    names = {"mac": "Mac (MoltenVK)", "gpu": "NVIDIA GPU (Vulkan)"}
+    if backend not in names:
+        return (
+            f"renderer comparison UNKNOWN: {repo_id} stored frames ({names[recorded]} renderer) "
+            f"vs this machine's renderer, which is neither the Mac nor an NVIDIA GPU renderer"
+        )
+    sim = f"sim device {device}"
+    if backend == recorded:
+        if backend == "mac":
+            return (
+                f"{SAME_RENDERER} (Mac renderer on both sides, {sim}; NOT a Mac-vs-GPU renderer "
+                "gap measurement)"
+            )
+        return f"{SAME_RENDERER} (the set re-rendered on the GPU renderer that recorded it, {sim})"
+    return (
+        f"renderer gap: {repo_id} stored frames ({names[recorded]} renderer) vs this "
+        f"{names[backend]} renderer ({sim})"
+    )
+
+
+# ------------------------------------------------------------------------------------ main
+def build_policy_for_gap(cfg: Config, args: argparse.Namespace, device: str) -> Any | None:
+    if args.skip_tokens:
+        return None
+    from src.policy.openvla_oft import build_policy
+
+    gap_cfg = cfg.get("render_gap", {})
+    pcfg_path = (
+        args.policy_config
+        or gap_cfg.get("policy_config")
+        or ("configs/sft_tiny.yaml" if cfg["preset"] == "tiny" else "configs/sft.yaml")
+    )
+    pcfg = load_config(cfg["preset"], REPO_ROOT / str(pcfg_path))
+    adapter = args.adapter if args.adapter is not None else gap_cfg.get("adapter")
+    if cfg["preset"] != "tiny" and adapter is None:
+        raise SystemExit("render-gap needs the SFT adapter (--adapter or render_gap.adapter)")
+    policy = build_policy(pcfg, device, adapter=adapter, is_trainable=False)
+    policy.eval()
+    return policy
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawTextHelpFormatter
+    )
+    add_config_args(parser)
+    parser.add_argument("--mode", choices=MODES, default=None, help="tiny: dry-run, else build")
+    parser.add_argument(
+        "--device", choices=["cpu", "cuda"], default=None, help="override cfg.device"
+    )
+    parser.add_argument("--push", action="store_true", help="build: push the dataset if it passes")
+    parser.add_argument("--num-envs", type=int, default=None, help="build: parallel envs")
+    parser.add_argument("--gap-dataset", default=None, help="render-gap: Hub id (default cfg)")
+    parser.add_argument("--adapter", default=None, help="render-gap: SFT adapter dir or Hub path")
+    parser.add_argument("--policy-config", default=None, help="render-gap: policy config file")
+    parser.add_argument("--gap-episodes", type=int, default=None, help="render-gap: per task")
+    parser.add_argument(
+        "--token-stride", type=int, default=None, help="render-gap: every k-th frame"
+    )
+    parser.add_argument("--floor-episodes", type=int, default=2, help="render-gap: codec floor")
+    parser.add_argument("--skip-tokens", action="store_true", help="render-gap: pixels only")
+    args = parser.parse_args(argv)
+
+    from src.data.recorder import (
+        ProtectedRepoError,
+        check_push_target,
+        dataset_location,
+        push_dataset,
+    )
+
+    cfg_path = args.config or default_config(args.preset)
+    cfg = load_config(args.preset, cfg_path)
+    if args.push:  # fail before the build, not after it (push_dataset checks again)
+        try:
+            check_push_target(dataset_location(cfg)[0])
+        except ProtectedRepoError as exc:
+            parser.error(str(exc))
+    if args.device:
+        cfg["device"] = args.device
+    device = str(cfg.get("device", "cpu"))
+    mode = args.mode or ("dry-run" if args.preset == "tiny" else "build")
+    if mode == "dry-run" and args.preset != "tiny":
+        raise SystemExit(
+            "--mode dry-run is the CPU tiny check; use build / render-gap on a GPU box"
+        )
+    gap_cfg = cfg.get("render_gap", {})
+    rc = 0
+    with Run(work_order="WO-01r", script=__file__, cfg=cfg, device=device) as run:
+        run.results["mode"] = mode
+        if mode in ("build", "dry-run"):
+            build_argv = ["--preset", args.preset, "--config", str(cfg_path)]
+            if args.device:
+                build_argv += ["--device", args.device]
+            if args.num_envs:
+                build_argv += ["--num-envs", str(args.num_envs)]
+            build_rc = int(_build_env_module().main(build_argv))
+            repo_id, root = dataset_location(cfg)
+            report = tail_report(root, list(cfg["env"]["tasks"]))
+            run.results.update(build_rc=build_rc, dataset=repo_id, tail=report)
+            print(f"\ntail check ({repo_id}):")
+            for task, r in report.items():
+                print(f"  {task:<10} {json.dumps(r)}")
+            problems = (
+                [] if args.preset == "tiny" else tail_ok(report, int(cfg["data"]["demos_per_task"]))
+            )
+            run.results["tail_problems"] = problems
+            if build_rc or problems:
+                print(
+                    "NOT pushed: " + "; ".join(problems or [f"build rc={build_rc}"]),
+                    file=sys.stderr,
+                )
+                rc = 1
+            elif args.push:
+                run.results["hub_url"] = push_dataset(repo_id, root, private=True)
+                print(f"pushed: {run.results['hub_url']}")
+        if mode in ("render-gap", "dry-run") and rc == 0:
+            if mode == "dry-run":
+                repo_id, root = dataset_location(cfg)
+            else:
+                repo_id = args.gap_dataset or gap_cfg.get("dataset") or dataset_location(cfg)[0]
+                root = dataset_location({**cfg, "data": {**cfg["data"], "hub_repo": repo_id}})[1]
+                from src.data.oft_dataset import _ensure_local
+
+                _ensure_local(repo_id, root)
+            policy = build_policy_for_gap(cfg, args, device)
+            episodes = args.gap_episodes or gap_cfg.get("episodes_per_task")
+            stride = int(args.token_stride or gap_cfg.get("token_stride", 1))
+            gap = render_gap(
+                cfg,
+                repo_id,
+                root,
+                policy,
+                episodes_per_task=None if episodes is None else int(episodes),
+                token_stride=stride,
+                floor_episodes=args.floor_episodes,
+                work_dir=run.dir,
+            )
+            gap["backend"] = {"device": device, "render": run.record["device"]}
+            backend = render_backend()
+            gap["backend"]["renderer"] = backend
+            gap["comparison"] = comparison_label(cfg, repo_id, mode, backend, device)
+            (run.dir / "render_gap.json").write_text(json.dumps(gap, indent=2))
+            run.results["render_gap"] = gap
+            print(
+                f"\nrender gap: {repo_id} stored frames vs this machine's renderer ({backend}, sim device"
+                f" {device}), {gap['comparison']}"
+            )
+            print_gap(gap)
+            print(f"wrote {run.dir / 'render_gap.json'}")
+    print(f"record: {run.record_path}")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

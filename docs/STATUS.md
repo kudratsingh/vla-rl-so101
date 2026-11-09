@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-11-07
+Updated: 2026-11-08
 
 ## Current work order
 
@@ -15,6 +15,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 06 | part 1 merged, kit arrived, physical bring-up pending | #5 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
 | 04 | **benchmark not met; next step waits for the owner**, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
 | 05, 07, 08, 09 | not started | | |
+| pre-run hardening | PR open, **waits for owner review** (touches the RL loop) | `fix/pre-run-hardening` | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
 
 ## Benchmarks met
 
@@ -77,6 +78,550 @@ and price the selected GPU, storage and duration before approving each run. The 
 authorize provisioning. Each paid run still needs explicit owner approval and its applicable
 probe gate.
 
+## Pre-run hardening (PR 1, branch `fix/pre-run-hardening`, 2026-11-08, $0)
+
+This implements the $0 items of the review's section 9 (`docs/reviews/2026-11-07-project-review.md`).
+Nothing ran on a GPU. Protocol `0.1-draft` (`src/eval/protocol.py`, hash `e9ce5bb47a88`) and
+`src/env/success.py` are unchanged, and no reported number changed.
+
+What changed:
+- RL gates (`src/rl/gates.py`): the 64-episode kill switch and the 32-episode peak stop are
+  replaced by windows of `rollout/success_rate` per trained task plus rollout entropy (`rl.gate_*`).
+  There are three gates: flat at step 38, decline from the best window, and entropy collapse. The
+  decline gate fires only when two consecutive non-overlapping windows are each more than
+  max(`gate_max_drop`, `gate_decline_z` x SE) below the best aligned window (z = 3: z = 2 stopped
+  35/100 simulated flat runs; the SE is group-level: simulated 1.1-2.1 points for a 10-step
+  window per task at p 0.08-0.20, 1.6-2.9 for a two-window difference). The flat gate (review
+  L-baseline) fits a per-task least-squares trend over steps 1-38 and measures the gain from step
+  1, the SFT policy; the old baseline window 1-10 had already taken 0-9 updates. Provisional
+  default (owner 2026-11-08, simulated only): stop only if gain + `gate_flat_z` (0.5) x SE < 3
+  points. Simulated P(stop): truly flat 0.40-0.73, one task truly +5 0.06-0.09 (plain +3 bar on
+  the trend 0.17-0.23, the older rollout-window rule 0.32-0.33); `gate_flat_z: 0` is the plain
+  bar. Table in `src/rl/gates.py`; it does not reproduce the original 64-episode greedy gate. They
+  decide spending only; the protocol eval decides improvement. Periodic greedy evals run on the
+  trained tasks only and are sanity logs. The removed config keys raise an error naming their
+  replacement.
+- Fixed-batch diagnostic (`src/rl/diagnostics.py`): it scores the first 32 trajectories of each
+  update batch against the PPO reference, before and after all optimizer steps. It logs
+  `diag/{pre,post}/*`: |dlogp|, dlogp by advantage sign, mean(A*dlogp), k3 KL, clip fraction and
+  outside-clip fraction. `train/grad_norm` and per-optimizer-step lists are also logged. The
+  mini-batch-averaged `train/approx_kl` / `train/clip_frac` are removed. `docs/results.md` and
+  ADR-0002 now say the old values were weak evidence (approx_kl halved by the on-policy mini-batch
+  1, measured after one Adam step on other prompts), not a measure of the per-update change.
+- Resume: checkpoints hold the optimizer, scheduler, RNG, trainable tensors and trainer state.
+  `scripts/wo03_rl.py --resume <ckpt>` continues the step numbering. A CPU round trip is
+  bit-identical. Resume from the newest `step_N` checkpoint without a suffix: a
+  `step_N_interrupted` one (weights may hold part of step N) is refused unless
+  `--resume-approximate`, which re-runs step N and sets `record.resume_approximate`. Checkpoints are written every 25 steps and are about 1.2 GB each for OFT.
+- `configs/rl.yaml` (ADR-0002 amendment 3, proposed): 16 prompts x K=8, lr 1e-4, `ppo_epochs` 2.
+  The lr follows the published LoRA recipes (RIPT-VLA, RLinf-VLA), not the logged KL.
+  `configs/rl_pickplace.yaml` inherits these settings. RL seeds >= 10 are rejected
+  (`src/eval/seed_ranges.py` `check_rl_seed`: an explicit [0, 10) bound, then the overlap check;
+  PR #25's copy has only the overlap check, which lets seeds 11-299 through, so keep this version
+  when #25 merges).
+- Rollout timing split (`src/rl/rollout.py`): policy / sim_step / render / obs_fn / host_copy /
+  reset / other. It goes to `metrics.jsonl` (`rollout/time/*_s`) and to the PROBE line.
+- Probe modes on `scripts/wo03_rl.py`: `--lr-sweep` (offline, on one stored batch) and
+  `--probe-temperatures` (rollouts only, the same prompts at each temperature). Both can be costed
+  with `--estimate`.
+- Demos: the recorder can keep recording through release and retreat. With
+  `configs/demos_v2.yaml` it records at least 15 frames past success, until the oracle has
+  finished, with a cap of 45 frames, and rejects a demo if success no longer holds at its end. The
+  SFT loader can drop chunks that would contain pad frames (`data.chunk_pad: drop`). The code
+  defaults are the 0.1 settings (no tail, oracle v1, `chunk_pad: repeat`), so `sim.yaml`,
+  `sft*.yaml` and `rl.yaml` keep their behaviour and config hashes; `demos_v2.yaml` (and
+  `demos_v2_tiny.yaml` for the CPU dry run) opt in, and an SFT config for the v2 set must set
+  `chunk_pad: drop`. `wo01_build_env.py --push` refuses the two 0.1 demo repos unless
+  `--overwrite-hub`. Measured on the existing 0.1 demo set: 11 of 25 PickPlace and 13 of 25
+  Stack demos end below the 0.45 rad release target.
+- Oracle v2 (`src/data/oracle.py`) slows to 0.5 cm/step over the last 6 cm and the descent. Results
+  on the Mac CPU sim, tiny preset, 100 episodes per cell: seen PickPlace / Push / Stack 100 / 100 /
+  100%, shifted 96 / 92 / 96%. Under v1 the same cells were 100 / 98 / 100% and 99 / 91 / 96%.
+  Near-object decisions per episode rose from ~1.5 to ~2.6-3.0. v1 stays the default and
+  reproduces the 0.1-era oracle exactly; v2 is opt-in (`data.oracle_profile: v2`).
+- Demo rebuild (`scripts/wo01r_rebuild_demos.py`, `scripts/pod/demo_rebuild_job.sh`,
+  `configs/demos_v2.yaml`): it rebuilds 25 demos per task on the GPU renderer into a new Hub repo
+  (`KudratSingh22/vla-rl-so101-demos-25-v2`); it does not write to the 0.1 repos. It also has a
+  render-gap mode that compares stored and fresh frames and greedy tokens against a codec floor.
+  Its headline is t = 0 (the first frame of each episode, before any replay physics); pooled
+  all-frame numbers are reported separately because replay physics drift contributes to them.
+  Preliminary single run on the Mac CPU (run 20261108T083504Z-wo01r-sim-c025, dirty tree at
+  2af16f6, first 3 of 25 episodes per task (223/163/209 frames), pixels and joints only, token
+  comparison skipped). **This is a same-renderer pipeline check:** the stored 0.1 frames and the
+  fresh frames were both rendered on the Mac CPU renderer. It is not a Mac-vs-GPU renderer gap
+  measurement. Headline, t = 0 (3 first frames per task, before any replay physics): pixel gap
+  mean-abs 1.997 / 1.968 / 2.001 (PickPlace / Push / Stack). This run recorded no t = 0 codec
+  floor and no tokens. Pooled all frames, reported separately because replay physics drift
+  contributes to them (joint drift was 0 in this run): within 0.03 mean-abs (<= 1.4%) of the
+  pooled codec floor on all 3 tasks (e.g. PickPlace 2.070 vs 2.042). The Mac-vs-GPU check (full
+  25 episodes, with tokens, on the 4090) is still pending (see Next).
+- Protocol 0.2 (`src/eval/protocol_v02.py`, new; `scripts/wo02_eval.py --protocol 0.2`). Its hash
+  combines the file bytes of the protocol, the eval loop (`src/eval/sim_eval.py`: episode seeds,
+  clip, success latch, episode end), env, success, camera and robot model with the canonical
+  run settings, the clip, the episode-seed probes and the sim-stack pins. Per-episode records go to
+  `runs/<id>/episodes.jsonl` under both protocols. Under 0.2 only, a 4 deg/step joint clip from
+  `configs/real.yaml` applies. Runs that deviate get `protocol_complete: false` and a list of the
+  deviations. 0.2 is not frozen: its hash is pinned when its first number is reported.
+- Camera jitter is now drawn from the episode RNG instead of the global torch RNG. It is off in
+  every current preset.
+- `make setup` = `uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla`
+  (`docs/ENVIRONMENT.md`).
+
+Next paid run (proposed, not launched; each pod needs the owner's explicit go): the review's
+diagnostics.
+
+**FIRM CAP: $8.42 for the whole diagnostics pass** (was $7.42, $7.65, then $7.85; round 3,
+2026-11-08: +$0.57 for the A100's paired clip on/off probe, owner 2026-11-08. Re-priced with live
+rates and storage, every cap counted from the pod create call instead of first boot, and an
+explicit allowance for the billed time between the create call and container boot).
+Caps are rounded up to the cent. The cap is enforced by three layers: the job's own delete, the in-container hard-cap timer,
+and the outside watchdog (`scripts/pod/watchdog.py` on a GitHub runner and on the Mac; see "Pod
+deletion backstop" and `docs/runbooks/pod-launch.md`). Each layer fires before `DEADLINE` =
+`T_req` + `SPEND_CAP_SECONDS`, where `T_req` is the epoch taken just before the create call.
+
+| Pod | GPU $/h (live, Secure) | Storage $/h | `SPEND_CAP_SECONDS` (max billable) | **Firm cap** | Expected (planned) | +25% | + full gate wait |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| RTX 4090, render gap (`demo_rebuild_job.sh` to its gate) | 0.89 | 0.0139 | **5940** (1.650 h) | **$1.50** | 29 min = $0.44 | $0.55 | $1.00 |
+| A100 80 GB, diagnostics (`diag_job.sh`, with the clip probe), gate wait | 1.79 | 0.0139 | **13800** (3.833 h) | **$6.92** | 134 min = $4.03 | $5.04 | $5.94 |
+| A100 80 GB, diagnostics, pre-approved (no gate wait) | 1.79 | 0.0139 | 12000 (3.333 h) | $6.02 | $4.03 | $5.04 | n/a |
+| **Both pods** (with the A100 gate) | | | | **$8.42** | **$4.47** | **$5.59** | $6.94 |
+| Both pods (A100 pre-approved) | | | | $7.52 | $4.47 | $5.59 | |
+
+Without the clip probe (`CLIP_GROUPS=0`) the round-2 figures still hold: A100 12660 / 10860 s,
+$6.35 / $5.45, both pods $7.85.
+
+Sources and assumptions:
+- GPU rates were read at 2026-11-08T13:32:45Z and again, unchanged, at 2026-11-08T14:23:29Z and
+  2026-11-08T14:43:08Z with RunPod's public, unauthenticated GraphQL `gpuTypes` query (read-only):
+  - RTX 4090: Secure $0.89/h, Community $0.34/h;
+  - `NVIDIA A100 80GB PCIe`: Secure $1.79/h, Community $1.19/h;
+  - `NVIDIA A100-SXM4-80GB`: Secure $1.79/h, Community $1.39/h.
+
+  The diagnostics timings come from WO-04 pods, which were A100-SXM4-80GB (ADR-0002, pods
+  `5rdd45j801bk5b` and `gzxhwhjhdtc1kc`). Both A100 types cost $1.79/h on Secure Cloud. The plan
+  uses Secure Cloud, as every earlier pod did.
+- Storage rates are from RunPod's pricing docs (docs.runpod.io/pods/pricing, read 2026-11-08,
+  re-read 14:23Z):
+  "Pods are billed by the second for compute and storage". Container disk costs $0.10/GB/month
+  while running. Volume disk costs $0.10/GB/month running and $0.20/GB/month stopped. A network
+  volume costs $0.07/GB/month and keeps billing after the pod is gone, so this plan does not use
+  one. The plan's 80 GB container disk plus a 20 GB pod volume at `/workspace` cost 100 x $0.10 /
+  720 h = **$0.0139/h** (assumes a 30-day month), or $0.02-0.05 per pod. Both disks stop billing at
+  termination, because the plan never stops a pod.
+- The disk sizes are agent estimates: no earlier pod's disk sizes are recorded in `docs/` or
+  `runs/`. The container disk holds the `nvidia/cuda:12.4.1-cudnn-devel` image layer, the Linux
+  CUDA venv and uv cache (~20 GB), the 15 GB OFT base in the HF cache, the adapter (~0.3 GB) and
+  `runs/` (~1 GB incl. `sweep_batch.pt`), ~45 GB in all, so 80 GB leaves headroom. `/workspace`
+  holds only the first-boot epoch, `job.log`, `stage` and `APPROVED.<pod id>`. A persistent pod volume is
+  needed so that a container restart does not re-arm a full cap.
+- Max billable time = `SPEND_CAP_SECONDS`, assuming billing starts no earlier than the create call
+  (`T_req` is taken before it) and per-second billing, as the docs say. The outside watchdog sends
+  its first delete at `DEADLINE` - 400 s, and three worst-case attempt cycles (~128 s each:
+  3 deletes x 15.5 s + 2 reads x 3 endpoints x 8.5 s + 3 x 10 s gap/pause) end by about
+  `DEADLINE` - 16 s. The in-container timer fires at `DEADLINE` - 480 s, and the job's soft deadline
+  falls 1200 s before that. The firm cap is therefore (GPU + storage) $/h x cap, as long as any one
+  layer works. If none has verified the pod gone by `DEADLINE` (RunPod's API down for every caller),
+  the watchdog alerts and keeps trying for 900 s more, which is +$0.23 on the 4090 and +$0.45 on the
+  A100, outside the firm cap. After that, only the console can stop the pod. (A watchdog that starts
+  or wakes late gets its 900 s from when it reaches the terminate phase, so a very late start could
+  add more; the GitHub copy normally starts within a minute of the create call.)
+- The caps count from `T_req`, so they now carry an explicit allowance for the billed time before
+  the container boots: cap = planned x 1.25 + the full gate wait (30 min) + the 20 min
+  soft-deadline margin + the 480 s in-pod lead + 240 s from `T_req` to boot (the old 180 s
+  `CAP_PRESTART_S` image-pull allowance plus ~60 s for the create call), rounded up to the minute:
+  5940 / 13800 / 12000 s (A100 planned 134 min: 167.5 + 30 + 20 + 8 + 4 = 229.5 -> 230 min;
+  pre-approved 199.5 -> 200 min). Measured from creation, the job's soft deadline falls at
+  71 / 202 / 172 min, which covers planned x 1.25 + gate + 4 min pre-boot = 70.25 / 201.5 /
+  171.5 min. If the
+  image pull and create call take longer than 240 s, the job loses that time at its end (the spend
+  cap still holds); `createdAt` vs boot time in the pod log shows the real figure. The expected cost
+  is unchanged apart from storage. (An earlier revision of this table, $7.65, had dropped the
+  pre-boot allowance: its slack was 15-45 s.)
+- The margin: seed 0's RL stage took 26.8 h against its probe's 23.1 h projection (+16%, job log
+  of pod `9d8p7vyfyv6ca4`). PickPlace-only took 28.7 h against 26.8 h (+7%).
+- Spend approval is pending, and nothing is launched. The GitHub watchdog only works once this PR
+  is on `main`. Until then, the Mac copy is the only outside layer.
+Timings below are from the WO-02/WO-04 job logs on the Hub (`KudratSingh22/vla-rl-so101-rl`
+`wo04/*/job.log`, `KudratSingh22/vla-rl-so101-sft` `wo02*/*/job.log`) unless marked estimated.
+
+1. Render-gap check on a 4090: `scripts/pod/demo_rebuild_job.sh` up to its approval gate (no
+   rebuild in this pass; a rebuild needs its own go and a larger cap). Planned 29 min = $0.43:
+   - pod start to job launch, and teardown: 4 min (1.6-4 min outside the job on 4090 pods
+     `jqtaavsbwvemin`, `cm7d9mlccy3xjm`, `82a5je0ve40rlp`);
+   - setup stage (apt, `uv sync`, CUDA check): 0.8 min (0.5-0.8 min measured on 4090 pods);
+   - GPU-sim v2 oracle check, 50 seen episodes x 3 tasks: 4 min (estimated; the A100 v1 check with
+     20 episodes x 3 took 1.6-1.9 min, and v2 makes ~2x the near-object decisions);
+   - render-gap invocation: 15 GB base download + 7B load 1.5 min (fetch ~10 s on 4090 pods),
+     replay of 75 episodes + 6 codec-floor episodes 3 min (estimated), greedy tokens on stored and
+     fresh frames, ~10,800 forwards (~5,000 frames x 2 + floor; the Mac preliminary run's first
+     3 episodes had 54-74 frames each) at 12.9 decisions/s = 14 min (4090 protocol eval: 2,700
+     episodes in ~1.05 h, sim included, so a lower bound on the rate);
+   - uploads 2 min; approval gate up to `APPROVAL_WAIT_S` 30 min (not in "planned").
+2. One A100 pod, `scripts/pod/diag_job.sh` (new; seed 3, SFT adapter a4 `step_004000`; every
+   probe uses `configs/rl.yaml`'s clip, 4.0 deg/step):
+   `--probe-temperatures 0.7,1.0,1.3 --probe-groups 64` (rollouts only, the short first step), then
+   `--probe-clip --probe-groups 32` (paired clip on/off, rollouts only), then
+   an approval gate (or the pre-approval file), then `--lr-sweep 5e-5,2e-4,5e-4,1e-3
+   --sweep-adam-steps 8`, upload to `KudratSingh22/vla-rl-so101-rl` `diag/<pod>/`, self-delete.
+   Planned 134 min = $4.00 GPU ($4.03 with storage; round 2 without the clip probe: 119 min):
+   - pod start to job launch 2.5 min (1.5-2.5 min: "pod up" minus job time, 4 WO-04 A100 pods);
+   - setup stage 1.9 min (0.4-1.9 min, 5 A100 job logs); adapter download 0.8 min (0.25-0.8);
+   - temperature-probe invocation: 15 GB base download + 7B load + 2 GPU env builds 1.5 min
+     (1.3-1.4 min: probe run start to first step, minus its baseline eval; base fetch 45-57 s,
+     env setup 5-7 s); rollouts 3 T x 16 env batches x 49.2 s = 39.4 min (49.2 s = the slowest
+     measured 32-env x 120-step batch, pod `s2ljj3drwg0ov0`; `--estimate` says 44.6 s);
+   - paired clip probe (round 3), 14.2 min: its `--estimate` check in the gpu-check stage 0.1 min;
+     cached 7B load + 2 env builds 0.5 min (as the lr sweep's invocation); rollouts 2 arms x 8 env
+     batches (32 prompts x K=8 = 256 episodes per arm, 4 groups per 32-env batch) x 49.2 s =
+     13.1 min (`--estimate` 44.65 s per batch: 11.9 min); upload 0.5 min (estimated, small files).
+     estimated: A100-80GB x 0.24 h = $0.43 (GPU $0.42 + storage $0.003; +25% $0.53);
+   - lr-sweep invocation: cached 7B load + env builds 0.5 min (10 s load + 5-7 s env setup
+     measured); collection, refill cap, 12 env batches x 49.2 s = 9.8 min; greedy + score
+     forwards of the 1,920-decision batch once, 2.1 min; per lr 8 Adam steps x 64 x 15 decisions /
+     10.3 per s + 2 forwards = 14.5 min, x 4 = 58.0 min (forward rate 31/s estimated; the WO-04
+     update with the recompute forward measured 241 s against 248 s predicted from these rates);
+   - uploads (incl. the ~0.3 GB `sweep_batch.pt`, estimated) and delete 3 min; approval gate 0
+     with the pre-approval file, else up to `APPROVAL_WAIT_S` 30 min (not in "planned"). The job
+     also refuses to start the sweep if the soft deadline leaves less than its estimate + 25%.
+   The sweep's per-lr old log-prob recompute is now done once (review L-sweep-recompute): the
+   `--estimate` fell from 1.20 h to 1.15 h.
+3. Only after 1-2, and after the recovery-SFT base clears rule 3: a GRPO run with the measured lr and
+   temperature written into `configs/rl.yaml` (clip 4.0, owner 2026-11-08), starting with
+   `--probe-steps 3`. **No full-run proposal until the paired clip probe has posted its numbers**
+   (sampled success and group-drop rate with vs without the clip set the refill cost of a clipped
+   run). The worst case is
+   estimated: A100-80GB x 41.3 h = $74 per 150-step seed. `rl.gate_stop` is false for this first
+   run (owner 2026-11-08), so the flat gate logs at step 38 and does not stop it. Budget the full
+   run. (A stop at step 38 would have been 10.5 h = $18.72.)
+
+**Approving a gate** (CLAUDE.md rule 1, all pod jobs, `scripts/pod/approval_lib.sh`): the gate
+passes only on `/workspace/APPROVED.<RUNPOD_POD_ID>` written after the pod's first boot
+(`/root/pod_start_epoch`). A file from an earlier pod on a reused volume, or the old unscoped
+`/workspace/APPROVED`, is ignored, and the job log lists it with the reason. On the owner's
+explicit go, the agent runs this over SSH on the pod, from the repo root:
+
+    bash -c '. /root/runpod.env; . scripts/pod/approval_lib.sh; approval_write "owner go <date>: <what>"'
+
+For a pre-approved pass, run the same command before the job reaches its gate (for example right
+after launch).
+
+**Pod deletion backstop** (2026-11-08, $0; checked against a hang-injection simulation, not on a
+pod). Every new pod uses `scripts/pod/pod_start_cmd.sh` as its start command: the whole file is
+the one string after the `["/bin/bash","-c"]` entrypoint, with no inline command. Its order is:
+- First it arms the hard-cap timer, before apt runs. The timer fires at first boot +
+  `SPEND_CAP_SECONDS` - `CAP_PRESTART_S`. `CAP_PRESTART_S` defaults to 180 s and covers billed
+  time before the container starts. That figure is an estimate.
+- The first-boot epoch is stored per pod id on `/workspace`, so a container restart re-arms the
+  timer with only the time left.
+- A cap that is not an integer deletes the pod at once.
+- At the cap, the timer runs `delete_self.sh`. It tries REST v2 DELETE, then GraphQL
+  `podTerminate`. Every curl has `--max-time 30`. A GraphQL reply counts only if the body holds
+  `podTerminate` and no `errors`. It reinstalls curl if it is missing and repeats every ~20-80 s
+  until the container dies.
+- Then apt runs under `timeout`, then a key check that writes `/root/backstop_status`
+  (`KEY_OK` / `KEY_BAD` / `KEY_UNVERIFIED` / `NO_CURL`, plus whether the timer is armed), then
+  sshd.
+
+The jobs (`diag_job.sh`, `demo_rebuild_job.sh`, `wo04_job.sh`) source `scripts/pod/job_lib.sh`
+(and `approval_lib.sh` for the approval gate, above):
+- The EXIT trap is installed before anything can fail.
+- Every stage runs under `timeout -k 120`, capped at the soft deadline (hard cap - 1200 s).
+- A watchdog sends TERM to the job 130 s after the soft deadline, which runs the trap.
+- The trap's upload is limited to 600 s (`uv run --no-sync`). Its delete loop is limited to
+  ~180 s, after which the timer keeps trying.
+- Worst case from the soft deadline: 130 + 630 + 270 s < 1200 s.
+
+Simulation: 47 cases at caps scaled to 120 s, with stub curl, uv and apt. They cover hangs in
+setup, uv sync, download, probe, gate, sweep/build and both uploads, children that ignore TERM, a
+step with no timeout, hung, failing or flaky deletes on either endpoint, a GraphQL error body, boot
+apt hanging, and an image without curl. Results:
+- 45 cases deleted the pod. The job deleted at or before the soft deadline + ~4 s scaled, or the
+  timer deleted at the cap + 0.2-4.3 s scaled. In real time, each failed delete attempt costs at
+  most ~80 s before the next one.
+- The 2 failures (one per job) are an API that fails every call for the whole window. The loop
+  kept trying (60-62 calls), but nothing inside the pod can fix that.
+
+`tests/test_pod_backstop.py` (CPU, ~7 s) pins the main cases: a hung REST DELETE falls back to
+GraphQL inside the cap, the restart re-arm works, and the start command's embedded copy of the
+delete script still matches `delete_self.sh`.
+
+Outside watchdog (2026-11-08, owner request, $0, checked against a fake API, not against RunPod):
+- **Why it exists.** The in-container timer starts only once the container boots. A Mac check at
+  hard cap + 5 min could let the pod run past the cap.
+- **What it does.** `scripts/pod/watchdog.py` (stdlib only) starts right after the create call
+  and counts from `T_req`. When `--cap-s` is given, it tightens the deadline to the pod's
+  `createdAt` + cap.
+  - **Confirm at launch.** It re-reads the pod for up to 120 s until the key sees it under a
+    `vla-rl-so101*` name (event `confirmed`). A pod that no source shows (wrong id, or not visible
+    to the key) gives an alert and exit 3 at once; 401/403 from both REST APIs gives exit 5 at
+    once. Both launchers count as armed only after `confirmed` (the Mac launcher waits for it; the
+    GitHub run has a separate "Confirm pod <id>" step; the launch gate below checks both). It never deletes a pod it has not
+    confirmed, because the RunPod account is shared.
+  - **Gone needs two sources.** A REST 404 also means "not accessible to the caller" (v2 OpenAPI),
+    so "gone" needs two of REST v2, REST v1 and GraphQL to agree (404, `TERMINATED` or a null
+    pod), and a pod shown by any source counts as present.
+  - **Watch.** It polls every 60 s. It exits 0 early only if the pod deleted itself: every read
+    over at least 120 s shows it gone.
+  - **Terminate.** At `DEADLINE` - 400 s it sends REST v2 `DELETE api.runpod.io/v2/pods/{id}`,
+    then REST v1 `DELETE rest.runpod.io/v1/pods/{id}`, then GraphQL `podTerminate`. A DELETE 404
+    does not count as accepted, so the next endpoint is tried. If an accepted delete leaves the pod
+    in place, every retry sends all three. Both REST endpoints are in RunPod's public OpenAPI specs
+    (api.runpod.io/v2/openapi.json and rest.runpod.io/v1/openapi.json, read 2026-11-08), and v2
+    also returns `createdAt`. A pod counts as gone after two consecutive reads at least 10 s apart.
+- **When it cannot verify the pod is gone.** If that has not happened by `DEADLINE`, it alerts
+  (macOS notification and bell, or a GitHub `::error::` annotation). It keeps trying for 900 s from
+  the later of `DEADLINE` and its own entry into the terminate phase, always at least one full
+  attempt, and again after a clock jump (a laptop waking from sleep). Then it exits 2.
+- **Safeguards.** A name without the `vla-rl-so101` prefix gives exit 4, and nothing is deleted.
+  The key is read only from the environment and is redacted from the JSONL log.
+- **Where it runs.**
+  - The GitHub copy is `.github/workflows/pod-watchdog.yml`, on `workflow_dispatch`. The key is an
+    environment secret of the `pod-watchdog` environment, limited to `main`, so no workflow on
+    another branch can read it. The job has a 360 min timeout, refuses deadlines more than 5.5 h
+    away, and has concurrency per pod id. It only works once this PR is on `main`. Its logs are
+    public.
+  - The Mac copy is `scripts/pod/watchdog_mac.sh`: it reads the key from the Keychain item
+    `vla-rl-so101-runpod`, runs under `nohup caffeinate -i -s`, and exits 0 only after `confirmed`.
+    On battery with the lid closed, the Mac still sleeps.
+- **Start command change.** `pod_start_cmd.sh` now also takes `POD_DEADLINE_EPOCH` and fires at
+  min(first boot + cap - 180, `POD_DEADLINE_EPOCH` - 480). A value that is set but is not a decimal
+  epoch in seconds (text, milliseconds, or a leading zero, which bash reads as octal) deletes the
+  pod at once. `/root/backstop_status` gains `cap_from=creation|first_boot`.
+- **Tests and runbook.** `tests/test_pod_watchdog.py` (26 cases, ~20 s) and 4 new cases in
+  `tests/test_pod_backstop.py` cover this. The launch order is in `docs/runbooks/pod-launch.md`.
+- **Owner, once:** create the Keychain item, the `pod-watchdog` environment (deployment branch
+  `main`) and its secret `RUNPOD_API_KEY`, ideally from a dedicated key. RunPod documents no
+  pod-only key scope; Restricted keys are scoped per Serverless endpoint only.
+
+Launch gate (2026-11-08, owner request, $0, checked against a fake GitHub API and fake `ps` /
+`ssh` / Keychain, not live):
+- **Why.** The old runbook took the newest `pod-watchdog` run (`gh run list -L 1`), which could be
+  another pod's, and went on if only one watchdog confirmed.
+- **What.** `scripts/pod/launch_gate.py` (stdlib). `dispatch` sends the workflow with a fresh nonce
+  (`dispatch_id`; run-name `pod-watchdog pod=<id> dispatch=<nonce>`, step `Confirm pod <id>`) and
+  `return_run_details: true`. It takes the run id from the dispatch response (`workflow_run_id`),
+  or else from the one run of that workflow on `main` created after the dispatch with exactly
+  that run-name; if none exists yet, the gate keeps resolving it until its deadline. It then verifies
+  the run: run-name, event, branch `main`, workflow file, created after the dispatch.
+  `gate` passes only when the GitHub run is in progress with `Confirm pod <id>` = success by
+  `T_req` + 300 s and its `Watchdog` step running, AND the Mac watchdog's log has a `confirmed`
+  line for this pod with this run's tag (`--run-tag`, new; `watchdog_mac.sh` writes
+  `runs/watchdog/<id>.mac.env`), by the same deadline, from a live process that runs exactly
+  that watchdog. On failure it writes no token and cleans up only the verified pod: the id needs
+  this launch's record (`<id>.github.json` / `<id>.mac.env` with this deadline, written after
+  `T_req` - 30 s), and the new `watchdog.py --terminate-now --created-after <T_req - 30>` (same
+  name-prefix and two-source checks) refuses a pod created before it (gate exit 13, nothing
+  deleted). Then the agent deletes via the connector and confirms the pod gone. A failed read
+  (`gh` 5xx, `ps` error) is retried, not a verdict: it fails the gate only after 60 s unreadable
+  past the deadline, or before a token write (review fix, 2026-11-08: one GitHub 502 in step 8
+  had deleted a confirmed pod in the fake). On a pass, `gate --ssh-host` writes `/workspace/WATCHDOGS_OK.<id>` over SSH, and
+  only if the pod's `runpod.env` names this pod. `diag_job.sh`, `demo_rebuild_job.sh` and
+  `wo04_job.sh` refuse to start without a valid token (rc 8, checked before setup; the EXIT trap
+  then deletes the pod). The in-container backstop (`pod_start_cmd.sh`, `delete_self.sh`,
+  `job_lib.sh`) and the lr-sweep approval gate are unchanged.
+- **Cost.** $0 now. At launch the gate normally passes within ~1-2 min, while the image is still
+  pulling, so the caps are unchanged. A gate that fails at its deadline deletes the pod
+  ~6.5 min after `T_req` (5.5 min + ~1 min of cleanup): ~$0.20 on the A100 ($1.80/h with
+  storage), ~$0.10 on the 4090. A token write that fails after the full 900 s SSH wait costs up to
+  ~$0.70 on the A100. Both are inside the firm cap.
+- **Not verified live:** the dispatch response shape with `return_run_details`, the run-name and
+  step-name expressions on GitHub, REST `createdAt` in the cleanup, and `ps` on the caffeinate pid. Checking them needs a dispatch once the workflow is on
+  `main`; it was not done here.
+
+Outside our control:
+- The pod cannot delete itself in four cases:
+  - RunPod's API is unreachable or refuses the pod-scoped key for the whole window;
+  - the key or pod id is missing (`KEY_MISSING`/`KEY_BAD`);
+  - the container restarts without a persistent `/workspace`;
+  - apt cannot supply curl.
+
+  In those cases the outside watchdog (GitHub and Mac copies) still deletes the pod, unless RunPod's
+  API refuses every caller. Then only the owner in the console can stop it.
+- RunPod's billing start and its teardown latency are not measured here. The estimate assumes
+  billing starts no earlier than the create call and stops once the pod reads as gone.
+
+Proposed, not run: a rerun of the existing SFT `step_004000` and the two RL step-150 checkpoints
+under protocol 0.2. It is priced from the measured eval runtime of ~1.05 h per checkpoint on a
+4090, plus ~5% for the clip. estimated: RTX 4090 x 3.4-3.8 h = $3.0-3.4. Adding two-task step 50
+and PickPlace-only step 100 brings it to $5.0-5.3.
+
+Unverified on GPU: gate behaviour and thresholds (`gate_min_gain` 0.03 now applies to sampled
+rollout success, as a gain from the SFT policy, and needs the owner's confirmation, as does
+`gate_flat_z` 0.5 (provisional default, simulated only); `gate_max_drop` 0.04, `gate_decline_z` 3 and
+`gate_entropy_min` 0.5 are not measured on GPU; z = 3 is from a CPU simulation only), diag/sweep forward cost, the throughput for the 16 x 8 / 2-epoch shape, the render
+hook timing on `physx_cuda`, the CUDA RNG restore (a GPU resume is not bit-identical), v2 oracle
+success on `physx_cuda`, recorder tail stepping on the GPU env, render-gap replay and 7B token
+comparison, and the 0.2 clip and end-flag capture on CUDA.
+
+RL rollout action clip: see "Owner instructions 2026-11-08, round 3" below. **Owner decision
+2026-11-08: ON at 4.0 deg/step in `configs/rl.yaml` and `configs/rl_pickplace.yaml`** (env action
+only; PPO keeps the sampled tokens). The tiny preset and the code default stay null (off), as in
+WO-04.
+The robot items (servo temperature/current fault response, `park()` on healthy shutdown, camera
+timestamp, placement grid, `wo07_real_eval.py`) belong to PR 2, on PR #23's branch. The plan
+revision for PR #25 is on `wo-recovery-sft`. PR #25's `configs/rl_pickplace_lr*.yaml` use the
+removed `early_stop_*` / `peak_stop_step` keys and need renaming when it merges, or they fail fast.
+
+### Owner instructions 2026-11-08, round 2 (blocking before any paid run; $0, CPU only)
+
+On PR #28 (`fix/pre-run-hardening`). Nothing ran on a GPU. Protocol `0.1-draft` (`e9ce5bb47a88`),
+`src/env/success.py` and every reported number are unchanged.
+
+- **PPO mini-batches** (`src/rl/trainer.py` `ppo_minibatches`). Each epoch splits the kept
+  groups into ceil(groups / (`ppo_mini_batch` / K)) equal whole-group mini-batches. Sizes differ
+  by at most one group and no group is split. Trajectories are contiguous per group
+  (e = g x K + k) and are gathered by group index. A full batch of 16 groups splits as before
+  (8 + 8), so its gradients are unchanged. A refill-capped batch no longer gives a short tail its
+  own full Adam step: 11 groups now split 6 + 5, where they used to split 8 + 3. Every consumer
+  of the old count is unchanged, because the count is the same: ceil(trajectories /
+  `ppo_mini_batch`) per epoch for the lr sweep's Adam-step count and epochs, the LambdaLR steps
+  and the resume state. Only the sizes change. The new log key is `train/minibatch_groups`. The
+  sweep `--estimate` uses the largest equal mini-batch, which gives the same number for a full
+  batch. `tests/test_rl_minibatch.py` covers 1/7/8/9/11/16/17 groups and checks the trajectories
+  each Adam step sees. ADR-0002 and `configs/rl.yaml` describe the rule.
+- **Approval gates** (`scripts/pod/approval_lib.sh`, all five pod jobs): see "Approving a gate"
+  above. `tests/test_pod_approval.py` checks that stale, unscoped and other-pod files are ignored
+  and that a fresh scoped file passes. `job_lib.sh` is unchanged.
+- **Spend gates observed, not trusted.** `rl.gate_stop: false` in `configs/rl.yaml` and
+  `configs/rl_pickplace.yaml` for the first RL training run. `gate_flat_z` stays at 0.5,
+  provisional. Every step logs `gate/would_stop` (0/1), `gate/would_stop_reason` (every gate that
+  fired) and `gate/first_would_stop_step` (0 = none yet). `record.json` `gate_decisions` (also
+  written for an interrupted run), the run summary and the console `GATE SUMMARY` line give the
+  first step each gate would have stopped the run. They also give the flat gate's numbers at its
+  check step and say whether it would have stopped the run there (step 38, where WO-04 seeds 1-2
+  stopped under the older rule). The gate log is checkpointed, so a resumed run keeps it. A
+  resume from a checkpoint without a gate log (written before this round) reports the steps
+  before it as unknown (`gate_log_complete: false`, `gate_log_from_step`,
+  `flat_check_unknown`), never as "not reached" or "would not have stopped".
+- **Render-gap reporting** (`scripts/wo01r_rebuild_demos.py`). The headline is t = 0, the first
+  frame of each episode, rendered from the reset state before any replay physics. It reports
+  `pixels_t0`, `tokens_stored_vs_fresh_t0` (every episode's first frame) and
+  `state_max_abs_diff_t0_rad`, next to the codec floor's t0 numbers. Pooled all-frame numbers
+  (`pixels_all`, `tokens_stored_vs_fresh_all`) go in a separate table and JSON block. They are
+  labelled because open-loop replay physics drift contributes to them. Each run carries a
+  `comparison` label keyed on the renderer, not the sim device: macOS renders through MoltenVK,
+  and a Linux CUDA box renders on the GPU even with `--device cpu`. So a pod run with CPU physics
+  against the 0.1 set is still labelled the Mac-vs-GPU renderer gap. The Mac result above is a **same-renderer pipeline check**, and its run
+  record now carries that note.
+- **RL rollout action clip (stated explicitly).** The current RL rollouts do **not** apply the
+  4 deg/step joint clip that protocol 0.2 sim eval applies. I checked `src/rl/rollout.py`
+  `collect_rollouts`: it passes the policy's actions to `env.step` unchanged. The same function
+  runs the in-training greedy evals and the temperature probe, so they do not clip either. The
+  WO-04 runs and every 0.1 protocol eval ran unclipped too. Only `scripts/wo02_eval.py
+  --protocol 0.2` clips (`src/eval/sim_eval.py` `clip_joint_step`, bound from
+  `configs/real.yaml`). The new key `rl.rollout_action_clip_deg` makes this explicit. It is null
+  (off) in `configs/rl.yaml`, which is the setting for the next run, and it keeps the current
+  behaviour bit for bit. Setting it to 4.0 applies protocol 0.2's `clip_joint_step` to every
+  executed rollout and in-training-eval action and logs `rollout/action_clip_frac`; the sampled
+  tokens and log-probs are unchanged. **Owner choice:** off keeps the run comparable with WO-04
+  and the 0.1 numbers; 4.0 matches protocol 0.2 and the real arm. The agent recommended off.
+  **Superseded: the owner chose 4.0 on 2026-11-08 (round 3 below).**
+- **Follow-ups.** `push_dataset` (every demo push, wo01r included) refuses the two 0.1 repos
+  unless `allow_protected` (`wo01_build_env.py --overwrite-hub` only); wo01r `--push` to one stops
+  before the build. With `data.require_tail_finished` (on in `demos_v2*.yaml`), the build drops a
+  successful demo whose release/retreat did not finish (oracle still running at the tail cap, or a
+  grasp task ending off the release target). It reports the demo per seed and records the next
+  seed instead, so one bad episode no longer blocks pushing the valid ones. A shortfall below
+  `demos_per_task` still blocks the push, before it runs, on both push paths (wo01r and
+  `wo01_build_env.py --push`, which records `push_refused` and exits 1). The protected-repo
+  check is case-insensitive, because Hub repo ids are. `load_sft_frames` refuses a v2 demo set (v2 oracle or a
+  recorded tail) unless `data.chunk_pad: drop`.
+- **Mac test note.** `.venv/bin/pytest` starts with `#!/bin/sh`, and macOS strips
+  `DYLD_FALLBACK_LIBRARY_PATH` from it, so torchcodec cannot find FFmpeg 7 and the recorder tests
+  fail. Run `uv run python -m pytest` on the Mac instead.
+  `tests/test_pod_backstop.py::test_cap_timer_retries_and_survives_restart` is timing-sensitive.
+  It failed once while a `uv sync` was running alongside and passed 3 of 3 times on its own.
+
+### Owner instructions 2026-11-08, round 3: the RL action clip ON ($0, CPU only)
+
+On PR #28. Nothing ran on a GPU; no RunPod resource was touched (one public read-only GraphQL price
+query, 14:43:08Z: A100 PCIe / SXM Secure $1.79/h, RTX 4090 $0.89/h, unchanged). Protocol
+`0.1-draft` (`e9ce5bb47a88`), `src/env/success.py`, `src/eval/sim_eval.py`, `src/eval/protocol_v02.py`
+and every reported number are unchanged.
+
+- **Decision (owner, overriding the agent's "leave it off"):** `rl.rollout_action_clip_deg: 4.0`
+  explicitly in `configs/rl.yaml` and `configs/rl_pickplace.yaml` (inherited, repeated so it is
+  explicit). The next run's preset is `configs/rl.yaml` (the diagnostics pod's `RL_CFG` default
+  and the plan above); `rl_pickplace.yaml` carries the same setting should it be used. 4.0 =
+  protocol 0.2's bound, min(4 deg, 60 deg/s / 15 Hz) from `configs/real.yaml`; a test checks the
+  presets equal `protocol_v02.action_clip().bound_deg`. `configs/tiny.yaml` and the code default
+  stay null.
+- **One function:** the rollout already called protocol 0.2's `clip_joint_step`
+  (`src/eval/sim_eval.py`); nothing moved, so the eval is byte-identical (sim_eval.py and the 0.2
+  hash unchanged).
+- **Env action only:** `src/rl/rollout.py` stores the sampled tokens and sampler log-probs before
+  the clip; the clip changes only what `env.step` receives. Old log-probs (sampler or recomputed),
+  ratios and advantages are on the sampled tokens. `tests/test_rl_action_clip.py`: stored =
+  sampled decision by decision, the env got `clip_joint_step(sampled, prev)` and it differs from
+  the sampled action, and an update on that batch scores only sampled token rows with an
+  on-policy first-mini-batch ratio (< 1e-5) and `train/logprob_mismatch` < 1e-5.
+- **Config hashes:** `rl.yaml` / `rl_pickplace.yaml` hashes change (`eb4c1be43f8b` for rl.yaml at
+  this head). No reported number cites them: the WO-04 RL runs cite commits `7c896d0` / `4a76953`
+  (their configs are reproducible from those commits; round 1 had already changed these files),
+  and every reported eval used a `sim` / `sft` config, which this round does not touch.
+- **Probes read the same preset:** `--probe-temperatures`, `--lr-sweep` (its batch) and
+  `--probe-steps` roll out with `rl.rollout_action_clip_deg`; no separate default. Their lines
+  print it (`TEMP-PROBE ... action clip 4 deg/step`, `LR-SWEEP batch ... rollouts with action clip
+  4 deg/step`, `--estimate` prints `rollout_action_clip_deg`).
+- **Intervention logging:** per RL step in `metrics.jsonl` (`rollout/action_clip_frac` env steps,
+  `_joint_frac`, `_frac_by_joint` (6), `_mean_abs_delta_deg` / `_max_abs_delta_deg` = |a - ref| -
+  bound over the changed entries, `_env_steps`); per temperature (`probe/action_clip_*`), in the
+  lr sweep's batch stats (record.json and a `lr_sweep_batch` row in metrics.jsonl), and in both
+  clip-probe arms. Counted over running episodes only, from the bound (`|a - ref| > bound`), not
+  from `clip_joint_step(a) != a`, which is not bit-exact when the clamp does not bind.
+- **Paired probe** (`scripts/wo03_rl.py --probe-clip [--probe-groups 32]`,
+  `GRPOTrainer.probe_clip`): rollouts only, no update. Both arms play the same prompts (reset
+  seeds, tasks round-robin) with the same sampling seeds (torch RNG reseeded per env batch),
+  K = the preset's 8, T = the preset's 1.0. Arm on applies the clip; arm off sends the sampled
+  action and counts how often the clip WOULD have changed it. Per arm: sampled success +- SE,
+  group-drop rate (all-equal groups; all-0 / all-1), entropy, mean episode length, intervention.
+  Paired (`src/rl/paired.py`; `src/eval/paired.py` is not on this branch): per-group success
+  difference +- SE over groups (the unit: a group's K samples share a scene), the episode count
+  table with an exact McNemar p (labelled optimistic: episodes in a group are not independent),
+  the paired dropped-group table, and a pairing check (first-decision tokens identical, 1.0 on
+  CPU). 32 prompts: the paired per-group difference has SE ~2.4 points at p ~0.13 (Beta
+  concentration 2, K = 8), so a 5-point change shows at 2 SE; 64 prompts would cost +13 min /
+  +$0.39 for SE ~1.7. Smoke: `tests/test_rl_clip_probe.py` (CPU, tiny preset + a 6-joint test env,
+  ~1 s; the toy env's state is not a joint reading, so the clip cannot apply to it).
+- **diag_job stage:** `probe-clip` runs after the temperature probe and BEFORE the lr-sweep gate,
+  under the launch approval: its numbers are what the owner wants before approving the sweep, and
+  its own gate would idle the A100 up to 30 min ($0.90) to guard a ~14 min ($0.43) stage. It
+  uploads its record, and the gate prints the last 4 `CLIP-PROBE` lines next to `TEMP-PROBE`.
+  `CLIP_GROUPS=0` skips it; the gpu-check stage `--estimate`s it first, which refuses a preset
+  with a null clip. Caps: above (13800 / 12000 s). The sweep keeps priority: the job runs the clip
+  probe only if, at that point, the time to the soft deadline covers the clip estimate x 1.25 +
+  2 min + the sweep's need (estimate x 1.25 + 2 min) + the full 30 min approval wait unless the
+  pass is pre-approved; otherwise it prints "clip probe skipped" and goes to the gate (a pod
+  launched at the round-2 caps 12660 / 10860 s skips it rather than losing the sweep). A clip-probe
+  failure other than a timeout continues to the gate (the gate then shows no `CLIP-PROBE` lines).
+- **Gates unchanged:** `rl.gate_stop: false` for the first training run in both presets, and
+  the gate-decision logging (`gate/would_stop*`, `record.gate_decisions`) is in place (checked).
+- **Unverified on GPU:** the clip-probe pairing on CUDA (multinomial on the CUDA generator after
+  `torch.manual_seed`; GPU kernel nondeterminism may lower the first-decision token match below
+  1.0), the per-step intervention tensors' overhead on `physx_cuda` (one host copy per env batch),
+  and how the clip changes the episode length, success and group-drop rate of the a4 SFT policy.
+
+#### Round 3 review fixes ($0, CPU only)
+
+- `src/rl/rollout.py`: clip intervention counted from the bound (`|a - ref| > bound`; delta =
+  `|a - ref| - bound`), not from `clip_joint_step(a) != a`. That float comparison flagged 1-ulp
+  rounding as clipping (measured: 10-19% of within-bound entries near 0.01-0.1 rad on a 1e-3 rad
+  target grid) and pulled the mean |delta| toward 0. The executed action is unchanged
+  (`clip_joint_step`); `src/eval/` untouched. Test: within-bound steps at poses 0.01-3 rad count 0.
+- `scripts/pod/diag_job.sh`: the clip-probe time check above (sweep priority) and a non-fatal
+  clip-probe failure (timeout still exits 22). With today's estimates (clip 714 s, sweep 1.15 h)
+  the check needs 1012 + 5295 + 1800 s = 135.1 min left (105.1 min pre-approved). At the 13800 s
+  cap (soft deadline 202 min after creation) the probe runs if it is reached by 66.9 min; it is
+  planned at ~48 min (~59 min with the 25% margin). At 12660 s (soft deadline 183 min) only an
+  on-plan pod (<= 47.9 min) runs it; later, it is skipped and the sweep still fits.
+- `src/rl/trainer.py` `lr_sweep`: records the BATCH's clip (collected: the preset's; stored: its
+  `sweep_batch.json`, written next to `sweep_batch.pt`, else "unknown"), `batch_source`, and a
+  `lr_sweep_batch` metrics row with the batch's clip stats. `probe_clip`: builds every env it
+  visits before any reseed or timer (an RNG-using env build no longer shifts arm off's first
+  draws; build time no longer lands in arm off) and reports `probe/s_per_env_batch_after_first`
+  (CUDA warm-up excluded).
+- No cost change: the planned stages, caps (5940 / 13800 / 12000 s) and $ above are unchanged.
+
 ## Blockers and decisions pending the owner
 
 - WO-04: GRPO has not produced a clear gain (PickPlace seen +3.7 to +5.7 points across four
@@ -117,6 +662,12 @@ probe gate.
   switch passes if ANY trained task is +3 at step 38; PickPlace-only run, success = final protocol
   eval, seen, PickPlace, 300 episodes, >= 27.0% (missed: 20.7%); stratified multi-task only if it
   cleared that bar.
+
+- 2026-11-08 RL action clip ON: `rl.rollout_action_clip_deg: 4.0` (protocol 0.2's bound) in
+  `configs/rl.yaml` / `rl_pickplace.yaml`, env action only, PPO on the sampled tokens; the probes
+  use the same setting; a paired clip on/off probe runs before the lr-sweep gate; no full-run
+  proposal until its numbers are in (ADR-0002 amendment 3). `rl.gate_stop: false` for the first
+  run.
 
 ## Decisions taken by the agent (one line each, link ADR if any)
 

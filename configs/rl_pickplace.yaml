@@ -1,12 +1,22 @@
-# WO-04 follow-up (owner, 2026-10-28): PickPlace-only GRPO, one seed, otherwise configs/rl.yaml.
-# Seeds 1-2 of the PickPlace+Push run stopped flat at step 38: PickPlace gained 5-9 points while
-# Push lost 2-9. This isolates whether RL improves one task when it gets every update. Push and
-# Stack stay in the evals (eval-only). Gate for multi-task with stratified batches: >= +10 points.
+# WO-04 follow-up (owner, 2026-10-28): PickPlace-only GRPO, one seed, otherwise configs/rl.yaml
+# (2026-11-08 shape: 16 prompts x K=8, lr 1e-4, ppo_epochs 2, rollout-window spend gates, the
+# fixed-batch diagnostic). Seeds 1-2 of the PickPlace+Push run stopped flat at step 38: PickPlace
+# gained 5-9 points while Push lost 2-9. This isolates whether RL improves one task when it gets
+# every update. Periodic greedy evals (sanity logs only) now cover PickPlace alone; Push and Stack
+# are measured by the protocol eval. Gate for multi-task with stratified batches: >= +10 points
+# (protocol eval).
 #   SEED=0 RL_CFG=configs/rl_pickplace.yaml bash scripts/pod/wo04_job.sh
+# The step-50 vs step-100 peak stop (owner 2026-10-28) compared two 32-episode greedy evals and
+# produced one wrong "peak" at step 50; it is replaced by rl.yaml's decline gate (windowed rollout
+# success > gate_max_drop below its best window) and every eval step keeps a checkpoint.
+#   estimated: A100-80GB x 41.2 h = $74 (worst case, refill cap every step; same arithmetic as
+#   rl.yaml with 1 trained task in the evals: --estimate prints it); gate_stop false: no early stop
 inherit: configs/rl.yaml
 
 rl:
   train_tasks: [PickPlace]
+  gate_stop: false          # owner 2026-11-08: the first RL run observes the gates (gate/would_stop,
+                            # record gate_decisions) before they may stop a run; as configs/rl.yaml
   checkpoint_every: 25      # owner 2026-10-28: every eval step has a checkpoint
-  peak_stop_step: 100       # owner 2026-10-28: if step 100 < step 50 (trained-task eval), stop:
-  peak_ref_step: 50         #   "don't train past the peak"; the best checkpoint is evaluated
+  rollout_action_clip_deg: 4.0  # owner 2026-11-08: protocol 0.2's clip on the env action, as
+                            # configs/rl.yaml (inherited; repeated so the setting is explicit)

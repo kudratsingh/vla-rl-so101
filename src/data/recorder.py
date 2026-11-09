@@ -20,11 +20,12 @@ torchcodec an fsspec file object, which torchcodec 0.2.1 (our torch-2.6 pin) rej
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,31 @@ ROBOT_TYPE = "so101_follower"
 SIDECAR = "meta/vla_rl_so101_episodes.jsonl"
 VIDEO_BACKEND = "torchcodec"
 REQUIRED_META = ("task_family", "seed", "cell", "oracle_success")
+# The 0.1-era demo sets every reported SFT/RL number trained on. Every push goes through
+# `push_dataset`, which refuses them unless `allow_protected` (wo01_build_env.py --overwrite-hub;
+# scripts/wo01r_rebuild_demos.py has no override).
+PROTECTED_HUB_REPOS = ("KudratSingh22/vla-rl-so101-demos", "KudratSingh22/vla-rl-so101-demos-25")
+
+
+class ProtectedRepoError(ValueError):
+    """A push to one of PROTECTED_HUB_REPOS without an explicit override."""
+
+
+def is_protected_repo(repo_id: str) -> bool:
+    """Case-insensitive: Hub repo ids resolve regardless of case, so 'kudratsingh22/...' is the
+    same repo as 'KudratSingh22/...' (review 2026-11-08)."""
+    key = repo_id.strip().casefold()
+    return any(key == r.casefold() for r in PROTECTED_HUB_REPOS)
+
+
+def check_push_target(repo_id: str, *, allow_protected: bool = False) -> None:
+    """Raise ProtectedRepoError for a protected repo (before any data or network is touched)."""
+    if is_protected_repo(repo_id) and not allow_protected:
+        raise ProtectedRepoError(
+            f"refusing to push to {repo_id}: it holds a 0.1-era demo set that reported SFT/RL "
+            "numbers trained on; set data.hub_repo to a new repo"
+        )
+
 
 ArrayLike = np.ndarray[Any, Any] | torch.Tensor
 
@@ -89,6 +115,25 @@ def install_torchcodec_compat() -> None:
 
         video_utils.VideoDecoderCache.get_decoder = get_decoder
         _compat_installed = True
+
+
+@contextlib.contextmanager
+def _datasets_write_compat() -> Iterator[None]:
+    """Let `datasets` write rows after torchcodec was imported in this process.
+
+    Once torchcodec is in sys.modules (any dataset was decoded, e.g. the render-gap check or an
+    earlier test), `datasets` imports `torchcodec.decoders.AudioDecoder` while encoding rows;
+    torchcodec 0.2.1 (our torch-2.6 pin) has no AudioDecoder. Our rows never hold decoder
+    objects (video goes to mp4 through LeRobot's encoder), so writes skip that branch.
+    """
+    import datasets.config
+
+    prev = datasets.config.TORCHCODEC_AVAILABLE
+    datasets.config.TORCHCODEC_AVAILABLE = False
+    try:
+        yield
+    finally:
+        datasets.config.TORCHCODEC_AVAILABLE = prev
 
 
 def dataset_location(cfg: Config) -> tuple[str, Path]:
@@ -160,16 +205,17 @@ class DemoRecorder:
         self.root.parent.mkdir(parents=True, exist_ok=True)
         self.image_hw = (int(image_hw[0]), int(image_hw[1]))
         self.num_joints = len(joint_names)
-        self.dataset = LeRobotDataset.create(
-            repo_id=repo_id,
-            fps=fps,
-            features=demo_features(self.image_hw, joint_names),
-            root=self.root,
-            robot_type=robot_type,
-            use_videos=True,
-            video_backend=VIDEO_BACKEND,
-            vcodec=vcodec,
-        )
+        with _datasets_write_compat():
+            self.dataset = LeRobotDataset.create(
+                repo_id=repo_id,
+                fps=fps,
+                features=demo_features(self.image_hw, joint_names),
+                root=self.root,
+                robot_type=robot_type,
+                use_videos=True,
+                video_backend=VIDEO_BACKEND,
+                vcodec=vcodec,
+            )
         self.sidecar_path = self.root / SIDECAR
         self.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
         self.sidecar_path.touch()
@@ -212,9 +258,10 @@ class DemoRecorder:
             self._instruction = instruction
         elif instruction != self._instruction:
             raise ValueError("instruction changed within an episode")
-        self.dataset.add_frame(
-            {IMAGE_KEY: img, STATE_KEY: st, ACTION_KEY: act, "task": instruction}
-        )
+        with _datasets_write_compat():
+            self.dataset.add_frame(
+                {IMAGE_KEY: img, STATE_KEY: st, ACTION_KEY: act, "task": instruction}
+            )
         self._num_frames += 1
 
     def save_episode(self, meta: dict[str, Any]) -> int:
@@ -225,7 +272,8 @@ class DemoRecorder:
         if self._num_frames == 0 or self._instruction is None:
             raise RuntimeError("no frames buffered")
         episode_index = self.num_episodes
-        self.dataset.save_episode()
+        with _datasets_write_compat():
+            self.dataset.save_episode()
         row = {
             "episode_index": episode_index,
             "task_family": str(meta["task_family"]),
@@ -259,16 +307,20 @@ class DemoRecorder:
         if self._finalized:
             return
         self.discard_episode()
-        self.dataset.finalize()
+        with _datasets_write_compat():
+            self.dataset.finalize()
         images = self.root / "images"
         if images.is_dir() and not any(p.is_file() for p in images.rglob("*")):
             shutil.rmtree(images)
         self._finalized = True
 
-    def push_to_hub(self, *, private: bool = True) -> str:
+    def push_to_hub(self, *, private: bool = True, allow_protected: bool = False) -> str:
         """Push the finalized dataset (sidecar included) to the Hub. Needs HF_TOKEN."""
+        check_push_target(self.repo_id, allow_protected=allow_protected)
         self.finalize()
-        return push_dataset(self.repo_id, self.root, private=private)
+        return push_dataset(
+            self.repo_id, self.root, private=private, allow_protected=allow_protected
+        )
 
 
 def _ensure_hf_token() -> None:
@@ -287,8 +339,12 @@ def _ensure_hf_token() -> None:
         raise RuntimeError("no Hugging Face token: set HF_TOKEN in the environment or .env")
 
 
-def push_dataset(repo_id: str, root: str | Path, *, private: bool = True) -> str:
-    """Push an on-disk demo dataset to `repo_id` (private by default); returns its URL."""
+def push_dataset(
+    repo_id: str, root: str | Path, *, private: bool = True, allow_protected: bool = False
+) -> str:
+    """Push an on-disk demo dataset to `repo_id` (private by default); returns its URL. Refuses
+    PROTECTED_HUB_REPOS unless `allow_protected` (ProtectedRepoError, before the token check)."""
+    check_push_target(repo_id, allow_protected=allow_protected)
     _ensure_hf_token()
     ds = load_demo_dataset(repo_id, root)
     ds.push_to_hub(private=private, tags=["vla-rl-so101", "so101", "maniskill3", "lerobot"])

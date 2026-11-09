@@ -1,0 +1,230 @@
+{
+  "run_id": "20261108T083504Z-wo01r-sim-c025",
+  "work_order": "WO-01r",
+  "script": "scripts/wo01r_rebuild_demos.py",
+  "argv": [
+    "--preset",
+    "sim",
+    "--device",
+    "cpu",
+    "--mode",
+    "render-gap",
+    "--skip-tokens",
+    "--gap-episodes",
+    "3"
+  ],
+  "preset": "sim",
+  "config_hash": "e81062727a77794c39a88fb9a43a2988d9bf72eff2d154b00614da835b9e13c3",
+  "config": {
+    "preset": "sim",
+    "device": "cpu",
+    "seed": 0,
+    "env": {
+      "name": "so101_tabletop",
+      "tasks": [
+        "PickPlace",
+        "Push",
+        "Stack"
+      ],
+      "num_envs": 64,
+      "image_size": 224,
+      "max_episode_steps": 150,
+      "randomize": false,
+      "randomization": {
+        "object_color_jitter": 0.08,
+        "object_physics": true,
+        "lighting": true,
+        "camera_pos_jitter_m": 0.02,
+        "camera_target_jitter_m": 0.01,
+        "camera_roll_jitter_rad": 0.02,
+        "camera_fov_jitter_deg": 1.5,
+        "robot_color": true,
+        "action_latency_max_steps": 2,
+        "reconfigure_every": 10
+      },
+      "camera": {
+        "pose": "front_left_45",
+        "fov_deg": 40,
+        "eye": [
+          0.555,
+          0.35,
+          0.495
+        ],
+        "target": [
+          0.205,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    "data": {
+      "demos_per_task": 25,
+      "dataset_root": "data/demos",
+      "hub_repo": "KudratSingh22/vla-rl-so101-demos-25-v2",
+      "oracle_profile": "v2",
+      "post_success_steps": 15,
+      "post_success_max_steps": 45,
+      "require_final_success": true,
+      "chunk_pad": "drop"
+    },
+    "policy": {
+      "base": "openvla_oft",
+      "checkpoint": null,
+      "lora_rank": 32,
+      "action_chunk": 8,
+      "precision": "bf16"
+    },
+    "sft": {
+      "steps": 2000,
+      "batch_size": 8,
+      "lr": 5e-05,
+      "warmup_steps": 100
+    },
+    "eval": {
+      "episodes_per_cell": 100,
+      "seeds": [
+        0,
+        1,
+        2
+      ],
+      "cells": [
+        "seen",
+        "shifted",
+        "unseen_objects"
+      ],
+      "protocol_hash": null
+    },
+    "render_gap": {
+      "dataset": "KudratSingh22/vla-rl-so101-demos-25",
+      "adapter": "KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000",
+      "policy_config": "configs/sft_a4.yaml",
+      "episodes_per_task": 25,
+      "token_stride": 1
+    },
+    "cost": {
+      "gpu": "RTX-4090",
+      "usd_per_hour": 0.89,
+      "est_hours": 0.75
+    }
+  },
+  "git": {
+    "commit": "2af16f6a19c8dc2d48b00ebc2a9e5191835b477b",
+    "branch": "pr1-data",
+    "dirty": true
+  },
+  "device": {
+    "device": "cpu",
+    "host": "Kudrats-MacBook-Pro-3.local",
+    "os": "macOS-26.5.2-arm64-arm-64bit",
+    "torch": "2.6.0",
+    "name": "Apple M3 Pro",
+    "runpod_pod_id": null
+  },
+  "start_utc": "2026-11-08T08:35:04Z",
+  "end_utc": "2026-11-08T08:35:13Z",
+  "wall_clock_s": 9.4,
+  "hourly_usd": 0.0,
+  "estimated_usd": 0.0,
+  "actual_usd": 0.0,
+  "status": "ok",
+  "notes": [
+    "2026-11-08 (label added afterwards, no number changed): SAME-RENDERER PIPELINE CHECK. The stored 0.1 frames and the fresh frames were both rendered on the Mac CPU renderer (MoltenVK); this is NOT a Mac-vs-GPU renderer gap measurement. The Mac-vs-GPU gap is the pending render-gap probe on the GPU pod (scripts/pod/demo_rebuild_job.sh)."
+  ],
+  "results": {
+    "mode": "render-gap",
+    "render_gap": {
+      "dataset": "KudratSingh22/vla-rl-so101-demos-25",
+      "tasks": {
+        "PickPlace": {
+          "episodes": 3,
+          "pixels_t0": {
+            "frames": 3,
+            "mean_abs": 1.997,
+            "psnr_db": 36.57,
+            "frac_pixels_changed": 0.02391
+          },
+          "pixels_all": {
+            "frames": 223,
+            "mean_abs": 2.07,
+            "psnr_db": 36.03,
+            "frac_pixels_changed": 0.02747
+          },
+          "state_max_abs_diff_t0_rad": 0.0,
+          "state_mean_max_abs_diff_rad": 0.0,
+          "seconds": 3.3,
+          "codec_floor": {
+            "pixels": {
+              "frames": 151,
+              "mean_abs": 2.042,
+              "psnr_db": 36.19,
+              "frac_pixels_changed": 0.02638
+            }
+          }
+        },
+        "Push": {
+          "episodes": 3,
+          "pixels_t0": {
+            "frames": 3,
+            "mean_abs": 1.968,
+            "psnr_db": 36.64,
+            "frac_pixels_changed": 0.02415
+          },
+          "pixels_all": {
+            "frames": 163,
+            "mean_abs": 2.093,
+            "psnr_db": 35.78,
+            "frac_pixels_changed": 0.02929
+          },
+          "state_max_abs_diff_t0_rad": 0.0,
+          "state_mean_max_abs_diff_rad": 0.0,
+          "seconds": 1.1,
+          "codec_floor": {
+            "pixels": {
+              "frames": 96,
+              "mean_abs": 2.086,
+              "psnr_db": 35.87,
+              "frac_pixels_changed": 0.02832
+            }
+          }
+        },
+        "Stack": {
+          "episodes": 3,
+          "pixels_t0": {
+            "frames": 3,
+            "mean_abs": 2.001,
+            "psnr_db": 36.26,
+            "frac_pixels_changed": 0.0255
+          },
+          "pixels_all": {
+            "frames": 209,
+            "mean_abs": 2.063,
+            "psnr_db": 35.76,
+            "frac_pixels_changed": 0.02824
+          },
+          "state_max_abs_diff_t0_rad": 0.0,
+          "state_mean_max_abs_diff_rad": 0.0,
+          "seconds": 1.5,
+          "codec_floor": {
+            "pixels": {
+              "frames": 139,
+              "mean_abs": 2.051,
+              "psnr_db": 35.85,
+              "frac_pixels_changed": 0.02747
+            }
+          }
+        }
+      },
+      "backend": {
+        "device": "cpu",
+        "render": {
+          "device": "cpu",
+          "host": "Kudrats-MacBook-Pro-3.local",
+          "os": "macOS-26.5.2-arm64-arm-64bit",
+          "torch": "2.6.0",
+          "name": "Apple M3 Pro",
+          "runpod_pod_id": null
+        }
+      }
+    }
+  }
+}

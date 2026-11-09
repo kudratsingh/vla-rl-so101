@@ -22,7 +22,7 @@ SENSITIVE = re.compile(
 )
 BENCHMARK_TASKS = ("PickPlace", "Push", "Stack")
 BENCHMARK_CELLS = ("seen", "shifted", "unseen_objects")
-METRIC_PREFIXES = ("train/", "rollout/", "eval/", "time/")
+METRIC_PREFIXES = ("train/", "rollout/", "eval/", "time/", "diag/")  # diag/: src/rl/diagnostics.py
 METRIC_FIELDS = {
     "loss",
     "l1_norm",
@@ -240,7 +240,7 @@ function cell(tr,value,cls){const td=document.createElement("td");td.textContent
 function fmt(n){return n===null||!Number.isFinite(n)?"—":Number(n).toLocaleString(undefined,{maximumFractionDigits:4});}
 function latest(r,key){const p=r.series[key]||[];return p.length?p[p.length-1][1]:null;}
 const keys=[...new Set(runs.flatMap(r=>Object.keys(r.series)))];
-const favorites=["eval/success_train","eval/success","rollout/success_rate","rollout/frac_groups_dropped","rollout/group_reward_std","train/pg_loss","train/approx_kl","train/clip_frac","train/entropy","loss","grad_norm"];
+const favorites=["eval/success_train","eval/success","rollout/success_rate","rollout/frac_groups_dropped","rollout/group_reward_std","train/pg_loss","diag/post/k3_kl","diag/post/clip_frac","diag/post/mean_abs_dlogp","train/grad_norm","train/entropy","loss","grad_norm"];
 keys.sort((a,b)=>(favorites.indexOf(a)<0?99:favorites.indexOf(a))-(favorites.indexOf(b)<0?99:favorites.indexOf(b))||a.localeCompare(b));
 for(const key of keys){const o=document.createElement("option");o.value=key;o.textContent=key;metric.appendChild(o);}
 function renderChart(){chart.replaceChildren();legend.replaceChildren();const key=metric.value;

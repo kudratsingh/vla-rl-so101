@@ -17,9 +17,12 @@ import numpy as np
 import sapien
 import torch
 from mani_skill.envs.sapien_env import BaseEnv
-from mani_skill.envs.utils.randomization.camera import noised_look_at
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
+from mani_skill.utils.geometry.rotation_conversions import (
+    axis_angle_to_quaternion,
+    quaternion_multiply,
+)
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.structs.actor import Actor
 from mani_skill.utils.structs.pose import Pose
@@ -59,6 +62,20 @@ def _q_yaw(yaw: torch.Tensor) -> torch.Tensor:
     return torch.stack(
         [torch.cos(yaw / 2), torch.zeros_like(yaw), torch.zeros_like(yaw), torch.sin(yaw / 2)], -1
     )
+
+
+def _jittered_look_at(eye: torch.Tensor, target: torch.Tensor, roll: torch.Tensor) -> Pose:
+    """(N, 3) eyes looking at (N, 3) targets, rolled by (N,) rad about the view axis.
+
+    The deterministic half of ManiSkill 3.0.1 ``noised_look_at``
+    (``mani_skill/envs/utils/randomization/camera.py``, haosulab/ManiSkill, tag v3.0.1, Apache-2.0)
+    with the noise passed in instead of drawn from the global torch RNG.
+    """
+    poses = sapien_utils.look_at(eye=eye, target=target)
+    axes = target - eye
+    unit = axes / torch.linalg.norm(axes, dim=-1, keepdim=True)
+    q_roll = axis_angle_to_quaternion(unit * roll[:, None])
+    return Pose.create_from_pq(poses.p, q=quaternion_multiply(q_roll, poses.q))
 
 
 def _sample_points(
@@ -333,13 +350,15 @@ class SO101TabletopEnv(BaseEnv):  # type: ignore[misc]
             self._act_hist[env_idx] = hold[:, None, :].repeat(1, 3, 1)
 
             if self.dr.camera_jitter:
-                eye = torch.tensor(self.camera_spec.eye).repeat(b, 1)
-                eye = eye + (torch.rand(b, 3) * 2 - 1) * self.dr.camera_pos_jitter_m
-                pose = noised_look_at(
-                    eye,
-                    target=torch.tensor(self.camera_spec.target),
-                    look_at_noise=self.dr.camera_target_jitter_m,
-                    view_axis_rot_noise=self.dr.camera_roll_jitter_rad,
+                # Drawn from the episode RNG (last, so the draws above are unchanged), not the
+                # global torch RNG: a reset with the same seed replays the same camera pose.
+                eye_noise = rngs.uniform(-1.0, 1.0, size=(3,)) * self.dr.camera_pos_jitter_m
+                target_noise = rngs.normal(0.0, 1.0, size=(3,)) * self.dr.camera_target_jitter_m
+                roll = rngs.normal(0.0, 1.0) * self.dr.camera_roll_jitter_rad
+                pose = _jittered_look_at(
+                    torch.tensor(self.camera_spec.eye) + torch.tensor(eye_noise).float(),
+                    torch.tensor(self.camera_spec.target) + torch.tensor(target_noise).float(),
+                    torch.tensor(roll).float().reshape(b),
                 )
                 self.camera_mount.set_pose(pose)
 
