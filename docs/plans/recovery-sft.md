@@ -10,7 +10,8 @@ owner's explicit go on its own probe numbers (CLAUDE.md rule 1).
 - The lr-escalation rule and every other rule keyed on the logged `train/clip_frac` /
   `train/approx_kl` are replaced by PR 1's fixed-batch pre/post-update diagnostic (section 11).
   With one PPO epoch the logged metric is structurally ~0 and uninformative; PR 1 removes it.
-- The step-20 checks use PR 1's rollout-window flat gate, not the 64-episode kill switch.
+- The step-20 checks use PR 1's flat gate on rollout success, not the 64-episode kill switch
+  (since the merge of main below: a trend over steps 1-20, logged only while `gate_stop` is false).
 - Every protocol eval must write per-episode records, so the comparisons can be paired (sections 9
   and 10).
 - The matched ordinary-demo control (section 7) is unchanged.
@@ -27,6 +28,34 @@ owner's explicit go on its own probe numbers (CLAUDE.md rule 1).
   readout of section 10 from the per-episode records.
 - With `chunk_pad: drop` (the v2 set), the correction cap and the control match count the frames
   that enter the SFT loss, not recorded frames (section 5).
+
+**Sync with main, 2026-11-08** (main after #28's final review rounds, #24, #23 and #29 merged into
+this branch; $0, CPU only). What changed for this plan:
+- Flat gate: main's `src/rl/gates.py` no longer compares two windows. At the check step it fits a
+  per-task least-squares trend of rollout success over every step 1..check_step. The gain is the
+  fitted change from step 1 (the base policy) to the check step. The run stops only if, for every
+  trained task, gain + `gate_flat_z` x SE < `gate_min_gain` (`gate_flat_z` 0.5, provisional,
+  simulated only). `gate_window` now sizes only the decline and entropy windows (sections 11, 12).
+- `gate_stop: false` in `configs/rl.yaml` and `configs/rl_pickplace.yaml` (owner 2026-11-08: the
+  first RL run on this recipe observes the gates before they may stop a run). The
+  `configs/rl_pickplace_lr*.yaml` inherit it. Every gate still evaluates and logs
+  `gate/would_stop*` and `record.gate_decisions`, but **no gate stops a stage B run**. The step-20
+  exit of sections 11-13 is now an owner decision (section 14, decision 5). The worst-case cost
+  lines already assume the full 75 steps, so no cap changes.
+- `rollout_action_clip_deg: 4.0` (owner 2026-11-08) is inherited by the three lr configs. RL
+  rollouts, in-training evals and every probe (`--lr-sweep`'s batch, `--probe-steps`) clip the env
+  action as protocol 0.2 does. PPO keeps the sampled tokens. The three lr arms are matched on it,
+  but they are not like-for-like with WO-04, which ran unclipped.
+- PPO mini-batches are equal whole-group splits (16 groups -> 8 + 8, unchanged for a full batch).
+  `--estimate` re-run on this merge: 20.6 h = $37 for 75 steps, identical for the three configs;
+  `--lr-sweep` 4 lrs x 8 Adam steps 1.15 h = $2.06 (was 1.20 h); `--probe-clip --probe-groups 32`
+  0.20 h = $0.36, optional here (section 13).
+- `load_sft_frames` refuses a v2 set unless `chunk_pad: drop`. It checks every part of the mix:
+  the demos and each extra dataset, so corrections recorded under `configs/demos_v2.yaml` are
+  covered too. `configs/sft_a5_*.yaml` (0.1 set, oracle v1, `chunk_pad: repeat`) pass unchanged.
+- Per-episode records carry the reset's `instruction`. `end_reason` is success | terminated |
+  horizon: a truncation counts as horizon, and the raw flag stays in `flags["truncated"]`. The
+  collector passes the instructions through `run_batch_traced` too.
 
 ## 0. Order (review Track B)
 
@@ -335,14 +364,18 @@ Every setting, as `scripts/wo03_rl.py --preset rl --estimate` validates it:
   log-probs, `ppo_epochs` 2, `ppo_mini_batch` 64 (4 optimizer steps per update), refill cap 3,
   PickPlace trained, 32-episode periodic greedy evals every 25 steps on PickPlace only (sanity
   logs; Push and Stack are measured by the protocol eval), the fixed-batch diagnostic every step
-  (32 trajectories), `gate_rule: any_task`, `gate_min_gain: 0.03`, the decline gate
-  (`gate_max_drop` 0.04, `gate_decline_z` 3) and the entropy gate (`gate_entropy_min` 0.5);
+  (32 trajectories), `gate_rule: any_task`, `gate_min_gain: 0.03`, `gate_flat_z: 0.5`, the
+  decline gate (`gate_max_drop` 0.04, `gate_decline_z` 3), the entropy gate (`gate_entropy_min`
+  0.5), `gate_stop: false` (the gates log `gate/would_stop*` and do not stop the run) and
+  `rollout_action_clip_deg: 4.0` (protocol 0.2's clip on the env action);
 - changed (`configs/rl_pickplace_lr*.yaml`): base = the recovery pick (`--adapter`); `seed: 3`;
   `lr` 5e-5 / 5e-4 / 1e-3; `steps: 75`, `checkpoint_every: 25`;
 - `gate_check_frac: 0.26` with `gate_window: 5`: the flat gate is at ceil(0.26 x 75) = ceil(19.5)
-  = step 20 and compares the steps 16-20 window with steps 1-5 (the inherited 0.25 would give step
-  19). This replaces the WO-04 `early_stop_check_at_frac` kill switch and the `peak_stop_step`
-  peak stop, which PR 1 removed (the trainer refuses the old keys and names the replacement).
+  = step 20 (the inherited 0.25 would give step 19) and reads the trend over steps 1-20. The
+  5-step window sizes the decline and entropy windows. This replaces the WO-04
+  `early_stop_check_at_frac` kill switch (stop at step 20) and the `peak_stop_step` peak stop
+  (off in these configs), which PR 1 removed. The trainer refuses the old keys and names the
+  replacement.
 
 The owner's diagnostic rules apply:
 
@@ -357,20 +390,25 @@ The owner's diagnostic rules apply:
    the lr stays at 5e-5. If no lr up to 1e-3 qualifies without being too far, stop and report:
    do not escalate past 1e-3. The thresholds (1% flips, 0.2 outside-clip) are the agent's
    proposal and must be confirmed by the owner before stage A runs. The logged
-   `train/clip_frac` / `train/approx_kl` are not used: with one PPO epoch they are structurally
-   ~0 whatever the update does (review 3.1), and PR 1 removes them.
-2. **Rule 2 (stage B). Flat gate at step 20** (PR 1 `src/rl/gates.py`): stop unless at least one
-   trained task's windowed `rollout/success_rate` over steps 16-20 is >= 3 points above its
-   steps 1-5 window (`gate_window: 5`, `gate_check_frac: 0.26`, `gate_rule: any_task`,
-   `gate_min_gain: 0.03`). The trainer implements this, so no separate job-script check is
-   needed. This replaces both the 64-episode kill switch, which cannot tell +3 from 0 (review
-   3.1), and the former clip-keyed rule 3. The periodic greedy evals are sanity logs only.
+   `train/clip_frac` / `train/approx_kl` are not used: with WO-04's one PPO epoch they were
+   structurally ~0 whatever the update did, and at `ppo_epochs` 2 they average mini-batches
+   whose first is exactly on-policy, so they are only weak evidence (review 3.1, configs/rl.yaml).
+2. **Rule 2 (stage B). Flat gate at step 20** (`src/rl/gates.py`): flat unless, for at least one
+   trained task, the trend gain of `rollout/success_rate` from step 1 to step 20, plus 0.5 x its
+   SE, is >= 3 points (`gate_check_frac: 0.26`, `gate_rule: any_task`, `gate_min_gain: 0.03`,
+   `gate_flat_z: 0.5`). This replaces both the 64-episode kill switch, which cannot tell +3 from
+   0 (review 3.1), and the former clip-keyed rule 3. The periodic greedy evals are sanity logs
+   only. **With the inherited `gate_stop: false` the trainer only logs the decision**
+   (`gate/would_stop`, `gate/first_would_stop_step`, `record.gate_decisions`), so the run goes on
+   to step 75. Making rule 2 stop the run needs `gate_stop: true` in the lr configs, or the job
+   script stopping on the logged decision. That is the owner's call (section 14, decision 5).
 3. **Rule 3 (stage B, every step).** The run is also stopped if the post-update fixed-batch
    diagnostic (`diag/post/k3_kl`; argmax flips only with `diag_argmax: true`, about +31 s/step)
    collapses to the stage A 5e-5 reference level for
    10 consecutive steps, meaning the updates stopped moving the policy, or if PR 1's entropy gate
-   fires (`gate_entropy_min`). The job script reads the diagnostic from `metrics.jsonl`. It must
-   exist with a tiny dry run before stage B is proposed.
+   fires (`gate_entropy_min`; with `gate_stop: false` read from `gate/would_stop_reason` in
+   `metrics.jsonl`). The job script reads both from `metrics.jsonl`. It must exist with a tiny dry
+   run before stage B is proposed.
 
 The readout is the final checkpoint's protocol table on a 4090. PickPlace seen (300 episodes)
 versus its own base, from the same protocol run in section 9. Stage A isolates lr from the same
@@ -381,10 +419,12 @@ base. Stage B measures "GRPO gain from this base at this lr" over 75 steps.
 These run only if the diagnostic's PickPlace seen is **>= +10 points over its base** (the owner's
 +10 bar of 2026-10-28) with p < 0.05 and it passed its step-20 checks. Seeds 0, 1 and 2 use the
 diagnostic's exact settings and step budget, run sequentially. Seeds 1-2 start only after seed 0
-passes its step-20 flat gate, as in WO-04. At 75 steps that is the stage B config with only
+passes its step-20 flat gate, as in WO-04 (under `gate_stop: false`: its logged step-20
+decision). At 75 steps that is the stage B config with only
 `seed` changed. At 150 steps the flat gate needs `gate_check_frac: 0.133`
 (ceil(19.95) = step 20; the inherited 0.25 would put it at step 38), and the decline gate
-(`gate_max_drop`) replaces the old peak stop. Each seed gets a full protocol eval. Between +3 and
+(`gate_max_drop`) replaces the old peak stop; with the inherited `gate_window` 10, step 20 is
+exactly 2 windows, the minimum the trainer accepts. Each seed gets a full protocol eval. Between +3 and
 +10 points, the result is reported and the owner decides. Nothing runs automatically.
 
 ## 13. Cost, from measured numbers
@@ -400,7 +440,8 @@ Rates: RTX 4090 $0.89/h, A100 80 GB $1.79/h (STATUS.md, 2026-11-07). Measured in
   `ppo_epochs` 2, the per-step diagnostic; throughputs measured on WO-04 pod gzxhwhjhdtc1kc and
   WO-02 pod u87r9sjnwig58d, the scoring rate estimated): 16.43 min = 0.274 h per step worst case
   (refill cap every step), 20.6 h for 75 steps, 41.2 h for 150; `--lr-sweep` 4 x 8 Adam steps
-  1.20 h. For the WO-04 shape the same estimator gave 0.221 h/step against the measured 0.20
+  1.15 h (re-run on the merge of main, 2026-11-08: 1.20 h before the equal mini-batch split;
+  the per-step and 75-step lines are unchanged). For the WO-04 shape the same estimator gave 0.221 h/step against the measured 0.20
   (16.6 h for 75 steps), so the worst case below is likely ~10% high.
 
 Protocol 0.2 adds the 4 deg/step clip to every eval and to the failure-mining rollouts. PR 1
@@ -432,9 +473,9 @@ GRPO diagnostic (A100 run + 4090 protocol 0.2 eval), PR 1 shape:
 
 | Stage | Exit | A100 h | $ |
 |---|---|---|---|
-| A (own go) | offline lr sweep, 4 lrs x 8 Adam steps (`--estimate`), + 0.5 h setup | 1.20 + 0.5 = 1.7 | 3.0 |
-| A | + one 3-step probe at the chosen lr: WO-04 probe overhead (0.85 - 3 x 0.218 = 0.19 h) + 3 x 0.274 | 1.7 + 1.0 = 2.7 | 4.8 |
-| B (own go) | flat gate at step 20 | 0.85 + 20 x 0.274 = 6.3 | 11.3 |
+| A (own go) | offline lr sweep, 4 lrs x 8 Adam steps (`--estimate`), + 0.5 h setup | 1.15 + 0.5 = 1.65 | 3.0 |
+| A | + one 3-step probe at the chosen lr: WO-04 probe overhead (0.85 - 3 x 0.218 = 0.19 h) + 3 x 0.274 | 1.65 + 1.0 = 2.7 | 4.8 |
+| B (own go) | flat gate at step 20, **only if the owner sets `gate_stop: true` or stops on the logged decision** (inherited `gate_stop: false` runs on) | 0.85 + 20 x 0.274 = 6.3 | 11.3 |
 | B | full 75 steps + 4090 protocol 0.2 eval (1.45 h = $1.3) | 0.85 + 20.6 = 21.4 | 38.4 + 1.3 = 39.7 |
 | A + B | worst case: sweep + probe + full run | 24.1 | ~44.5 |
 
@@ -447,10 +488,15 @@ min).
 Confirmatory seeds: 3 x $39.7 = **~$119** at 75 steps, within **$210**. At 150 steps per seed:
 0.85 + 41.2 = 42.0 h = $75.2 + $1.3 = ~$76.5 per seed, **~$230** for three, **over** the $210
 allowance in the worst case (75-step seeds, two 150-step seeds, or the owner raising the
-allowance). A seed stopped at its step-20 flat gate costs about $11.3.
+allowance). A seed stopped at its step-20 flat gate costs about $11.3 (again only with
+`gate_stop: true` or a stop on the logged decision). STATUS.md's allowance line for these seeds
+is "up to three at $70 each": the 75-step seed ($39.7) fits it, a 150-step seed ($76.5) does not.
 
 All stages together, worst case from the caps: $12 + $46 + $119 = **~$177** with 75-step seeds,
-or $12 + $46 + $230 = ~$288 with 150-step seeds, of the $300 total allowance.
+or $12 + $46 + $230 = ~$288 with 150-step seeds, of the $300 these three allowances total
+(STATUS.md "Spend", 2026-11-08: inside the $700 core part of the $1,100 cloud compute cap; the
+allowances themselves are unchanged). The optional `--probe-clip` (0.20 h = $0.36 on the stage A
+pod) fits the ~$46 stage A + B cap.
 Most likely, the plan stops at one of the gates well before that.
 
 ## 14. Owner decisions needed
@@ -473,6 +519,13 @@ Most likely, the plan stops at one of the gates well before that.
    (~$230, over the $210 allowance in the worst case). Whether WO-04's
    2-of-3-task benchmark needs a two-task (PickPlace + Push) confirmatory run instead. It would
    cost about the same, at about 0.18 h/step (A100 ledger, pod `9d8p7vyfyv6ca4`: (28.4 - 0.85) / 150).
+5. **Gate stops in stage B and the confirmatory seeds** (new with the merge of main, 2026-11-08).
+   `configs/rl_pickplace_lr*.yaml` inherit `gate_stop: false`, so the step-20 flat gate and the
+   decline / entropy gates only log. Options: (a) keep false, which follows the owner's "observe
+   first" rule; the run goes to step 75 at the priced worst case, $39.7. (b) Set `gate_stop: true`
+   in the lr configs, which restores the plan's step-20 exit ($11.3) under the trend rule with
+   `gate_flat_z` 0.5 (provisional, simulated only). (c) Keep false and have the stage B job
+   script stop the pod on `gate/first_would_stop_step`. The agent has not changed the setting.
 
 ## 15. Run sequence (after approval)
 
@@ -506,8 +559,10 @@ The pod job script (probe stage, approval gate, upload, self-delete) follows the
 - `scripts/wo02_sft.py --preset tiny` on demos + corrections: 151 + 74 frames, per-dataset
   coverage 0.0 clipped, 4 steps.
 - `scripts/wo03_rl.py --preset rl --estimate` on the three section 11 configs: `GRPOConfig`
-  validates, RL seed 3 passes `check_rl_seed`, kill switch at step 20, evals at steps 0, 20, 25,
-  50, 75; 16.6 h / $29.7 for 75 steps. `scripts/wo03_rl.py --preset tiny` (toy env, CPU): the GRPO
+  validates, RL seed 3 passes `check_rl_seed`, flat gate (trend, logged only under
+  `gate_stop: false`) at step 20, 4 periodic evals (steps 0, 25, 50, 75), clip 4.0 deg/step;
+  20.6 h / $37 for 75 steps (re-run on the merge of main, 2026-11-08; it was 16.6 h / $29.7 at the
+  WO-04 shape). `scripts/wo03_rl.py --preset tiny` (toy env, CPU): the GRPO
   loop runs end to end.
 - Tests:
   - restore of swapped rows, the Push latch and a re-rendered frame;

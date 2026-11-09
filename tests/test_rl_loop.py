@@ -216,7 +216,7 @@ def test_update_matches_upstream_per_trajectory_loss_and_ignores_micro_batching(
 
 
 def test_tiny_loop_improves_success_deterministically(tmp_path: Path) -> None:
-    cfg = _cfg(steps=40, eval_every=10)  # flat gate at step 10 (windows 1-5 vs 6-10)
+    cfg = _cfg(steps=40, eval_every=10)  # flat gate at step 10 (trend over steps 1-10)
     first = _trainer(cfg, tmp_path / "a").run()
     again = _trainer(cfg, tmp_path / "b").run()
     assert first["eval_history"] == again["eval_history"]  # same seed -> same numbers
@@ -233,7 +233,7 @@ def test_tiny_loop_improves_success_deterministically(tmp_path: Path) -> None:
                 "diag/post/clip_frac", "diag/pre/k3_kl", "rollout/episodes_per_hour",
                 "rollout/time/policy_s", "rollout/time/sim_step_s", "gate/success_window"):  # fmt: skip
         assert any(key in r for r in train), key
-    for removed in ("train/clip_frac", "train/approx_kl"):  # uninformative aggregates (3.1)
+    for removed in ("train/clip_frac", "train/approx_kl"):  # weak mini-batch aggregates (3.1)
         assert not any(removed in r for r in train)
     # 128 trajectories / 32 per mini-batch = 4 optimizer steps, each with its own pre-step stats
     assert len(train[0]["train/opt_step_k3_kl"]) == 4 and train[0]["train/opt_step_k3_kl"][0] < 1e-9
@@ -422,11 +422,87 @@ def test_flat_gate_stops_a_run_that_cannot_learn(tmp_path: Path) -> None:
     assert summary["stop_reason"] == "flat" and summary["stopped_flat"]
     assert summary["steps_completed"] == 10
     rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
-    assert rows[-1]["event/flat_run"] == 1.0 and rows[-1]["gate/flat_gain"] < 0.03
+    last = [r for r in rows if r["kind"] == "train"][-1]
+    assert last["event/flat_run"] == 1.0 and last["gate/flat_gain"] < 0.03
     assert (tmp_path / "checkpoints" / "step_000010" / "adapter").is_dir()
-    cfg["rl"]["gate_stop"] = False  # gates only log
-    summary = _trainer(cfg, tmp_path / "log_only").run()
+    assert summary["gate_decisions"]["first_would_stop_step"] == 10
+    assert summary["gate_decisions"]["would_have_stopped_at_flat_check"] is True
+
+
+def test_gate_stop_false_logs_every_decision_and_when_it_would_have_stopped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """rl.gate_stop false (configs/rl.yaml for the first run, owner 2026-11-08): the run goes
+    on, every step logs gate/would_stop, and the summary says the flat gate would have stopped
+    it at its check step (ceil(0.25 x 40) = 10 here; step 38 in configs/rl.yaml)."""
+    cfg = _cfg(steps=40, lr=0.0, eval_every=100, gate_stop=False)
+    with caplog.at_level("INFO", logger="src.rl.trainer"):
+        summary = _trainer(cfg, tmp_path).run()
     assert summary["stop_reason"] is None and summary["steps_completed"] == 40
+    rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    train = {r["step"]: r for r in rows if r["kind"] == "train"}
+    assert sorted(train) == list(range(1, 41))
+    for step, r in train.items():  # logged on every step, numeric 0/1 and a reason string
+        assert r["gate/would_stop"] in (0.0, 1.0) and isinstance(r["gate/would_stop_reason"], str)
+        assert r["gate/first_would_stop_step"] == (0.0 if step < 10 else 10.0), step
+    assert train[10]["gate/would_stop"] == 1.0 and "flat" in train[10]["gate/would_stop_reason"]
+    assert train[10]["event/gate_ignored"] == 1.0
+    assert all(train[s]["gate/would_stop"] == 0.0 for s in range(1, 10))
+    g = summary["gate_decisions"]
+    assert g["gate_stop"] is False and g["flat_check_step"] == 10
+    assert g["first_would_stop_step"] == 10 and "flat" in g["first_would_stop_reasons"]
+    assert g["first_step_by_gate"]["flat"] == 10 and g["steps_fired_by_gate"]["flat"] == 1
+    assert g["would_have_stopped_at_flat_check"] is True
+    assert g["any_gate_would_have_stopped_by_flat_check_step"] is True
+    fc = g["flat_check"]
+    assert fc["would_stop"] and fc["gain_upper"] < fc["min_gain"] == 0.03 and fc["flat_z"] == 0.0
+    assert rows[-1]["kind"] == "gate_summary" and rows[-1]["first_would_stop_step"] == 10
+    text = caplog.text
+    assert "GATE SUMMARY (rl.gate_stop=false)" in text and "at step 10 WOULD HAVE STOPPED" in text
+    assert "logged only" in text
+    # the gate log survives a checkpoint round trip (resume keeps the summary)
+    state = json.loads(
+        (tmp_path / "checkpoints" / "step_000040" / "trainer_state.json").read_text()
+    )
+    assert state["gate_decisions"]["log"][0] == [10, ["flat"]]
+    assert state["gate_decisions"]["flat_check"]["step"] == 10
+
+
+def test_gate_summary_after_resuming_a_checkpoint_without_a_gate_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review F1 (2026-11-08): a checkpoint written before round 2 has no gate log. Resuming it
+    must report the flat check at step 10 as unknown, not 'not reached' / False."""
+    cfg = _cfg(steps=40, lr=0.0, eval_every=100, gate_stop=False, checkpoint_every=20)
+    _trainer(cfg, tmp_path / "a").run()
+    ckpt = tmp_path / "a" / "checkpoints" / "step_000020"
+    state_path = ckpt / "trainer_state.json"
+    state = json.loads(state_path.read_text())
+    assert state["gate_decisions"]["log_from"] == 1
+    # with the log: resuming keeps the definite answer
+    tr = _trainer(cfg, tmp_path / "b")
+    tr.load_checkpoint(ckpt)
+    g = tr.run()["gate_decisions"]
+    assert g["gate_log_complete"] and g["first_would_stop_step"] == 10
+    assert g["would_have_stopped_at_flat_check"] is True
+    # without it (an older checkpoint): unknown, never a false definite answer
+    del state["gate_decisions"]
+    state_path.write_text(json.dumps(state))
+    tr = _trainer(cfg, tmp_path / "c")
+    tr.load_checkpoint(ckpt)
+    with caplog.at_level("INFO", logger="src.rl.trainer"):
+        g = tr.run()["gate_decisions"]
+    assert g["steps_completed"] == 40 and not g["gate_log_complete"]
+    assert g["gate_log_from_step"] == 21 and g["flat_check_unknown"] is True
+    assert g["first_would_stop_step"] is None and g["first_logged_would_stop_step"] is None
+    assert g["would_have_stopped_at_flat_check"] is None
+    assert g["any_gate_would_have_stopped_by_flat_check_step"] is None
+    assert "flat gate check step 10: UNKNOWN" in caplog.text and "not reached" not in caplog.text
+    # a further checkpoint carries the gap forward
+    later = json.loads(
+        (tmp_path / "c" / "checkpoints" / "step_000040" / "trainer_state.json").read_text()
+    )
+    assert later["gate_decisions"]["log_from"] == 21
 
 
 def test_config_validation() -> None:
@@ -438,14 +514,17 @@ def test_config_validation() -> None:
     # owner amendment after the WO-04 probes (2026-10-27, ADR-0002)
     assert (rl.temperature, rl.recompute_old_log_probs, rl.steps) == (1.0, True, 150)
     assert (rl.train_tasks, rl.max_episode_steps) == (("PickPlace", "Push"), 120)
-    # spend gates on rollout windows; flat gate at step 38 compares windows 1-10 and 29-38
+    # spend gates; flat gate at step 38: trend over steps 1-38, gain + 0.5 x SE vs +3 points
     assert gate_check_step(rl) == 38 and rl.gate_window == 10
-    assert (rl.gate_min_gain, rl.gate_rule, rl.gate_stop) == (0.03, "any_task", True)
+    # owner 2026-11-08: the first RL run observes the gates (logged, not acted on)
+    assert (rl.gate_min_gain, rl.gate_rule, rl.gate_stop) == (0.03, "any_task", False)
+    assert rl.gate_flat_z == 0.5
     assert rl.eval_episodes == 32 and rl.require_nonzero_baseline
     assert (rl.diag_every, rl.diag_trajectories) == (1, 32)
     pick = GRPOConfig.from_config(load_config("rl", REPO / "configs" / "rl_pickplace.yaml"))
     assert pick.train_tasks == ("PickPlace",) and pick.checkpoint_every == 25
     assert (pick.lr, pick.samples_per_prompt, pick.ppo_epochs) == (1e-4, 8, 2)
+    assert pick.gate_stop is False and pick.gate_flat_z == 0.5
     with pytest.raises(ValueError, match="kl_coef"):
         GRPOConfig.from_config(_cfg(kl_coef=0.01))
     with pytest.raises(ValueError, match="multiple of K"):
@@ -496,15 +575,15 @@ def test_cost_estimate_matches_rl_yaml_arithmetic() -> None:
     assert est["dollars"] == pytest.approx(est["hours"] * 1.79)
     assert est["gate_check_step"] == 38
     assert est["gate_check_stop_h"] == pytest.approx((38 * step_s + 64 * 2 * 120 / 86) / 3600)
-    # Track B probes: lr sweep = one capped collection + per lr (8 Adam steps x 64 x 15 / 10.3 +
-    # 3 forwards of 1,920 decisions / 31) + one greedy forward; temperature probe = 16 env
-    # batches of 32 x 120 actions / 86 per temperature
+    # Track B probes: lr sweep = one capped collection + 2 forwards of 1,920 decisions / 31
+    # before the first lr (greedy, scores: cached for every lr) + per lr (8 Adam steps x 64 x 15
+    # / 10.3 + 2 forwards); temperature probe = 16 env batches of 32 x 120 actions / 86 per T
     probes = script.estimate_probes(
         load_config("rl"), lrs=[5e-5, 2e-4, 5e-4, 1e-3], adam_steps=8, stored_batch=False,
         temperatures=[0.7, 1.0, 1.3], groups=64,
     )  # fmt: skip
-    per_lr = 8 * 64 * 15 / 10.3 + 3 * 1920 / 31
-    assert probes["lr_sweep_h"] == pytest.approx((46_080 / 86 + 1920 / 31 + 4 * per_lr) / 3600)
+    per_lr = 8 * 64 * 15 / 10.3 + 2 * 1920 / 31
+    assert probes["lr_sweep_h"] == pytest.approx((46_080 / 86 + 2 * 1920 / 31 + 4 * per_lr) / 3600)
     assert probes["temp_probe_h"] == pytest.approx(3 * 16 * 32 * 120 / 86 / 3600)
 
 
@@ -525,6 +604,8 @@ def test_entry_script_tiny_writes_run_record(
     assert record["wo"] == "WO-03" and record["config"]["seed"] == 1
     assert record["summary"]["steps_completed"] == summary["steps_completed"] == 3
     assert (run_dir / "metrics.jsonl").exists()
+    g = record["gate_decisions"]  # flat gate off here: nothing fired, no check step
+    assert g["first_would_stop_step"] is None and g["flat_check_step"] is None
 
 
 def test_entry_script_probe_prints_projection(

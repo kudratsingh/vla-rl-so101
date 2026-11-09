@@ -192,6 +192,10 @@ class Run:
         self._write()
         return self.record_path
 
+    def flush(self) -> None:
+        """Write record.json now (results so far), so a run killed before ``finish`` keeps them."""
+        self._write()
+
     def _write(self) -> None:
         tmp = self.record_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self.record, indent=2, default=str) + "\n")

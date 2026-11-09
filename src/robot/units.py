@@ -178,6 +178,35 @@ class UnitMap:
         return out
 
 
+def _cal(c: Any, key: str) -> int:
+    """A calibration field from a lerobot ``MotorCalibration`` or the parsed ``<id>.json`` dict."""
+    return int(c[key] if isinstance(c, Mapping) else getattr(c, key))
+
+
+def raw_to_lerobot(name: str, raw: float, calibration: Any) -> float:
+    """One ``Present_Position`` raw tick value -> LeRobot units, as lerobot 0.4.4's
+    ``MotorsBus._normalize`` (``lerobot/motors/motors_bus.py:838-865``) with its SO-101 norm modes
+    (arm DEGREES, gripper RANGE_0_100, drive mode applied to the gripper), EXCEPT that the gripper
+    is NOT clamped to [range_min, range_max]: lerobot clamps it, which hides a gripper resting
+    outside its calibrated range. ``calibration``: that motor's MotorCalibration (or json dict)."""
+    lo, hi = _cal(calibration, "range_min"), _cal(calibration, "range_max")
+    if hi == lo:
+        raise ValueError(f"invalid calibration for {name}: range_min == range_max")
+    if name == "gripper":
+        pct = (float(raw) - lo) / (hi - lo) * 100.0
+        return 100.0 - pct if _cal(calibration, "drive_mode") else pct
+    return (float(raw) - (lo + hi) / 2.0) * LEROBOT_DEG_PER_TICK
+
+
+def raw_to_canonical(
+    units: UnitMap, raw: Mapping[str, float], calibration: Mapping[str, Any]
+) -> FloatArray:
+    """Raw ``Present_Position`` ticks of all six motors -> canonical radians (unclamped)."""
+    return units.to_canonical(
+        {f"{n}.pos": raw_to_lerobot(n, raw[n], calibration[n]) for n in JOINT_NAMES}
+    )
+
+
 def urdf_limits_deg() -> dict[str, tuple[float, float]]:
     return {k: (math.degrees(lo), math.degrees(hi)) for k, (lo, hi) in URDF_LIMITS_RAD.items()}
 

@@ -46,6 +46,15 @@ CHUNK_PAD_MODES = ("drop", "repeat")
 DEFAULT_CHUNK_PAD = "repeat"
 
 
+def is_v2_demo_set(rows: Sequence[dict[str, Any]]) -> bool:
+    """Sidecar rows of a v2 demo set: recorded with the v2 oracle or a release/retreat tail
+    (scripts/wo01_build_env.py; configs/demos_v2.yaml). The 0.1 sets have neither."""
+    return any(
+        r.get("oracle_profile") == "v2" or int(r.get("post_success_frames", 0) or 0) > 0
+        for r in rows
+    )
+
+
 def pad_free_indices(
     frames: FrameSource, chunk_len: int, action_key: str = ACTION_KEY
 ) -> list[int]:
@@ -340,7 +349,11 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
     `data.chunk_pad` (default "repeat", the 0.1-era SFT runs, WO-02 attempts 1-4, which trained
     on the pad). `drop`: frames whose chunk is padded past the episode end are left out of the
     SFT loss, in every part; set it in any SFT config for the v2 demo set (configs/demos_v2.yaml
-    does). The extra-dataset caps then count trained frames (`select_budget`)."""
+    does). The extra-dataset caps then count trained frames (`select_budget`). A v2 set
+    (`is_v2_demo_set`: the demos or any extra dataset, e.g. corrections recorded under
+    configs/demos_v2.yaml) is REFUSED unless `chunk_pad: drop` (owner 2026-11-08): its long
+    release/retreat tails would otherwise teach "freeze at the last command" from the repeated
+    pad."""
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
     rec: Any = importlib.import_module("src.data.recorder")  # WO-01
@@ -376,6 +389,18 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
                 "num_frames": sum(x_frames.values()),
             }
         )
+    chunk_pad = _chunk_pad(cfg)
+    read_sidecar = getattr(rec, "read_sidecar", None)
+    if read_sidecar is not None and chunk_pad != "drop":
+        for _, p_repo, p_root, p_eps in parts:
+            chosen = set(p_eps)
+            rows = [r for r in read_sidecar(p_root) if int(r["episode_index"]) in chosen]
+            if is_v2_demo_set(rows):
+                raise ValueError(
+                    f"{p_repo} is a v2 demo set (v2 oracle / release-retreat tail): SFT on it "
+                    f"needs data.chunk_pad: drop (got {chunk_pad!r}), or padded chunks teach the "
+                    "policy to freeze at the last command"
+                )
     sources: list[FrameSource] = []
     fps_all: set[int] = set()
     for _, p_repo, p_root, p_eps in parts:
@@ -390,7 +415,6 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
     frames: FrameSource = (
         sources[0] if len(sources) == 1 else ConcatFrames(sources, [p[0] for p in parts])
     )
-    chunk_pad = _chunk_pad(cfg)
     ds = ChunkedDemoDataset(
         frames,
         chunk_len=chunk_len,

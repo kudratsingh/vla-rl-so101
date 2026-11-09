@@ -108,9 +108,10 @@ before allowing for having looked at four checkpoints.
   +/-15 points at 32 episodes). In-training evals are not a safe way to pick a checkpoint here.
 - WO-04 logged update metrics: approx_kl ~3e-5, clip fraction 0.000 in every 25-step window of
   both runs. Correction (2026-11-08, `docs/reviews/2026-11-07-project-review.md` section 3.1): with
-  one PPO epoch these logged values are structurally ~0 and uninformative. The logged mean includes
-  mini-batch 1, which is exactly on-policy (ratio 1), and mini-batch 2 is measured after one Adam
-  step on other prompts. They neither show nor rule out that the updates were too small; that
-  remains a hypothesis. PR 1 (`fix/pre-run-hardening`) replaces them with a fixed-batch pre/post-
+  one PPO epoch these logged values are only weak evidence. The logged approx_kl is the mean of 2
+  mini-batches; mini-batch 1 is exactly on-policy (ratio 1, KL 0), so it is half of mini-batch 2's
+  KL (~6e-5), which is measured after one Adam step on other prompts, not on the trained prompts
+  after the full update. Clip fraction is ~0 at this step size whether or not learning happens.
+  They are consistent with small updates but do not show it; that remains a hypothesis. PR 1 (`fix/pre-run-hardening`) replaces them with a fixed-batch pre/post-
   update diagnostic (`diag/*`). PickPlace-only sampled success still rose (7.9% -> 12.6%, entropy 1.31 -> 1.08,
   groups dropped 61% -> 51%); two-task stayed flat (6.8% -> 7.7%, entropy ~1.5).

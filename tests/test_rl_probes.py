@@ -69,6 +69,30 @@ def test_lr_sweep_restores_state_and_movement_grows_with_lr(tmp_path: Path) -> N
     assert again["rows"][0]["diag/post/k3_kl"] == pytest.approx(k3[1], rel=1e-9)
 
 
+def test_lr_sweep_records_the_batch_clip_not_the_presets(tmp_path: Path) -> None:
+    # review R3-3: a stored batch may have been collected under another clip setting
+    tr = _trainer(load_config("tiny"), tmp_path)
+    out = tr.lr_sweep([1e-3], adam_steps=1)
+    assert out["batch_source"] == "collected" and out["rollout_action_clip_deg"] is None
+    meta = json.loads((tmp_path / "sweep_batch.json").read_text())
+    assert meta == {"rollout_action_clip_deg": None}
+    rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert [r["kind"] for r in rows if r["kind"] == "lr_sweep_batch"] == ["lr_sweep_batch"]
+    script = _script()
+    pt = tmp_path / "sweep_batch.pt"
+    assert script.stored_clip_deg(pt) is None  # collected with the clip off
+    (tmp_path / "sweep_batch.json").write_text('{"rollout_action_clip_deg": 4}')
+    assert script.stored_clip_deg(pt) == 4.0
+    (tmp_path / "sweep_batch.json").unlink()
+    assert script.stored_clip_deg(pt) == "unknown"  # saved before the metadata existed
+    cfg = load_config("tiny")
+    cfg["rl"]["rollout_action_clip_deg"] = 4.0  # today's preset says 4; the stored batch does not
+    tr2 = _trainer(cfg, tmp_path / "again")
+    again = tr2.lr_sweep([1e-3], adam_steps=1, batch=RolloutBatch.load(pt))
+    assert again["batch_source"] == "stored" and again["rollout_action_clip_deg"] == "unknown"
+    assert "unknown" in script._clip_text(again["rollout_action_clip_deg"])
+
+
 def test_temperature_probe_pairs_prompts_across_temperatures(tmp_path: Path) -> None:
     tr = _trainer(load_config("tiny"), tmp_path)
     resets: list[list[int]] = []

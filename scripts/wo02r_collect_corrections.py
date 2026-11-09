@@ -246,6 +246,7 @@ def find_branches(
     for b, start in enumerate(range(0, len(seeds), n)):
         batch = seeds[start : start + n]
         end: dict[str, torch.Tensor] = {}
+        instr: list[str] = []
         ok, length, trace = run_batch_traced(
             policy.act_batch,
             env,
@@ -255,10 +256,11 @@ def find_branches(
             snapshot_fn=state_mod.snapshot,
             action_clip=action_clip,
             end_info=end,
+            instructions_out=instr,
         )
         traces.append(trace)
         if log_episode is not None:
-            for rec in episode_records(task, "seen", -1, batch, ok, length, end):
+            for rec in episode_records(task, "seen", -1, batch, ok, length, end, instr):
                 log_episode(rec)
         steps = [bd.step for bd in trace.boundaries]
         for row, seed in enumerate(batch):

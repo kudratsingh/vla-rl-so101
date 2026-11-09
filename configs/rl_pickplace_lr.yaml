@@ -1,6 +1,7 @@
 # Recovery SFT follow-up (docs/plans/recovery-sft.md section 11): higher-LR GRPO diagnostic, NOT
 # approved. Everything else is configs/rl_pickplace.yaml (PickPlace-only, PR #28 shape: 16 prompts
-# x K=8, ppo_epochs 2, rollout-window spend gates, the fixed-batch diagnostic). The base is the
+# x K=8, ppo_epochs 2, rollout-success spend gates, logged only (gate_stop false), the 4 deg/step
+# rollout clip, the fixed-batch diagnostic). The base is the
 # recovery pick, passed per run with --adapter. Stage A (one owner go) is the offline lr sweep on
 # one stored batch (`--lr-sweep`, plan section 11), then one `--probe-steps 3` on the config of the
 # lr rule 1 picks (rl_pickplace_lr5e-5.yaml, this file, rl_pickplace_lr1e-3.yaml; identical
@@ -17,10 +18,14 @@ rl:
   lr: 5e-4                  # 5x rl.yaml's 1e-4, 10x WO-04's 5e-5; rule 1 (fixed-batch sweep) picks
   steps: 75
   checkpoint_every: 25
-  # Flat gate at step 20 (owner): ceil(0.26 x 75) = ceil(19.5) = 20, comparing the rollout-success
-  # windows of steps 16-20 and 1-5 (gate_window 5; rl.yaml's 10 would need step >= 20 as well, but
-  # its windows 11-20 vs 1-10 would see only 10 steps of updates). Replaces the 64-episode kill
-  # switch (early_stop_check_at_frac 0.26). gate_rule any_task and gate_min_gain 0.03 are
-  # inherited; the old peak stop (off here) is replaced by the inherited decline gate.
+  # Flat gate at step 20 (owner): ceil(0.26 x 75) = ceil(19.5) = 20 (0.2667 gives 21: the float
+  # product is 20.0025). Replaces the 64-episode kill switch (early_stop_check_at_frac 0.26); the
+  # old peak stop (peak_stop_step 0, off here) is replaced by the inherited decline gate. Since the
+  # merge of main (2026-11-08) the flat gate is the trend of rollout success over steps 1-20
+  # (gate_flat_z 0.5 inherited) and gate_window sizes only the decline / entropy windows (5 steps
+  # here, 10 in rl.yaml). gate_rule any_task, gate_min_gain 0.03 and rollout_action_clip_deg 4.0
+  # are inherited, and so is gate_stop: false (owner 2026-11-08): the gates LOG their step-20 and
+  # later decisions but do not stop this run. Whether stage B stops at step 20 is an owner
+  # decision (docs/plans/recovery-sft.md section 14, decision 5).
   gate_check_frac: 0.26
   gate_window: 5

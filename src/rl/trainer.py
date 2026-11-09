@@ -47,6 +47,18 @@ Intentional differences (none changes the gradient of a step except the refill c
     the rollout's entropy is estimated from the sampled tokens' log-probs (free).
   * no KL / reference model: `kl_coef` must be 0 (ADR-0002); anything else is rejected.
   * the constant lr runs through a LambdaLR(1.0) scheduler so its state is checkpointed.
+  * mini-batches are EQUAL WHOLE-GROUP splits of the kept groups (`ppo_minibatches`, owner
+    2026-11-08): ceil(groups / (ppo_mini_batch / K)) mini-batches per epoch whose sizes differ by
+    at most one group, no group split. Upstream's batch is always full (uncapped refill), so its
+    contiguous `ppo_mini_batch` split never leaves a tail; ours can (refill cap hit, e.g. 11 kept
+    groups at 8 groups per mini-batch was 64 + a 24-trajectory tail with its own full Adam step;
+    now 6 + 5 groups). A full batch (groups a multiple of ppo_mini_batch / K) splits exactly as
+    before, so its gradients are unchanged.
+  * `rollout_action_clip_deg` (owner 2026-11-08: 4.0 in configs/rl.yaml, null in tiny and the
+    code default): protocol 0.2's per-joint step clip on the action SENT TO THE ENV in rollouts
+    and in-training evals (src/rl/rollout.py). It is part of the environment, not of the policy:
+    the batch keeps the sampled tokens and their sampler log-probs, so old log-probs (sampler or
+    recomputed), ratios and advantages are all on the sampled tokens. Upstream has no clip.
 """
 
 from __future__ import annotations
@@ -69,7 +81,7 @@ from torch import Tensor
 
 from src.config import Config
 from src.rl.diagnostics import argmax_flip_frac, entropy_from_sampled_log_probs, movement_stats
-from src.rl.gates import RolloutGates, TaskTally
+from src.rl.gates import GateResult, RolloutGates, TaskTally
 from src.rl.grpo import (
     ADV_EPS,
     clip_higher_policy_loss,
@@ -77,10 +89,12 @@ from src.rl.grpo import (
     group_advantages,
     seq_mean_token_mean_weights,
 )
+from src.rl.paired import paired_group_rewards
 from src.rl.policy_api import RLPolicy
 from src.rl.rollout import (
     STORAGE,
     TIMING_KEYS,
+    ClipStats,
     ObsFn,
     RolloutBatch,
     RolloutTimer,
@@ -93,6 +107,9 @@ log = logging.getLogger(__name__)
 EnvFactory = Callable[[str, int], VecEnv]  # (task, num_envs) -> batched env
 TRAIN_SEED_STRIDE = 10_000_000  # train prompt seeds: seed * stride + counter
 EVAL_SEED_BASE = 4_000_000_000  # eval seeds: fixed, shared by all run seeds, disjoint from train
+# probe_clip: torch RNG seed of env batch b = this + seed * TRAIN_SEED_STRIDE + b, the same in both
+# arms (a sampling seed, not an env reset seed)
+CLIP_PROBE_SAMPLING_SEED = 9_000_000_000
 
 # rl keys removed 2026-11-08 (review 3.1): the greedy-eval kill switch and peak stop -> gate_*
 REMOVED_KEYS = {
@@ -105,6 +122,7 @@ REMOVED_KEYS = {
     "peak_ref_step": "gate_max_drop",
 }
 StopReason = Literal["flat", "decline", "entropy"]
+GATES: tuple[StopReason, ...] = ("flat", "decline", "entropy")
 
 
 @dataclass(frozen=True)
@@ -120,7 +138,7 @@ class GRPOConfig:
     weight_decay: float = 0.01
     grad_clip: float = 1.0
     ppo_epochs: int = 1
-    ppo_mini_batch: int = 128  # trajectories per optimizer step
+    ppo_mini_batch: int = 128  # max trajectories per optimizer step (equal whole-group split)
     micro_batch: int = 8  # decisions (chunks) per forward/backward; memory knob only
     clip_low: float = 0.2
     clip_high: float = 0.28
@@ -134,12 +152,13 @@ class GRPOConfig:
     # Spend gates (src/rl/gates.py): decide whether to keep spending, never whether RL improved
     gate_window: int = 10  # steps per rollout-success / entropy window
     gate_check_frac: float = 0.25  # flat gate at ceil(frac x steps); 0 = off
-    gate_min_gain: float = 0.03  # flat: windowed rollout success gain over the first window
+    gate_min_gain: float = 0.03  # flat: rollout success gain from step 1 (trend) at the check step
+    gate_flat_z: float = 0.0  # flat stops only if gain + z x its SE < min_gain (src/rl/gates.py)
     gate_rule: Literal["any_task", "mean"] = "any_task"  # best trained task, or the task mean
     gate_max_drop: float = 0.0  # decline: score < best non-overlapping window - this; 0 = off
     gate_decline_z: float = 3.0  # decline also needs drop > z x SE of (best - window), twice
     gate_entropy_min: float = 0.0  # entropy collapse: window rollout entropy < this; 0 = off
-    gate_stop: bool = True  # False: gates only log their events
+    gate_stop: bool = True  # False: gates only log their events (gate/would_stop every step)
     # Fixed-batch pre/post-update diagnostic (src/rl/diagnostics.py)
     diag_every: int = 1  # steps; 0 = off
     diag_trajectories: int = 32  # the update batch's first trajectories (whole groups); 0 = all
@@ -148,6 +167,11 @@ class GRPOConfig:
     group_reset_check: Literal["error", "warn", "off"] = "error"
     train_tasks: tuple[str, ...] = ()  # RL rollouts and periodic evals on these; () = every task
     max_episode_steps: int = 0  # RL rollout + in-training eval horizon; 0 = env.max_episode_steps
+    # Per-joint step clip (deg) on every executed RL-rollout and in-training-eval action, as
+    # protocol 0.2's sim eval applies it (4 deg/step from configs/real.yaml). None = off: the code
+    # default, the tiny preset and every RL run so far (WO-04). configs/rl.yaml sets 4.0 (owner
+    # 2026-11-08). Env action only: PPO trains on the sampled tokens (module docstring).
+    rollout_action_clip_deg: float | None = None
 
     @classmethod
     def from_config(cls, cfg: Config) -> GRPOConfig:
@@ -171,7 +195,9 @@ class GRPOConfig:
         kwargs: dict[str, Any] = {}
         for key, value in rl.items():
             default = getattr(cls, key)
-            if isinstance(default, bool):
+            if key == "rollout_action_clip_deg":  # null = off
+                kwargs[key] = None if value is None else float(value)
+            elif isinstance(default, bool):
                 if not isinstance(value, bool):
                     raise TypeError(f"rl.{key} must be true/false, got {value!r}")
                 kwargs[key] = value
@@ -195,7 +221,10 @@ class GRPOConfig:
         if min(*counts, self.eval_every, self.eval_episodes, self.checkpoint_every) < 1:
             raise ValueError("batch/step/epoch/eval/checkpoint counts must be >= 1")
         if self.ppo_mini_batch < k or self.ppo_mini_batch % k:
-            raise ValueError("ppo_mini_batch (trajectories) must be a positive multiple of K")
+            raise ValueError(
+                f"ppo_mini_batch={self.ppo_mini_batch} (trajectories) must be a positive multiple "
+                f"of K={k}: mini-batches hold whole groups"
+            )
         if not (0 < self.clip_low < 1 and self.clip_high > 0):
             raise ValueError("need 0 < clip_low < 1 and clip_high > 0")
         if self.temperature <= 0:
@@ -214,14 +243,48 @@ class GRPOConfig:
             raise ValueError("gate_rule must be any_task|mean")
         if self.gate_max_drop < 0 or self.gate_entropy_min < 0:
             raise ValueError("gate_max_drop and gate_entropy_min must be >= 0 (0 = off)")
-        if self.gate_decline_z < 0:
-            raise ValueError("gate_decline_z must be >= 0")
+        if self.gate_decline_z < 0 or self.gate_flat_z < 0:
+            raise ValueError("gate_decline_z and gate_flat_z must be >= 0")
         if self.diag_every < 0 or self.diag_trajectories < 0 or self.diag_trajectories % k:
             raise ValueError("diag_every >= 0, diag_trajectories >= 0 and a multiple of K")
         if self.group_reset_check not in ("error", "warn", "off"):
             raise ValueError("group_reset_check must be error|warn|off")
         if self.max_episode_steps < 0:
             raise ValueError("max_episode_steps must be >= 0 (0 = env.max_episode_steps)")
+        clip = self.rollout_action_clip_deg
+        if clip is not None and not 0 < clip <= 180:
+            raise ValueError("rollout_action_clip_deg must be null (off) or in (0, 180] deg/step")
+
+    @property
+    def action_clip_rad(self) -> float | None:
+        clip = self.rollout_action_clip_deg
+        return None if clip is None else math.radians(clip)
+
+
+def ppo_minibatches(n_groups: int, groups_per_minibatch: int) -> list[range]:
+    """One PPO epoch's mini-batches as ranges of GROUP indices: ceil(n_groups / groups_per_mb)
+    mini-batches of whole groups whose sizes differ by at most one (larger ones first), together
+    covering every group exactly once, in order. 16 groups at 8 per mini-batch -> 8 + 8 (the
+    contiguous split upstream uses); 11 -> 6 + 5, not 8 + a 3-group tail with its own Adam step."""
+    if groups_per_minibatch < 1:
+        raise ValueError("groups_per_minibatch must be >= 1")
+    if n_groups < 1:
+        return []
+    n_mb = math.ceil(n_groups / groups_per_minibatch)
+    base, extra = divmod(n_groups, n_mb)
+    out: list[range] = []
+    start = 0
+    for i in range(n_mb):
+        size = base + (1 if i < extra else 0)
+        out.append(range(start, start + size))
+        start += size
+    return out
+
+
+def group_trajectories(groups: range, group_size: int) -> Tensor:
+    """Trajectory indices of `groups` (RolloutBatch layout: trajectory e = g * K + k)."""
+    g = torch.tensor(list(groups), dtype=torch.long)
+    return (g.unsqueeze(1) * group_size + torch.arange(group_size)).reshape(-1)
 
 
 def gate_check_step(rl: GRPOConfig) -> int:
@@ -282,6 +345,9 @@ class DiagSpec:
     trajectories: int  # the batch's first N trajectories; 0 = all
     argmax: bool
     pre_greedy: Tensor | None = None  # cached pre-update greedy tokens (lr sweep)
+    # cached pre-update log-probs of ALL trajectories (lr sweep: identical params for every lr);
+    # also the old log-probs when rl.recompute_old_log_probs
+    pre_scores: Tensor | None = None
 
 
 @dataclass
@@ -289,6 +355,40 @@ class _Snapshot:
     params: list[Tensor]
     optimizer: dict[str, Any]
     scheduler: dict[str, Any]
+
+
+CHECKPOINT_KEYS = (
+    "step",
+    "completed_step",
+    "next_prompt_seed",
+    "next_task",
+    "seed",
+    "eval_history",
+    "gates",
+    "rl",
+)
+CHECKPOINT_FILES = ("trainable.pt", "optimizer.pt", "scheduler.pt", "rng.pt")
+
+
+def read_checkpoint_state(path: Path) -> dict[str, Any]:
+    """trainer_state.json of a resumable `save_checkpoint` directory. FileNotFoundError without
+    one; ValueError naming what is missing for a checkpoint written before resume support (PR #28:
+    main's checkpoints hold only adapter/, optimizer.pt and {step, next_prompt_seed,
+    eval_history}) or an incomplete one. Cheap: the entry script calls it before any model load."""
+    state_file = path / "trainer_state.json"
+    if not state_file.is_file():
+        raise FileNotFoundError(f"{path}: no trainer_state.json (a checkpoint dir?)")
+    state = cast(dict[str, Any], json.loads(state_file.read_text()))
+    missing = [k for k in CHECKPOINT_KEYS if k not in state]
+    missing += [name for name in CHECKPOINT_FILES if not (path / name).is_file()]
+    if not (path / "adapter").is_dir():
+        missing.append("adapter/")
+    if missing:
+        raise ValueError(
+            f"{path}: not a resumable checkpoint (written before resume support, PR #28, or "
+            f"incomplete): missing {missing}"
+        )
+    return state
 
 
 class GRPOTrainer:
@@ -336,6 +436,7 @@ class GRPOTrainer:
             max_drop=rl.gate_max_drop,
             entropy_min=rl.gate_entropy_min,
             decline_z=rl.gate_decline_z,
+            flat_z=rl.gate_flat_z,
         )
         self._envs: dict[str, VecEnv] = {}
         self._next_prompt = seed * TRAIN_SEED_STRIDE
@@ -345,8 +446,18 @@ class GRPOTrainer:
         self._start_step = 1
         self._history: list[tuple[int, float]] = []  # (step, greedy eval success)
         self._last_tallies: dict[str, TaskTally] = {}
+        self._last_eval_batch_s: list[float] = []
         self._last_entropy = (0.0, 0)
         self.resumed_from: Path | None = None
+        self.resume_overrides: dict[str, list[Any]] = {}  # rl key -> [checkpoint, this run]
+        # gate decisions, logged whether or not rl.gate_stop acts on them (owner 2026-11-08):
+        # (step, gates that fired) for every step a gate would have stopped the run, and the flat
+        # gate's numbers at its check step
+        self._gate_log: list[tuple[int, list[str]]] = []
+        self._flat_check: dict[str, Any] | None = None
+        # first step the gate log covers: > 1 after resuming a checkpoint that has no gate log
+        # (written before 2026-11-08 round 2), whose earlier gate decisions are unknown
+        self._gate_log_from = 1
 
     # ------------------------------------------------------------------ envs / logging
     def _env(self, task: str) -> VecEnv:
@@ -396,6 +507,7 @@ class GRPOTrainer:
                     max_episode_steps=self.max_episode_steps,
                     task=task,
                     group_reset_check="off",
+                    action_clip=self.rl.action_clip_rad,
                 )
                 batch_s.append(time.perf_counter() - tb)
                 successes.append(batch.rewards)
@@ -408,6 +520,7 @@ class GRPOTrainer:
         out["eval/episodes"] = float(episodes * len(self.train_tasks))
         out["eval/batch_s_median"] = statistics.median(batch_s)
         out["eval/time_s"] = time.perf_counter() - t0
+        self._last_eval_batch_s = batch_s  # per env batch, in order (probe: warm-up excluded)
         return out
 
     def _check_baseline(self, baseline: dict[str, float]) -> None:
@@ -450,6 +563,7 @@ class GRPOTrainer:
         ent_sum, ent_tokens = 0.0, 0
         reset_diff = 0.0
         n_batches = 0
+        clip_stats = ClipStats()
         for _ in range(max_batches):
             task = self.train_tasks[self._next_task % len(self.train_tasks)]
             self._next_task += 1
@@ -466,6 +580,8 @@ class GRPOTrainer:
                 task=task,
                 group_reset_check=rl.group_reset_check,
                 timer=timer,
+                action_clip=rl.action_clip_rad,
+                clip_stats=clip_stats,
             )
             n_batches += 1
             reset_diff = max(reset_diff, diff)
@@ -507,6 +623,8 @@ class GRPOTrainer:
         }
         for key, value in timer.totals(elapsed).items():  # sums to rollout/time_s
             stats[f"rollout/time/{key}_s"] = value
+        if rl.rollout_action_clip_deg is not None:  # clip intervention over this step's rollouts
+            stats.update(clip_stats.summary("rollout/action_clip"))
         for t, (gen_t, kept_t, trained_t) in per_task.items():
             if gen_t:
                 stats[f"rollout/frac_groups_dropped/{t}"] = 1.0 - kept_t / gen_t
@@ -586,8 +704,13 @@ class GRPOTrainer:
         token_mask = _token_mask(batch)  # (E, S, C, A)
         old_log_probs = batch.log_probs
         mismatch = mismatch_mean = 0.0
+        cached = diag.pre_scores if diag is not None else None
         if rl.recompute_old_log_probs:
-            old_log_probs = self._score(batch, torch.arange(n_traj), batch.log_probs)
+            old_log_probs = (
+                cached
+                if cached is not None
+                else self._score(batch, torch.arange(n_traj), batch.log_probs)
+            )
             dev_tok = (old_log_probs - batch.log_probs).abs()[token_mask]
             mismatch, mismatch_mean = float(dev_tok.max()), float(dev_tok.mean())
 
@@ -599,7 +722,12 @@ class GRPOTrainer:
             traj = self._diag_traj(batch, spec)
             ref = old_log_probs[traj]
             # recompute on: the pre-update scores ARE the reference (same params, same forward)
-            pre = ref if rl.recompute_old_log_probs else self._score(batch, traj, ref)
+            if rl.recompute_old_log_probs:
+                pre = ref
+            elif spec.pre_scores is not None:
+                pre = spec.pre_scores[traj]
+            else:
+                pre = self._score(batch, traj, ref)
             greedy = spec.pre_greedy
             if spec.argmax and greedy is None:
                 greedy = self._greedy(batch, traj)
@@ -612,6 +740,10 @@ class GRPOTrainer:
             diag_stats["diag/trajectories"] = float(len(traj))
             diag_stats["diag/time_s"] = time.perf_counter() - td
 
+        k = batch.group_size
+        if rl.ppo_mini_batch % k:
+            raise ValueError(f"ppo_mini_batch {rl.ppo_mini_batch} is not a multiple of K={k}")
+        minibatches = ppo_minibatches(batch.num_groups, rl.ppo_mini_batch // k)
         self.policy.train()
         sums = {"pg_loss": 0.0, "entropy": 0.0}
         opt_clip: list[float] = []
@@ -622,10 +754,10 @@ class GRPOTrainer:
         n_opt = 0
         n_epochs = rl.ppo_epochs if epochs is None else epochs
         for epoch in range(n_epochs):
-            for start in range(0, n_traj, rl.ppo_mini_batch):
+            for j, groups in enumerate(minibatches):
                 if opt_steps is not None and n_opt >= opt_steps:
                     break
-                traj_mb = torch.arange(start, min(n_traj, start + rl.ppo_mini_batch))
+                traj_mb = group_trajectories(groups, k)  # whole groups, gathered by group index
                 weights = seq_mean_token_mean_weights(token_mask[traj_mb])  # sums to 1
                 e_loc, s_idx = decision_valid[traj_mb].nonzero(as_tuple=True)
                 self.optimizer.zero_grad(set_to_none=True)
@@ -647,7 +779,7 @@ class GRPOTrainer:
                     sums["entropy"] += float((out.entropy.detach() * w).sum())
                     mb_clip += float(pl.clip_frac)
                     mb_k3 += float(pl.k3_kl)
-                    if epoch == 0 and start == 0:  # params == rollout params: ratio must be 1
+                    if epoch == 0 and j == 0:  # params == rollout params: ratio must be 1
                         dev_tok = (out.log_probs.detach() - old).abs()[w > 0]
                         first_dev = max(first_dev, float(dev_tok.max()))
                         first_dev_sum += float(dev_tok.sum())
@@ -677,6 +809,8 @@ class GRPOTrainer:
                 "train/trajectories": float(n_traj),
                 "train/decisions": float(decision_valid.sum()),
                 "train/optimizer_steps": float(n_opt),
+                # groups per mini-batch of one epoch (equal whole-group split, ppo_minibatches)
+                "train/minibatch_groups": [len(g) for g in minibatches],
                 "train/logprob_mismatch": mismatch,
                 "train/logprob_mismatch_mean": mismatch_mean,
                 "train/first_minibatch_max_abs_log_ratio": first_dev,
@@ -723,6 +857,12 @@ class GRPOTrainer:
             "eval_history": self._history,
             "gates": self.gates.state_dict(),
             "rl": asdict(self.rl),
+            # optional on load (checkpoints written before 2026-11-08 round 2 lack it)
+            "gate_decisions": {
+                "log": self._gate_log,
+                "flat_check": self._flat_check,
+                "log_from": self._gate_log_from,
+            },
         }
         (path / "trainer_state.json").write_text(json.dumps(state, indent=2))
         return path
@@ -735,7 +875,7 @@ class GRPOTrainer:
         counters from inside step `step`, so resuming re-runs part or all of that step on top of
         it. Refused unless `allow_partial` (`--resume-approximate`); then the gate windows and the
         eval history are cut back to completed_step so the re-run step can be recorded again."""
-        state = json.loads((path / "trainer_state.json").read_text())
+        state = read_checkpoint_state(path)
         step, completed = int(state["step"]), int(state["completed_step"])
         if step != completed:
             plain = sorted(
@@ -770,11 +910,24 @@ class GRPOTrainer:
             torch.load(path / "optimizer.pt", map_location=STORAGE, weights_only=True)
         )
         self._load_scheduler(torch.load(path / "scheduler.pt", weights_only=True))
+        # load_state_dict restores the SAVED lr / weight_decay (param groups, scheduler base_lrs)
+        # over this run's config. The config wins, so record.json describes what trains; Adam
+        # moments and step counts stay as loaded.
+        self._set_lr(self.rl.lr)
+        for group in self.optimizer.param_groups:
+            group["weight_decay"] = self.rl.weight_decay
         # our own file: python/numpy RNG states are tuples / ndarrays, not tensors
         set_rng_state(torch.load(path / "rng.pt", weights_only=False))
-        diff = {k: v for k, v in asdict(self.rl).items() if state["rl"].get(k) != _jsonable(v)}
+        saved_rl = state["rl"]
+        diff = {k: v for k, v in asdict(self.rl).items() if saved_rl.get(k) != _jsonable(v)}
+        self.resume_overrides = {k: [saved_rl.get(k), _jsonable(v)] for k, v in diff.items()}
         if diff:
-            log.warning("resuming %s with rl settings that differ from it: %s", path, diff)
+            log.warning(
+                "resuming %s with rl settings that differ from it (checkpoint -> this run; the "
+                "run's values apply, lr and weight_decay included; Adam moments kept): %s",
+                path,
+                self.resume_overrides,
+            )
         if int(state["seed"]) != self.seed:
             log.warning("resuming seed-%s checkpoint under seed %d", state["seed"], self.seed)
         self._completed_step = completed
@@ -786,6 +939,25 @@ class GRPOTrainer:
         ]
         self.gates.load_state_dict(state["gates"])
         self.gates.truncate(completed)
+        decisions = state.get("gate_decisions")
+        if decisions is None:  # older checkpoint: gate decisions for steps <= completed unknown
+            log.warning(
+                "checkpoint %s has no gate log: gate decisions for steps 1-%d are unknown, the "
+                "gate summary will say so",
+                path,
+                completed,
+            )
+            decisions = {}
+            self._gate_log_from = completed + 1
+        else:
+            self._gate_log_from = min(int(decisions.get("log_from", 1)), completed + 1)
+        self._gate_log = [
+            (int(st), [str(r) for r in rs])
+            for st, rs in decisions.get("log", [])
+            if int(st) <= completed
+        ]
+        fc = decisions.get("flat_check")
+        self._flat_check = fc if fc is not None and int(fc["step"]) <= completed else None
         self.resumed_from = path
         log.info("resumed from %s: continuing at step %d", path, self._start_step)
 
@@ -849,6 +1021,7 @@ class GRPOTrainer:
                 self.gates.record(step, self._last_tallies, ent_sum, ent_tokens)
                 gate = self.gates.evaluate(step)
                 row.update(gate.metrics)
+                row.update(self._gate_decision(step, gate))
                 if step in schedule:
                     row.update(self.evaluate(schedule[step]))
                     self._history.append((step, row["eval/success"]))
@@ -876,10 +1049,14 @@ class GRPOTrainer:
             raise
         finally:
             self.close()
+        gates = self.gate_summary()
+        self._log({"kind": "gate_summary", "step": self._completed_step, **gates})
+        self._console_gate_summary(gates)
         hist = self._history
         return {
             "steps_completed": self._completed_step,
             "stop_reason": reason,
+            "gate_decisions": gates,
             "stopped_flat": reason == "flat",
             "resumed_from": None if self.resumed_from is None else str(self.resumed_from),
             "initial_eval_success": hist[0][1] if hist else None,
@@ -890,13 +1067,130 @@ class GRPOTrainer:
             "wall_time_s": time.perf_counter() - t_start,
         }
 
+    def _gate_decision(self, step: int, gate: GateResult) -> dict[str, Any]:
+        """Per-step gate decision for metrics.jsonl, logged whether or not rl.gate_stop acts on
+        it: gate/would_stop (0/1), gate/would_stop_reason (comma-separated gates that fired, ""
+        if none), gate/first_would_stop_step (first step any gate fired so far; 0 = none yet)."""
+        if gate.reasons:
+            self._gate_log.append((step, list(gate.reasons)))
+        check = gate_check_step(self.rl)
+        if check and step == check:
+            m = gate.metrics
+            self._flat_check = {
+                "step": step,
+                "would_stop": "flat" in gate.reasons,
+                "gain": _finite(m.get("gate/flat_gain")),
+                "gain_se": _finite(m.get("gate/flat_gain_se")),
+                "gain_upper": _finite(m.get("gate/flat_gain_upper")),
+                "window_gain_old_rule": _finite(m.get("gate/flat_window_gain")),
+                "min_gain": self.rl.gate_min_gain,
+                "flat_z": self.rl.gate_flat_z,
+                "rule": self.rl.gate_rule,
+                "per_task": {
+                    k.removeprefix("gate/flat_gain/"): _finite(v)
+                    for k, v in m.items()
+                    if k.startswith("gate/flat_gain/")
+                },
+            }
+        first = self._gate_log[0][0] if self._gate_log else 0
+        return {
+            "gate/would_stop": float(bool(gate.reasons)),
+            "gate/would_stop_reason": ",".join(gate.reasons),
+            "gate/first_would_stop_step": float(first),
+        }
+
+    def gate_summary(self) -> dict[str, Any]:
+        """When each spend gate would have stopped this run (whether or not rl.gate_stop let it),
+        and the flat gate's decision at its check step (step 38 in configs/rl.yaml, where WO-04
+        seeds 1-2 stopped under the older rule). For the run record and the console."""
+        check = gate_check_step(self.rl)
+        first_by_gate: dict[str, int | None] = dict.fromkeys(GATES)
+        fired: dict[str, int] = dict.fromkeys(GATES, 0)
+        for st, reasons in self._gate_log:
+            for r in reasons:
+                fired[r] += 1
+                if first_by_gate[r] is None:
+                    first_by_gate[r] = st
+        first = self._gate_log[0] if self._gate_log else None
+        reached = bool(check) and self._completed_step >= check
+        fc = self._flat_check
+        log_from = self._gate_log_from
+        complete = log_from <= 1  # False: resumed from a checkpoint without a gate log
+        # the flat check step fell in the unknown stretch before the log starts
+        flat_unknown = fc is None and bool(check) and check < log_from
+        if not reached:
+            any_by_check: bool | None = None
+        elif first is not None and first[0] <= check:
+            any_by_check = True  # fired at a logged step, so true whatever came before
+        else:
+            any_by_check = False if complete else None
+        return {
+            "gate_stop": self.rl.gate_stop,
+            "steps_completed": self._completed_step,
+            "gate_log_complete": complete,
+            # steps before this have no gate log (older checkpoint resumed); the first_* and
+            # per-gate fields below then cover only steps >= gate_log_from_step
+            "gate_log_from_step": log_from,
+            "first_would_stop_step": (first[0] if first else None) if complete else None,
+            "first_would_stop_reasons": (first[1] if first else []) if complete else [],
+            "first_logged_would_stop_step": first[0] if first else None,
+            "first_step_by_gate": first_by_gate,
+            "steps_fired_by_gate": fired,
+            "flat_check_step": check or None,
+            "flat_check": fc,
+            "flat_check_unknown": flat_unknown,
+            # None: the check step was not reached, the flat gate is off, or (flat_check_unknown)
+            # it fell before the gate log starts
+            "would_have_stopped_at_flat_check": None if fc is None else bool(fc["would_stop"]),
+            "any_gate_would_have_stopped_by_flat_check_step": any_by_check,
+        }
+
+    def _console_gate_summary(self, g: dict[str, Any]) -> None:
+        check = g["flat_check_step"]
+        fc = g["flat_check"]
+        if fc is not None:
+            verdict = "WOULD HAVE STOPPED" if fc["would_stop"] else "would NOT have stopped"
+            flat = (
+                f"flat gate at step {check} {verdict} the run (gain {_fmt(fc['gain'])}, SE "
+                f"{_fmt(fc['gain_se'])}, gain + {fc['flat_z']:g} x SE = {_fmt(fc['gain_upper'])} vs "
+                f"min_gain {fc['min_gain']:.3f}, rule {fc['rule']})"
+            )
+        elif g["flat_check_unknown"]:
+            flat = (
+                f"flat gate check step {check}: UNKNOWN (resumed from a checkpoint without a "
+                f"gate log; steps 1-{g['gate_log_from_step'] - 1} not logged)"
+            )
+        elif check:
+            flat = f"flat gate check step {check} not reached ({g['steps_completed']} steps)"
+        else:
+            flat = "flat gate off"
+        first = g["first_would_stop_step"]
+        firsts = ", ".join(
+            f"{k} {v if v is not None else '-'}" for k, v in g["first_step_by_gate"].items()
+        )
+        log.info(
+            "GATE SUMMARY (rl.gate_stop=%s): %s; first step any gate would have stopped: %s %s; "
+            "first step per gate: %s",
+            str(self.rl.gate_stop).lower(),
+            flat,
+            (
+                (first if first is not None else "none")
+                if g["gate_log_complete"]
+                else f"unknown (log starts at step {g['gate_log_from_step']}; first logged "
+                f"{g['first_logged_would_stop_step'] or 'none'})"
+            ),
+            g["first_would_stop_reasons"] or "",
+            firsts,
+        )
+
     def _gate_warning(self, step: int, reason: StopReason, m: dict[str, float]) -> None:
         bar = "!" * 78
         what = {
             "flat": (
-                f"FLAT: windowed rollout success gained {m.get('gate/flat_gain', 0.0):+.3f} "
-                f"(SE {m.get('gate/flat_gain_se', 0.0):.3f}) over the first {self.rl.gate_window}-"
-                f"step window, under {self.rl.gate_min_gain:.3f}. Check "
+                f"FLAT: rollout success trend gained {m.get('gate/flat_gain', 0.0):+.3f} "
+                f"(SE {m.get('gate/flat_gain_se', 0.0):.3f}) since step 1 (rule {self.rl.gate_rule}); "
+                f"gain + {self.rl.gate_flat_z:g} x SE = {m.get('gate/flat_gain_upper', 0.0):+.3f}"
+                f" is under {self.rl.gate_min_gain:.3f}. Check "
                 "rollout/frac_groups_dropped, temperature, diag/post/* (did updates move the "
                 "policy?)"
             ),
@@ -914,7 +1208,11 @@ class GRPOTrainer:
                 f"nats/token < {self.rl.gate_entropy_min:.3f}: sampling has collapsed"
             ),
         }[reason]
-        action = "STOPPING (rl.gate_stop=true)" if self.rl.gate_stop else "continuing (gate_stop)"
+        action = (
+            "STOPPING (rl.gate_stop=true)"
+            if self.rl.gate_stop
+            else "continuing: rl.gate_stop=false, logged only (gate/would_stop)"
+        )
         log.warning(
             "\n%s\nSPEND GATE at step %d: %s. %s. This gate decides spending only; the protocol "
             "eval decides improvement.\n%s",
@@ -930,7 +1228,8 @@ class GRPOTrainer:
         """Measure the real loop for the pod job's probe -> approval gate: build the envs, run the
         step-0 baseline eval (as `run` does), then `steps` RL steps. Saves nothing; the policy is
         discarded afterwards (the full run restarts from the SFT adapter). Step 1 carries CUDA
-        warm-up, so timings use steps 2.. when there are any."""
+        warm-up, so timings use steps 2.. when there are any; likewise the per-batch greedy eval
+        time skips the baseline's first env batch."""
         out: dict[str, Any] = {
             "steps": steps,
             "trainable_params": self.num_trainable,
@@ -944,6 +1243,7 @@ class GRPOTrainer:
                 self._env(task)
             out["env_setup_s"] = time.perf_counter() - t0
             baseline = self.evaluate(self.rl.eval_episodes)
+            eval_batch_s = list(self._last_eval_batch_s)
             self._log({"kind": "probe_eval", "step": 0, **baseline})
             out["baseline"] = baseline
             self._check_baseline(baseline)
@@ -977,9 +1277,23 @@ class GRPOTrainer:
                 "rollout_episodes_per_hour": total("rollout/episodes")
                 / total("rollout/time_s")
                 * 3600.0,
-                "eval_s_per_env_batch": baseline["eval/batch_s_median"],
+                # the baseline's first env batch is the process's first policy forward / render
+                # (CUDA warm-up): drop it as the RL timings drop step 1. With one batch (one
+                # trained task) fall back to the warm rollout batch (same envs and horizon)
+                "eval_s_per_env_batch": (
+                    statistics.median(eval_batch_s[1:])
+                    if len(eval_batch_s) > 1
+                    else min(eval_batch_s[0], total("rollout/time_s") / n_batches)
+                ),
+                "eval_s_first_env_batch": eval_batch_s[0],
                 "frac_groups_dropped": total("rollout/frac_groups_dropped") / len(timed),
                 "refill_cap_hit_frac": total("rollout/refill_cap_hit") / len(timed),
+                # mean over steps of the env-step fraction the clip changed; None = clip off
+                "action_clip_frac": (
+                    total("rollout/action_clip_frac") / len(timed)
+                    if self.rl.rollout_action_clip_deg is not None
+                    else None
+                ),
                 "first_minibatch_max_abs_log_ratio": max(
                     r.get("train/first_minibatch_max_abs_log_ratio", 0.0) for r in rows
                 ),
@@ -999,26 +1313,48 @@ class GRPOTrainer:
         return out
 
     def lr_sweep(
-        self, lrs: Sequence[float], adam_steps: int, batch: RolloutBatch | None = None
+        self,
+        lrs: Sequence[float],
+        adam_steps: int,
+        batch: RolloutBatch | None = None,
+        batch_clip_deg: float | str | None = "unknown",
     ) -> dict[str, Any]:
         """Offline replay lr sweep (review 8, Track B): ONE rollout batch (collected here, or a
         stored one), then for each lr: restore the adapter + optimizer state, run `adam_steps`
         optimizer steps over its mini-batches (epoch-major, as the loop does), and score the
         WHOLE batch with the fixed-batch diagnostic (k3 KL, clip fraction, dlogp by advantage
         sign, greedy argmax flip rate). Saves the batch as run_dir/sweep_batch.pt; leaves the
-        policy and optimizer as they were. Costs one rollout collection + per lr: adam_steps x a
-        mini-batch forward/backward + 2 forwards of the batch (scores, greedy)."""
+        policy and optimizer as they were. Costs one rollout collection + 2 forwards of the batch
+        before the first lr (greedy tokens; log-probs, reused as every lr's old log-probs and
+        diag reference) + per lr: adam_steps x a mini-batch forward/backward + 2 forwards of the
+        batch (post scores, post greedy).
+
+        The rollout action clip recorded is the batch's own: this preset's when collected here
+        (also logged to metrics.jsonl as a `lr_sweep_batch` row with its clip intervention stats
+        and written next to the batch as sweep_batch.json), else `batch_clip_deg` (the stored
+        batch's sweep_batch.json; "unknown" without one), never the current preset's."""
         if not lrs or adam_steps < 1:
             raise ValueError("need >= 1 lr and adam_steps >= 1")
         rows: list[dict[str, Any]] = []
-        out: dict[str, Any] = {"adam_steps": adam_steps, "lrs": list(lrs)}
+        out: dict[str, Any] = {
+            "adam_steps": adam_steps,
+            "lrs": list(lrs),
+            # of the batch's rollouts: a stored batch may come from another clip setting
+            "rollout_action_clip_deg": (
+                batch_clip_deg if batch is not None else (self.rl.rollout_action_clip_deg)
+            ),
+            "batch_source": "stored" if batch is not None else "collected",
+        }
         try:
             stats: dict[str, float] = {}
             if batch is None:
                 batch, stats = self.collect()
                 if batch is None:
                     raise RuntimeError("every collected group was all-equal: nothing to replay")
+                self._log({"kind": "lr_sweep_batch", "step": 0, **stats})
             batch.save(self.run_dir / "sweep_batch.pt")
+            meta = {"rollout_action_clip_deg": out["rollout_action_clip_deg"]}
+            (self.run_dir / "sweep_batch.json").write_text(json.dumps(meta) + "\n")
             out["batch"] = {
                 "trajectories": batch.num_trajectories,
                 "groups": batch.num_groups,
@@ -1028,10 +1364,20 @@ class GRPOTrainer:
             }
             t0 = time.perf_counter()
             snap = self._snapshot()
-            n_mb = math.ceil(batch.num_trajectories / self.rl.ppo_mini_batch)
-            pre_greedy = self._greedy(batch, torch.arange(batch.num_trajectories))
+            # optimizer steps per epoch: the trainer's equal whole-group split of this batch
+            n_mb = len(
+                ppo_minibatches(batch.num_groups, self.rl.ppo_mini_batch // batch.group_size)
+            )
+            every = torch.arange(batch.num_trajectories)
+            pre_greedy = self._greedy(batch, every)
             out["pre_greedy_s"] = time.perf_counter() - t0
-            spec = DiagSpec(trajectories=0, argmax=True, pre_greedy=pre_greedy)
+            # the same params before every lr: score once (old log-probs + diag reference)
+            t1 = time.perf_counter()
+            pre_scores = self._score(batch, every, batch.log_probs)
+            out["pre_score_s"] = time.perf_counter() - t1
+            spec = DiagSpec(
+                trajectories=0, argmax=True, pre_greedy=pre_greedy, pre_scores=pre_scores
+            )
             for lr in lrs:
                 self._restore(snap)
                 self._set_lr(float(lr))
@@ -1086,6 +1432,7 @@ class GRPOTrainer:
                     raise ValueError("probe temperatures must be > 0")
                 self._next_prompt, self._next_task = start_prompt, start_task  # paired prompts
                 timer = RolloutTimer()
+                clip_stats = ClipStats()
                 t0 = time.perf_counter()
                 by_task: dict[str, list[Tensor]] = {t: [] for t in self.train_tasks}
                 ent_sum, ent_tokens = 0.0, 0
@@ -1105,12 +1452,21 @@ class GRPOTrainer:
                         task=task,
                         group_reset_check=rl.group_reset_check,
                         timer=timer,
+                        action_clip=rl.action_clip_rad,
+                        clip_stats=clip_stats,
                     )
                     by_task[task].append(batch.group_rewards)
                     es, et = entropy_from_sampled_log_probs(batch.log_probs, _token_mask(batch))
                     ent_sum, ent_tokens = ent_sum + es, ent_tokens + et
                 elapsed = time.perf_counter() - t0
-                row: dict[str, Any] = {"kind": "temp_probe", "step": 0, "temperature": temp}
+                row: dict[str, Any] = {
+                    "kind": "temp_probe",
+                    "step": 0,
+                    "temperature": temp,
+                    "rollout_action_clip_deg": rl.rollout_action_clip_deg,  # the preset's
+                }
+                if rl.rollout_action_clip_deg is not None:
+                    row.update(clip_stats.summary("probe/action_clip"))
                 everything = torch.cat([r for rs in by_task.values() for r in rs])
                 row.update(_group_summary(everything, "probe"))
                 for t, rs in by_task.items():
@@ -1137,7 +1493,155 @@ class GRPOTrainer:
                 )
         finally:
             self.close()
-        return {"groups": n_batches * gpb, "env_batches_per_temperature": n_batches, "rows": rows}
+        return {
+            "groups": n_batches * gpb,
+            "env_batches_per_temperature": n_batches,
+            "rollout_action_clip_deg": rl.rollout_action_clip_deg,
+            "rows": rows,
+        }
+
+    def probe_clip(self, groups: int) -> dict[str, Any]:
+        """Paired clip on/off probe (owner 2026-11-08), rollouts only (no update, no dynamic
+        sampling, no refill). Both arms play the SAME `groups` prompts (reset seeds and tasks
+        round-robin from the trainer's counters, as in training; rounded up to whole env batches)
+        with the SAME sampling seeds: the global torch RNG is reseeded to the same value before
+        each env batch of each arm, so a slot's first decision draws identical tokens and later
+        decisions use common random numbers. K = rl.samples_per_prompt, T = rl.temperature (the
+        preset's). Arm "on" applies rl.rollout_action_clip_deg to the env action; arm "off" sends
+        the sampled action unchanged and only measures how often the clip WOULD have changed it
+        (against its own previous executed action). Per arm: sampled success, group-drop rate
+        (all-equal groups, which dynamic sampling drops), entropy, episode length and clip
+        intervention; paired: per-group success difference and the episode / group count tables
+        (src/rl/paired.py)."""
+        rl = self.rl
+        bound = rl.action_clip_rad
+        if bound is None:
+            raise ValueError(
+                "probe_clip compares the preset's rl.rollout_action_clip_deg against no clip; "
+                "it is null"
+            )
+        if groups < 1:
+            raise ValueError("groups must be >= 1")
+        k = rl.samples_per_prompt
+        gpb = rl.rollout_envs // k
+        n_batches = math.ceil(groups / gpb)
+        arms = {"off": False, "on": True}  # arm -> clip applied to the env action
+        rewards: dict[str, list[Tensor]] = {a: [] for a in arms}
+        by_task: dict[str, dict[str, list[Tensor]]] = {
+            a: {t: [] for t in self.train_tasks} for a in arms
+        }
+        first_tokens: dict[str, list[Tensor]] = {a: [] for a in arms}
+        ep_len: dict[str, list[Tensor]] = {a: [] for a in arms}
+        ent = {a: [0.0, 0] for a in arms}
+        clip_stats = {a: ClipStats() for a in arms}
+        timers = {a: RolloutTimer() for a in arms}
+        elapsed = {a: 0.0 for a in arms}
+        batch_s: dict[str, list[float]] = {a: [] for a in arms}
+        sampling_seeds: list[int] = []
+        try:
+            # build every env this probe visits BEFORE any seeding or timing: the lazy build would
+            # otherwise land inside arm "off"'s time (it runs first) and run after the reseed
+            first_task = self._next_task
+            for i in range(min(n_batches, len(self.train_tasks))):
+                self._env(self.train_tasks[(first_task + i) % len(self.train_tasks)])
+            for b in range(n_batches):
+                task = self.train_tasks[self._next_task % len(self.train_tasks)]
+                self._next_task += 1
+                seeds = list(range(self._next_prompt, self._next_prompt + gpb))
+                self._next_prompt += gpb
+                sampling_seed = CLIP_PROBE_SAMPLING_SEED + self.seed * TRAIN_SEED_STRIDE + b
+                sampling_seeds.append(sampling_seed)
+                env = self._env(task)  # built above: no RNG use, no build time from here on
+                for arm, apply in arms.items():
+                    torch.manual_seed(sampling_seed)  # CPU and every CUDA device: same draws
+                    t0 = time.perf_counter()
+                    batch, _ = collect_rollouts(
+                        self.policy,
+                        env,
+                        self.obs_fn,
+                        prompt_seeds=seeds,
+                        group_size=k,
+                        temperature=rl.temperature,
+                        max_episode_steps=self.max_episode_steps,
+                        task=task,
+                        group_reset_check=rl.group_reset_check,
+                        timer=timers[arm],
+                        action_clip=bound,
+                        clip_stats=clip_stats[arm],
+                        clip_apply=apply,
+                    )
+                    batch_s[arm].append(time.perf_counter() - t0)
+                    elapsed[arm] += batch_s[arm][-1]
+                    rewards[arm].append(batch.group_rewards)
+                    by_task[arm][task].append(batch.group_rewards)
+                    first_tokens[arm].append(batch.tokens[:, 0])
+                    ep_len[arm].append(batch.episode_len)
+                    es, et = entropy_from_sampled_log_probs(batch.log_probs, _token_mask(batch))
+                    ent[arm][0] += es
+                    ent[arm][1] += int(et)
+        finally:
+            self.close()
+        rows: list[dict[str, Any]] = []
+        for arm, apply in arms.items():
+            row: dict[str, Any] = {
+                "kind": "clip_probe",
+                "step": 0,
+                "arm": arm,
+                "clip_applied": apply,
+                "rollout_action_clip_deg": rl.rollout_action_clip_deg,
+                "temperature": rl.temperature,
+                "samples_per_prompt": k,
+            }
+            row.update(_group_summary(torch.cat(rewards[arm]), "probe"))
+            for t, rs in by_task[arm].items():
+                if rs:
+                    row.update(_group_summary(torch.cat(rs), f"probe/{t}"))
+            row["probe/entropy"] = ent[arm][0] / max(int(ent[arm][1]), 1)
+            row["probe/mean_episode_len"] = float(torch.cat(ep_len[arm]).float().mean())
+            # arm on: how often the clip changed the env action; arm off: how often it WOULD have
+            row.update(clip_stats[arm].summary("probe/action_clip"))
+            row["probe/time_s"] = elapsed[arm]
+            row["probe/s_per_env_batch"] = elapsed[arm] / n_batches
+            # batch 0 of arm "off" carries the process's first forwards (CUDA warm-up): compare
+            # the arms' speed on the later batches
+            later = batch_s[arm][1:]
+            row["probe/s_per_env_batch_after_first"] = (
+                sum(later) / len(later) if later else elapsed[arm]
+            )
+            for key, value in timers[arm].totals(elapsed[arm]).items():
+                row[f"probe/time/{key}_s"] = value
+            self._log(row)
+            rows.append(row)
+        paired = paired_group_rewards(torch.cat(rewards["off"]), torch.cat(rewards["on"]))
+        tok_off, tok_on = torch.cat(first_tokens["off"]), torch.cat(first_tokens["on"])
+        # pairing check: same scene + same RNG -> the first decision's tokens agree (1.0 on CPU;
+        # GPU kernel nondeterminism can flip a few)
+        paired["first_decision_token_match"] = float(
+            (tok_off == tok_on).flatten(1).all(-1).float().mean()
+        )
+        self._log({"kind": "clip_probe_paired", "step": 0, **paired})
+        log.info(
+            "clip probe: success off %.3f / on %.3f (paired diff %+.3f, SE %.3f), dropped "
+            "off %.3f / on %.3f, clip changed %.3f of steps (on), would change %.3f (off)",
+            rows[0]["probe/success_rate"],
+            rows[1]["probe/success_rate"],
+            paired["success_diff_on_minus_off"],
+            paired["success_diff_se"],
+            rows[0]["probe/frac_groups_dropped"],
+            rows[1]["probe/frac_groups_dropped"],
+            rows[1]["probe/action_clip_frac"],
+            rows[0]["probe/action_clip_frac"],
+        )
+        return {
+            "groups": n_batches * gpb,
+            "env_batches_per_arm": n_batches,
+            "samples_per_prompt": k,
+            "temperature": rl.temperature,
+            "rollout_action_clip_deg": rl.rollout_action_clip_deg,
+            "sampling_seeds": sampling_seeds,
+            "rows": rows,
+            "paired": paired,
+        }
 
     @staticmethod
     def _console(step: int, row: dict[str, Any]) -> None:
@@ -1169,6 +1673,15 @@ def _constant_lr(_: int) -> float:
 def _token_mask(batch: RolloutBatch) -> Tensor:
     """(E, S, C, A) bool: tokens of executed actions."""
     return batch.action_mask.unsqueeze(-1).expand_as(batch.tokens)
+
+
+def _finite(value: float | None) -> float | None:
+    """JSON-safe gate number: None for a missing or non-finite value (no trend -> -inf)."""
+    return None if value is None or not math.isfinite(value) else float(value)
+
+
+def _fmt(value: float | None) -> str:
+    return "-" if value is None else f"{value:+.3f}"
 
 
 def _jsonable(value: Any) -> Any:

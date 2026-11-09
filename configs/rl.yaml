@@ -47,15 +47,17 @@
 #   env actions            384 x 120 (RL horizon)        = 46,080 -> / 86 per s  = 535.8 s
 #   old log-prob recompute 128 x ceil(120 / 8) = 1,920 decisions / 31 per s     =  61.9 s
 #   update                 2 epochs x 1,920 decisions / 10.3 per s              = 372.8 s
-#                          (2 mini-batches of 64 x 2 epochs = 4 Adam steps; upstream ~4)
+#                          (2 mini-batches of 64 x 2 epochs = 4 Adam steps; upstream ~4;
+#                          fewer kept groups split equally: 11 -> 6 + 5 groups, 7 -> 1 x 7)
 #   fixed-batch diagnostic 32 trajectories x 15 decisions = 480 / 31 per s      =  15.5 s
 #   step                                                               = 986.0 s = 16.4 min
 #   evals (sanity only)    steps {0, 25, ..., 150}: 7 x 32 episodes x 2 trained tasks
 #                          x 120 actions / 86 per s                             =   0.17 h
 #   run: 150 x 986 s + 0.17 h = 41.3 h x $1.79 = ~$74 per seed, worst case. The K=16 runs hit the
 #   refill cap on only 16-26% of steps (~11.5 min/step measured), so expect less if the new base
-#   drops fewer groups. Flat-gate stop at step 38: ~10.5 h = ~$19.
-#   estimated: A100-80GB x 41.3 h = $74 per seed (worst case); flat-gate stop 10.5 h = $19
+#   drops fewer groups. A flat-gate stop at step 38 would be ~10.5 h = ~$19, but gate_stop is false
+#   for the first run (owner 2026-11-08): budget the full 41.3 h.
+#   estimated: A100-80GB x 41.3 h = $74 per seed (worst case; gate_stop false: no early stop)
 # vs the previous 8 x K=16, 1 epoch shape: same 128 trajectories and the same rollout cap (4 env
 # batches per round), +186 s/step for the second epoch, +15 s for the diagnostic.
 #
@@ -99,14 +101,18 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   max_rollout_rounds: 3     # dynamic-sampling refill cap, in multiples of one full round
   steps: 150                # owner amendment (ADR-0002): was 300
   # lr 1e-4 rests on the published LoRA recipes (RIPT-VLA, RLinf-VLA; RL4VLA also uses 1e-4 for
-  # LoRA), NOT on the logged approx_kl / clip_frac: those were averaged over mini-batches measured
-  # before their own optimizer step and are uninformative (review 3.1). `--lr-sweep` measures the
-  # on-batch movement per lr before any longer run.
+  # LoRA), NOT on the logged approx_kl / clip_frac: averaged over 2 mini-batches, the first exactly
+  # on-policy, they are only weak evidence of the per-update change (review 3.1). `--lr-sweep`
+  # measures the on-batch movement per lr before any longer run.
   lr: 1e-4                  # was 5e-5 (owner, WO-04), 1e-5 before that
   weight_decay: 0.01
   grad_clip: 1.0            # not a step-size lever under Adam (rescaling g cancels); lr/epochs are
   ppo_epochs: 2             # 2026-11-08: was 1
-  ppo_mini_batch: 64        # trajectories per optimizer step -> 2 per epoch, 4 per update
+  ppo_mini_batch: 64        # max trajectories (8 whole groups) per optimizer step. Each epoch
+                            # splits the kept groups into ceil(groups / 8) EQUAL whole-group
+                            # mini-batches (owner 2026-11-08; src/rl/trainer.py ppo_minibatches):
+                            # 16 groups -> 8 + 8 (2 per epoch, 4 per update); 11 (refill cap) ->
+                            # 6 + 5, not 8 + a 3-group tail with its own full Adam step
   micro_batch: 8            # decisions per forward/backward; memory only, gradient unchanged
   clip_low: 0.2
   clip_high: 0.28
@@ -126,16 +132,26 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   checkpoint_every: 25      # resume (--resume) loses at most 25 steps (~6.8 h worst case)
   # Spend gates (src/rl/gates.py), replacing the 64-episode kill switch and the 32-episode peak
   # stop (neither could tell +3 points from 0). They decide whether to KEEP SPENDING on this run;
-  # they do not decide whether RL improved the policy. Inputs: windowed rollout/success_rate over
-  # every generated episode (~130-380 per step), but the unit is the GROUP (its K samples share a
-  # scene): 8-24 groups per task per step, so under WO-04-like scene heterogeneity a 10-step
-  # window's score has a group-level SE of ~1-2 points (a two-window difference ~1.5-2.5). The
-  # episodes also come from a changing policy, hence not a measure of improvement. Plus the
-  # rollout's sampled-token entropy.
-  gate_window: 10           # steps per window
-  gate_check_frac: 0.25     # flat gate at step ceil(0.25 x 150) = 38: window 29-38 vs 1-10
-  gate_min_gain: 0.03       # owner's +3 points (WO-04), now on windowed SAMPLED success (owner to
-                            # confirm: sampled success moved 7.9% -> 12.6% over 150 K=16 steps)
+  # they do not decide whether RL improved the policy. Inputs: rollout/success_rate over every
+  # generated episode (~130-380 per step), but the unit is the GROUP (its K samples share a
+  # scene): 8-24 groups per task per step. SIMULATED (Beta concentration 2, K=8, this refill) at
+  # p 0.08-0.20: ~16-24 groups/task/step, a 10-step window's per-task SE 1.1-2.1 points, a
+  # two-window difference 1.6-2.9, the flat gate's trend gain 2.0-3.6. The episodes also come
+  # from a changing policy, hence not a measure of improvement. Plus the rollout's sampled-token
+  # entropy.
+  gate_window: 10           # steps per window (decline / entropy gates)
+  gate_check_frac: 0.25     # flat gate at step ceil(0.25 x 150) = 38: per-task least-squares
+                            # trend over steps 1-38, gain = fitted change from step 1 (the SFT
+                            # policy) to 38. Was window 29-38 vs 1-10, whose baseline had already
+                            # taken 0-9 updates (review L-baseline, PR #28)
+  gate_min_gain: 0.03       # owner's +3 points (WO-04), now a gain from the SFT policy in SAMPLED
+                            # success (owner to confirm: sampled success moved 7.9% -> 12.6% over
+                            # 150 K=16 steps, i.e. ~+1.2 points by step 38 at that pace)
+  gate_flat_z: 0.5          # PROVISIONAL default (owner 2026-11-08, PR #28; simulated only): stop
+                            # only if gain + 0.5 x SE < 3 points. Simulated P(stop): flat run 0.73 /
+                            # 0.57 / 0.40 (p 0.08 / 0.13 / 0.20), one task truly +5: 0.06 / 0.08 /
+                            # 0.09 (z 0: 0.17-0.23; the older rollout-window rule 0.32-0.33, not
+                            # the original 64-episode greedy gate). 0 = the plain +3 bar
   gate_rule: any_task       # owner 2026-10-28: pass if ANY trained task gained it
   gate_max_drop: 0.04       # decline: stop if the window is > 4 points below its best
                             # non-overlapping window (replaces the step-50/100 peak stop) ...
@@ -143,7 +159,12 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
                             # windows; z = 2 stopped 35/100 simulated flat runs (src/rl/gates.py)
   gate_entropy_min: 0.5     # nats/token at T: below this sampling has collapsed onto the argmax
                             # (WO-04 K=16 run: 1.32 -> 1.07 over 150 steps); judgment, not measured
-  gate_stop: true
+  # Owner 2026-11-08: the first RL training run on this recipe OBSERVES the gates before they are
+  # trusted to stop a run (gate_flat_z 0.5 is simulated only). Every gate still evaluates and logs
+  # gate/would_stop, gate/would_stop_reason and gate/first_would_stop_step per step; the run record's
+  # gate_decisions says when each gate would have stopped it, incl. the flat gate at step 38 (where
+  # WO-04 seeds 1-2 stopped under the older rule). Set true again once a run has been observed.
+  gate_stop: false
   # Fixed-batch policy-movement diagnostic (src/rl/diagnostics.py): diag/pre/* and diag/post/*
   # = per-token |dlogp| by advantage sign, k3 KL and clip fraction of the first 32 trajectories of
   # each update, before and after ALL its optimizer steps; + train/grad_norm. ~15 s per step.
@@ -158,6 +179,15 @@ rl:                         # GRPO, ADR-0002; every key is documented in src/rl/
   # RL rollout + in-training eval horizon (owner amendment, ADR-0002); the protocol eval
   # (scripts/wo02_eval.py) keeps env.max_episode_steps = 150.
   max_episode_steps: 120
+  # Protocol 0.2's per-joint step clip inside RL rollouts, the in-training evals and every probe
+  # of this preset (--probe-temperatures, --lr-sweep's batch, --probe-steps). OWNER DECISION
+  # 2026-11-08: ON at 4.0 deg/step, the bound protocol 0.2 eval and the real arm apply
+  # (configs/real.yaml robot.safety: min(max_joint_step_deg 4, max_velocity_deg_s 60 / 15 Hz);
+  # tests/test_rl_action_clip.py checks the two agree). It clips the action SENT TO THE ENV only:
+  # PPO keeps the sampled tokens and their log-probs (src/rl/rollout.py). WO-04 ran with no clip
+  # (null), so this run is NOT like-for-like with WO-04 on this axis; `--probe-clip` measures the
+  # difference on paired rollouts before the run. null = off (the code default, tiny preset).
+  rollout_action_clip_deg: 4.0
 
 cost:
   gpu: A100-80GB

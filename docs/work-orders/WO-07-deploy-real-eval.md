@@ -21,5 +21,27 @@ logged (target <150 ms); video produced.
 
 ## Notes
 
+- Latency (2026-11-08): the client logs `frame_return_to_first_write_ms`, which starts at
+  LeRobot's frame stamp (taken after the driver returns the frame) and so excludes capture. The
+  benchmark's capture-to-write number needs the one-off optical offset from
+  `docs/bringup/latency-measurement.md` (`deploy.capture_offset_ms`). Until that is measured,
+  no latency is called end-to-end.
 - Expect real numbers well below sim. Published zero-real-demo sim-to-real landed at 17.5% → 38.5%.
   Report whatever happens; WO-08 is for fixing it.
+- Scoring (owner 2026-11-08, judging rule `real-judge-2`, `scripts/wo07_real_eval.py`): the
+  primary real metric is successes / trials whose policy started (the first action from the
+  policy server reached the safety filter). A servo, serial or safety fault after the start
+  (also with torque off unconfirmed) is a failure, recorded separately (`fault`); the operator
+  judges only clean trials; an unjudged score prompt (Ctrl-C, EOF, timeout) is a failure.
+  Attempts that never started the policy are retried with the same placement, never scored.
+  The success rate excluding faulted trials is reported only as a labelled secondary diagnostic.
+- Prompts with torque on are bounded (`deploy.prompt_torque_timeout_s`, 60 s, then support,
+  grace, torque off); "supported" is recorded only after an explicit ENTER
+  (`src/robot/prompts.py`); the bound covers the whole line (a partial line at the deadline is
+  no answer), and `--hardware` refuses a stdin / stdout that is not a terminal before anything
+  opens. Typed-ahead input is discarded before each prompt; Ctrl-C outside
+  a prompt is a flag checked between control ticks; closing the Terminal (SIGHUP) takes the
+  closed-stdin path (grace, torque off, `released_unconfirmed`).
+- A started trial is durable: a `trial_started` row is written the moment the policy starts,
+  and a resume scores a started trial without a record (the run was killed mid-trial) as a
+  failure (fault kind `session_lost`), never a redo.

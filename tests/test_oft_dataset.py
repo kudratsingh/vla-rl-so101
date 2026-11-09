@@ -152,6 +152,38 @@ def test_padded_chunks_are_dropped_with_chunk_pad_drop(fake_recorder: Path) -> N
         ChunkedDemoDataset(short, chunk_len=3, chunk_pad="drop")
 
 
+def test_v2_demo_set_needs_chunk_pad_drop(
+    fake_recorder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A v2 set (v2 oracle / release-retreat tail in the sidecar) is refused unless chunk_pad:
+    drop; the 0.1-style sidecar (no such fields) keeps loading with the default repeat."""
+    side = fake_recorder / "meta" / "vla_rl_so101_episodes.jsonl"
+    rows = [json.loads(x) for x in side.read_text().splitlines()]
+
+    def read_sidecar(r: Path) -> list[dict[str, Any]]:
+        return [json.loads(x) for x in (Path(r) / "meta/vla_rl_so101_episodes.jsonl").open()]
+
+    monkeypatch.setattr(
+        sys.modules["src.data.recorder"], "read_sidecar", read_sidecar, raising=False
+    )
+    cfg = load_config("tiny", "configs/sft_tiny.yaml")
+    cfg["env"]["tasks"] = list(TASKS)
+    cfg["data"]["demos_per_task"] = 1
+    cfg["data"].pop("chunk_pad", None)
+    assert load_sft_frames(cfg, chunk_len=3)[1]["chunk_pad"] == "repeat"  # 0.1-style rows
+    for v2 in ({"oracle_profile": "v2"}, {"post_success_frames": 15}):
+        side.write_text("".join(json.dumps({**r, **v2}) + "\n" for r in rows))
+        for pad in (None, "repeat"):
+            if pad is None:
+                cfg["data"].pop("chunk_pad", None)
+            else:
+                cfg["data"]["chunk_pad"] = pad
+            with pytest.raises(ValueError, match="v2 demo set.*chunk_pad: drop"):
+                load_sft_frames(cfg, chunk_len=3)
+        cfg["data"]["chunk_pad"] = "drop"
+        assert load_sft_frames(cfg, chunk_len=3)[1]["chunk_pad"] == "drop"
+
+
 def test_synthetic_frames_feed_the_policy() -> None:
     from src.policy.openvla_oft import build_policy
 
@@ -167,8 +199,9 @@ def test_synthetic_frames_feed_the_policy() -> None:
         ChunkedDemoDataset(frames, chunk_len=4)[0]
 
 
-def _record(root: Path, repo: str, episodes: list[tuple[int, str, bool]]) -> None:
-    """A real WO-01-recorder dataset: (frames, sidecar kind, oracle_success) per episode."""
+def _record(root: Path, repo: str, episodes: list[tuple[int, str, bool]], **extra: Any) -> None:
+    """A real WO-01-recorder dataset: (frames, sidecar kind, oracle_success) per episode; `extra`
+    goes into every sidecar row (e.g. oracle_profile="v2")."""
     from src.data.recorder import DemoRecorder
 
     rec = DemoRecorder(repo, root / repo.split("/")[-1], image_hw=(32, 32))
@@ -180,6 +213,7 @@ def _record(root: Path, repo: str, episodes: list[tuple[int, str, bool]]) -> Non
         rec.save_episode(
             {"task_family": "PickPlace", "seed": ep, "cell": "seen", "oracle_success": ok}
             | ({} if kind == "demo" else {"kind": kind})
+            | extra
         )
     rec.finalize()
 
@@ -239,3 +273,21 @@ def test_extra_datasets_capped_and_frame_matched(tmp_path: Path) -> None:
              "episode_index": i, "num_frames": 10} for i in range(3)]  # fmt: skip
     assert select_budget(rows, "PickPlace", kind="demo", max_episodes=2) == ([0, 1], 20)
     assert select_budget(rows, "PickPlace", kind="correction") == ([], 0)
+
+
+def test_v2_extra_dataset_needs_chunk_pad_drop(tmp_path: Path) -> None:
+    """The v2 refusal covers every part of the mix: 0.1-style demos plus corrections recorded
+    with the v2 oracle (configs/demos_v2.yaml) are refused under chunk_pad repeat."""
+    _record(tmp_path, "local/d", [(5, "demo", True), (6, "demo", True)])
+    _record(tmp_path, "local/c", [(4, "correction", True)] * 2, oracle_profile="v2")
+    cfg = tmp_path / "mix.yaml"
+    cfg.write_text(
+        f"inherit: configs/sft_tiny.yaml\ndata:\n  dataset_root: {tmp_path}\n  hub_repo: local/d\n"
+        "  extra_datasets:\n    - {hub_repo: local/c, kind: correction}\n"
+    )
+    with pytest.raises(ValueError, match="local/c is a v2 demo set.*chunk_pad: drop"):
+        load_sft_frames(load_config("tiny", cfg), chunk_len=3)
+    cfg.write_text(cfg.read_text().replace("  extra_", "  chunk_pad: drop\n  extra_"))
+    ds, info = load_sft_frames(load_config("tiny", cfg), chunk_len=3)
+    assert len(ds) == (5 - 2) + (6 - 2) + 2 * 2
+    assert info["chunk_pad"] == "drop" and info["extra_datasets"][0]["num_frames"] == 2 * 2

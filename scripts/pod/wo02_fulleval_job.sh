@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # WO-02 close-out: full protocol eval (3 tasks x 3 cells x 3 seeds x 100 episodes, GPU sim) of one
 # SFT checkpoint. setup -> render check -> PROBE (50 episodes, timed, projected h and $) -> owner
-# APPROVAL GATE (/workspace/APPROVED) -> full eval -> upload -> self-delete. Launched over SSH:
+# APPROVAL GATE (/workspace/APPROVED.<pod id>, scripts/pod/approval_lib.sh) -> full eval -> upload
+# -> self-delete. Launched over SSH:
 #   CKPT=<hub sub-path> RATE_USD_H=0.89 nohup bash scripts/pod/wo02_fulleval_job.sh > /workspace/job.log 2>&1 &
 set -uo pipefail
 source /root/runpod.env
+# shellcheck source=scripts/pod/approval_lib.sh
+. "$(dirname "$0")/approval_lib.sh"  # this pod's approval file only
 if [ -z "${OMP_NUM_THREADS:-}" ] && read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null && [ "$q" != max ]; then
   export OMP_NUM_THREADS=$(( (q + p - 1) / p )) MKL_NUM_THREADS=$(( (q + p - 1) / p ))
 fi
 export PATH="$HOME/.local/bin:$PATH"
-export HF_TOKEN="$(cat /root/.hf_token)"
+HF_TOKEN="$(cat /root/.hf_token)"
+export HF_TOKEN
 export HUB_REPO="${HUB_REPO:-KudratSingh22/vla-rl-so101-sft}"
 CFG="${SFT_CFG:-configs/sft.yaml}"
 STAGE_FILE=/workspace/stage
@@ -66,19 +70,11 @@ print(f"[job] PROBE 50 episodes in {dt:.0f} s -> full eval (2700 episodes) <= {h
 EOF
 
 stage await-approval
-APPROVAL_WAIT_S="${APPROVAL_WAIT_S:-1800}"
-t1=$(date +%s)
-until [ -f /workspace/APPROVED ]; do
-  if [ $(( $(date +%s) - t1 )) -ge "$APPROVAL_WAIT_S" ]; then
-    echo "[job] no owner approval within $((APPROVAL_WAIT_S / 60)) min; stopping"; exit 21
-  fi
-  sleep 15
-done
-echo "[job] approved: $(cat /workspace/APPROVED)"
+await_approval "${APPROVAL_WAIT_S:-1800}" || exit 21
 
 stage full-eval
 s=$(left); [ "$s" -le 60 ] && { echo "[job] soft deadline before the full eval"; exit 124; }
 timeout "$s" uv run scripts/wo02_eval.py --preset sim --config "$CFG" --adapter "$ADAPTER" \
   --num-envs 50 --sim-device cuda || exit 30
 echo "[job] full eval -> $(ls -d runs/*-wo02eval-sim-* | sort | tail -1)"
-stage done
+stage "done"

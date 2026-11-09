@@ -60,13 +60,20 @@ checks: `/usr/share/vulkan/icd.d/nvidia_icd.json` with `"library_path": "libEGL_
 ```bash
 brew install uv molten-vk ffmpeg@7   # ffmpeg@7 is keg-only; FFmpeg 9 is too new for torchcodec 0.2.1
 source scripts/mac_env.sh      # VK_ICD_FILENAMES (MoltenVK, so SAPIEN can render) + DYLD_FALLBACK_LIBRARY_PATH (ffmpeg@7)
-uv sync --extra robot          # lerobot robot extras, feetech sdk, grpcio, opencv; no torch-cuda
-uv run lerobot-find-port       # find the Waveshare board
-uv run lerobot-calibrate --robot.type=so101_follower --robot.port=/dev/tty.usbmodemXXXX
+uv sync --frozen --extra dev --extra gpu --extra robot   # uv sync is exact: a bare --extra robot uninstalls dev/gpu
+uv run scripts/wo06_calibrate.py --preset real find-port --write              # find the Waveshare board
+uv run scripts/wo06_calibrate.py --preset real calibrate --device follower    # torque off, always fresh
 ```
 
 `make` targets export these env vars automatically. ManiSkill CPU sim + rendering works on
-Apple Silicon this way (used for the `tiny` preset and oracle runs).
+Apple Silicon this way (used for the `tiny` preset and oracle runs). Add `--extra smolvla` to the
+sync if you also want SmolVLA on the Mac.
+
+Do not use stock `lerobot-calibrate` on this arm: without `--robot.id` it writes `None.json`
+(the repo reads `so101_follower.json`), and its connect enables torque without the driver's
+Goal := Present hook. Never use `lerobot-teleoperate`, `lerobot-record`, `lerobot-replay` or
+`lerobot-find-joint-limits` either: they drive the follower without `src/robot/safety.py`. The
+full bring-up procedure is `docs/bringup/WO-06-checklist.md`.
 
 Policy inference for OpenVLA-OFT runs on the GPU box and is served to the Mac over gRPC;
 SmolVLA can run on the Mac CPU/MPS for smoke tests only.
@@ -85,7 +92,9 @@ syncs `dev` + `gpu`.
 
 ## Hardware
 
-- SO-101 follower (leader optional). Feetech STS3215 servos, Waveshare bus board, 5 V 4 A supply.
+- SO-101 follower (leader optional). Feetech STS3215 servos, Waveshare bus board, 5 V 4 A supply
+  (for the 7.4 V STS3215 variant; an arm built with 12 V STS3215 servos needs its 12 V supply:
+  read the servo label).
 - 2 USB webcams at 640×480 @ 30 fps: one fixed overhead/front (matches the sim camera pose),
   one optional wrist cam. Record intrinsics in `configs/real.yaml`.
 - Table clamps; printed placement grid (A3) for randomized object positions; cubes 3 cm, bowl.
