@@ -1,93 +1,82 @@
 # Plan
 
+Rewritten 2026-11-09 for the pivot to SmolVLA on the real SO-101 (ADR-0003). The OpenVLA-OFT /
+GRPO plan that came before it is in git history and in ADR-0001 / ADR-0002.
+
 ## What we are building
 
-A post-training pipeline that takes a pre-trained VLA, fine-tunes it on ≤25 demonstrations (≤10 until 2026-10-27, ADR-0001) per
-task (SFT), then improves it with reinforcement learning against a binary success reward in a
-GPU-parallel simulator (GRPO), on one GPU — and then deploys the result to a real SO-101 arm and
-measures whether the RL gain survives contact with reality.
+SmolVLA, with ACT as the baseline, fine-tuned the way LeRobot trains this arm: leader-arm teleop
+demos with two cameras (wrist + front), fine-tuned on a rented 24 GB GPU, inference on the Mac
+(MPS) inside the existing safety / deadman deploy loop. Both policies are evaluated on the real
+arm under a frozen, hashed real protocol. A separate sim experiment tests whether reward-filtered
+behaviour cloning improves a SmolVLA checkpoint, and only a measured sim gain is tried on the arm.
 
-## Why this is worth doing
+Few-shot stays a sim experiment. The real arm is data-first.
 
-- Published VLA-RL recipes (SimpleVLA-RL, πRL/RLinf, RLinf-VLA) report +40–50 point gains from a
-  few-shot SFT start, but all of them trained on 8×80 GB GPUs. No single-GPU reproduction with
-  numbers exists.
-- Only one of those papers reports real-robot results (SimpleVLA-RL: 17.5% → 38.5% real, zero real
-  demos). Real-world validation of VLA-RL on cheap hardware is rare.
-- The owner's direction is physical AI; this project is the post-training + sim-to-real core of it.
+## Why the pivot
+
+OFT PickPlace reached 17% on seen positions at 25 demos and GRPO missed the WO-04 benchmark
+(`docs/results.md`, partial result). OFT has no SO-101 evidence; SmolVLA was pretrained on SO-100
+community data (the related predecessor of this arm) and has published SO-101 fine-tunes. Details
+and citations: ADR-0003.
 
 ## Phases
 
 | Phase | WOs | Output |
 |---|---|---|
-| A. Sim pipeline | 01–03 | Env, demos, SFT checkpoint with nonzero success, RL loop verified on CPU |
-| B. RL result | 04–05 | 3-seed SFT vs SFT+RL table in sim; ablations; public writeup v1 |
-| C. Real | 06–08 | Arm bring-up, real eval tables, gap-closing retrain |
-| D. Release | 09 | README, model card, reproducibility |
+| Closed: OFT sim track | 01–05 | Sim env, oracle, demos, OFT SFT, GRPO loop and runs; recorded partial result |
+| A. Bring-up | 06 | Calibrated arm, drift check, leader teleop, both cameras matched with locked exposure / white balance, Mac MPS latency on the mock rig |
+| B. Real baseline | 07 | 50 PickPlace demos, SmolVLA and ACT fine-tunes, 50 binary trials per cell for each, immutable export for `vishwaroop` |
+| C. Sim post-training | 08 | Filtered behaviour cloning on SmolVLA in a two-camera sim; transfer test on the arm only after a sim gain |
+| D. Release | 09 | README table, model cards, reproduce commands, ADR index |
 
-Phase B is a complete, shippable result on its own.
+## Tasks
 
-## Tasks (sim and real must match)
-
-1. `PickPlace` — pick the named object, place in the bowl.
+1. `PickPlace` — pick the named object, place it in the bowl. The real arm starts here.
 2. `Push` — push the cube to the marked target.
 3. `Stack` — stack cube A on cube B.
 
-Each task has a programmatic success check in `src/env/success.py`. Language instruction is a
-template per task with object names filled in.
+Push and Stack wait until the PickPlace baseline is in. Each task has a programmatic success check
+in `src/env/success.py` (sim); the real arm is judged by the real rubric (`real-judge-2`).
 
-## Base model decision (ADR-0001)
+## Real data and evaluation (ADR-0003, decisions D1-D5)
 
-Default: **OpenVLA-OFT** with LoRA — it is what the open RL recipes target and its action-chunk
-inference (≈108 Hz on LIBERO) keeps rollouts cheap.
-Fallback: **π0.5** via openpi LoRA (>22.5 GB VRAM) through RLinf's πRL path if OpenVLA-OFT's
-SFT lands below 20% on seen positions after WO-02.
-Smoke-test model: **SmolVLA** (450M) in WO-01 only, to prove the data path.
+- Demos: 50 PickPlace = 10 at each of five seen slots chosen from the 16-slot inner block of the
+  placement grid (one near each corner, one central), bowl at one fixed position, both cameras.
+  100 only if a failure analysis of development trials shows more data addresses the failures.
+- Cells, 50 binary trials each: seen (10 per seen slot), shifted (balanced over the 20 ring slots),
+  unseen objects (25 purple cube + 25 green cube at the seen slots; per object and pooled, pooled
+  is the headline). Same seeded schedule for both policies.
+- The slot ids, bowl position and trial schedule are frozen and hashed in a new real protocol
+  version before the first demo. Development trials use a disjoint schedule and are never reported.
 
-Decide at the end of WO-02; record in the ADR.
+## Sim evaluation
 
-## RL recipe (ADR-0002)
-
-GRPO as in SimpleVLA-RL: 8 samples per prompt, binary outcome reward from the env success
-check, group-normalized advantages, clip-higher (ε_low 0.2, ε_high 0.28), rollout temperature
-≈1.6, no KL penalty, dynamic sampling (drop groups whose rewards are all-equal). Single GPU:
-rollouts and updates alternate on the same card; LoRA parameters only; rollout batch sized to
-VRAM. Start from the WO-02 SFT checkpoint.
-
-## Evaluation protocol (frozen in `src/eval/protocol.py`)
-
-- Cells: seen positions · shifted positions (objects re-sampled outside the SFT demo range) ·
-  unseen objects (same task, new object meshes/colours).
-- Sim: 100 episodes per cell per task, 3 seeds. Real: 50 trials per cell per task, one physical
-  setup, randomized object placement from a printed grid.
-- Report success rate with a 95% Wilson interval, SFT-only vs SFT+RL side by side.
-- Protocol hash = SHA-256 of the protocol file; every number cites it.
+Protocols 0.1-draft (`src/eval/protocol.py`) and 0.2 (`src/eval/protocol_v02.py`) stay frozen for
+the recorded OFT numbers. WO-08 adds a wrist camera to the sim scene and a new two-camera protocol
+version that carries over 0.2's success rules, cells and 4°/step action limit. Sim: 100 episodes
+per cell, 3 seeds, 95% Wilson interval; every number cites its protocol hash.
 
 ## Non-goals
 
 - No learned reward models, no shaped rewards, no human-in-the-loop RL in this project.
+- No RL or GRPO in the new plan; WO-08 is filtered behaviour cloning.
 - No serving beyond the deploy loop; no web UI.
 - No new simulator; ManiSkill3 only. No Isaac Sim.
 - No dexterous, deformable or bimanual tasks.
-- No full fine-tuning of 7B models; LoRA only.
 
 ## Budget
 
-Cloud compute has a **$1,100 lifetime planning cap**. The core sim-to-real work has a $700
-cap including recorded spend. Up to $400 is reserved for the original WO-05 ablation sweeps
-if earlier results justify them. See [spend and allocations](STATUS.md#spend) for the staged
-plan. Each paid run still requires its own estimate and explicit owner approval under
-[CLAUDE.md](../CLAUDE.md#hard-rules).
+Cloud compute keeps the **$1,100 lifetime planning cap**; recorded spend is about $156.10
+(`docs/STATUS.md`). The OFT-era allocations for GRPO diagnostics, confirmatory seeds and WO-05
+ablations are void. The next paid run is the first SmolVLA fine-tune, after a short probe; PR 2
+carries its cost line. Each paid run still requires its own estimate and explicit owner approval
+under [CLAUDE.md](../CLAUDE.md#hard-rules).
 
-Hardware is budgeted separately. The original hardware estimate was $300–600 for an SO-101
-follower or pair, webcams and clamps.
-
-## Timeline (owner's)
-
-Nine weeks, one WO per week, WO-06 starts when the arm arrives. Order the arm during WO-01.
+Hardware is budgeted separately (SO-101 follower + leader, wrist camera module, Logitech C920x,
+spare gripper servo).
 
 ## Follow-ons (not in scope now)
 
-- Residual RL on the frozen VLA using object poses (Microsoft CoRL 2026 recipe, no code
-  released) — reuses this repo's arm, sim and SFT checkpoint.
+- Residual RL on a frozen VLA using object poses (Microsoft CoRL 2026 recipe, no code released).
 - The same brain-over-skills loop on the Microduck's command block.

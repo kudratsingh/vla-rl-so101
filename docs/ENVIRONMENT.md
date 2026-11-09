@@ -75,8 +75,9 @@ Goal := Present hook. Never use `lerobot-teleoperate`, `lerobot-record`, `lerobo
 `lerobot-find-joint-limits` either: they drive the follower without `src/robot/safety.py`. The
 full bring-up procedure is `docs/bringup/WO-06-checklist.md`.
 
-Policy inference for OpenVLA-OFT runs on the GPU box and is served to the Mac over gRPC;
-SmolVLA can run on the Mac CPU/MPS for smoke tests only.
+Policy inference for OpenVLA-OFT ran on the GPU box and was served to the Mac over gRPC. Since
+the pivot (ADR-0003, 2026-11-09) SmolVLA and ACT inference for the real arm runs on the Mac over
+MPS (code in the pivot's PR 2); training stays on the GPU box. No pin changes.
 
 ## Install — development (all extras, any machine)
 

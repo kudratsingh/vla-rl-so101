@@ -1,5 +1,10 @@
 # SO-101 — VLA Reinforcement Learning & Sim-to-Real
 
+> **Pivot, 2026-11-09 ([ADR-0003](docs/adr/0003-pivot-to-smolvla.md)):** the OpenVLA-OFT / GRPO
+> track described below is stopped; its results are a recorded partial result. The project is now
+> SmolVLA (with ACT as the baseline) on the real SO-101, trained on leader-arm teleop demos with
+> wrist + front cameras. This overview is rewritten in WO-09.
+
 A **vision-language-action (VLA) reinforcement-learning and sim-to-real manipulation stack** for the **SO-101 robot arm**. It connects few-shot **OpenVLA-OFT LoRA supervised fine-tuning** to single-GPU **GRPO post-training**, using camera-conditioned policies and task-success rewards in **ManiSkill3**.
 
 The pipeline spans scripted IK demonstrations, LeRobotDataset recording, grouped rollouts, action-token log-probability updates, checkpoint evaluation and robot-side command filtering. Protocol-hashed evaluations separate seen positions, shifted positions and unseen objects, while joint, workspace, velocity and deadman checks define the hardware control boundary.

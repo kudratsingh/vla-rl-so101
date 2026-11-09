@@ -3,7 +3,10 @@
 Every number: run id, config hash, protocol hash, seeds, date, GPU, dollars. Single-run numbers
 are labelled single-run. Sim and real are never mixed in one table.
 
-## Sim — success rate (%), 100 episodes/cell, 3 seeds, 95% Wilson interval
+**The OpenVLA-OFT sim rows below (WO-02 SFT, WO-04 RL) are a partial result, track stopped
+2026-11-09** (ADR-0003). No number in them has changed.
+
+## Sim — success rate (%), 100 episodes/cell, 3 seeds, 95% Wilson interval (OpenVLA-OFT: partial result, track stopped 2026-11-09)
 
 SFT-only = OpenVLA-OFT LoRA, WO-02 attempt 4 `step_004000` (25 demos/task, 8000 steps; Hub
 `KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000`).
@@ -25,10 +28,11 @@ One SFT training run (single-run); GPU sim (physx_cuda), RTX 4090, 2026-10-27, e
 | Stack | shifted | 0.0 [0.0, 1.3] (0, 0, 0) | | | `20261027T190836Z-wo02eval-sim-cdd3` | 0.1-draft `e9ce5bb47a88` |
 | Stack | unseen objects | 2.0 [0.9, 4.3] (1, 3, 2) | | | `20261027T190836Z-wo02eval-sim-cdd3` | 0.1-draft `e9ce5bb47a88` |
 
-The SFT+RL column stays empty: it needs 3 training seeds, and only one two-task seed finished.
+The SFT+RL column stays empty: it needs 3 training seeds, and only one two-task seed finished. It
+will not be filled: the track stopped on 2026-11-09 (ADR-0003).
 The two RL runs that completed are in the next table.
 
-## Sim — WO-04 RL runs, each a single training seed (single-run)
+## Sim — WO-04 RL runs, each a single training seed (single-run; partial result, track stopped 2026-11-09)
 
 Success %, pooled over 3 sim seeds x 100 episodes, [95% Wilson]. Protocol 0.1-draft
 `e9ce5bb47a88`, horizon 150, GPU sim, A100-80GB, final checkpoint (step 150). Both start from the
@@ -70,16 +74,20 @@ No peak: each mid-run checkpoint is within 2 points of its run's final checkpoin
 27.0%. Against SFT-only (unpaired): two-task step 50 p = 0.18, PickPlace-only step 100 p = 0.08,
 before allowing for having looked at four checkpoints.
 
-## Ablations (WO-05)
+## Ablations (WO-05; not run, track stopped 2026-11-09)
 
 | Factor | Levels | Result | Run ids |
 |---|---|---|---|
 | Demos per task | 1 / 5 / 10 | | |
 | Samples per prompt | 4 / 8 / 16 | | |
 
-## Real — success rate (%), 50 trials/cell, one setup
+## Real — success rate (%), 50 binary trials/cell, one setup
 
-| Task | Cell | SFT-only | SFT+RL | Δ | Date | Protocol |
+WO-07: SmolVLA and ACT on the same 50 PickPlace demos, the same seeded schedule, under the new real
+protocol version (ADR-0003). Unseen objects are reported per object (purple cube, green cube) and
+pooled; the pooled 50 is the headline.
+
+| Task | Cell | SmolVLA | ACT | Date | Run ids | Protocol |
 |---|---|---|---|---|---|---|
 
 ## Negative results and surprises

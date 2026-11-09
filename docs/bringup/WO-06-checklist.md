@@ -33,6 +33,41 @@ and, optionally, `lerobot-find-port`. For anything that moves the follower, use 
 `scripts/wo06_teleop_record.py`, which sends every command through `src/robot/safety.py`
 (`So101Driver.step` in `src/robot/driver.py`: `safety.filter`, then `_write`).
 
+## Hardware floor (owner decision 2026-11-09, SmolVLA pivot; ADR-0003)
+
+Everything below is in place before the first demo is recorded. The scripts in this checklist do
+not yet cover every item (the recorder is front-only today); the missing code is PR 2 of the pivot
+(`docs/reviews/2026-11-09-smolvla-pivot-handoff.md`).
+
+- Two cameras from day one (owner decision 2026-11-09): the kit's 32 mm module on the wrist, the
+  Logitech C920x as the front camera at the sim pose, both 640 × 480 at 30 fps as in the guide's
+  rollout command. Record both in every demo and every eval trial. The paper used a top plus
+  wrist pair on the SO-100; our elevated 45° front view is the stand-in for "top", and this
+  difference is recorded, not hidden.
+- Recording and eval both produce a LeRobotDataset with both image streams, state and action
+  (the merged recorder is front-only and the real-eval path writes trial records only; both are
+  deliverables, and a mock export is tested against the vishwaroop importer before the 50 demos).
+- Servo position P gain recorded (default 32); calibration drift check at the start of every
+  session; spare gripper servo on hand.
+- Exposure and white balance locked on both cameras before camera match; never auto.
+- Shutdown and fault behaviour as merged in #29. Powered steps 9–10 only under supervision.
+
+Agent notes on these items:
+- **P gain.** 32 is the STS3215 firmware default, but LeRobot 0.4.4's `SOFollower.configure()`
+  writes `P_Coefficient` 16 to every motor at each connect (`LR/robots/so_follower/so_follower.py:161-162`,
+  "lower value to avoid shakiness"), and `So101Driver.connect` runs it. Record the value read back
+  from the servos after a connect, not the default (no script reads it back yet; PR 2 adds it to
+  the session record). Keeping 16 or setting 32 is the owner's call;
+  record it either way, and keep it the same for demos and evaluation.
+- **Drift check.** Until PR 2 adds a dedicated command, the check is step 5's `verify` at the
+  calibration middle pose (every arm joint within ~5° of 0), compared with the step 5 lines
+  reported at bring-up. Recalibrate (steps 3-5) on a larger change.
+- **Seen cell and bowl.** The five seen slots, the fixed bowl position and the trial schedule are
+  frozen in a new real protocol version before the first demo (ADR-0003, D1-D4). That freeze
+  (PR 2) also comes before any camera-match frame (step 7) or teleop episode (step 10) that shows
+  objects: until then step 7 runs with an empty table. Frames never show the unseen objects
+  (purple cube, green cube) and use no slot outside the five seen slots.
+
 ---
 
 ## 0. Prerequisites 🟢 NO MOTION
@@ -306,8 +341,18 @@ Mount the camera at the sim pose that the script prints: `eye [0.555, 0.35, 0.49
 [0.205, 0, 0] m`, in the robot base frame (+x forward from the base, +y the robot's left, z up,
 origin at the shoulder_pan axis on the table; `configs/sim.yaml:24-30`). That is 0.555 m in front
 of the base, 0.35 m to the robot's left, 0.495 m above the table, aimed at the centre of the
-seen region, 0.205 m in front of the base. Place the objects where the sim panel shows them.
-Adjust the camera until the table edges, the base and the objects overlap in the 50/50 blend panel.
+seen region, 0.205 m in front of the base. Adjust the camera until the table edges and the base
+overlap in the 50/50 blend panel.
+
+**Objects in camera-match frames (D1, D2, D4).** The sim panel draws the objects at the sim's
+uniform spawn positions for that seed (anywhere in the seen region, bowl included), not at the
+five frozen seen slots, so do not place real objects where the panel shows them. Until the PR 2
+real-protocol freeze (five seen slot ids plus the fixed bowl position) is committed, run 7a and
+7b with **no objects on the table**; any earlier frame that shows objects is discarded, not
+saved as a camera-match record. After the freeze, objects may appear only at the five frozen seen
+slots, with the bowl at its frozen position, and never the purple or green cube. Object overlap
+with the sim panel is then not a pass criterion, because the script has no option to put the sim
+objects on a given slot.
 
 **7b. Sim arm posed at the real joints 🟡 TORQUE OFF, OWNER MOVES JOINTS BY HAND**
 
@@ -320,7 +365,7 @@ uv run scripts/wo06_camera_match.py --preset real --with-arm --task PickPlace   
 - **Expected:** `sim camera 'front_left_45': eye ... fov 40.0 deg`, then
   `saved docs/assets/camera-match/... {"mean_abs_diff": ...}`. In 7b the sim arm overlaps the
   real arm in the blend panel, wrist_roll included.
-- **Pass/fail:** the objects, base and table edge overlap within a few pixels. In 7b the arms
+- **Pass/fail:** the base and table edge overlap within a few pixels. In 7b the arms
   overlap. On this branch a posing failure is an error, not a silent rest pose
   (`scripts/wo06_camera_match.py:89-104`, `tests/test_camera_match.py`). Before this fix, the Mac
   CPU `SerialVecEnv` had no `.agent`, and `--with-arm` showed the rest pose.
@@ -331,10 +376,13 @@ uv run scripts/wo06_camera_match.py --preset real --with-arm --task PickPlace   
   unsupported arm): if any servo is torqued it refuses with `follower torque is ON ...`. Then
   run step 5's `verify` (it asks you to support the arm before torque goes off) or power-cycle the
   servo supply, and retry. You pose the limp arm by hand.
-- **Decision for `docs/STATUS.md`** (WO-06 benchmark): from the blend and the colour stats,
-  decide whether the WO-01 randomization retrain is needed (WO-06 deliverable 5).
-- **Report back:** the PNG and JSON paths, `mean_abs_diff`, a screenshot of one blend, and your
-  call on the randomization retrain.
+- **Gate for `docs/STATUS.md`** (WO-06 deliverable 4): camera match passed for the front camera
+  at `front_left_45` (and for the wrist module once it is mounted), with exposure and white
+  balance locked on both cameras (Hardware floor). The OFT-era randomization retrain decision is
+  dropped (WO-06 work order, Notes).
+- **Report back:** the PNG and JSON paths, `mean_abs_diff`, a screenshot of one blend, whether
+  any object was on the table (and if so, that the freeze was committed first), and the locked
+  exposure / white balance values.
 
 ---
 
@@ -518,8 +566,11 @@ What happens and what you do:
 ## 10. Five teleop sanity episodes per task (PickPlace, Push, Stack) 🔴 POWERED MOTION: OWNER IN PERSON
 
 Prerequisite: step 9 went cleanly. Objects: 3 cm red and blue cubes, a bowl, and a Push
-target mark, placed on the seen-region positions from step 7 (centre 0.205 m in front of the
-base, ±5 cm in x, ±7 cm in y; `src/eval/protocol.py:63`).
+target mark. These are sanity episodes, never training demos. Run step 10 after the PR 2
+real-protocol freeze: place the PickPlace cube only at the five frozen seen slots and the bowl at
+its frozen position (D1, D2, D4); never use the other 11 inner slots, the 20 ring slots or the
+purple / green cube. Push and Stack objects stay inside the seen region (centre 0.205 m in front
+of the base, ±5 cm in x, ±7 cm in y; `src/eval/protocol.py:63`).
 
 > **WO-07 demos are different (protocol real-0.1, owner 2026-11-09).** The 50 PickPlace demos use
 > ONLY the five frozen seen slots `B2 B5 E2 E5 C4` (10 each) and the bowl FIXED on its mark at
@@ -646,7 +697,8 @@ trips before the prompt waits.
 | 3-4 | `check` table + effective limits |
 | 5 | verify lines (middle pose, resting pose) + any `robot.units` change; rest pose supported with torque off (y/n), park path clear (y/n), whether you set `robot.park.enabled: true` |
 | 6 | intrinsics lines (fx, fy, rms, crop window, any WARNING) |
-| 7 | camera-match PNG/JSON paths, `mean_abs_diff`, retrain decision |
+| 7 | camera-match PNG/JSON paths, `mean_abs_diff`, objects on the table (none before the freeze), camera-match gate (front at `front_left_45`, wrist once mounted, exposure / white balance locked) |
 | 8 | leader vs follower verify lines for the same pose |
 | 9 | rehearsal log (incl. the `Max_Temperature_Limit` line, any `TORQUE ENABLE REFUSED` / `SERVO FAULT` / `TORQUE OFF UNCONFIRMED`), end-of-session servo temperatures, whether a cube slips at the -5 deg gripper floor, anything unexpected |
 | 10 | `saved N episodes`, per-task notes, Hub URL if pushed |
+| Hardware floor | wrist + front camera indices and settings (640 × 480, 30 fps), locked exposure / white balance values, P gain read back from the servos, drift-check lines for the session, spare gripper servo on hand (y/n) |
