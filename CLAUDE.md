@@ -49,8 +49,10 @@ SmolVLA checkpoint before trying it on the arm.
    In sim, SFT uses ≤25 demos per task (amended from ≤10 on 2026-10-27, ADR-0001). On the real
    arm, start with 50 PickPlace demos (10 at each of five frozen seen positions, both cameras);
    go to 100 only if a failure analysis of development trials shows that more data addresses the
-   observed failures. A post-training step (WO-08 filtered behaviour cloning) needs a base with
-   nonzero success: if the base is at 0%, fix the base, do not launch it.
+   observed failures. A post-training step (WO-08 filtered behaviour cloning) may start from a
+   checkpoint with ≥10% success on seen positions on at least 2 of 3 tasks (owner amendment
+   2026-10-27, unchanged by the pivot; the 20–60% band stays the target). Post-training cannot
+   rescue a 0%-success base; if the base is at 0%, fix the base, do not launch it.
 4. **Eval protocol is fixed before training.** `src/eval/protocol.py` defines: tasks, 100 episodes
    per cell in sim, 50 trials per cell on the real arm, cells = {seen positions, shifted positions,
    unseen objects}, 3 seeds in sim. Every reported number cites its protocol hash. Never change

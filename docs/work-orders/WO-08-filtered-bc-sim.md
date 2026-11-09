@@ -35,8 +35,9 @@ tested on the arm only after the sim gain is in.
    camera, the two-camera observation function and the new protocol in new files that import
    the frozen ones.
 4. **SFT base.** SmolVLA (`policy.base` from config) fine-tuned on the rebuilt 25 demos per task,
-   both camera streams, with the same script as WO-07. Entry rule (CLAUDE.md rule 3): a base at
-   0% on a task is fixed first, not filtered.
+   both camera streams, with the same script as WO-07. Entry rule (CLAUDE.md rule 3, owner
+   amendment 2026-10-27): filtered BC may start only from a checkpoint with ≥10% success on seen
+   positions on at least 2 of 3 tasks; a base at 0% is fixed first, not filtered.
 5. **Reward-filtered behaviour cloning.** Sample K rollouts per prompt (task + reset seed) from
    the SFT checkpoint; keep the episodes that succeed by the project's own success check
    (`info["success"]`, computed by `src/env/success.py` in `src/env/tasks.py`; never any
@@ -56,20 +57,22 @@ tested on the arm only after the sim gain is in.
 | Code | Reuse | Depends on OFT tokens or PPO |
 |---|---|---|
 | `src/env/success.py` | Unchanged; it is the filter. Pure tensor checks, policy-agnostic. | No |
-| `src/rl/rollout.py` group layout and episode loop | The rule "a group = one reset seed repeated K times in consecutive envs", chunk executed step by step, episode end at success / termination / truncation / step limit, binary reward = success before the end. | The loop calls `RLPolicy.sample()` and reads `step.tokens.shape[1]` for the chunk length. |
-| `src/rl/rollout.py` `check_group_reset`, `RolloutTimer`, `instrument_render`, `ClipStats`, the clip via `clip_joint_step` | As is. `check_group_reset` loops over every observation key, so it already covers two image streams. | No |
+| `src/rl/rollout.py` group layout and episode loop | The rule "a group = one reset seed repeated K times in consecutive envs", chunk executed step by step, episode end at success / termination / truncation / step limit, binary reward = success before the end. | The loop calls `RLPolicy.sample()` and reads `step.tokens.shape[1]` for the chunk length. Importing `rollout.py` at all pulls in `src/rl/policy_api.py` (module-level `from src.rl.policy_api import RLPolicy`). |
+| `src/rl/rollout.py` `RolloutTimer`, `instrument_render`, `ClipStats`, the clip via `clip_joint_step` | The logic as is, but copied or moved to a neutral module (e.g. under `src/eval/`) so WO-08 code does not import `src/rl/rollout.py` and, through it, `policy_api.py`. | No |
+| `src/rl/rollout.py` `check_group_reset` | The check is reusable and loops over every observation key, so it already covers two image streams. Not as is: its error text says "a GRPO group would not share its prompt" and points to the config key `rl.group_reset_check` (`src/rl/rollout.py:355-359`, key defined in `src/rl/trainer.py`). Needs a neutral wrapper or a move with neutral messages and a non-`rl` config key. | No (naming only) |
 | `src/rl/rollout.py` `RolloutBatch`, `collect_rollouts` storage | Not as is. It stores `tokens` and sampler `log_probs` (E, S, C, A) for the PPO ratio, and observations only at decision boundaries. Filtered BC needs the observation (both images) and executed action at every env step, written as a LeRobotDataset of the kept episodes. | Yes: tokens, log-probs |
 | `src/rl/policy_api.py` (`RLPolicy`, `RolloutStep`, `TokenLogProbs`) | Not reused. Its contract is OFT's 256-bin action tokens, tempered `log_prob`, LoRA-only grads. SmolVLA is flow matching: no tokens, no temperature; rollout diversity comes from the flow noise, whose seed is recorded per episode. | Yes: tokens |
 | `src/rl/grpo.py`, `src/rl/trainer.py`, `src/rl/diagnostics.py`, `src/rl/gates.py` | Not reused: group advantages, clip-higher loss, PPO epochs, recomputed old log-probs, log-prob movement, entropy gates. Only the run-record / checkpoint / `metrics.jsonl` patterns carry over. | Yes: PPO |
-| `src/rl/paired.py` | Reusable for paired counts of two arms on the same (G, K) prompts. | No |
+| `src/rl/paired.py` | Partly. `mcnemar_exact_p` and the per-group paired difference are reusable for two arms on the same (G, K) prompts. The module imports `src/rl/grpo.py` (`dynamic_sampling_keep`) at module level and reports a table of groups dropped by dynamic sampling, a GRPO concept. Copy or move the two functions into a neutral module (e.g. `src/eval/paired.py`) without that table. | Imports `grpo.py` |
 | `src/rl/toy_env.py`, `toy_policy.py` | Not reused (token toy policy). | Yes: tokens |
 | `src/eval/sim_eval.py` (`run_batch`, `evaluate`, `summarize`, `to_markdown`, `episode_seeds`, `clip_joint_step`) | Reused: the policy enters through `ActFn(obs, instructions) -> (N, C, A)`. Two edits needed in new code, not in this hashed file: a two-camera observation function (`src.env.policy_obs` returns only the front `image`), and the video `frames` hook, which reads `obs["image"]`. `exec_steps` already allows executing part of SmolVLA's 50-step chunk. | No |
 | `src/eval/protocol.py`, `protocol_v02.py` | Imported for tasks, cells, seeds and regions by the new version; never edited. 0.2's `SETTINGS` fix a single front camera and image size 224, so they do not describe the two-camera runs. | No |
-| `src/eval/seed_ranges.py` | Reused to register the rollout seed range and keep it disjoint from protocol seeds. It imports `EVAL_SEED_BASE` / `TRAIN_SEED_STRIDE` from `src/rl/trainer.py` (constants only). | Import only |
+| `src/eval/seed_ranges.py` | Reused to register the rollout seed range and keep it disjoint from protocol seeds. It imports `EVAL_SEED_BASE` / `TRAIN_SEED_STRIDE` from `src/rl/trainer.py`: only two constants are used, but the import loads the whole trainer module (GRPO/PPO code). Acceptable for a seed registry; if WO-08 wants no `src/rl` import at all, move the two constants to a neutral module first. | Import only (loads `trainer.py`) |
 
 ## Notes
 
 - One SmolVLA fine-tune and one GPU-sim rollout pass are the cost drivers; price both from a
   short probe before requesting spend.
-- If the base is at 0% on a task, there is nothing to filter: fix the base.
+- Below the rule 3 entry gate (≥10% on seen positions on at least 2 of 3 tasks), do not launch
+  filtered BC; at 0% there is nothing to filter: fix the base.
 - Sim numbers are never presented as real numbers.
