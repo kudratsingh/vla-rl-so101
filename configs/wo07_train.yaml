@@ -1,0 +1,58 @@
+# WO-07 real-arm fine-tunes (scripts/wo07_train.py --preset real --policy {smolvla,act}): SmolVLA
+# and ACT on the SAME real teleop demos, recorded in the frozen convention src/robot/convention.py
+# (both cameras, canonical radians, absolute targets, 15 Hz). One policy per run, one run per pod
+# (scripts/pod/wo07_train_job.sh: probe -> owner approval -> full run -> checkpoint upload).
+# Defaults: LeRobot SmolVLA guide + SmolVLA paper (arXiv 2506.01844 §4.3); LeRobot's ACT defaults
+# for the SO-101 (lerobot-train --policy.type=act, il_robots guide), chunk from the convention.
+preset: real
+device: cuda
+seed: 0
+
+dataset:
+  repo_id: KudratSingh22/vla-rl-so101-real-teleop   # = configs/real.yaml teleop.hub_repo
+  root: data/real_teleop             # local root; the dataset lives at <root>/<repo name>
+  revision: null                     # Hub commit of the 50-demo set: PIN before the paid run
+  allow_rehearsal: false             # refuse a dataset recorded with wo06_teleop_record --rehearsal
+
+train:
+  num_workers: 4                     # Linux DataLoader workers (macOS: 0, see the script)
+  log_freq: 200
+  save_freq: 5000                    # checkpoints kept on the pod volume; the last one is uploaded
+  compare_seed: 0                    # flow-noise seed of the save/reload check
+
+probe:
+  steps: 30                          # timed steps (first 5 dropped as warm-up)
+  warmup_steps: 5
+  setup_h: 0.35                      # h, ESTIMATE (not measured for this job): apt, uv sync, base +
+                                     # dataset downloads, image pull
+
+cost:
+  gpu: RTX 4090                      # 24 GB, RunPod Secure
+  usd_per_hour: 0.89                 # public GraphQL gpuTypes read, 2026-11-09T05:35Z (= 2026-11-08)
+  storage_usd_per_gb_month: 0.10     # RunPod network volume
+  volume_gb: 50
+
+policies:
+  smolvla:
+    type: smolvla
+    base: lerobot/smolvla_base       # LeRobot guide: --policy.path=lerobot/smolvla_base
+    steps: 20000                     # guide + paper §4.3
+    batch_size: 64                   # guide + paper; the probe drops it on a 24 GB OOM (64 -> 32 -> 16)
+    precision: bf16                  # LeRobot's own: VLM loaded bf16 (smolvlm_with_expert.py:80),
+                                     # action expert fp32, no AMP (= lerobot-train defaults)
+    overrides:                       # set on the smolvla_base config, then checked
+      chunk_size: 50                 # = convention.CHUNK_SIZE["smolvla"]
+      n_action_steps: 50
+      num_steps: 10                  # flow-matching integration steps
+      resize_imgs_with_padding: [512, 512]
+    est_s_per_step: null             # filled from the probe; null = no estimate yet
+  act:
+    type: act
+    base: act                        # fresh LeRobot ACT (ResNet-18 ImageNet backbone), as the guide
+    steps: 100000                    # lerobot-train default (TrainPipelineConfig.steps)
+    batch_size: 8                    # lerobot-train default (TrainPipelineConfig.batch_size)
+    precision: fp32                  # LeRobot ACT default (use_amp false)
+    overrides:
+      chunk_size: 50                 # = convention.CHUNK_SIZE["act"] (3.3 s at 15 Hz)
+      n_action_steps: 50
+    est_s_per_step: null
