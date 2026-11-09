@@ -33,6 +33,40 @@ and, optionally, `lerobot-find-port`. For anything that moves the follower, use 
 `scripts/wo06_teleop_record.py`, which sends every command through `src/robot/safety.py`
 (`So101Driver.step` in `src/robot/driver.py`: `safety.filter`, then `_write`).
 
+## Hardware floor (owner decision 2026-11-09, SmolVLA pivot; ADR-0003)
+
+Everything below is in place before the first demo is recorded. The scripts in this checklist do
+not yet cover every item (the recorder is front-only today); the missing code is PR 2 of the pivot
+(`docs/reviews/2026-11-09-smolvla-pivot-handoff.md`).
+
+- Two cameras from day one (owner decision 2026-11-09): the kit's 32 mm module on the wrist, the
+  Logitech C920x as the front camera at the sim pose, both 640 × 480 at 30 fps as in the guide's
+  rollout command. Record both in every demo and every eval trial. The paper used a top plus
+  wrist pair on the SO-100; our elevated 45° front view is the stand-in for "top", and this
+  difference is recorded, not hidden.
+- Recording and eval both produce a LeRobotDataset with both image streams, state and action
+  (the merged recorder is front-only and the real-eval path writes trial records only; both are
+  deliverables, and a mock export is tested against the vishwaroop importer before the 50 demos).
+- Servo position P gain recorded (default 32); calibration drift check at the start of every
+  session; spare gripper servo on hand.
+- Exposure and white balance locked on both cameras before camera match; never auto.
+- Shutdown and fault behaviour as merged in #29. Powered steps 9–10 only under supervision.
+
+Agent notes on these items:
+- **P gain.** 32 is the STS3215 firmware default, but LeRobot 0.4.4's `SOFollower.configure()`
+  writes `P_Coefficient` 16 to every motor at each connect (`LR/robots/so_follower/so_follower.py:161-162`,
+  "lower value to avoid shakiness"), and `So101Driver.connect` runs it. Record the value read back
+  from the servos after a connect, not the default (no script reads it back yet; PR 2 adds it to
+  the session record). Keeping 16 or setting 32 is the owner's call;
+  record it either way, and keep it the same for demos and evaluation.
+- **Drift check.** Until PR 2 adds a dedicated command, the check is step 5's `verify` at the
+  calibration middle pose (every arm joint within ~5° of 0), compared with the step 5 lines
+  reported at bring-up. Recalibrate (steps 3-5) on a larger change.
+- **Seen cell and bowl.** The five seen slots, the fixed bowl position and the trial schedule are
+  frozen in a new real protocol version before the first demo (ADR-0003, D1-D4). Camera-match
+  frames (step 7) never show the unseen objects (purple cube, green cube) and use no slot outside
+  the five seen slots.
+
 ---
 
 ## 0. Prerequisites 🟢 NO MOTION
@@ -637,3 +671,4 @@ trips before the prompt waits.
 | 8 | leader vs follower verify lines for the same pose |
 | 9 | rehearsal log (incl. the `Max_Temperature_Limit` line, any `TORQUE ENABLE REFUSED` / `SERVO FAULT` / `TORQUE OFF UNCONFIRMED`), end-of-session servo temperatures, whether a cube slips at the -5 deg gripper floor, anything unexpected |
 | 10 | `saved N episodes`, per-task notes, Hub URL if pushed |
+| Hardware floor | wrist + front camera indices and settings (640 × 480, 30 fps), locked exposure / white balance values, P gain read back from the servos, drift-check lines for the session, spare gripper servo on hand (y/n) |

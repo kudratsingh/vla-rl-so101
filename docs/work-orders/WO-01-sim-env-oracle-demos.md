@@ -1,5 +1,8 @@
 # WO-01 — Sim env, scripted oracle, few-shot demos
 
+> **Pivot 2026-11-09 (ADR-0003):** the OpenVLA-OFT / GRPO track is stopped. Benchmark met 2026-10-26. The content below is
+> kept as written for the record; the current work orders are WO-06 to WO-09.
+
 Branch: `wo-01-sim-env`. Tier: dev (4090) after CPU smoke.
 
 ## Deliverables

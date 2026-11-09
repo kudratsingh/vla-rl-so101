@@ -1,5 +1,8 @@
 # WO-04 — RL in sim, the headline result (owner reviews this PR)
 
+> **Pivot 2026-11-09 (ADR-0003):** the OpenVLA-OFT / GRPO track is stopped. **Benchmark unmet.** Recorded partial result: GRPO +5.0 (two-task) and +3.7 (PickPlace-only) points on PickPlace seen, single training seeds (`docs/results.md`). The content below is
+> kept as written for the record; the current work orders are WO-06 to WO-09.
+
 Branch: `wo-04-rl-sim`. Tier: rl (A100 80 GB).
 
 ## Deliverables

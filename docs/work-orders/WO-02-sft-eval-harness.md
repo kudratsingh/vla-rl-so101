@@ -1,5 +1,8 @@
 # WO-02 — Few-shot SFT of the base VLA + eval harness
 
+> **Pivot 2026-11-09 (ADR-0003):** the OpenVLA-OFT / GRPO track is stopped. Closed by owner decision 2026-10-27, below the original 20-60% band (OpenVLA-OFT PickPlace seen 17.0%). The content below is
+> kept as written for the record; the current work orders are WO-06 to WO-09.
+
 Branch: `wo-02-sft`. Tier: dev (4090); rl (A100) only if VRAM forces it.
 
 ## Deliverables

@@ -1,5 +1,8 @@
 # WO-05 — Ablations and writeup v1 (sim milestone)
 
+> **Pivot 2026-11-09 (ADR-0003):** the OpenVLA-OFT / GRPO track is stopped. Not started; cancelled with the OFT track. The content below is
+> kept as written for the record; the current work orders are WO-06 to WO-09.
+
 Branch: `wo-05-ablations`. Tier: rl.
 
 ## Deliverables

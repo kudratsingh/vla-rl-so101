@@ -1,28 +1,33 @@
-# WO-06 — Hardware bring-up and sim/real camera match
+# WO-06 — Bring-up
 
-Branch: `wo-06-hardware`. Tier: Mac + dev GPU.
+Branch: `wo-06-hardware-values` (bring-up values, owner) and the agent's code branches. Tier: Mac
+only; $0 cloud. Rewritten 2026-11-09 for the SmolVLA pivot (ADR-0003). The robot-side code
+(safety, units, driver, calibration, camera match, teleop recorder) is merged (#5, #24, #29).
+
+## Done when
+
+Checklist steps 0–10 complete under supervision: calibration verified, per-session drift check,
+teleop with the leader arm, both cameras matched and exposure/white balance locked, MPS inference
+latency measured on the mock rig.
 
 ## Deliverables
 
-1. `src/robot/`: LeRobot SO-101 driver glue, calibration script wrapper, `safety.py` (joint
-   limits, workspace box, per-step action clip, velocity cap, deadman on frame/serial loss).
-2. `configs/real.yaml`: serial port, camera ids, intrinsics, the sim-matching camera pose, object
-   grid definition.
-3. `scripts/wo06_camera_match.py`: captures real frames and renders the sim camera at the same
-   pose; saves side-by-side images to `docs/assets/camera-match/`.
-4. Teleop recording of 5 real episodes per task (for sanity, not training) in LeRobotDataset
-   format.
-5. If the side-by-side shows a clear gap (colour, lighting, crop): enable the WO-01 randomization
-   hooks and re-run SFT+RL once (owner approves) → "randomized" checkpoint.
-
-## Benchmark
-
-Arm calibrated and teleoperable; safety module blocks an out-of-bounds command in a test; real
-and sim frames side by side with the same object layout; a decision recorded in STATUS.md on
-whether a randomized retrain is needed.
+1. `docs/bringup/WO-06-checklist.md` steps 0–10 run by the owner, results reported back with the
+   table at its end. Powered steps 9–10 only under supervision (owner in person).
+2. The checklist's **Hardware floor** in place before any demo is recorded (two cameras, P gain
+   recorded, drift check, spare gripper servo, exposure / white balance locked, #29 shutdown and
+   fault behaviour).
+3. `configs/real.yaml` bring-up values (port, calibration-derived limits, both camera indices and
+   intrinsics, locked camera controls, servo P gain) committed through a PR.
+4. Both cameras matched: the front camera at the sim pose (`front_left_45`), the wrist module on
+   the gripper; side-by-side frames saved under `docs/assets/camera-match/`.
+5. Mac MPS inference latency for SmolVLA and ACT on the mock rig: chunk latency and the gap between
+   consecutive commands, recorded (`docs/bringup/latency-measurement.md`; code in PR 2).
 
 ## Notes
 
-- Owner does the physical assembly and calibration on the Mac; the agent writes the scripts and
-  the safety module first so they are ready when the arm arrives.
+- The OFT-era deliverable "randomization retrain if the camera match shows a gap" is dropped: the
+  real policy is trained on real demos. The camera match now gates the two-camera recording and
+  the WO-08 sim wrist camera, not a sim retrain.
 - STS3215 servos overheat under aggressive commands; the velocity cap is not optional.
+- No arm commands without the owner present.
