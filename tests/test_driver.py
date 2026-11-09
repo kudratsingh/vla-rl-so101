@@ -316,7 +316,9 @@ def test_park_never_runs_on_a_fault_path() -> None:
     fol2 = FakeFollower()
     drv2 = make(fol2, clock=time.perf_counter)
     drv2.connect()
-    stop = iter([False, False, True])  # the operator's Ctrl-C flag, checked between ticks
+    # the operator's Ctrl-C flag, checked before each tick and again right before its goal
+    # write (round 8): two ticks write, the 3rd tick's first check stops the park
+    stop = iter([False, False, False, False, True])
     assert drv2.park(settings, time.perf_counter, stop_fn=lambda: next(stop)) is False
     assert len(fol2.sent) == 3 and fol2.sent[-1] == pytest.approx(fol2.pos)  # 2 steps + hold
     assert fol2.bus.torque_enabled  # the caller asks the operator to support the arm first

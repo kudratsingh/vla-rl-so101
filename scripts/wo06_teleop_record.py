@@ -100,6 +100,7 @@ from src.robot.driver import (
     TORQUE_OFF_UNCONFIRMED,
     TORQUE_OFF_UNCONFIRMED_MSG,
     DeadmanTripped,
+    MotionStopped,
     ParkSettings,
     SerialFault,
     ServoFault,
@@ -231,7 +232,8 @@ class Session:
             return None
 
     def stop_requested(self) -> bool:
-        """Checked before every tick and before every goal write of the end-of-session park: a
+        """Checked before every tick, and immediately before every goal write of a tick and of
+        the end-of-session park (``So101Driver.step``'s ``stop_fn``): a
         Ctrl-C (``stop``), a RECORDED hang-up (SIGHUP / SIGTERM, ``INTERRUPTS.hangup``: also
         while the terminal still reports this process as its foreground), or the terminal's
         foreground lost (recorded, or polled here: ``Interrupts.terminal_gone``). On a hang-up
@@ -243,7 +245,10 @@ class Session:
 
     def tick(self) -> tuple[Any, StepResult]:
         """One control step. Returns (camera frame or None, step result). The loops call
-        ``stop_requested`` first."""
+        ``stop_requested`` first; ``arm.step`` calls it again after the camera, leader and servo
+        reads, immediately before its goal write, and raises ``MotionStopped`` (nothing written)
+        when it is True: a hang-up, a lost foreground or a Ctrl-C recorded while this tick waited
+        on a frame never sends one more leader-following goal (review F2, round 8)."""
         try:
             frame = self.cam.read()
         except CameraFault as e:
@@ -255,7 +260,11 @@ class Session:
             self.arm.deadman.trip(f"leader read failed: {e}", DeadmanResponse.HOLD)
             self.arm.hold()
             raise DeadmanTripped(self.arm.deadman.reason) from e
-        out = self.arm.step(self.target, frame_time=None if frame is None else frame.capture_time)
+        out = self.arm.step(
+            self.target,
+            frame_time=None if frame is None else frame.capture_time,
+            stop_fn=self.stop_requested,
+        )
         return frame, out
 
     def sleep_to(self, t0: float) -> None:
@@ -282,7 +291,11 @@ class Session:
                 print("\nsync aborted")
                 return False
             t0 = time.perf_counter()
-            _, out = self.tick()
+            try:
+                _, out = self.tick()
+            except MotionStopped:  # recorded mid-tick: no goal written this tick
+                print("\nsync aborted")
+                return False
             cmd = out.safety.command
             assert cmd is not None and self.target is not None
             goal = np.clip(self.target, np.minimum(lo, cmd), np.maximum(hi, cmd))
@@ -561,7 +574,10 @@ def _episodes(
                 print(f"recording ({ep_time:.0f} s max, Ctrl-C to end) ...")
                 while time.perf_counter() - t_start < ep_time and not sess.stop_requested():
                     t0 = time.perf_counter()
-                    frame, out = sess.tick()
+                    try:
+                        frame, out = sess.tick()
+                    except MotionStopped:  # recorded mid-tick: no goal, no frame this tick
+                        break
                     assert frame is not None and out.safety.command is not None
                     dataset.add_frame(
                         {
