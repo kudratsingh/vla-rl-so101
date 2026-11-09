@@ -5,7 +5,10 @@ foreground, the Ctrl-C flag) to ``So101Driver.step`` as ``stop_fn``, so a stop r
 tick waits on its camera frame, the policy query or the servo read never produces one more goal.
 The trial starts only once its first policy goal write was begun
 (``So101Driver.goal_write_attempted``): a first goal blocked by the check is ``not_started`` with
-no ``trial_started`` row, and a resume retries the slot with the same placement.
+no ``trial_started`` row, and a resume retries the slot with the same placement. The first goal
+writes the durable start marker and checks again after that I/O, right before the write: a stop
+recorded during the marker I/O, or a marker that cannot be saved, blocks the goal and retracts
+the marker (``trial_start_retracted``), so the attempt is ``not_started`` and resume retries it.
 
 Real signals (``os.kill`` on this process) through the real ``operator_signals`` /
 ``job_control`` handlers; the terminal keeps reporting this process group as foreground
@@ -18,6 +21,7 @@ Run by name before the real-eval protocol is frozen (PR #32):
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -35,6 +39,7 @@ from src.robot import prompts as P
 from src.robot.client import DeployLoop, ScriptedOperator
 from src.robot.driver import So101Driver
 from src.robot.safety import DeadmanResponse
+from src.runs import Run
 
 SIGNAL_KIND = {  # the signal -> the stop reason / fault kind the loop records
     "SIGHUP": "hangup",
@@ -85,12 +90,22 @@ class Probe:
       writes the trial's first policy goal);
     * ``policy``: policy query ``n`` (the signal arrives while the query is in flight);
     * ``servo``: the joint read inside ``step`` of policy write tick ``n`` of the first chunk;
-    * ``home_camera``: the frame read of move-home tick ``n``.
+    * ``home_camera``: the frame read of move-home tick ``n``;
+    * ``marker``: the write of the ``n``-th durable ``trial_started`` row (``Run.log_metrics``,
+      reached through the real ``on_policy_start``), right after the row is on disk.
 
-    ``action`` "serial" instead makes the goal write of that tick fail (a bus fault mid-write)."""
+    ``action`` "serial" instead makes the goal write of that tick fail (a bus fault mid-write);
+    with ``where="marker"``, "marker_fail" makes that row's write raise ENOSPC (nothing written)
+    and "marker_fail_all" makes it and every later log write raise (the disk stays full)."""
 
     def __init__(
-        self, loop: DeployLoop, sig: str | None, where: str, n: int, action: str = "signal"
+        self,
+        loop: DeployLoop,
+        sig: str | None,
+        where: str,
+        n: int,
+        action: str = "signal",
+        monkeypatch: pytest.MonkeyPatch | None = None,
     ) -> None:
         self.loop, self.sig, self.where, self.n, self.action = loop, sig, where, n, action
         self.log: list[tuple[Any, ...]] = []
@@ -170,6 +185,26 @@ class Probe:
             finally:
                 self._in_pre_write = False
 
+        if where == "marker":
+            assert monkeypatch is not None
+            real_log = Run.log_metrics
+            markers = [0]
+
+            def log_metrics(run: Run, step: int | None = None, **row: Any) -> None:
+                if self.fired and self.action == "marker_fail_all":
+                    raise OSError(errno.ENOSPC, "No space left on device")
+                if row.get("kind") == "trial_started":
+                    markers[0] += 1
+                    if self.action != "signal" and self._maybe_fire("marker", markers[0]):
+                        raise OSError(errno.ENOSPC, "No space left on device")
+                    real_log(run, step, **row)
+                    if self.action == "signal":
+                        self._maybe_fire("marker", markers[0])
+                    return
+                real_log(run, step, **row)
+
+            monkeypatch.setattr(Run, "log_metrics", log_metrics)
+
         self._in_step = False
         loop.cam.read = read  # type: ignore[method-assign]
         fol.get_observation = get_observation  # type: ignore[method-assign]
@@ -180,14 +215,17 @@ class Probe:
         loop.stop_requested = stop_requested_logged  # type: ignore[method-assign]
         loop._pre_write_stop = pre_write_logged  # type: ignore[method-assign]
 
-    def _maybe_fire(self, where: str, count: int) -> None:
+    def _maybe_fire(self, where: str, count: int) -> bool:
         if self.fired or where != self.where or count != self.n:
-            return
+            return False
         self.fired = True
         if self.action == "serial":
             self.loop.arm.follower.fail_write = True  # type: ignore[attr-defined]
             self.log.append(("serial_fault_armed",))
-            return
+            return True
+        if self.action.startswith("marker_fail"):
+            self.log.append(("marker_failed",))
+            return True
         assert self.sig is not None
         self.log.append(("signal", self.sig))
         os.kill(os.getpid(), getattr(signal, self.sig))
@@ -198,17 +236,23 @@ class Probe:
             "SIGTTOU": P.INTERRUPTS.lost_foreground,
         }[self.sig]
         assert recorded, f"{self.sig} not recorded by its handler"
+        return True
+
+    def _event(self) -> int:
+        return next(
+            i
+            for i, e in enumerate(self.log)
+            if e[0] in ("signal", "serial_fault_armed", "marker_failed")
+        )
 
     def after_signal(self) -> list[tuple[Any, ...]]:
-        i = next(i for i, e in enumerate(self.log) if e[0] in ("signal", "serial_fault_armed"))
-        return self.log[i + 1 :]
+        return self.log[self._event() + 1 :]
 
     def goals_after_signal(self) -> int:
         return sum(e == ("write", "goal") for e in self.after_signal())
 
     def goals_before_signal(self) -> int:
-        i = next(i for i, e in enumerate(self.log) if e[0] in ("signal", "serial_fault_armed"))
-        return sum(e == ("write", "goal") for e in self.log[:i])
+        return sum(e == ("write", "goal") for e in self.log[: self._event()])
 
 
 def _metrics(tmp_path: Path) -> list[dict[str, Any]]:
@@ -223,6 +267,7 @@ def _pilot_session(
     n: int,
     action: str = "signal",
     script: tuple[str, ...] = ("", "", ""),  # home, placement, support (or the score, support)
+    monkeypatch: pytest.MonkeyPatch | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], Probe, Rig]:
     """One pilot trial (``scripts/wo07_pilot.session``) under the real signal handlers, the real
     ConsoleOperator on a scripted stdin read through the real ``_reading`` checks."""
@@ -237,7 +282,7 @@ def _pilot_session(
                 return fake(prompt, timeout_s)
 
         op.guard.read_line = read_line
-        probe = Probe(r.loop, sig, where, n, action)
+        probe = Probe(r.loop, sig, where, n, action, monkeypatch)
         pilot.session(real_cfg(), r.loop, op, r.server_info, **_pilot_kw(tmp_path))
         return _record(tmp_path), _metrics(tmp_path), probe, r
 
@@ -281,7 +326,8 @@ def test_stop_before_the_first_policy_goal_is_not_started(
     assert not t["policy_started"] and t["policy_started_utc"] is None
     assert t["stop_reason"] == kind and t["fault"] is None and t["steps"] == 0
     assert t["stop_detail"]  # the stop cause
-    assert not any(row["kind"] == "trial_started" for row in rows)  # nothing resume counts
+    # nothing resume counts: no marker, so nothing to retract either
+    assert not any(row["kind"] in ("trial_started", "trial_start_retracted") for row in rows)
     assert [row["kind"] for row in rows if row["kind"] == "trial"] == ["trial"]
     assert res["summary"]["cells"]["PickPlace/seen"]["n"] == 0
     assert res["summary"]["cells"]["PickPlace/seen"]["not_started"] == 1
@@ -349,8 +395,9 @@ def test_serial_fault_during_the_first_policy_write_is_a_started_failure(
         "serial_fault",
     )
     assert t["steps"] == 0  # the write never completed
-    kinds = [row["kind"] for row in rows if row["kind"] in ("trial_started", "trial")]
-    assert kinds == ["trial_started", "trial"]
+    assert t["stop_detail"] and "retracted" not in t["stop_detail"]
+    kinds = [row["kind"] for row in rows if row["kind"].startswith("trial")]
+    assert kinds == ["trial_started", "trial"]  # the marker stands: no retraction
     assert r.arm.goal_write_attempted and not r.fol.bus.torque_enabled
 
 
@@ -388,7 +435,11 @@ def test_healthy_trial_writes_every_goal_after_a_passing_pre_write_check(
     goals = [i for i, e in enumerate(probe.log) if e == ("write", "goal")]
     assert len(goals) >= 16
     assert all(probe.log[i - 1] == ("stop_check", "pre_write", False) for i in goals)
-    kinds = [row["kind"] for row in rows if row["kind"] in ("trial_started", "trial")]
+    # exactly one goal (the first policy goal) has two passing pre-write checks before it: the
+    # one before the start marker and the final one after it, right before the write
+    twice = [i for i in goals if probe.log[i - 2] == ("stop_check", "pre_write", False)]
+    assert len(twice) == 1
+    kinds = [row["kind"] for row in rows if row["kind"].startswith("trial")]
     assert kinds == ["trial_started", "trial"]
     started = next(row for row in rows if row["kind"] == "trial_started")
     first_decision = next(row for row in rows if row["kind"] == "decision")
@@ -556,3 +607,257 @@ def test_driver_reports_goal_sent_only_once_the_write_began(
     with pytest.raises(SerialFault):
         arm.step(q, frame_time=clock())
     assert arm.goal_write_attempted
+
+
+# -- the start marker: the final stop check after its I/O, and a marker that cannot be saved -----
+def _trial_rows(rows: list[dict[str, Any]]) -> list[str]:
+    return [row["kind"] for row in rows if str(row.get("kind", "")).startswith("trial")]
+
+
+@pytest.mark.parametrize("sig", list(SIGNAL_KIND))
+def test_stop_during_the_start_marker_blocks_the_first_goal_and_retracts_it(
+    tmp_path: Path, terminal: None, monkeypatch: pytest.MonkeyPatch, sig: str
+) -> None:
+    """(a) The stop is recorded while the first goal's durable ``trial_started`` row is being
+    saved (the real signal, right after the row reached metrics.jsonl): the final check after
+    the marker I/O blocks the goal. Zero policy goals, the hold still runs, the marker is
+    retracted by a durable row, and the attempt is ``not_started`` with the stop cause."""
+    res, rows, probe, r = _pilot_session(tmp_path, sig, "marker", 1, monkeypatch=monkeypatch)
+    kind = SIGNAL_KIND[sig]
+    assert probe.fired and probe.goals_after_signal() == 0
+    assert probe.queries == 1  # the first policy goal's tick: no policy goal was ever written
+    after = probe.after_signal()
+    assert after[0] == ("stop_check", "pre_write", True)  # the final check, right after the I/O
+    assert ("write", "hold") in after
+    (t,) = res["trials"]
+    assert (t["outcome"], t["outcome_source"]) == ("not_started", "not_scored")
+    assert not t["policy_started"] and t["policy_started_utc"] is None
+    assert t["stop_reason"] == kind and t["fault"] is None and t["steps"] == 0
+    assert "marker was retracted" in t["stop_detail"]
+    assert _trial_rows(rows) == ["trial_started", "trial_start_retracted", "trial"]
+    started, retraction = (
+        next(row for row in rows if row["kind"] == k)
+        for k in ("trial_started", "trial_start_retracted")
+    )
+    assert (retraction["cell"], retraction["trial_idx"], retraction["start_utc"]) == (
+        started["cell"],
+        started["trial_idx"],
+        started["start_utc"],
+    )
+    assert retraction["reason"].startswith("stop recorded while the trial_started marker")
+    c = res["summary"]["cells"]["PickPlace/seen"]
+    assert (c["n"], c["not_started"]) == (0, 1)
+    _assert_shutdown(res, r, kind)
+
+
+def test_ctrl_c_raised_inside_the_marker_without_the_handler_is_not_started() -> None:
+    """(a) Mock (no flag handler): a Ctrl-C raised from inside the marker write propagates, the
+    goal is never written, the marker is retracted, and the attempt is not started."""
+    from test_deploy import _trials
+
+    rows: list[dict[str, Any]] = []
+
+    def log_row(**row: Any) -> None:
+        rows.append(row)
+        if row["kind"] == "trial_started":
+            raise KeyboardInterrupt
+
+    with rig() as r:
+        sent_before: list[int] = []
+        real_act = r.client.act
+
+        def act(*a: Any, **k: Any) -> Any:
+            sent_before.append(len(r.fol.sent))
+            return real_act(*a, **k)
+
+        r.client.act = act  # type: ignore[method-assign]
+        trials, end = _trials(r, ScriptedOperator(), log_row=log_row)
+        (t,) = trials
+        assert len(r.fol.sent) == sent_before[0] + 1  # only the hold after the first query
+        assert t["outcome"] == "not_started" and t["stop_reason"] == "operator_abort"
+        assert not t["policy_started"] and not r.arm.goal_write_attempted
+        assert _trial_rows(rows) == ["trial_started", "trial_start_retracted", "trial"]
+        assert end == "operator_abort" and r.arm.deadman.tripped
+
+
+@pytest.mark.parametrize("disk", ["marker_fail", "marker_fail_all"])
+def test_a_marker_that_cannot_be_saved_blocks_the_first_goal_and_ends_the_session(
+    tmp_path: Path, terminal: None, monkeypatch: pytest.MonkeyPatch, disk: str
+) -> None:
+    """(b) Saving the ``trial_started`` row raises ENOSPC: the first policy goal is never written,
+    the arm holds, the attempt is ``not_started`` with the reason, and the session ends
+    (``start_marker_failed``: a started slot without its marker could be re-rolled). Then the
+    hold-and-support shutdown and torque off. ``marker_fail_all``: the disk stays full, so the
+    retraction and the attempt's own row fail too; the session ends on that error, after the
+    same shutdown, and record.json (written separately) still holds the attempt."""
+    if disk == "marker_fail":
+        res, rows, probe, r = _pilot_session(
+            tmp_path, None, "marker", 1, action=disk, monkeypatch=monkeypatch
+        )
+    else:
+        with pytest.raises(OSError, match="No space left"):
+            _pilot_session(tmp_path, None, "marker", 1, action=disk, monkeypatch=monkeypatch)
+        res = _record(tmp_path)
+        # nothing was logged before the first goal's marker, and nothing could be after it
+        assert not list(tmp_path.glob("*/metrics.jsonl"))
+        rows = []
+    if disk == "marker_fail":
+        assert probe.fired and probe.goals_after_signal() == 0
+        assert ("write", "hold") in probe.after_signal()
+        assert probe.queries == 1
+        assert res["session_end"].startswith("start_marker_failed: the trial_started marker")
+        assert _trial_rows(rows) == ["trial_start_retracted", "trial"]  # no marker row
+        r_fol = r.fol
+    else:
+        assert res["session_end"] == "error"
+        assert _trial_rows(rows) == []  # nothing could be logged from the marker on
+        r_fol = None
+    (t,) = res["trials"]
+    assert (t["outcome"], t["outcome_source"]) == ("not_started", "not_scored")
+    assert not t["policy_started"] and t["policy_started_utc"] is None and t["steps"] == 0
+    assert t["stop_reason"] == "start_marker_failed" and t["fault"] is None
+    assert "No space left on device" in t["stop_detail"]
+    assert "first policy goal was not sent" in t["stop_detail"]
+    if disk == "marker_fail_all":
+        assert "the retraction could not be saved" in t["stop_detail"]
+    assert res["shutdown"] == "supported" and res["support_confirmed"] is True
+    assert res["torque_off_unconfirmed"] is None
+    if r_fol is not None:
+        assert not r_fol.bus.torque_enabled
+
+
+def test_mutation_without_the_post_marker_check_a_goal_follows_the_stop(
+    tmp_path: Path, terminal: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sensitivity: without the final check after the marker I/O (the mutation), a SIGHUP
+    recorded during the marker is followed by the first policy goal and the trial counts as
+    started: the test above depends on that check."""
+
+    def no_recheck(self: DeployLoop, res: Any, mark_ms: list[float]) -> bool:
+        if self._pre_write_stop():
+            return True
+        self._policy_started(res)
+        return False
+
+    monkeypatch.setattr(DeployLoop, "_first_goal_check", no_recheck)
+    res, rows, probe, _r = _pilot_session(tmp_path, "SIGHUP", "marker", 1, monkeypatch=monkeypatch)
+    assert probe.goals_after_signal() == 1
+    (t,) = res["trials"]
+    assert t["policy_started"] and t["outcome"] == "failure"
+    assert "trial_start_retracted" not in _trial_rows(rows)
+
+
+def _real_eval_with_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sig: str | None, action: str
+) -> tuple[Path, Probe]:
+    probes: list[Probe] = []
+
+    class SignalLoop(DeployLoop):
+        def __init__(self, *a: Any, **k: Any) -> None:
+            super().__init__(*a, **{**k, "interrupts": P.INTERRUPTS})
+            probes.append(Probe(self, sig, "marker", 1, action, monkeypatch))
+
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    monkeypatch.setattr(ev, "DeployLoop", SignalLoop)
+    argv = _args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen")
+    with P.operator_signals():
+        P.INTERRUPTS.tty_fd = 0
+        rec = ev.main(argv)
+    monkeypatch.setattr(ev, "DeployLoop", DeployLoop)  # the resumed run: no stop
+    (probe,) = probes
+    return rec, probe
+
+
+@pytest.mark.parametrize("cut", ["none", "after_retraction", "before_retraction"])
+def test_real_eval_stop_during_the_marker_is_not_started_and_resume_retries_the_slot(
+    tmp_path: Path, terminal: None, monkeypatch: pytest.MonkeyPatch, cut: str
+) -> None:
+    """(a) ``wo07_real_eval --mock``: SIGTERM while slot 0's ``trial_started`` row is saved. No
+    policy goal, the hold runs, slot 0 is ``not_started`` and the marker is retracted. The real
+    ``--resume`` then retries slot 0 with the same placement:
+
+    * ``none``: from the run's full logs;
+    * ``after_retraction``: the run was killed right after the retraction row (metrics.jsonl cut
+      there, record.json without the attempt): ``load_prior`` honours the retraction;
+    * ``before_retraction`` (control): killed between the marker and its retraction, only the
+      bare marker survives; the logs cannot show the goal was blocked, so the resume scores slot 0
+      a ``session_lost`` failure and does not re-run it (doubt = started)."""
+    rec, probe = _real_eval_with_probe(tmp_path, monkeypatch, "SIGTERM", "signal")
+    assert probe.fired and probe.goals_after_signal() == 0
+    assert probe.after_signal()[0] == ("stop_check", "pre_write", True)
+    assert ("write", "hold") in probe.after_signal()
+    run_dir = rec.parent
+    r1 = json.loads(rec.read_text())["results"]
+    assert r1["session_end"].startswith("hangup: SIGTERM")
+    assert (r1["shutdown"], r1["support_confirmed"]) == ("supported", True)
+    assert not probe.loop.arm.follower.bus.torque_enabled  # type: ignore[attr-defined]
+    (t0,) = r1["trials"]
+    assert (t0["trial_idx"], t0["outcome"], t0["policy_started"]) == (0, "not_started", False)
+    assert t0["stop_reason"] == "hangup" and "SIGTERM" in t0["stop_detail"]
+    rows = [json.loads(x) for x in (run_dir / "metrics.jsonl").read_text().splitlines()]
+    assert _trial_rows(rows) == ["trial_started", "trial_start_retracted", "trial"]
+    assert ev.done_indices(r1["trials"], "seen") == set()
+    if cut != "none":  # simulate the kill: nothing after the cut reached the disk
+        i = next(i for i, x in enumerate(rows) if x.get("kind") == "trial_start_retracted")
+        kept = rows[: i + 1] if cut == "after_retraction" else rows[:i]
+        (run_dir / "metrics.jsonl").write_text("".join(json.dumps(x) + "\n" for x in kept))
+        data = json.loads(rec.read_text())
+        data["results"]["trials"] = []
+        rec.write_text(json.dumps(data))
+        _settings, prior = ev.load_prior(run_dir)
+        if cut == "after_retraction":
+            assert prior == []  # the retraction cancels the bare marker
+        else:
+            ((lost),) = prior
+            assert lost["fault"]["kind"] == "session_lost" and lost["policy_started"]
+
+    rec2 = ev.main(_args(tmp_path, "--resume", run_dir.name))
+    r2 = json.loads(rec2.read_text())["results"]
+    assert r2["resumed_from"] == run_dir.name and r2["session_end"] == "completed"
+    by_idx: dict[int, list[dict[str, Any]]] = {}
+    for t in r2["trials"]:
+        by_idx.setdefault(t["trial_idx"], []).append(t)
+    c = r2["summary"]["cells"]["PickPlace/seen"]
+    if cut == "before_retraction":
+        assert [t["trial_idx"] for t in r2["trials"]] == [0, 1]
+        assert by_idx[0][0]["fault"]["kind"] == "session_lost"  # never re-run
+        assert (c["n"], c["faults_by_kind"]) == (2, {"session_lost": 1})
+        return
+    expected = [0, 0, 1] if cut == "none" else [0, 1]
+    assert [t["trial_idx"] for t in r2["trials"]] == expected
+    retried = by_idx[0][-1]
+    assert retried["policy_started"] and retried["outcome"] in ("success", "failure")
+    assert retried["placement"] == t0["placement"]  # the same placement
+    assert (c["n"], c["not_started"]) == (2, 1 if cut == "none" else 0)
+    assert r2["summary"]["complete"]
+
+
+def test_real_eval_marker_failure_ends_the_session_and_resume_retries_the_slot(
+    tmp_path: Path, terminal: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(b) ``wo07_real_eval --mock``: slot 0's ``trial_started`` row cannot be saved (ENOSPC).
+    No policy goal, the hold runs, slot 0 is ``not_started`` with the reason, the session ends
+    ``start_marker_failed`` with the support shutdown and torque off; ``--resume`` retries slot 0
+    with the same placement."""
+    rec, probe = _real_eval_with_probe(tmp_path, monkeypatch, None, "marker_fail")
+    assert probe.fired and probe.goals_after_signal() == 0
+    assert ("write", "hold") in probe.after_signal()
+    r1 = json.loads(rec.read_text())["results"]
+    assert r1["session_end"].startswith("start_marker_failed: ")
+    assert (r1["shutdown"], r1["support_confirmed"]) == ("supported", True)
+    assert not probe.loop.arm.follower.bus.torque_enabled  # type: ignore[attr-defined]
+    (t0,) = r1["trials"]
+    assert (t0["outcome"], t0["policy_started"], t0["stop_reason"]) == (
+        "not_started",
+        False,
+        "start_marker_failed",
+    )
+    assert "No space left on device" in t0["stop_detail"]
+    rows = [json.loads(x) for x in (rec.parent / "metrics.jsonl").read_text().splitlines()]
+    assert _trial_rows(rows) == ["trial_start_retracted", "trial"]
+    assert not r1["summary"]["complete"]
+    rec2 = ev.main(_args(tmp_path, "--resume", rec.parent.name))
+    r2 = json.loads(rec2.read_text())["results"]
+    assert r2["session_end"] == "completed" and r2["summary"]["complete"]
+    assert [t["trial_idx"] for t in r2["trials"]] == [0, 0, 1]
+    assert r2["trials"][1]["placement"] == t0["placement"] and r2["trials"][1]["policy_started"]

@@ -50,7 +50,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 05 | cancelled with the OFT track (ADR-0003) | | |
 | 08, 09 | not started (08 is now filtered behaviour cloning in sim; plan in `docs/work-orders/WO-08-filtered-bc-sim.md`) | | |
 | pre-run hardening | merged | #28 (`fix/pre-run-hardening`) | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
-| deploy pre-write stop | PR open | `fix/deploy-prewrite-stop` | Owner 2026-11-09: the pilot / real-eval loop checks its stop right before every goal write; a blocked first policy goal is `not_started` (no start marker, slot retried). $0, fakes only. See "Pre-write stop in the policy loop" below. |
+| deploy pre-write stop | PR open | `fix/deploy-prewrite-stop` | Owner 2026-11-09: the pilot / real-eval loop checks its stop right before every goal write; a blocked first policy goal is `not_started` (no start marker, slot retried); round 2: a final stop check after the start-marker I/O, a failed marker blocks the goal and ends the session, a blocked goal's marker is retracted. $0, fakes only. See "Pre-write stop in the policy loop" below. |
 | robot safety (PR 2) | merged | #29 (`fix/robot-safety`) | Review 3.3 gaps 2, 3, 5 and 7, plus the owner's 2026-11-08 review changes (homing offsets, torque off unconfirmed, real-eval session fingerprint, parking off by default), $0, **unverified on hardware**. See "Robot safety hardening" below. |
 
 ## Benchmarks met
@@ -1087,6 +1087,47 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
   begins, also when that write fails part-way). Mutations checked: making the pre-write check
   always pass fails 19 tests; restoring the old start-marker ordering fails 12; writing the
   marker after `step` (the first version of this PR) fails 2.
+- Round 2 (owner 2026-11-09), `DeployLoop._first_goal_check`:
+  - **Final check after the marker.** The first policy goal's `stop_fn` is now: stop check ->
+    stamp + durable `trial_started` row -> stop check again, and `step` begins the write right
+    after it returns False (nothing in between but setting `goal_write_attempted`). A stop
+    recorded during the marker I/O blocks the goal.
+  - **Neutralising the marker.** A goal blocked after the marker was attempted never reached the
+    bus, so the attempt is `not_started`: the stamp is cleared and a durable
+    `trial_start_retracted` row (same cell, trial_idx, start_utc, the reason) is written before
+    `step` raises. `load_prior` drops a `trial_started` row that has a retraction (the slot is
+    retried with the same placement), and the retraction clears the in-memory pending start, so
+    the `session_lost` path of `run_trials` never records it. Only a process killed between the
+    marker and its retraction leaves a bare marker; the resume then scores it a `session_lost`
+    failure (the logs cannot show the goal was blocked: doubt = started). A write that began
+    counts as started even if it failed part-way (unchanged).
+  - **Marker save fails** (any exception from `on_policy_start`; before this, logged and
+    ignored): the goal is not sent. The loop raises `SessionStop("start_marker_failed", reason)`
+    through the same path as a hang-up (hold via `arm.trip`), the marker is retracted best
+    effort (a row may have landed before the error), the attempt is `not_started` with
+    `stop_reason` `start_marker_failed` and the error in `stop_detail`, and `run_trials` ends
+    the session `start_marker_failed: ...` (not a healthy end: no park, support prompt, torque
+    off). Why end the session: the marker is what stops a resume from re-rolling a started slot;
+    if it cannot be saved, the next trial's start could not be made durable and the record can
+    no longer be trusted. If the disk stays full, the retraction and the attempt's own row fail
+    too; the session then ends on that error after the same hold-and-support shutdown, and
+    record.json (written separately) still holds the not-started attempt. A Ctrl-C raised
+    inside the marker write (mock, no flag handler) also retracts and is `not_started`.
+  - Cost on a mock real-clock session (10 trials, Mac M3 Pro, local SSD):
+    `policy_start_mark_ms` median 0.34 ms, max 0.68 ms; the first decision's frame-return-to-
+    first-write median 68.3 ms vs 67.9 ms for the other decisions (mock policy). The append is
+    not fsynced (`src/runs.Run.log_metrics`): the marker survives SIGKILL; across power loss
+    only as far as the OS flushed it.
+  - The judging text is unchanged ("one stopped before its write never started" already covers
+    it), so the rule text hash is unchanged.
+  - Tests (new, `tests/test_deploy_prewrite_stop.py`): stop during the marker for SIGHUP /
+    SIGTERM / SIGINT / SIGTTOU (pilot end to end, real signals); Ctrl-C raised inside the marker
+    without the handler; marker save raising once and with the disk staying full; real eval
+    with SIGTERM during the marker and `--resume` from the full logs, from logs cut right after
+    the retraction, and (control) from logs cut before it; real eval with a failed marker and
+    `--resume`; an in-suite mutation without the final check. Mutations run by hand: removing
+    the final check fails 8 tests, swallowing the marker failure again fails 3, ignoring
+    retractions in `load_prior` fails 1.
 - Unverified on hardware.
 
 ## Blockers and decisions pending the owner

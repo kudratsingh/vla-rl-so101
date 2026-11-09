@@ -80,6 +80,9 @@ a slot whose attempts all ended before the policy started is retried with the sa
 The start is durable: the moment the policy starts, a ``trial_started`` row goes to
 metrics.jsonl, and a resume scores a started trial that has no record (the process was killed,
 crashed or lost power mid-trial) as a FAILURE with fault kind ``session_lost`` (``load_prior``).
+A first goal blocked after that row (a stop recorded during its I/O, or the row failed to save:
+the session then ends ``start_marker_failed``) was never sent: a ``trial_start_retracted`` row
+cancels the marker, and the slot is retried with the same placement.
 Each invocation is its own run record, holding every trial of the session so far; record.json is
 written when the session is bound and after every trial, so a run killed without exiting
 (SIGKILL, power loss) can be resumed itself. Closing the Terminal (SIGHUP / SIGTERM) is not a
@@ -431,7 +434,10 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     plus every ``trial_started`` row without its trial: the policy started and the process died
     before the trial was recorded (killed, crashed, power lost). That row is the record as it
     stood at the start, a FAILURE with fault kind ``session_lost``: the started slot is done and
-    is never re-run (real-judge-2)."""
+    is never re-run (real-judge-2). A ``trial_started`` row with a ``trial_start_retracted`` row
+    of the same attempt (cell, trial_idx, start_utc) is dropped: the first goal was blocked after
+    the marker (a stop recorded during its I/O, or the marker failed), nothing was sent, the
+    attempt never started and the slot is retried (``DeployLoop._first_goal_check``)."""
     rec_path = run_dir / "record.json"
     if not rec_path.is_file():
         sys.exit(f"--resume: no {rec_path}")
@@ -445,15 +451,19 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     seen = {(t["cell"], t["trial_idx"], t["start_utc"]) for t in trials}
     metrics = run_dir / "metrics.jsonl"
     started: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    retracted: set[tuple[Any, Any, Any]] = set()
     if metrics.is_file():
         for line in metrics.read_text().splitlines():
             try:
                 row = json.loads(line)
             except ValueError:  # a line cut short by the kill
                 continue
-            if row.get("kind") not in ("trial", "trial_started"):
+            if row.get("kind") not in ("trial", "trial_started", "trial_start_retracted"):
                 continue
             key = (row["cell"], row["trial_idx"], row["start_utc"])
+            if row["kind"] == "trial_start_retracted":
+                retracted.add(key)
+                continue
             rec = {k: v for k, v in row.items() if k not in ("kind", "t", "step")}
             if row["kind"] == "trial_started":
                 started.setdefault(key, rec)
@@ -461,7 +471,12 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 seen.add(key)
                 trials.append(rec)
     for key, rec in started.items():
-        if key not in seen:
+        if key in retracted and key not in seen:
+            print(
+                f"--resume: {key[0]} trial {key[1]}: its start was retracted (the first goal was "
+                "blocked before its write): not started, the slot is retried"
+            )
+        elif key not in seen:
             seen.add(key)
             print(
                 f"--resume: {key[0]} trial {key[1]} started at {rec.get('policy_started_utc')} and "

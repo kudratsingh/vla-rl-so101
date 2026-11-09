@@ -62,7 +62,10 @@ stop is recorded finishes. Not guarded, on purpose: the hold at the measured pos
 the deadman's HOLD response, ``arm.trip``) and the torque off, which are the safe-state actions,
 not motion goals; the settle writes nothing; the healthy-shutdown park has its own ``stop_fn``.
 The deadman needs no entry in the predicate: ``step`` refuses a latched deadman on entry and the
-filter refuses one right before ``stop_fn``.
+filter refuses one right before ``stop_fn``. The trial's FIRST policy goal also writes the durable
+start marker inside ``stop_fn`` and checks the predicate again after that I/O, right before the
+write; a stop recorded during the marker I/O, or a marker that cannot be saved, blocks the goal
+and retracts the marker (``DeployLoop._first_goal_check``): the attempt is not started.
 
 Prompts with torque on (``ConsoleOperator`` through ``src/robot/prompts.py``'s ``TorqueGuard``,
 owner 2026-11-08): every prompt answered while the arm holds under torque (between trials, the
@@ -414,9 +417,10 @@ class TrialResult:
     t_last_write: float | None = None
     # policy started: the goal write of the trial's first policy action was begun
     # (So101Driver.goal_write_attempted: it returned, or raised from inside the write or after
-    # it). Loop clock and UTC, stamped when that write began (DeployLoop._first_goal_check, the
-    # step's stop_fn, right before the write). None: no policy goal was ever sent (e.g. the
-    # pre-write stop check blocked the first one): not started.
+    # it). Loop clock and UTC, stamped when the start marker's I/O began, right before that write
+    # (DeployLoop._first_goal_check, the step's stop_fn). None: no policy goal was ever sent
+    # (e.g. a stop check blocked the first one, before or after the marker, or the marker could
+    # not be saved; a stamp is cleared then): not started.
     policy_started_t: float | None = None
     policy_started_utc: str | None = None
 
@@ -447,9 +451,14 @@ def _say(msg: str) -> None:
         pass  # the terminal is gone (hang-up)
 
 
+START_MARKER_FAILED = "start_marker_failed"
+"""Stop reason / session end: the durable ``trial_started`` marker of a trial's first policy goal
+could not be saved, so that goal was never written (``DeployLoop._first_goal_check``)."""
+
+
 class SessionStop(Exception):
     """A Ctrl-C (flag), a hang-up or a lost foreground seen between ticks
-    (``DeployLoop.stop_requested``)."""
+    (``DeployLoop.stop_requested``); also a failed start marker (``START_MARKER_FAILED``)."""
 
     def __init__(self, kind: str, reason: str):
         super().__init__(reason)
@@ -475,8 +484,12 @@ class DeployLoop:
         self.on_decision = on_decision
         # runs once per trial, right before the write of its first policy goal begins (after
         # the pre-write stop check passed; _first_goal_check): the durable "policy started"
-        # marker (run_trials)
+        # marker (run_trials). An exception from it blocks that goal (START_MARKER_FAILED).
         self.on_policy_start: Callable[[TrialResult], None] | None = None
+        # (result, why): the marker was attempted but the first goal was then blocked (a stop
+        # recorded during the marker I/O, or the marker failed): the durable retraction row that
+        # makes the attempt not_started for a resume (run_trials; load_prior)
+        self.on_policy_start_retracted: Callable[[TrialResult, str], None] | None = None
         # the session's signal flags (src/robot/prompts.operator_signals; hardware only): a
         # Ctrl-C or a hang-up stops motion between ticks, never inside a bus transaction
         self.interrupts = interrupts
@@ -694,32 +707,80 @@ class DeployLoop:
                     return
 
     def _first_goal_check(self, res: TrialResult, mark_ms: list[float]) -> bool:
-        """``stop_fn`` of the step carrying the trial's first policy goal: the pre-write stop
-        check, then, when it passes, the policy start (``_policy_started``) BEFORE returning
-        False. ``So101Driver.step`` begins the goal write right after ``stop_fn`` returns False
-        (nothing else runs in between), so the stamp is the first write's begin time and the
-        durable marker is on disk before any byte of the first goal can reach the bus: a process
-        killed mid-write (SIGKILL, power loss) still leaves its ``trial_started`` row, and a goal
-        the check blocked leaves none. Cost: one log write before the first goal of each trial,
-        inside that decision's ``LATENCY_KEY`` and also recorded as ``policy_start_mark_ms``."""
+        """``stop_fn`` of the step carrying the trial's first policy goal (owner 2026-11-09):
+
+        1. the pre-write stop check: a stop recorded before it blocks the goal, no marker;
+        2. the policy start (``_policy_started``): the stamp and the durable ``trial_started``
+           row. If saving it fails (any exception: I/O error, disk full), the goal is blocked
+           with ``START_MARKER_FAILED`` (a ``SessionStop``: hold, the session ends), since a
+           started slot without its durable marker could be re-rolled by a resume;
+        3. the stop check AGAIN, after the marker I/O: a stop recorded while the marker was saved
+           blocks the goal. ``So101Driver.step`` begins the write right after this returns False
+           (nothing runs in between but setting ``goal_write_attempted``).
+
+        A goal blocked in 2 or 3 never reached the bus: the attempt is ``not_started`` and a
+        resume retries the same placement. The marker row may already be on disk, so it is
+        neutralised (``_retract_start``): the stamp is cleared and a durable
+        ``trial_start_retracted`` row is written, which ``load_prior`` honours. Only a process
+        killed between the marker and its retraction leaves a bare marker, which a resume scores
+        a ``session_lost`` failure (the logs cannot show that the goal was blocked: doubt =
+        started). A write that began counts as started even when it fails part-way. Cost: one
+        log write before the first goal of each trial, inside that decision's ``LATENCY_KEY``
+        and also recorded as ``policy_start_mark_ms``; the stamp is taken when the marker I/O
+        begins, that long before the write."""
         if self._pre_write_stop():
             return True
         t0 = self.clock()
-        self._policy_started(res)
+        try:
+            self._policy_started(res)
+        except Exception as e:  # the marker was not saved: never send the goal
+            log.exception("saving the policy-start marker failed: the first goal is not sent")
+            why = f"the trial_started marker could not be saved ({type(e).__name__}: {e})"
+            note = self._retract_start(res, why)
+            self._pending_stop = SessionStop(
+                START_MARKER_FAILED, f"{why}; the first policy goal was not sent{note}"
+            )
+            return True
+        except BaseException:  # e.g. a Ctrl-C without the flag handler: nothing was sent
+            self._retract_start(res, "interrupted while the trial_started marker was saved")
+            raise
         mark_ms.append(_ms(t0, self.clock()))
+        if self._pre_write_stop():  # the final check: the write follows it directly
+            stop = self._pending_stop
+            assert stop is not None
+            note = self._retract_start(
+                res, f"stop recorded while the trial_started marker was saved: {stop.reason}"
+            )
+            self._pending_stop = SessionStop(
+                stop.kind,
+                f"{stop.reason} (recorded while the start marker was saved; the first policy "
+                f"goal was not sent and the marker was retracted{note})",
+            )
+            return True
         return False
 
     def _policy_started(self, res: TrialResult) -> None:
-        """The trial's first policy goal is about to be written (``_first_goal_check``; the step
-        then reports ``goal_write_attempted``): stamp it and write the durable marker. Never
-        called for a step stopped before its write."""
+        """The trial's first policy goal is about to be written (``_first_goal_check``): stamp
+        it and write the durable marker. Raises when the marker cannot be saved (the caller
+        then blocks the goal). Never called for a step stopped before the marker."""
         res.policy_started_t, res.policy_started_utc = self.clock(), utc_now()
-        if self.on_policy_start is None:
-            return
-        try:
+        if self.on_policy_start is not None:
             self.on_policy_start(res)
-        except Exception:  # a logging failure must not stop the trial
-            log.exception("recording the policy start failed")
+
+    def _retract_start(self, res: TrialResult, why: str) -> str:
+        """The first policy goal was blocked after ``_policy_started``: not started after all.
+        Clears the stamp and writes the durable retraction (``on_policy_start_retracted``).
+        Returns "" or, when the retraction could not be saved, a note for the stop detail (the
+        stop goes on: this is already a stop path)."""
+        res.policy_started_t = res.policy_started_utc = None
+        if self.on_policy_start_retracted is None:
+            return ""
+        try:
+            self.on_policy_start_retracted(res, why)
+        except Exception as e:
+            log.exception("saving the start retraction failed")
+            return f"; the retraction could not be saved ({type(e).__name__}: {e})"
+        return ""
 
     @staticmethod
     def _record_safety(res: TrialResult, safety: Any) -> None:
@@ -1207,18 +1268,24 @@ def run_trials(
     timeout) is a failure with ``unjudged: {how, reason}``.
 
     Durable start: the moment the policy starts (the pre-write stop check of its first goal
-    passed and the write begins next: never for a blocked goal, always before any byte of the
-    goal can reach the bus, so a process killed mid-write still leaves it), a
-    ``trial_started`` row (the record as it would stand if the process died there: a failure,
-    fault kind ``session_lost``) goes to ``log_row``; a resume (scripts/wo07_real_eval.load_prior)
-    turns one without its ``trial`` row into that failure, so a started slot is never re-rolled.
-    An exception that ends the session between the start and the record (a crash, a Ctrl-C
-    without the flag handler) appends that record before it propagates.
+    passed; always before any byte of the goal can reach the bus, so a process killed mid-write
+    still leaves it), a ``trial_started`` row (the record as it would stand if the process died
+    there: a failure, fault kind ``session_lost``) goes to ``log_row``; a resume
+    (scripts/wo07_real_eval.load_prior) turns one without its ``trial`` row into that failure, so
+    a started slot is never re-rolled. An exception that ends the session between the start and
+    the record (a crash, a Ctrl-C without the flag handler) appends that record before it
+    propagates. If the goal is blocked after the marker (a stop recorded during the marker I/O,
+    seen by the stop check right before the write; or the marker failed to save) nothing was
+    sent: a ``trial_start_retracted`` row (same cell, trial_idx, start_utc) goes to ``log_row``,
+    the attempt is ``not_started``, and the resume retries the slot (``DeployLoop.
+    _first_goal_check``). A marker that cannot be saved ends the session
+    (``start_marker_failed``): without it a started slot could be re-rolled by a resume.
 
     The session ends on: q (``operator_quit``), a torque-on prompt timeout (``prompt_timeout``:
     torque released), a servo / serial fault (``torque_off: ...``), a failed torque-off, a
     Ctrl-C during motion (``operator_abort``), a hang-up (``hangup: ...``), Ctrl-C at the score
-    prompt (``operator_ctrl_c``), a declined resume after a HOLD stop. EOF at the score prompt
+    prompt (``operator_ctrl_c``), a declined resume after a HOLD stop, a start marker that could
+    not be saved (``start_marker_failed: ...``; held, not started). EOF at the score prompt
     raises EOFError after the trial is recorded; Ctrl-C / EOF at the other prompts propagate. The
     operator supports the arm after a fault in the shutdown (``safe_shutdown``) that follows
     every session end."""
@@ -1299,7 +1366,27 @@ def run_trials(
                 res, home, ("failure", "fault", dict(SESSION_LOST), None), kind="trial_started"
             )
 
+        def on_policy_start_retracted(
+            res: TrialResult,
+            why: str,
+            slot: dict[str, Any] = slot,
+            k: int = k,
+            start: str = start,
+        ) -> None:
+            slot["pending"] = None  # nothing was sent: no session_lost record for this attempt
+            if log_row is not None:
+                log_row(
+                    kind="trial_start_retracted",
+                    task=task,
+                    cell=cell,
+                    trial_idx=k,
+                    start_utc=start,
+                    retracted_utc=utc_now(),
+                    reason=why,
+                )
+
         loop.on_policy_start = on_policy_start
+        loop.on_policy_start_retracted = on_policy_start_retracted
         try:
             result: TrialResult | None = None
             try:
@@ -1357,7 +1444,7 @@ def run_trials(
                     log_row(kind="trial", **pending)
             raise
         finally:
-            loop.on_policy_start = None
+            loop.on_policy_start = loop.on_policy_start_retracted = None
         unjudged = scored[3]
         log.info("%s %s: %s (%d steps)", tag, rec["outcome"], rec["stop_reason"], result.steps)
         if unjudged is not None:
@@ -1375,6 +1462,8 @@ def run_trials(
             return trials, "operator_abort"
         if result.stop_reason in TERMINAL_GONE:  # hangup | lost_foreground
             return trials, f"{result.stop_reason}: {result.stop_detail}"
+        if result.stop_reason == START_MARKER_FAILED:  # the records can no longer be trusted
+            return trials, f"{START_MARKER_FAILED}: {result.stop_detail}"
         if arm.deadman.tripped:
             if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
                 return trials, _torque_off_end(arm)
