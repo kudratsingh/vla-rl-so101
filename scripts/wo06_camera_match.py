@@ -16,8 +16,9 @@ On the Mac (zsh; the sim renders on CPU through MoltenVK):
     uv run scripts/wo06_camera_match.py --preset real --with-arm               # sim arm at real joints
 
 Place the real objects where the sim panel shows them; in the blend panel table edges, robot base
-and objects must overlap. ``--with-arm`` reads the follower's joints (read-only, torque untouched)
-and poses the sim arm identically: overlapping arms validate the unit mapping and camera pose.
+and objects must overlap. ``--with-arm`` reads the follower's joints (read-only; refuses if torque
+is on) and poses the sim arm identically (an error, not a silent rest pose, if that fails):
+overlapping arms validate the unit mapping and camera pose.
 """
 
 from __future__ import annotations
@@ -58,20 +59,49 @@ def real_frame(cfg: dict[str, Any], image: Path | None) -> Img:
         return cam.read().image
 
 
-def read_arm_joints(cfg: dict[str, Any]) -> Img:
-    """Follower joint angles (canonical rad). Opens the port only: no configure, torque untouched."""
-    from src.robot.driver import follower_from_config
+def read_arm_joints(cfg: dict[str, Any], bus: Any = None) -> Img:
+    """Follower joint angles (canonical rad). Opens the port only: no configure, torque untouched.
 
-    follower = follower_from_config(cfg)
-    bus = follower.bus
+    Refuses if any servo is torqued (e.g. after a crashed session): the operator poses the arm by
+    hand, and turning torque off here would drop an unsupported arm.
+    """
+    if bus is None:
+        from src.robot.driver import follower_from_config
+
+        bus = follower_from_config(cfg).bus
     bus.connect()
     try:
         if not bus.is_calibrated:
             sys.exit("follower motors do not match the calibration file; run wo06_calibrate.py")
+        torqued = [m for m, v in bus.sync_read("Torque_Enable").items() if int(v)]
+        if torqued:
+            sys.exit(
+                f"follower torque is ON ({', '.join(torqued)}; crashed session?): support the arm "
+                "and run `wo06_calibrate.py --preset real verify` (or power-cycle the servo "
+                "supply), then pose the limp arm and retry"
+            )
         raw = bus.sync_read("Present_Position")
     finally:
         bus.disconnect(disable_torque=False)
     return UnitMap.from_config(cfg).to_canonical({f"{m}.pos": v for m, v in raw.items()})
+
+
+def sim_base(env: Any) -> Any:
+    """The ManiSkill env holding the robot: on CPU ``make_env`` returns a ``SerialVecEnv`` (no
+    ``.agent``; its ``.unwrapped`` is itself), so take its single sub-env."""
+    return env.envs[0].unwrapped if hasattr(env, "envs") else env.unwrapped
+
+
+def pose_sim_arm(env: Any, qpos: Img) -> None:
+    """Set the sim arm to ``qpos`` (canonical rad). Fails loudly: --with-arm without a posed sim
+    arm would show the rest pose and the overlay check would be meaningless."""
+    import torch
+
+    robot = sim_base(env).agent.robot
+    robot.set_qpos(torch.as_tensor(np.asarray(qpos)[None], dtype=torch.float32))
+    got = np.asarray(robot.get_qpos().cpu().numpy()).reshape(-1)
+    if not np.allclose(got, qpos, atol=1e-4):
+        raise RuntimeError(f"sim arm not posed: asked {np.round(qpos, 4)}, got {np.round(got, 4)}")
 
 
 def sim_frame(
@@ -91,13 +121,8 @@ def sim_frame(
     try:
         obs, _ = env.reset(seed=seed)
         if qpos is not None:
-            try:
-                import torch
-
-                env.unwrapped.agent.robot.set_qpos(torch.as_tensor(qpos[None], dtype=torch.float32))
-                obs = env.unwrapped.get_obs()
-            except Exception as e:  # noqa: BLE001 - optional overlay; report and continue
-                print(f"could not pose the sim arm ({type(e).__name__}: {e}); default pose shown")
+            pose_sim_arm(env, qpos)
+            obs = sim_base(env).get_obs()
         img = policy_obs(obs)["image"][0]
         return np.asarray(img.cpu().numpy() if hasattr(img, "cpu") else img, dtype=np.uint8)
     finally:

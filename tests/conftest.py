@@ -2,13 +2,28 @@
 
 GitHub's ubuntu runners have no GPU and Mesa's software Vulkan is not a device SAPIEN accepts, so
 image-producing envs cannot be built there; the Mac (MoltenVK) and GPU boxes run these tests.
+
+The robot tests' ``robot_fakes.real_cfg()`` sees configs/real.yaml with the WO-06 bring-up values
+(port, joint limits, intrinsics, units, leader) reset to the shipped placeholders
+(tests/real_fixture.py), so calibrating the real arm does not break the suite.
 """
 
 from __future__ import annotations
 
 import functools
+import sys
+from collections.abc import Iterator
 
 import pytest
+from real_fixture import load_config_placeholders
+
+
+@pytest.fixture(autouse=True)
+def _real_yaml_placeholders(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    fakes = sys.modules.get("robot_fakes")
+    if fakes is not None:  # robot_fakes.real_cfg() calls its module-level load_config
+        monkeypatch.setattr(fakes, "load_config", load_config_placeholders)
+    yield
 
 
 @functools.cache
