@@ -1149,7 +1149,14 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
     write is never appended / logged as a `session_lost` failure.
   - **Timing (F33-R4).** `policy_start_mark_ms` = stamp + marker I/O + freshness re-check; it
     excludes only the final stop check (a flag read and `tcgetpgrp`), so nothing else runs
-    between that check and the write. The figures above were measured before round 3.
+    between that check and the write. The figures above were measured before round 3; re-run
+    at bbc42ba (mock real-clock session, 10 trials, same Mac, single run): median 0.96 ms, max
+    1.70 ms; first decision's frame-return-to-first-write median 74.2 ms vs 76.7 ms for the
+    other decisions (mock policy; the difference between runs is machine noise, not the check).
+  - Mutations run by hand (`tests/test_deploy_prewrite_stop.py`, `test_deploy.py`,
+    `test_real_eval.py`, 151 tests): no freshness re-check fails 4; no retraction net in
+    `run_trial` fails 2; the retraction not clearing the pending start fails 1; no final stop
+    check fails 10; swallowing the marker failure fails 4.
   - **Full disk (F33-R5).** The "record.json still holds the attempt" claim is now qualified
     (only when metrics.jsonl alone fails); a new real-eval test fails both files from the marker
     on: torque off and the support shutdown still run, the error propagates, record.json has no
