@@ -187,4 +187,4 @@ eval:                                # scripts/wo07_real_eval.py
                                      # Protocol real-0.1 (the default, src/eval/protocol_real.py)
                                      # ignores it: its schedule, slots and bowl are frozen and hashed
   settle_s: 3.0                      # s the arm holds still after a trial before it is scored
-                                     # (judging rule real-judge-2; recorded per trial)
+                                     # (judging rule real-judge-3; recorded per trial)

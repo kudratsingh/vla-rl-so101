@@ -40,7 +40,7 @@ demos; 50 binary trials per cell (seen, shifted, unseen) for each; immutable exp
 | Unseen objects | 50 at the five seen slots: 25 purple cube + 25 green cube, five per slot per object |
 
 Unseen objects are reported per object and pooled; the pooled 50 is the headline. Scoring is
-binary success under `real-judge-2` (CLAUDE.md rule 4). The paper's partial-credit score
+binary success under `real-judge-3` (CLAUDE.md rule 4). The paper's partial-credit score
 (SmolVLA §4.1 subtasks) may be logged as a secondary column, never as the headline.
 
 ## Freeze before recording (D4)
@@ -102,8 +102,8 @@ selected checkpoints.
   capture-to-write number needs the one-off optical offset from
   `docs/bringup/latency-measurement.md` (`deploy.capture_offset_ms`). Until that is measured,
   no latency is called end-to-end.
-- Scoring (owner 2026-11-08, judging rule `real-judge-2`, `scripts/wo07_real_eval.py`): the
-  primary real metric is successes / trials whose policy started (the bus write of the first
+- Scoring (owner 2026-11-08; judging rule `real-judge-3` with the start rule of PR #33,
+  2026-11-09; `scripts/wo07_real_eval.py`): the primary real metric is successes / trials whose policy started (the bus write of the first
   policy goal was begun; a first goal blocked before its write, e.g. by the pre-write stop check
   after a Ctrl-C or a closed Terminal, never started and is retried). A servo, serial or safety
   fault after the start (also with torque off unconfirmed) is a failure, recorded separately

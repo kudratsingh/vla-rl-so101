@@ -12,16 +12,17 @@ composite hash (``src/eval/protocol_v02.py``) with the 0.1-draft version and has
 the placement and the placement plan's hash, the judging-rule version, the settling interval, the
 real-eval file hashes and the session fingerprint. ``record.json`` holds the Wilson table.
 
-Judging rule ``real-judge-2`` (``judging_rule()``; project review 2026-11-07 section 3.2: a real
+Judging rule ``real-judge-3`` (``judging_rule()``; project review 2026-11-07 section 3.2: a real
 judge must be defined before WO-07; real-judge-1 approved by the owner 2026-11-08, real-judge-2
-implements the owner's trial-scoring decision of 2026-11-08): after the trial has ended, the arm
+implements the owner's trial-scoring decision of 2026-11-08, real-judge-3 the start rule of PR
+#33, owner 2026-11-09): after the trial has ended, the arm
 holds still for ``eval.settle_s`` seconds (the settling interval: objects stop rolling or
 tipping), then it is judged ONCE (the prompt only appears then), by eye, without touching
 anything. Real trials have no success latch: the sim stops at its first success step, the arm
 keeps acting until ``trial_max_steps`` or a stop, so a success undone before the end is a failure
 (stricter than sim). Doubt counts as a failure.
 
-What real-judge-2 changes against real-judge-1 (which had the operator score faulted trials after
+What real-judge-2 changed against real-judge-1 (which had the operator score faulted trials after
 supporting the arm, and left trials with a failed torque-off unscored): a trial counts once its
 policy STARTED (``policy_started``: the goal write of the trial's first action from the policy
 server was begun, ``So101Driver.goal_write_attempted``; recorded with its UTC time; a first goal
@@ -42,16 +43,17 @@ attempts log, never scored, and retried with the same placement on a resume. Pri
 successes / started trials, per cell, with the Wilson interval; ``diagnostic_excluding_faulted``
 (success rate over started trials without a fault) and ``faults_by_kind`` are a clearly labelled
 SECONDARY diagnostic. The rule's version and text hash are in the session fingerprint, so a
-session scored under real-judge-1 can be neither resumed nor pooled with real-judge-2 records.
+session scored under an earlier rule (real-judge-1 or real-judge-2) can be neither resumed nor
+pooled with real-judge-3 records.
 
-Start-rule wording change inside real-judge-2 (2026-11-09, PR fix/deploy-prewrite-stop; before
-the real-eval protocol is frozen, no real session recorded): "started" moved from "the first
-action reached the safety filter" to "the bus write of the first action was begun". Deliberate
-reclassification: a first step that ends before its write (the pre-write stop check, a deadman
-trip at its frame check or in the filter, a joint-read serial fault) is now ``not_started`` and
-retried instead of a started failure. The text hash changed with it; the first FROZEN real-eval
-protocol (PR #32, ``src/eval/protocol_real.py``) must carry this wording, and real-judge-2 is
-cited only from that frozen version.
+What real-judge-3 changes against real-judge-2 (owner 2026-11-09, after PR #33; before the
+real-eval protocol is frozen, no real session recorded): "started" moved from "the first action
+reached the safety filter" to "the bus write of the first action was begun". Deliberate
+reclassification: a first step that ends before its write (the pre-write stop check, a stop or a
+frame / chunk gone stale while the start marker was saved, a marker that could not be saved or
+synced, a deadman trip at its frame check or in the filter, a joint-read serial fault) is now
+``not_started`` and retried instead of a started failure; a write that began and failed still
+counts as started. The rule text lives in ``src/eval/protocol_real.py`` (real-0.1 hashes it).
 
 Paired placements (owner 2026-11-08): the SFT and the SFT+RL sessions use the SAME slot sequence.
 ``--hardware`` refuses a ``--slot-seed`` other than ``eval.slot_seed``, and the plan is
@@ -258,12 +260,12 @@ from src.runs import RUNS_DIR, Run, new_run_id
 
 PROTOCOLS = (PR.PROTOCOL_VERSION, P2.PROTOCOL_VERSION)
 
-JUDGING_RULE_VERSION = PR.JUDGING_RULE_VERSION  # "real-judge-2"
+JUDGING_RULE_VERSION = PR.JUDGING_RULE_VERSION  # "real-judge-3"
 # metrics rows synced to stable storage before log_row returns (module doc, Run.log_durable)
 DURABLE_ROWS: tuple[str, ...] = (*DURABLE_ROW_KINDS, "session")
 DEFAULT_SETTLE_S = 3.0  # eval.settle_s
-# the rule's text lives in src/eval/protocol_real.py (hashed by real-0.1); #33's start wording
-# is ported there with real-judge-3 (the follow-up commit), and protocol 0.2 sessions share it
+# the rule's text lives in src/eval/protocol_real.py (hashed by real-0.1), with #33's start
+# wording (real-judge-3); protocol 0.2 sessions record the same version and text hash
 JUDGING_GENERAL = PR.JUDGING_GENERAL
 JUDGING_RULE: dict[str, str] = PR.JUDGING_RULE
 
@@ -554,7 +556,7 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     plus every ``trial_started`` row without its trial: the policy started and the process died
     before the trial was recorded (killed, crashed, power lost). That row is the record as it
     stood at the start, a FAILURE with fault kind ``session_lost``: the started slot is done and
-    is never re-run (real-judge-2). A ``trial_started`` row with a ``trial_start_retracted`` row
+    is never re-run (real-judge-3). A ``trial_started`` row with a ``trial_start_retracted`` row
     of the same attempt is dropped: the first goal was blocked after the marker (a stop recorded
     during its I/O, a frame / chunk gone stale during it, or the marker failed), nothing was sent,
     the attempt never started and the slot is retried (``DeployLoop._first_goal_check``); a
@@ -1855,6 +1857,9 @@ def real_hardware_problems(cfg: Config, settings: dict[str, Any]) -> list[str]:
     bowl = bowl_box_problem(cfg)  # the bowl is pending (owner 2026-11-09): no session at it
     if bowl is not None:
         out.append(bowl)
+    frozen = PR.freeze_problem()  # PR.FREEZE_STATUS: pending until the owner confirms the bowl
+    if frozen is not None:
+        out.append(frozen)
     return out
 
 

@@ -108,3 +108,10 @@ def test_release_window_and_the_pending_bowl_preflights(
     )  # fmt: skip
     with pytest.raises(SystemExit, match="refusing the real-0.1 demo schedule; nothing was opened"):
         teleop.main()
+    # the freeze status refuses on its own too (the bowl fit check is pending, PR.FREEZE_STATUS):
+    # with a bowl that fits the box, the demo schedule and the hardware session still refuse
+    monkeypatch.setattr(teleop, "bowl_box_problem", lambda *_a, **_k: None)
+    with pytest.raises(SystemExit, match="not frozen \\(pending: bowl fit check\\)"):
+        teleop.main()
+    monkeypatch.setattr(ev, "bowl_box_problem", lambda *_a, **_k: None)
+    assert PR.freeze_problem() in ev.real_hardware_problems(cfg, s)

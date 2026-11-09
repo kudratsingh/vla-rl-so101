@@ -15,6 +15,7 @@ import pytest
 
 from src.config import REPO_ROOT
 from src.eval import protocol as P1
+from src.eval import protocol_real as PR
 from src.eval import protocol_v02 as P2
 from src.eval import real_grid as G
 from src.robot.client import ScriptedOperator
@@ -69,9 +70,10 @@ def test_sample_plan_is_seeded_balanced_and_feasible(task: str) -> None:
 
 
 def test_placement_pdf_is_committed_a3_and_current() -> None:
-    assert (
-        grid_pdf.main(["--preset", "real", "--check"]) == 0
-    )  # the committed PDF is what the script draws now
+    # the committed PDF is what the script draws now; while the real-0.1 freeze is pending it is
+    # stale by the printed hash prefix only (tests/test_protocol_real.py, PR.FREEZE_STATUS)
+    pending = PR.FREEZE_STATUS != PR.FROZEN
+    assert grid_pdf.main(["--preset", "real", "--check"]) == (1 if pending else 0)
     data = (REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf").read_bytes()
     assert data.startswith(b"%PDF-1.4") and b"/MediaBox [0 0 841.89 1190.55]" in data  # A3 pt
     assert b"10 cm scale bar" in data
@@ -684,17 +686,21 @@ def test_faults_after_the_start_fail_and_unstarted_attempts_are_retried(
     assert (c2["n"], c2["successes"], c2["not_started"]) == (3, 2, 1) and r2["summary"]["complete"]
 
 
+@pytest.mark.parametrize("old_rule", ["real-judge-1", "real-judge-2"])
 def test_judging_rule_bump_refuses_a_real_judge_1_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_rule: str
 ) -> None:
-    assert ev.JUDGING_RULE_VERSION == "real-judge-2"
+    """A session recorded under an earlier judging rule (real-judge-1, or real-judge-2: the start
+    at the safety filter, before PR #33) is refused on resume."""
+    assert ev.JUDGING_RULE_VERSION == "real-judge-3"
     assert "policy started" in ev.judging_rule(3.0)["general"]
+    assert "bus write of its first action" in ev.judging_rule(3.0)["general"]
     monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(2))
     rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen"))
     data = json.loads(rec.read_text())
     session = data["results"]["session"]
     for holder in (session["protocol"], session["fingerprint"]["values"]["protocol"]):
-        holder["real_eval"]["judging_rule"] = "real-judge-1"  # recorded under the old rule
+        holder["real_eval"]["judging_rule"] = old_rule  # recorded under the old rule
     rec.write_text(json.dumps(data))
     monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
     with pytest.raises(SystemExit, match="resume refused(.|\n)*real_eval"):

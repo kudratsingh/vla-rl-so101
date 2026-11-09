@@ -23,8 +23,12 @@ from src.robot import convention as conv
 from src.robot.client import ScriptedOperator
 
 # Pinned: frozen before the first demo (owner D4). A change fails here on purpose: add a new real
-# protocol version instead (CLAUDE.md rule 4).
-FROZEN = {"real-0.1": "edee44aa957d3c0525edfb0f3d37c47958cf115ef01f7a289e756883f279d749"}
+# protocol version instead (CLAUDE.md rule 4). PENDING (PR.FREEZE_STATUS): the current computed
+# value after real-judge-3 (2026-11-09); the bowl fit check, the rubric bump and the PDF follow.
+FROZEN = {"real-0.1": "dca199e6da6275bddc047812e1ea83379a70f21778f564315c5483811c0954f2"}
+# the hash prefix the committed placement-grid PDF prints: real-0.1 before real-judge-3. The PDF
+# is regenerated with the freeze, not before (owner 2026-11-09)
+PDF_HASH12_PENDING = "edee44aa957d"
 SCHEDULES = {
     "eval": "dd1345de09b4595048d6f23f2e38057a65d6e06d39f79d7a554e189fc48d0e71",
     "dev": "21fe5598a9784ae119960b444a715a3bf36b9510491749c41e965889fe26af59",
@@ -125,7 +129,8 @@ def test_demo_and_dev_schedules() -> None:
 def test_rubric_is_binary_with_partial_credit_secondary() -> None:
     r = PR.rubric()
     assert r["scoring"] == "binary" and r["protocol_hash"] == PR.protocol_hash()
-    assert r["judging_rule"] == ev.JUDGING_RULE_VERSION == "real-judge-2"
+    assert r["judging_rule"] == ev.JUDGING_RULE_VERSION == "real-judge-3"
+    assert "bus write of its first action" in r["when"] and "safety filter" not in r["when"]
     assert "never the headline" in r["secondary"]["partial_credit"]
     assert ev.JUDGING_RULE is PR.JUDGING_RULE  # one text, one hash
     rows = PR.cell_tables(
@@ -145,11 +150,35 @@ def test_rubric_is_binary_with_partial_credit_secondary() -> None:
 
 def test_placement_sheet_marks_the_seen_slots_and_the_bowl() -> None:
     grid_pdf = _load("make_placement_grid")
-    assert grid_pdf.main(["--preset", "real", "--check"]) == 0
+    pending = PR.FREEZE_STATUS != PR.FROZEN  # stale by the hash prefix only (test below)
+    assert grid_pdf.main(["--preset", "real", "--check"]) == (1 if pending else 0)
     ops = grid_pdf.draw()
     assert ops.count("(SEEN)") == 5 and ops.count("(not used)") == 11
     assert "BOWL LINE" in ops and "centre x = 0.195 m, y = +0.205 m" in ops
     assert PR.protocol_hash()[:12] in ops
+
+
+def test_the_freeze_is_pending_and_every_real_session_and_demo_refuses() -> None:
+    """Owner 2026-11-09: the bowl fit check of B' is pending. The protocol says so
+    (``FREEZE_STATUS``), the bowl and the rubric version are unchanged, the hardware session and
+    the demo schedule refuse on the freeze status (and on the bowl box), and the committed
+    placement-grid PDF differs from what the script draws ONLY in the printed hash prefix (it is
+    regenerated with the freeze)."""
+    assert PR.FREEZE_STATUS == "pending: bowl fit check" and PR.FREEZE_STATUS != PR.FROZEN
+    assert PR.BOWL_XY_M == (0.195, 0.205) and PR.RUBRIC_VERSION == "1"
+    problem = PR.freeze_problem()
+    assert problem is not None and "pending: bowl fit check" in problem
+    from src.config import load_config
+
+    cfg = load_config("real")
+    s = {"schedule": "eval", "trials_per_cell": 50, "cells": list(PR.CELLS), "capture": True}
+    assert problem in ev.real_hardware_problems(cfg, s)
+    grid_pdf = _load("make_placement_grid")
+    assert grid_pdf.main(["--preset", "real", "--check"]) == 1  # stale by the hash, on purpose
+    committed = (REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf").read_bytes()
+    ops = grid_pdf.draw()
+    assert PR.protocol_hash()[:12] in ops and PDF_HASH12_PENDING not in ops
+    assert grid_pdf.pdf_bytes(ops.replace(PR.protocol_hash()[:12], PDF_HASH12_PENDING)) == committed
 
 
 # ------------------------------------------------------------------------------------------------

@@ -83,7 +83,7 @@ before the wait and after the answer, and waits at most ``deploy.prompt_torque_t
 ``deploy.prompt_support_grace_s`` (default 10 s, ENTER = now), deadman TORQUE_OFF, torque off, and
 the session ends (``prompt_timeout``; no park). Mock runs use ``ScriptedOperator`` (instant).
 
-Scoring (``run_trials`` / ``_score``, judging rule real-judge-2 in scripts/wo07_real_eval.py):
+Scoring (``run_trials`` / ``_score``, judging rule real-judge-3 in scripts/wo07_real_eval.py):
 a trial counts once its policy started (``TrialResult.policy_started``: the goal write of the
 trial's first policy action was begun, ``So101Driver.goal_write_attempted``; a write that raised
 from inside counts, since the goal may have reached the bus; a step stopped before its write, by
@@ -1264,7 +1264,7 @@ Scored = tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]
 def _score(
     loop: DeployLoop, operator: Operator, result: TrialResult, settle: dict[str, Any] | None
 ) -> Scored:
-    """Judging rule real-judge-2 (scripts/wo07_real_eval.py). A trial whose policy never started
+    """Judging rule real-judge-3 (scripts/wo07_real_eval.py). A trial whose policy never started
     is an attempt (``not_started``, never scored). A started trial that ended in a fault, or
     faults during the settle / at the score prompt, is a failure (``fault``) and the operator is
     not asked. A clean one settles, the servos are read, then the operator judges it; a score
@@ -1317,7 +1317,7 @@ def _score(
             how, why = EOF, f"stdin closed (EOF) during {stage}"
     except PromptTimeout as e:
         how, why = TIMEOUT, f"{e}; torque released"
-    return "failure", "unjudged", None, {"how": how, "reason": f"{why}: doubt = n (real-judge-2)"}
+    return "failure", "unjudged", None, {"how": how, "reason": f"{why}: doubt = n (real-judge-3)"}
 
 
 def _late_fault(result: TrialResult, e: BaseException, where: str) -> dict[str, Any]:
@@ -1362,7 +1362,7 @@ def run_trials(
     runs on every trial record (not the ``trial_started`` marker) before it is appended and logged
     (the evaluation capture adds its ``capture`` block there).
 
-    Scoring (``_score``, judging rule real-judge-2): ``policy_started`` (the goal write of the
+    Scoring (``_score``, judging rule real-judge-3): ``policy_started`` (the goal write of the
     trial's first policy action was begun: ``TrialResult.policy_started_t``) decides whether an
     attempt counts. Not started (home failed / faulted / Ctrl-C, a server failure or a stale first
     chunk before the first action, the first policy goal blocked by the pre-write stop check or

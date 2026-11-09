@@ -37,7 +37,7 @@ and citations: ADR-0003.
 3. `Stack` — stack cube A on cube B.
 
 Push and Stack wait until the PickPlace baseline is in. Each task has a programmatic success check
-in `src/env/success.py` (sim); the real arm is judged by the real rubric (`real-judge-2`).
+in `src/env/success.py` (sim); the real arm is judged by the real rubric (`real-judge-3`).
 
 ## Real data and evaluation (ADR-0003, decisions D1-D5)
 

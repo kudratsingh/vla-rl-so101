@@ -57,8 +57,12 @@ Schedules (D3, D4, D5), all seeded and frozen, materialized in the hash:
 Every coordinate is a PLANNED pose (the grid slot centre and yaw the operator is told to use), never
 a measurement: the keys say ``planned_`` and ``POSE_SOURCE`` says so.
 
-Scoring (CLAUDE.md rule 4): binary success under ``RUBRIC`` (judging rule ``real-judge-2``, the
-settle interval and the fault rule) is the headline. The paper's partial-credit score may be logged
+Scoring (CLAUDE.md rule 4): binary success under ``RUBRIC`` (judging rule ``real-judge-3``, the
+settle interval and the fault rule) is the headline. real-judge-3 (owner 2026-11-09, after PR #33)
+moves the start of a trial from "its first action reached the safety filter" (real-judge-2) to
+"the bus write of its first policy goal was begun": a first goal blocked before its write (the
+pre-write stop check, a stop or a stale frame / chunk after the start marker, a marker that could
+not be saved) never started and is redone; a write that began and then failed counts as started. The paper's partial-credit score may be logged
 as a secondary column (``RUBRIC["secondary"]``), never as the headline. Unseen is reported per
 object and pooled; the pooled 50 is the headline.
 
@@ -68,6 +72,14 @@ objects, the three schedules in full, the grid geometry (every slot's id, cell a
 judging rule and rubric, the horizon and settle interval, and the observation/action convention
 hash (``src/robot/convention.py``). Values, not file bytes, so a comment edit never moves it.
 Pinned in ``tests/test_protocol_real.py``: freeze before the first demo (D4).
+
+Freeze status (``FREEZE_STATUS``): PENDING. The owner is checking bowl option B' (0.205, 0.185) m
+on the bench (unpowered fit check); until he confirms, ``BOWL_XY_M``, ``RUBRIC_VERSION`` and the
+placement-grid PDF stay as they are, the hash pinned in the test is the current computed value
+(it moved with real-judge-3), and ``freeze_problem()`` makes every hardware session and the demo
+schedule refuse (scripts/wo07_real_eval.py ``real_hardware_problems``, scripts/wo06_teleop_record.py
+``--demo-schedule``), next to ``bowl_fit.bowl_box_problem``. The freeze sets ``FREEZE_STATUS`` to
+``FROZEN``, moves the bowl, bumps the rubric and regenerates the PDF and the hash together.
 """
 
 from __future__ import annotations
@@ -83,6 +95,8 @@ from src.eval import protocol as P
 from src.eval import real_grid as G
 
 PROTOCOL_VERSION = "real-0.1"
+FROZEN = "frozen"
+FREEZE_STATUS = "pending: bowl fit check"  # module doc; FROZEN once the owner confirms the bowl
 TASK = "PickPlace"
 TASK_ID = "so101-real-pickplace"
 CELLS: tuple[str, ...] = P.CELLS  # seen, shifted, unseen_objects
@@ -168,13 +182,15 @@ TRIAL_MAX_STEPS = (
     450  # 30 s at 15 Hz = the teleop demo cap (configs/real.yaml teleop.episode_time_s)
 )
 SETTLE_S = 3.0
-JUDGING_RULE_VERSION = "real-judge-2"
+JUDGING_RULE_VERSION = "real-judge-3"
 JUDGING_GENERAL = (
     "Judge ONCE, after the trial has ended and the arm has then held still for the settling "
     "interval of {settle_s:g} s (eval.settle_s; this prompt only appears then), by eye, touching "
     "nothing. y only if ALL of the task's conditions hold NOW; a success that was undone before "
-    "the end is n. Doubt = n. A trial counts once its policy started (its first action from the "
-    "policy server reached the safety filter) and is then scored exactly once, never redone. A "
+    "the end is n. Doubt = n. A trial counts once its policy started (the bus write of its first "
+    "action from the policy server was begun, even if that write then failed; a first goal "
+    "blocked before its write, also one blocked after the start was marked, never started) and "
+    "is then scored exactly once, never redone. A "
     "fault after the start (servo, serial, a safety-layer or deadman stop: joint / workspace "
     "violation, lost frame, stall, stale chunk; a policy-server failure; Ctrl-C during motion; a "
     "client error; torque off unconfirmed; inside the trial, at the settle read or while this "
@@ -194,6 +210,17 @@ JUDGING_RULE: dict[str, str] = {  # mirrors src/env/success.py, read only
 RUBRIC_ID = "so101-real-pickplace-rubric"
 RUBRIC_VERSION = "1"
 TASK_VERSION = f"{RUBRIC_ID}-{RUBRIC_VERSION}"  # vishwaroop task_version = rubric version
+
+
+def freeze_problem() -> str | None:
+    """Why no demo or hardware session may use this protocol yet (None once it is frozen)."""
+    if FREEZE_STATUS == FROZEN:
+        return None
+    return (
+        f"protocol {PROTOCOL_VERSION} is not frozen ({FREEZE_STATUS}): the bowl position, the "
+        "rubric version, the placement-grid PDF and the hash wait for the owner's confirmation "
+        "(src/eval/protocol_real.py FREEZE_STATUS)"
+    )
 
 
 def judging_text(settle_s: float = SETTLE_S) -> str:

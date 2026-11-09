@@ -684,7 +684,7 @@ trips before the prompt waits.
   the arm and waits for ENTER (bounded); the run record keeps how you answered
   (`shutdown_detail.ack`: `enter` / `ctrl_c` / `eof` / `timeout`). Scoring: you are asked y/n
   only for a trial whose policy started and that ended without a fault; a fault after the
-  policy started is a failure automatically (judging rule `real-judge-2`,
+  policy started is a failure automatically (judging rule `real-judge-3`,
   `scripts/wo07_real_eval.py`), and a score prompt that ends without your answer (Ctrl-C,
   closed input, timeout) is a failure too (doubt = n). A trial whose policy started is never
   re-run on a resume, even if the run was killed before its record was written (it is then a
