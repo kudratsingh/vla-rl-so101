@@ -80,6 +80,44 @@ message); the session must run in the terminal's foreground, and losing it takes
 run would fork the session and drop the newer runs' scored trials), and warns (``--hardware``: asks for
 'checked') when an earlier run ended with TORQUE OFF UNCONFIRMED, in a trial or at shutdown.
 
+Protocol real-0.1 (``--protocol real-0.1``, the default; ``src/eval/protocol_real.py``; owner
+2026-11-09, final2 item 6 and amendments D1-D5). PickPlace only. The frozen schedule (seen = 10 at
+each of B2 B5 E2 E5 C4, shifted = 50 over the 20 ring slots, unseen = 25 purple + 25 green cube at
+the seen slots, the bowl fixed at (0.195, +0.205) m) runs in ONE seeded order across all three
+cells: the same placements and the same order for every policy (SmolVLA and ACT), every record
+carrying ``schedule_pos``, ``schedule_sha256`` and the real-0.1 composite hash. ``--schedule dev``
+runs the disjoint 30-trial development schedule (checkpoint selection, the 100-demo failure
+analysis): ``reportable: false``, never a result. The horizon is the protocol's
+(``TRIAL_MAX_STEPS`` 450 = 30 s at 15 Hz), the settle 3 s; ``--hardware`` refuses ``--trials``,
+``--cells`` and ``--slot-seed`` (the schedule is frozen), and needs ``--labeler`` (the named person
+who scores), ``--family`` / ``--training-run-id`` / ``--checkpoint-dir`` (the policy's stable family
+id, its training run and the content hash of the checkpoint files, recorded in the session's
+fingerprint). Every trial is captured (``src/robot/recording.py``): both cameras, state and action
+at the control rate into one LeRobotDataset v3.0 per session (``<runs>/<session>/capture/dataset``,
+episode = trial; ``capture.episode_index`` in the trial record, the trial id in the dataset's
+``meta/vla_rl_so101.json``); a not-started attempt is never an episode. The summary reports seen,
+shifted, unseen per object and unseen pooled (the headline). ``--report RUN RUN`` prints two
+sessions side by side and refuses unless they ran the same protocol hash and schedule.
+Bench budget: 150 trials per policy at up to ~65 s each (home ~5 s, place ~15 s, up to 30 s of
+policy, 3 s settle, ~5 s to score, the episode save: 7.3 s for a 30 s episode of both cameras on
+an M3 Pro, measured 2026-11-09; the capture itself costs 0.4 ms per control tick) is 2.3-2.7 h per
+policy, so one policy per bench session.
+
+Audit against final2 item 5 (where each requirement lives):
+* randomized trial order, seeded and recorded, the same for both policies: real-0.1 =
+  ``protocol_real.eval_schedule`` (one permutation of all 150) + ``schedule_pos`` /
+  ``schedule_sha256`` per record; protocol 0.2 = per-cell seeded slot permutation
+  (``real_grid.sample_plan``), cells in protocol order, ``placement_plan_sha256`` per record and
+  ``--hardware`` refusing a ``--slot-seed`` other than ``eval.slot_seed`` (``run_hardware``).
+* initial object pose per trial from the grid: ``placement`` in every record (``run_trials`` in
+  ``src/robot/client.py``); real-0.1 names them ``planned_*`` with ``pose_source``.
+* named labeler and success rubric in the record: real-0.1 ``labeler`` and ``rubric`` (id,
+  version, judging rule) per record; the judging rule text and hash in every record
+  (``protocol_fields``).
+* fault after the policy started = failure with the reason: ``client._score`` / ``trial_fault``.
+* resume skips started attempts and retries only never-started slots: ``done_indices``,
+  ``load_prior`` (a started trial without a record is a ``session_lost`` failure).
+
 --mock      CPU, in-process, safe anywhere: MockPolicy behind gRPC on 127.0.0.1, the fake arm and
             camera from tests/robot_fakes.py, the real safety filter and sim FK. Scripted scores.
             NOT a result.
@@ -96,9 +134,12 @@ run would fork the session and drop the newer runs' scored trials), and warns (`
             once; a failed torque-off blocks all motion and says to switch off the inline power
             switch.
 
-    uv run scripts/wo07_real_eval.py --preset real --mock --fake-clock --trials 2 --max-steps 16
+    uv run scripts/wo07_real_eval.py --preset real --mock --fake-clock --trials 2 --max-steps 16 \\
+        --task PickPlace
     .venv/bin/python scripts/wo07_real_eval.py --preset real --hardware --i-am-present \\
-        --task PickPlace --label sft
+        --task PickPlace --label smolvla-20k --labeler <name> --family smolvla \\
+        --training-run-id <train run id> --checkpoint-dir <pretrained_model dir>
+    uv run scripts/wo07_real_eval.py --preset real --report <smolvla run> <act run>
     .venv/bin/python scripts/wo07_real_eval.py --preset real --hardware --i-am-present --resume <id>
 """
 
@@ -117,15 +158,19 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import Config, add_config_args, load_config
 from src.eval import protocol as P1
+from src.eval import protocol_real as PR
 from src.eval import protocol_v02 as P2
 from src.eval import real_grid as G
-from src.robot.camera import PolicyImagePipeline
+from src.robot import convention as conv
+from src.robot.camera import CameraRig, PolicyImagePipeline
 from src.robot.client import (
     ConsoleOperator,
     DeployConfig,
@@ -142,39 +187,25 @@ from src.robot.client import (
     shutdown_results,
     summarize,
     trial_object,
+    utc_now,
 )
 from src.robot.driver import So101Driver
 from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals, require_terminal
+from src.robot.recording import EvalCapture, RigFrameSource
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
 from src.robot.units import UnitMap
 from src.runs import RUNS_DIR, Run, new_run_id
 
-JUDGING_RULE_VERSION = "real-judge-2"
+PROTOCOLS = (PR.PROTOCOL_VERSION, P2.PROTOCOL_VERSION)
+
+JUDGING_RULE_VERSION = PR.JUDGING_RULE_VERSION  # "real-judge-2"
 DEFAULT_SETTLE_S = 3.0  # eval.settle_s
-JUDGING_GENERAL = (
-    "Judge ONCE, after the trial has ended and the arm has then held still for the settling "
-    "interval of {settle_s:g} s (eval.settle_s; this prompt only appears then), by eye, touching "
-    "nothing. y only if ALL of the task's conditions hold NOW; a success that was undone before "
-    "the end is n. Doubt = n. A trial counts once its policy started (its first action from the "
-    "policy server reached the safety filter) and is then scored exactly once, never redone. A "
-    "fault after the start (servo, serial, a safety-layer or deadman stop: joint / workspace "
-    "violation, lost frame, stall, stale chunk; a policy-server failure; Ctrl-C during motion; a "
-    "client error; torque off unconfirmed; inside the trial, at the settle read or while this "
-    "prompt waits) makes it a failure without a judgement (the fault is recorded; a later "
-    "'resume' does not change it). A score prompt that ends without a judgement (Ctrl-C, closed "
-    "input, no answer in deploy.prompt_torque_timeout_s) scores it n. An attempt whose policy "
-    "never started is not scored and is redone with the same placement."
-)
-JUDGING_RULE: dict[str, str] = {  # mirrors src/env/success.py, read only
-    "PickPlace": "the object rests inside the bowl (over the bowl floor, below the rim), the bowl "
-    "is upright, and the object touches neither gripper jaw",
-    "Push": "the object's centre is inside the 5 cm target disc, the object is on the table, it "
-    "was never lifted off the table during the trial, and the gripper is not holding it",
-    "Stack": "the object rests on top of the blue cube (centred within ~1.5 cm, flat), the blue "
-    "cube is still on the table, and the object touches neither gripper jaw",
-}
+# the rule's text lives in src/eval/protocol_real.py (hashed by real-0.1); unchanged, so the
+# judging_rule_sha256 of protocol 0.2 sessions is unchanged too
+JUDGING_GENERAL = PR.JUDGING_GENERAL
+JUDGING_RULE: dict[str, str] = PR.JUDGING_RULE
 
 MOCK_LABEL = "MOCK: fake arm, fake camera, mock policy; exercises the eval loop only, NOT a result"
 HARDWARE_LABEL = "real arm, operator-scored, single session per checkpoint"
@@ -229,20 +260,43 @@ def judging_rule(settle_s: float) -> dict[str, Any]:
     }
 
 
-def protocol_fields(settle_s: float = DEFAULT_SETTLE_S) -> dict[str, Any]:
-    """Per-trial protocol citation: 0.2 composite hash, 0.1-draft as a reference, real-eval files."""
+def protocol_fields(
+    settle_s: float = DEFAULT_SETTLE_S,
+    protocol: str = P2.PROTOCOL_VERSION,
+    schedule: str | None = None,
+) -> dict[str, Any]:
+    """Per-trial protocol citation. 0.2: its composite hash, 0.1-draft as a reference, real-eval
+    files. real-0.1: its composite hash (slots, bowl, objects, schedules, grid, rubric, convention),
+    the schedule run and its hash, the same reference and files."""
     rule_text = json.dumps(judging_rule(settle_s), sort_keys=True)
+    real_eval: dict[str, Any] = {
+        "judging_rule": JUDGING_RULE_VERSION,
+        "judging_rule_sha256": hashlib.sha256(rule_text.encode()).hexdigest(),
+        "settle_s": float(settle_s),
+        "grid_sha256": _sha256(REPO_ROOT / "src" / "eval" / "real_grid.py"),
+        "grid_pdf_sha256": _sha256(REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf"),
+    }
+    if protocol == PR.PROTOCOL_VERSION:
+        sched = schedule or "eval"
+        return {
+            "protocol_version": PR.PROTOCOL_VERSION,
+            "protocol_hash": PR.protocol_hash(),
+            "protocol_ref": {"version": P1.PROTOCOL_VERSION, "hash": P1.protocol_hash()},
+            "real_eval": {
+                **real_eval,
+                "schedule": sched,
+                "schedule_sha256": PR.schedule_sha256(sched),
+                "rubric": {"id": PR.RUBRIC_ID, "version": PR.RUBRIC_VERSION},
+                "convention": conv.citation(),
+            },
+        }
+    if protocol != P2.PROTOCOL_VERSION:
+        raise ValueError(f"unknown protocol {protocol!r}; expected one of {PROTOCOLS}")
     return {
         "protocol_version": P2.PROTOCOL_VERSION,
         "protocol_hash": P2.protocol_hash(),
         "protocol_ref": {"version": P1.PROTOCOL_VERSION, "hash": P1.protocol_hash()},
-        "real_eval": {
-            "judging_rule": JUDGING_RULE_VERSION,
-            "judging_rule_sha256": hashlib.sha256(rule_text.encode()).hexdigest(),
-            "settle_s": float(settle_s),
-            "grid_sha256": _sha256(REPO_ROOT / "src" / "eval" / "real_grid.py"),
-            "grid_pdf_sha256": _sha256(REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf"),
-        },
+        "real_eval": real_eval,
     }
 
 
@@ -301,8 +355,12 @@ def fingerprint_values(
     *,
     max_steps: int | None,
     settle_s: float,
+    protocol: str = P2.PROTOCOL_VERSION,
+    schedule: str | None = None,
+    identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The effective settings a session is bound to, per component (module doc)."""
+    """The effective settings a session is bound to, per component (module doc). ``identity``
+    (real-0.1): the policy's family id, training run and checkpoint content hash."""
     r = cfg["robot"]
     sc = arm.safety.config
     deploy = {
@@ -310,12 +368,13 @@ def fingerprint_values(
     }  # control_hz, chunk_len, exec_steps, timeouts, chunk age, trial steps, home, park
     return _canon(
         {
-            "protocol": protocol_fields(settle_s),
+            "protocol": protocol_fields(settle_s, protocol, schedule),
             "policy": {
                 "policy_id": info.get("policy_id"),
                 "policy_checkpoint": dcfg.policy_checkpoint,
                 "adapter_sha256": info.get("adapter_sha256"),  # the weights, not the name
                 "adapter_revision": info.get("adapter_revision"),
+                **({} if identity is None else {"identity": _identity_key(identity)}),
             },
             "camera": {"cameras": cfg["cameras"]},
             "calibration": calibration_values(arm, cfg),
@@ -337,6 +396,11 @@ def fingerprint_values(
             },
         }
     )
+
+
+def _identity_key(identity: dict[str, Any]) -> dict[str, Any]:
+    """What binds a session to a policy (the checkpoint's path is not part of it)."""
+    return {k: identity.get(k) for k in ("family_id", "training_run_id", "checkpoint_sha256")}
 
 
 def make_fingerprint(values: dict[str, Any]) -> dict[str, Any]:
@@ -542,8 +606,16 @@ def table(
     s["protocol_complete"] = (
         s["complete"] and n == P1.REAL_TRIALS_PER_CELL and set(settings["cells"]) == set(P1.CELLS)
     )
+    real = settings.get("protocol_id") == PR.PROTOCOL_VERSION
+    if real:
+        # binary success per reporting row; unseen per object and pooled (the headline)
+        s["real_rows"] = PR.cell_tables(scored)
+        s["schedule"] = settings.get("schedule")
+        s["reportable"] = settings.get("schedule") == "eval"
+        s["protocol_complete"] = bool(s["protocol_complete"] and s["reportable"])
+        s["policy_identity"] = settings.get("policy_identity")
     s.update(
-        protocol_version=P2.PROTOCOL_VERSION,
+        protocol_version=settings["protocol"]["protocol_version"],
         protocol_hash=settings["protocol"]["protocol_hash"],
         protocol_ref=settings["protocol"]["protocol_ref"],
         label=settings["label"],
@@ -574,6 +646,15 @@ def print_table(
             f"[{100 * lo:.1f}, {100 * hi:.1f}] | {c['faulted']}{f' ({kinds})' if kinds else ''} "
             f"| {c['unjudged']} | {c['not_started']} |"
         )
+    if s.get("real_rows"):
+        tag = "" if s.get("reportable") else "  (DEVELOPMENT schedule: never reported)"
+        print(f"{PR.PROTOCOL_VERSION} rows, binary success (unseen pooled = headline){tag}")
+        for name, r in s["real_rows"].items():
+            rate = "n/a" if r["success_rate"] is None else f"{100 * r['success_rate']:.1f}%"
+            lo, hi = r["wilson_95"]
+            print(
+                f"  {name}: {r['successes']} / {r['n']} = {rate}  [{100 * lo:.1f}, {100 * hi:.1f}]"
+            )
     print("SECONDARY diagnostic (NOT the result): success rate excluding faulted trials")
     for name, c in s["cells"].items():
         d = c["diagnostic_excluding_faulted"]
@@ -614,7 +695,7 @@ def session(
     prior_runs: Sequence[str] = (),
     torque_wait: TorqueWait | None = None,
 ) -> Path:
-    task, n = str(settings["task"]), int(settings["trials_per_cell"])
+    task = str(settings["task"])
     settle_s = float(settings["settle_s"])
     trials: list[dict[str, Any]] = list(prior_trials)
     end = "error"
@@ -655,55 +736,59 @@ def session(
                 run.flush()
 
         print(f"{judging_rule(settle_s)['general']}\n  {task} success = {JUDGING_RULE[task]}.")
+        real = settings.get("protocol_id") == PR.PROTOCOL_VERSION
+        capture: EvalCapture | None = None
         try:
-            for cell in settings["cells"]:
-                done = done_indices(trials, cell)
-                todo = [k for k in range(n) if k not in done]
-                if not todo:
-                    continue
-                plan = G.sample_plan(task, cell, n, int(settings["slot_seed"]))
-
-                def place(
-                    k: int, cell: str = cell, plan: list[dict[str, Any]] = plan
-                ) -> tuple[str, dict[str, Any]]:
-                    obj = trial_object(task, cell, k)
-                    return G.placement_prompt(obj.label, plan[k]), plan[k]
-
-                _, why = run_trials(
+            if real and settings.get("capture"):
+                capture = open_capture(cfg, settings, run, loop, resumed=resumed_from is not None)
+                loop.on_write = capture.on_write  # every policy write: both cameras, state, action
+                run.results["capture"] = {
+                    "root": str(capture.root),
+                    "dataset": str(capture.dataset_root),
+                }
+                run.flush()
+            if real:
+                end = _run_schedule(
                     loop,
                     operator,
-                    task=task,
-                    cell=cell,
-                    n_trials=n,
-                    info=info,
-                    camera_calibrated=camera_calibrated,
+                    settings,
+                    info,
+                    trials,
+                    extra,
+                    capture,
                     log_row=log_row,
                     max_steps=max_steps,
-                    trials=trials,
+                    camera_calibrated=camera_calibrated,
                     on_trial_start=on_trial_start,
-                    indices=todo,
-                    placement_fn=place,
-                    record_extra={
-                        **extra,
-                        "placement_plan_sha256": plan_sha256(
-                            task, cell, int(settings["slot_seed"]), n
-                        ),
-                    },
-                    settle_s=settle_s,
                 )
-                if why != "completed":
-                    end = why
-                    break
             else:
-                end = "completed"
+                end = _run_cells_02(
+                    loop,
+                    operator,
+                    settings,
+                    info,
+                    trials,
+                    extra,
+                    log_row=log_row,
+                    max_steps=max_steps,
+                    camera_calibrated=camera_calibrated,
+                    on_trial_start=on_trial_start,
+                )
         except KeyboardInterrupt:
             end = "operator_ctrl_c"
         except Exception as e:  # never a healthy end: hold + support, no park
             end = f"error: {type(e).__name__}: {e}"
             raise
         finally:
+            loop.on_write = None
             shutdown = shutdown_or_record(run.results, loop, operator, end)
             end = final_session_end(loop.arm, end)  # a failed torque-off wins over any end
+            if capture is not None:
+                try:
+                    capture.close()  # Parquet footers: the dataset is readable and resumable
+                    run.results["capture"]["episodes"] = len(capture.provenance["episodes"])
+                except Exception as e:  # noqa: BLE001 - the trial records stand
+                    run.results["capture"]["close_error"] = f"{type(e).__name__}: {e}"
             run.results.update(
                 session_end=end,
                 **shutdown_results(shutdown),
@@ -718,6 +803,249 @@ def session(
     return run.record_path
 
 
+def _run_cells_02(
+    loop: DeployLoop,
+    operator: Operator,
+    settings: dict[str, Any],
+    info: dict[str, Any],
+    trials: list[dict[str, Any]],
+    extra: dict[str, Any],
+    *,
+    log_row: Callable[..., None],
+    max_steps: int | None,
+    camera_calibrated: bool,
+    on_trial_start: Callable[[int], None] | None,
+) -> str:
+    """Protocol 0.2: cells in protocol order, the per-cell seeded slot plan (real_grid)."""
+    task, n = str(settings["task"]), int(settings["trials_per_cell"])
+    for cell in settings["cells"]:
+        done = done_indices(trials, cell)
+        todo = [k for k in range(n) if k not in done]
+        if not todo:
+            continue
+        plan = G.sample_plan(task, cell, n, int(settings["slot_seed"]))
+
+        def place(
+            k: int, cell: str = cell, plan: list[dict[str, Any]] = plan
+        ) -> tuple[str, dict[str, Any]]:
+            obj = trial_object(task, cell, k)
+            return G.placement_prompt(obj.label, plan[k]), plan[k]
+
+        _, why = run_trials(
+            loop,
+            operator,
+            task=task,
+            cell=cell,
+            n_trials=n,
+            info=info,
+            camera_calibrated=camera_calibrated,
+            log_row=log_row,
+            max_steps=max_steps,
+            trials=trials,
+            on_trial_start=on_trial_start,
+            indices=todo,
+            placement_fn=place,
+            record_extra={
+                **extra,
+                "placement_plan_sha256": plan_sha256(task, cell, int(settings["slot_seed"]), n),
+            },
+            settle_s=float(settings["settle_s"]),
+        )
+        if why != "completed":
+            return why
+    return "completed"
+
+
+def session_items(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    """The real-0.1 schedule items this session runs, in schedule order: the whole schedule, or
+    (mock subsets) the first ``trials_per_cell`` items of each chosen cell."""
+    items = PR.schedule(str(settings["schedule"]))
+    n = int(settings["trials_per_cell"])
+    out, taken = [], {c: 0 for c in settings["cells"]}
+    for it in items:
+        c = it["cell"]
+        if c in taken and taken[c] < n:
+            taken[c] += 1
+            out.append(it)
+    return out
+
+
+def trial_id(session_id: str, cell: str, trial_idx: int) -> str:
+    return f"{session_id}/{cell}/{int(trial_idx):03d}"
+
+
+def _run_schedule(
+    loop: DeployLoop,
+    operator: Operator,
+    settings: dict[str, Any],
+    info: dict[str, Any],
+    trials: list[dict[str, Any]],
+    extra: dict[str, Any],
+    capture: EvalCapture | None,
+    *,
+    log_row: Callable[..., None],
+    max_steps: int | None,
+    camera_calibrated: bool,
+    on_trial_start: Callable[[int], None] | None,
+) -> str:
+    """real-0.1: the frozen schedule in its seeded order, one trial at a time across the cells;
+    a started (cell, trial_idx) is never re-run, a never-started one is retried in its place."""
+    task, n = str(settings["task"]), int(settings["trials_per_cell"])
+    items = session_items(settings)
+    total = len(items)
+    sched = str(settings["schedule"])
+    rubric = {
+        "id": PR.RUBRIC_ID,
+        "version": PR.RUBRIC_VERSION,
+        "judging_rule": JUDGING_RULE_VERSION,
+    }
+    base = {
+        **extra,
+        "schedule": sched,
+        "schedule_sha256": PR.schedule_sha256(sched),
+        "reportable": sched == "eval",
+        "labeler": settings.get("labeler"),
+        "rubric": rubric,
+        "policy_identity": settings.get("policy_identity"),
+    }
+    sid = str(settings["session_id"])
+    for item in items:
+        cell, k = str(item["cell"]), int(item["trial_idx"])
+        if k in done_indices(trials, cell):
+            continue
+        pos = int(item["schedule_pos"])
+        tid = trial_id(sid, cell, k)
+        obj = PR.object_by_label(str(item["object"]))
+
+        def place(
+            _k: int, item: dict[str, Any] = item, pos: int = pos
+        ) -> tuple[str, dict[str, Any]]:
+            return f"(session trial {pos + 1}/{total}) {PR.placement_prompt(item)}", dict(item)
+
+        def start(_k: int, tid: str = tid, item: dict[str, Any] = item) -> None:
+            if capture is not None:
+                meta = {
+                    key: item[key]
+                    for key in ("cell", "trial_idx", "schedule_pos", "object", "object_slot")
+                }
+                capture.begin(tid, str(item["instruction"]), meta)
+            if on_trial_start is not None:
+                on_trial_start(_k)
+
+        def hook(rec: dict[str, Any], tid: str = tid) -> None:
+            rec["trial_id"] = tid
+            if capture is None:
+                rec["capture"] = {
+                    "episode_index": None,
+                    "reason": "capture off (mock --no-capture)",
+                }
+                return
+            try:
+                rec["capture"] = capture.finish(rec)
+            except Exception as e:  # noqa: BLE001 - never let the capture end the session
+                rec["capture"] = {"episode_index": None, "error": f"{type(e).__name__}: {e}"}
+
+        _, why = run_trials(
+            loop,
+            operator,
+            task=task,
+            cell=cell,
+            n_trials=n,
+            info=info,
+            camera_calibrated=camera_calibrated,
+            log_row=log_row,
+            max_steps=max_steps,
+            trials=trials,
+            on_trial_start=start,
+            indices=[k],
+            placement_fn=place,
+            record_extra={**base, "schedule_pos": pos},
+            settle_s=float(settings["settle_s"]),
+            object_fn=lambda _k, obj=obj: obj,
+            record_hook=hook,
+        )
+        if why != "completed":
+            return why
+    return "completed"
+
+
+def open_capture(
+    cfg: Config, settings: dict[str, Any], run: Run, loop: DeployLoop, *, resumed: bool
+) -> EvalCapture:
+    """The session's capture dataset (``<runs>/<session id>/capture``); a resume appends."""
+    sid = str(settings["session_id"])
+    root = Path(run.dir).parent / sid / "capture"
+    cam = loop.cam
+    if not isinstance(cam, RigFrameSource):
+        raise TypeError("the evaluation capture needs the two-camera rig (RigFrameSource)")
+    rig = cam.rig
+    provenance: dict[str, Any] = {
+        "source": "scripts/wo07_real_eval.py",
+        "purpose": "evaluation",
+        "session_id": sid,
+        "recorded_at": settings.get("recorded_at"),
+        "robot_id": str(cfg["robot"]["id"]),
+        "convention": conv.citation(),
+        "units": dict(conv.DECLARED_UNITS),
+        "protocol": PR.citation(),
+        "task": {"name": PR.TASK, "id": PR.TASK_ID, "version": PR.TASK_VERSION},
+        "schedule": settings.get("schedule"),
+        "schedule_sha256": PR.schedule_sha256(str(settings.get("schedule"))),
+        "policy_identity": settings.get("policy_identity"),
+        "labeler": settings.get("labeler"),
+        "cameras": {n: dict((cfg.get("cameras") or {}).get(n) or {}) for n in conv.CAMERA_NAMES},
+        "runs": [run.id],
+    }
+    return EvalCapture.open(
+        root,
+        f"local/so101-real-eval-{sid}",
+        provenance,
+        resume=resumed,
+        follower=loop.arm.follower,
+        end_state=lambda: rig.read().images,
+    )
+
+
+def policy_identity(args: argparse.Namespace) -> dict[str, Any] | None:
+    """--family / --training-run-id / --checkpoint-dir -> the policy's identity (all or none)."""
+    given = [args.family, args.training_run_id, args.checkpoint_dir]
+    if all(v is None for v in given):
+        return None
+    if any(v is None for v in given):
+        sys.exit("--family, --training-run-id and --checkpoint-dir go together")
+    from src.eval.export_bundle import FAMILIES, checkpoint_identity
+
+    ident = checkpoint_identity(Path(args.checkpoint_dir))
+    return {
+        "family": args.family,
+        "family_id": FAMILIES[args.family],
+        "training_run_id": str(args.training_run_id),
+        "checkpoint_sha256": ident["sha256"],
+        "checkpoint_files": ident["files"],
+        "checkpoint_dir": str(Path(args.checkpoint_dir).resolve()),
+    }
+
+
+def check_identity(settings: dict[str, Any], args: argparse.Namespace) -> None:
+    """A resume re-hashes the checkpoint (``--checkpoint-dir``, else the recorded dir) and refuses
+    other files: the session is bound to the weights it started with."""
+    ident = settings.get("policy_identity")
+    if not ident:
+        return
+    from src.eval.export_bundle import ExportRefused, checkpoint_identity
+
+    path = Path(args.checkpoint_dir or ident["checkpoint_dir"])
+    try:
+        now = checkpoint_identity(path)["sha256"]
+    except ExportRefused as e:
+        sys.exit(f"--resume refused: {e}")
+    if now != ident["checkpoint_sha256"]:
+        sys.exit(
+            f"--resume refused: the checkpoint files changed ({path} hashes to {now[:12]}, the "
+            f"session ran {str(ident['checkpoint_sha256'])[:12]})"
+        )
+
+
 def new_settings(args: argparse.Namespace, cfg: Config) -> dict[str, Any]:
     ecfg = cfg.get("eval") or {}
     n = int(
@@ -725,8 +1053,25 @@ def new_settings(args: argparse.Namespace, cfg: Config) -> dict[str, Any]:
         if args.trials is not None
         else ecfg.get("trials_per_cell", P1.REAL_TRIALS_PER_CELL)
     )
+    protocol = str(args.protocol)
+    real = protocol == PR.PROTOCOL_VERSION
+    schedule = str(args.schedule) if real else None
+    if real:
+        if args.task != PR.TASK:
+            sys.exit(
+                f"protocol {protocol} defines {PR.TASK} only (Push and Stack wait for the baseline)"
+            )
+        full = len(PR.schedule(str(schedule))) // len(PR.CELLS)  # equal per cell: 50 eval, 10 dev
+        n = full if args.trials is None else int(args.trials)
+        if not 1 <= n <= full:
+            sys.exit(f"--trials must be in [1, {full}] for the {schedule} schedule")
+    elif args.schedule != "eval":
+        sys.exit("--schedule is a real-0.1 option")
     return {
         "session_id": None,  # the first run's id
+        "protocol_id": protocol,
+        "schedule": schedule,
+        "recorded_at": utc_now(),
         "task": args.task,
         "cells": list(args.cells or ecfg.get("cells") or P1.CELLS),
         "trials_per_cell": n,
@@ -735,9 +1080,12 @@ def new_settings(args: argparse.Namespace, cfg: Config) -> dict[str, Any]:
             args.slot_seed if args.slot_seed is not None else ecfg.get("slot_seed", 0)
         ),
         "label": args.label,
+        "labeler": args.labeler,
+        "policy_identity": policy_identity(args) if real else None,
+        "capture": bool(real and not args.no_capture),
         "policy_id": None,  # from the server's Info
         "settle_s": settle_s_from_config(cfg),
-        "protocol": protocol_fields(settle_s_from_config(cfg)),
+        "protocol": protocol_fields(settle_s_from_config(cfg), protocol, schedule),
         "fingerprint": None,  # bind_session, once the rig and the server are known
     }
 
@@ -747,7 +1095,11 @@ def check_resume(
 ) -> None:
     """Refuse to resume when the protocol, the policy or (with ``values``) any fingerprint
     component differs from the session's."""
-    now = protocol_fields(float(settings.get("settle_s", DEFAULT_SETTLE_S)))
+    now = protocol_fields(
+        float(settings.get("settle_s", DEFAULT_SETTLE_S)),
+        str(settings.get("protocol_id") or P2.PROTOCOL_VERSION),
+        settings.get("schedule"),
+    )
     bad = [
         f"{k}: session {settings['protocol'][k]!r} != now {now[k]!r}"
         for k in ("protocol_hash", "protocol_ref", "real_eval")
@@ -783,7 +1135,15 @@ def bind_session(
     An earlier TORQUE OFF UNCONFIRMED (any trial, or a run's session end / shutdown) is warned
     about; with ``acknowledge`` (hardware) the operator must type 'checked'."""
     values = fingerprint_values(
-        cfg, arm, info, dcfg, max_steps=max_steps, settle_s=settle_s_from_config(cfg)
+        cfg,
+        arm,
+        info,
+        dcfg,
+        max_steps=max_steps,
+        settle_s=settle_s_from_config(cfg),
+        protocol=str(settings.get("protocol_id") or P2.PROTOCOL_VERSION),
+        schedule=settings.get("schedule"),
+        identity=settings.get("policy_identity"),
     )
     if resumed_from:
         check_resume(settings, info, values)
@@ -860,7 +1220,12 @@ def mock_rig(
         ):
             info = client.info()
             check_server(info, dcfg)
-            loop = DeployLoop(arm, FakeCam(clock), pipe, client, dcfg, clock=clock, sleep=sleep)
+            cam: Any = FakeCam(clock)
+            if getattr(args, "protocol", P2.PROTOCOL_VERSION) == PR.PROTOCOL_VERSION:
+                wrist = FakeCam(clock)
+                wrist.image = np.ascontiguousarray(255 - wrist.image)  # a swap would show
+                cam = RigFrameSource(CameraRig({"front": cam, "wrist": wrist}))
+            loop = DeployLoop(arm, cam, pipe, client, dcfg, clock=clock, sleep=sleep)
             yield loop, info, lambda _k: policy.reset(), pipe.calibrated
     finally:
         policy.release.set()
@@ -879,6 +1244,7 @@ def run(
         settings, prior = load_prior(prior_dir)
         prior_runs = check_newest(prior_dir, settings)
         resumed_from: str | None = prior_dir.name
+        check_identity(settings, args)
     else:
         if args.task is None:
             sys.exit("--task is required for a new session")
@@ -906,6 +1272,25 @@ def run(
         )
 
 
+def real_hardware_problems(cfg: Config, settings: dict[str, Any]) -> list[str]:
+    """Why a real-0.1 hardware session may not start (empty = it may)."""
+    out = [f"convention: {p}" for p in conv.check_config(cfg)]  # both cameras, 15 Hz, gripper
+    if settle_s_from_config(cfg) != PR.SETTLE_S:
+        out.append(f"eval.settle_s {settle_s_from_config(cfg)} != the protocol's {PR.SETTLE_S}")
+    if not settings.get("labeler"):
+        out.append("--labeler is required: the named person who scores every trial")
+    if not settings.get("policy_identity"):
+        out.append(
+            "--family, --training-run-id and --checkpoint-dir are required (policy identity)"
+        )
+    full = len(PR.schedule(str(settings.get("schedule")))) // len(PR.CELLS)
+    if int(settings["trials_per_cell"]) != full or set(settings["cells"]) != set(PR.CELLS):
+        out.append("--trials / --cells: a hardware session runs the whole frozen schedule")
+    if not settings.get("capture"):
+        out.append("the evaluation capture is required on the arm (final2 hardware floor)")
+    return out
+
+
 def run_hardware(
     cfg: Config,
     args: argparse.Namespace,
@@ -929,8 +1314,14 @@ def run_hardware(
     cam_cfg = cfg["cameras"]["front"]
     if not cam_cfg.get("intrinsics"):
         sys.exit("cameras.front.intrinsics is null: run scripts/wo06_camera_intrinsics.py first")
+    real = settings.get("protocol_id") == PR.PROTOCOL_VERSION
+    max_steps: int | None = PR.TRIAL_MAX_STEPS if real else None
+    if real:
+        problems = real_hardware_problems(cfg, settings)
+        if problems:
+            sys.exit("refusing a real-0.1 session; nothing was opened:\n  " + "\n  ".join(problems))
     cfg_seed = int((cfg.get("eval") or {}).get("slot_seed", 0))
-    if int(settings["slot_seed"]) != cfg_seed:
+    if not real and int(settings["slot_seed"]) != cfg_seed:
         sys.exit(
             f"slot seed {settings['slot_seed']} != eval.slot_seed {cfg_seed}: the SFT and SFT+RL "
             "sessions must use the same placements (owner 2026-11-08); drop --slot-seed"
@@ -957,7 +1348,9 @@ def run_hardware(
         # builds the follower (lerobot reads the calibration file; no port is opened) so the
         # fingerprint and the resume check run before anything can move
         arm = So101Driver.from_config(cfg, fk)
-        bind_session(cfg, settings, prior, resumed_from, arm, info, dcfg, None, acknowledge=input)
+        bind_session(
+            cfg, settings, prior, resumed_from, arm, info, dcfg, max_steps, acknowledge=input
+        )
         print(f"policy server OK: {info['policy_id']} (server run {info.get('server_run')})")
         if dcfg.policy_checkpoint is None:
             print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
@@ -965,8 +1358,12 @@ def run_hardware(
         operator = JudgeOperator(guard, str(settings["task"]), settle_s_from_config(cfg))
         # Ctrl-C a flag outside prompts, SIGHUP / SIGTERM / a lost foreground the closed-stdin
         # path, Ctrl-Z ignored: from before torque on to after the final torque off (prompts.py)
-        with operator_signals() as interrupts, OpenCVFrameSource(cam_cfg) as cam, arm:
-            loop = DeployLoop(arm, cam, pipe, client, dcfg, interrupts=interrupts)
+        cams: Any = (
+            CameraRig.from_config(cfg, conv.CAMERA_NAMES) if real else OpenCVFrameSource(cam_cfg)
+        )
+        with operator_signals() as interrupts, cams as cam, arm:
+            source: Any = RigFrameSource(cam) if real else cam
+            loop = DeployLoop(arm, source, pipe, client, dcfg, interrupts=interrupts)
             return session(
                 cfg,
                 loop,
@@ -976,7 +1373,7 @@ def run_hardware(
                 settings=settings,
                 prior_trials=prior,
                 resumed_from=resumed_from,
-                max_steps=args.max_steps,
+                max_steps=max_steps,
                 camera_calibrated=pipe.calibrated,
                 runs_dir=args.runs_dir,
                 prior_runs=prior_runs,
@@ -990,6 +1387,22 @@ def main(argv: Sequence[str] | None = None) -> Path:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--mock", action="store_true", help="in-process fakes (CPU, safe)")
     mode.add_argument("--hardware", action="store_true", help="REAL ARM; owner only")
+    mode.add_argument(
+        "--report", nargs=2, metavar="RUN", default=None, help="two sessions side by side"
+    )
+    parser.add_argument("--protocol", choices=PROTOCOLS, default=PR.PROTOCOL_VERSION)
+    parser.add_argument(
+        "--schedule", choices=sorted(PR.SCHEDULES), default="eval", help="real-0.1: eval | dev"
+    )
+    parser.add_argument("--labeler", default=None, help="the named person who scores (real-0.1)")
+    parser.add_argument("--family", choices=sorted(("smolvla", "act")), default=None)
+    parser.add_argument("--training-run-id", default=None, help="the checkpoint's training run")
+    parser.add_argument(
+        "--checkpoint-dir", type=Path, default=None, help="the served checkpoint's files"
+    )
+    parser.add_argument(
+        "--no-capture", action="store_true", help="mock only: skip the evaluation capture"
+    )
     parser.add_argument("--i-am-present", action="store_true", help="owner at the arm")
     parser.add_argument("--task", choices=P1.TASKS, default=None)
     parser.add_argument("--cells", choices=P1.CELLS, nargs="+", default=None)
@@ -1015,8 +1428,68 @@ def main(argv: Sequence[str] | None = None) -> Path:
         )
     if args.hardware and args.max_steps is not None:
         parser.error("--max-steps is for mock runs; the real eval uses deploy.trial_max_steps")
+    if args.hardware and args.no_capture:
+        parser.error("--no-capture is for mock runs: every trial on the arm is captured")
+    if args.hardware and args.protocol == PR.PROTOCOL_VERSION and args.slot_seed is not None:
+        parser.error("--slot-seed is a protocol 0.2 option; real-0.1's schedule is frozen")
+    if args.report:
+        report([_run_dir(args.runs_dir, r) for r in args.report])
+        return args.runs_dir
     cfg = load_config(args.preset, args.config)
     return run(cfg, args)
+
+
+def _run_dir(runs_dir: Path, r: str) -> Path:
+    return Path(r) if Path(r).is_dir() else runs_dir / r
+
+
+def report(run_dirs: Sequence[Path]) -> dict[str, Any]:
+    """Two real-0.1 sessions (e.g. SmolVLA and ACT) side by side. Refuses unless both ran the
+    same protocol hash and the same evaluation schedule, under different policies."""
+    rows = []
+    for d in run_dirs:
+        results = json.loads((d / "record.json").read_text()).get("results") or {}
+        st, summ = results.get("session") or {}, results.get("summary") or {}
+        if st.get("protocol_id") != PR.PROTOCOL_VERSION:
+            sys.exit(f"--report: {d.name} is not a {PR.PROTOCOL_VERSION} session")
+        rows.append((d.name, st, summ))
+    (_, a, sa), (_, b, sb) = rows
+    pa, pb = a["protocol"], b["protocol"]
+    if pa["protocol_hash"] != pb["protocol_hash"] or pa["real_eval"].get("schedule_sha256") != pb[
+        "real_eval"
+    ].get("schedule_sha256"):
+        sys.exit("--report refused: the sessions ran different protocol hashes or schedules")
+    if a.get("schedule") != "eval" or b.get("schedule") != "eval":
+        sys.exit("--report refused: development sessions are never reported")
+    ida, idb = a.get("policy_identity") or {}, b.get("policy_identity") or {}
+    if ida and idb and ida.get("checkpoint_sha256") == idb.get("checkpoint_sha256"):
+        sys.exit("--report refused: both sessions ran the same checkpoint")
+    out = {
+        "protocol_version": PR.PROTOCOL_VERSION,
+        "protocol_hash": pa["protocol_hash"],
+        "rows": {},
+    }
+    names = [
+        f"{(st.get('policy_identity') or {}).get('family') or st.get('label')}" for _, st, _ in rows
+    ]
+    print(
+        f"protocol {PR.PROTOCOL_VERSION} {pa['protocol_hash'][:12]}; binary success, single session each"
+    )
+    print(f"| row | {names[0]} | {names[1]} |")
+    print("|---|---|---|")
+    for row in sa.get("real_rows") or {}:
+        cells = []
+        for summ in (sa, sb):
+            r = (summ.get("real_rows") or {}).get(row) or {}
+            rate = "n/a" if r.get("success_rate") is None else f"{100 * r['success_rate']:.1f}%"
+            cells.append(f"{r.get('successes', 0)}/{r.get('n', 0)} = {rate}")
+        out["rows"][row] = cells
+        print(f"| {row} | {cells[0]} | {cells[1]} |")
+    complete = [bool(summ.get("protocol_complete")) for summ in (sa, sb)]
+    if not all(complete):
+        print("  NOT a protocol table: a session is incomplete")
+    out["protocol_complete"] = all(complete)
+    return out
 
 
 if __name__ == "__main__":

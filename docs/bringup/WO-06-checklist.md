@@ -518,6 +518,16 @@ Prerequisite: step 9 went cleanly. Objects: 3 cm red and blue cubes, a bowl, and
 target mark, placed on the seen-region positions from step 7 (centre 0.205 m in front of the
 base, ±5 cm in x, ±7 cm in y; `src/eval/protocol.py:63`).
 
+> **WO-07 demos are different (protocol real-0.1, owner 2026-11-09).** The 50 PickPlace demos use
+> ONLY the five frozen seen slots `B2 B5 E2 E5 C4` (10 each) and the bowl FIXED on its mark at
+> x 0.195 m, y +0.205 m (the placement sheet's "bowl line": 100 mm left of its end tick). Never the
+> other 11 inner slots, the shaded ring or the purple / green cube, in a demo or a camera-match
+> frame. Record them with `--task PickPlace --demo-schedule`: every episode's prompt names its slot
+> and yaw (`src/eval/protocol_real.py` `demo_schedule()`), and `meta/vla_rl_so101.json` records
+> each placement, the protocol hash, the session id and the follower calibration that
+> `scripts/wo07_export_bundle.py demo` needs. The five sanity episodes per task below stay as
+> they are.
+
 ```bash
 source scripts/mac_env.sh
 .venv/bin/python scripts/wo06_teleop_record.py --preset real    # 3 tasks x 5 episodes, 30 s max each

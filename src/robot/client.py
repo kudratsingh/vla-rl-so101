@@ -137,6 +137,7 @@ from src.robot.driver import (
     SerialFault,
     ServoFault,
     So101Driver,
+    StepResult,
     park_from_config,
 )
 from src.robot.prompts import (
@@ -482,6 +483,10 @@ class DeployLoop:
         # runs once per trial, right after its first action went to the safety filter (the
         # durable "policy started" marker; run_trials)
         self.on_policy_start: Callable[[TrialResult], None] | None = None
+        # runs after every policy write with that tick's frame and step result (the evaluation
+        # capture, src/robot/recording.py: both cameras, measured state, written command). A
+        # failure in it is logged and never reaches the arm or the trial
+        self.on_write: Callable[[Frame | None, StepResult], None] | None = None
         # the session's signal flags (src/robot/prompts.operator_signals; hardware only): a
         # Ctrl-C or a hang-up stops motion between ticks, never inside a bus transaction
         self.interrupts = interrupts
@@ -653,6 +658,7 @@ class DeployLoop:
                 finally:
                     if first:  # after the write and its stamp: never delays or skews either
                         self._policy_started(res)
+                self._wrote(frame, out)
                 t_tick = t0
                 res.steps += 1
                 self._record_safety(res, out.safety)
@@ -680,6 +686,14 @@ class DeployLoop:
             self.on_policy_start(res)
         except Exception:  # a logging failure must not stop the trial
             log.exception("recording the policy start failed")
+
+    def _wrote(self, frame: Frame | None, out: StepResult) -> None:
+        if self.on_write is None:
+            return
+        try:
+            self.on_write(frame, out)
+        except Exception:  # a recording failure must not stop the trial
+            log.exception("recording the policy write failed")
 
     @staticmethod
     def _record_safety(res: TrialResult, safety: Any) -> None:
@@ -1143,6 +1157,8 @@ def run_trials(
     placement_fn: PlacementFn | None = None,
     record_extra: Mapping[str, Any] | None = None,
     settle_s: float | None = None,
+    object_fn: Callable[[int], protocol.ObjectSpec] | None = None,
+    record_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Home -> trial -> outcome for each trial index (``indices``, default ``range(n_trials)``).
     Returns (trial records, why the session ended). Records are appended to ``trials`` as they
@@ -1151,6 +1167,10 @@ def run_trials(
     prompt and record (scripts/wo07_real_eval.py); ``record_extra`` is merged into every record.
     ``settle_s``: after a clean trial the arm holds still this long (``loop.sleep``), the servos
     are read once, and only then is the operator asked to score it; recorded as ``settle``.
+    ``object_fn(k)``: the manipulated object (default ``trial_object``: protocol 0.1-draft's
+    objects; the real protocol ``src/eval/protocol_real.py`` passes its schedule's). ``record_hook``
+    runs on every trial record (not the ``trial_started`` marker) before it is appended and logged
+    (the evaluation capture adds its ``capture`` block there).
 
     Scoring (``_score``, judging rule real-judge-2): ``policy_started`` (the trial's first action
     from the policy server was handed to the safety filter) decides whether an attempt counts.
@@ -1185,7 +1205,7 @@ def run_trials(
     for k in range(n_trials) if indices is None else indices:
         if arm.torque_off_unconfirmed is not None:  # no motion is possible: never start a trial
             return trials, _torque_off_end(arm)
-        obj = trial_object(task, cell, k)
+        obj = trial_object(task, cell, k) if object_fn is None else object_fn(k)
         instruction = protocol.instruction(task, obj)
         tag = f"[{task}/{cell} {k + 1}/{n_trials}]"
         if placement_fn is None:
@@ -1237,6 +1257,8 @@ def run_trials(
                 rec["settle"] = dict(settle)
             if record_extra:
                 rec.update(record_extra)
+            if kind == "trial" and record_hook is not None:
+                record_hook(rec)
             stamp_torque_off_unconfirmed(rec, arm)  # last: nothing after it overwrites the flag
             if kind == "trial":
                 trials.append(rec)
