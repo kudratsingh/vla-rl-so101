@@ -414,8 +414,9 @@ class TrialResult:
     t_last_write: float | None = None
     # policy started: the goal write of the trial's first policy action was begun
     # (So101Driver.goal_write_attempted: it returned, or raised from inside the write or after
-    # it). Loop clock and UTC, stamped right after that step returned / raised. None: no policy
-    # goal was ever sent (e.g. the pre-write stop check blocked the first one): not started.
+    # it). Loop clock and UTC, stamped when that write began (DeployLoop._first_goal_check, the
+    # step's stop_fn, right before the write). None: no policy goal was ever sent (e.g. the
+    # pre-write stop check blocked the first one): not started.
     policy_started_t: float | None = None
     policy_started_utc: str | None = None
 
@@ -472,8 +473,9 @@ class DeployLoop:
         self.arm, self.cam, self.pipe, self.client, self.dcfg = arm, cam, pipe, client, dcfg
         self.clock, self.sleep = clock, sleep
         self.on_decision = on_decision
-        # runs once per trial, right after the step that sent its first policy goal (returned or
-        # raised with goal_write_attempted): the durable "policy started" marker (run_trials)
+        # runs once per trial, right before the write of its first policy goal begins (after
+        # the pre-write stop check passed; _first_goal_check): the durable "policy started"
+        # marker (run_trials)
         self.on_policy_start: Callable[[TrialResult], None] | None = None
         # the session's signal flags (src/robot/prompts.operator_signals; hardware only): a
         # Ctrl-C or a hang-up stops motion between ticks, never inside a bus transaction
@@ -660,14 +662,15 @@ class DeployLoop:
                 frame_time = None if frame is None else frame.capture_time
                 if frame_time is not None:
                     res.max_frame_age_ms = max(res.max_frame_age_ms, _ms(frame_time, now))
+                mark_ms: list[float] = []
+                stop_fn: Callable[[], bool] = self._pre_write_stop
+                if res.policy_started_t is None:  # the trial's first policy goal
+                    stop_fn = functools.partial(self._first_goal_check, res, mark_ms)
                 try:
-                    out = self.arm.step(action, frame_time=frame_time, stop_fn=self._pre_write_stop)
+                    out = self.arm.step(action, frame_time=frame_time, stop_fn=stop_fn)
                     t_write = self.clock()
                 except MotionStopped as e:  # nothing written: the top-of-tick stop's path
                     raise self._stopped(e) from e
-                finally:  # after the write and its stamp: never delays or skews either
-                    if res.policy_started_t is None and self.arm.goal_write_attempted:
-                        self._policy_started(res)
                 t_tick = t0
                 res.steps += 1
                 self._record_safety(res, out.safety)
@@ -675,6 +678,8 @@ class DeployLoop:
                     timing["pace_wait_ms"] = wait * 1e3
                     timing["recv_to_first_write_ms"] = _ms(reply.t_recv, t_write)
                     timing[LATENCY_KEY] = _ms(t_capture, t_write)
+                    if mark_ms:  # the durable start marker preceded this write (and is in it)
+                        timing["policy_start_mark_ms"] = mark_ms[0]
                     if res.t_last_write is not None:  # last write of the previous chunk -> this
                         timing["boundary_gap_ms"] = _ms(res.t_last_write, t_write)
                     res.timings.append(timing)
@@ -688,9 +693,26 @@ class DeployLoop:
                     res.stop_detail = "; ".join(iv.reason for iv in out.safety.interventions)
                     return
 
+    def _first_goal_check(self, res: TrialResult, mark_ms: list[float]) -> bool:
+        """``stop_fn`` of the step carrying the trial's first policy goal: the pre-write stop
+        check, then, when it passes, the policy start (``_policy_started``) BEFORE returning
+        False. ``So101Driver.step`` begins the goal write right after ``stop_fn`` returns False
+        (nothing else runs in between), so the stamp is the first write's begin time and the
+        durable marker is on disk before any byte of the first goal can reach the bus: a process
+        killed mid-write (SIGKILL, power loss) still leaves its ``trial_started`` row, and a goal
+        the check blocked leaves none. Cost: one log write before the first goal of each trial,
+        inside that decision's ``LATENCY_KEY`` and also recorded as ``policy_start_mark_ms``."""
+        if self._pre_write_stop():
+            return True
+        t0 = self.clock()
+        self._policy_started(res)
+        mark_ms.append(_ms(t0, self.clock()))
+        return False
+
     def _policy_started(self, res: TrialResult) -> None:
-        """The trial's first policy goal was sent (``So101Driver.goal_write_attempted``): stamp
-        it and write the durable marker. Never called for a step stopped before its write."""
+        """The trial's first policy goal is about to be written (``_first_goal_check``; the step
+        then reports ``goal_write_attempted``): stamp it and write the durable marker. Never
+        called for a step stopped before its write."""
         res.policy_started_t, res.policy_started_utc = self.clock(), utc_now()
         if self.on_policy_start is None:
             return
@@ -1184,7 +1206,9 @@ def run_trials(
     'resume' does not change it. A score prompt that ends without a judgement (Ctrl-C, EOF,
     timeout) is a failure with ``unjudged: {how, reason}``.
 
-    Durable start: the moment the policy starts (never before its first goal write was begun), a
+    Durable start: the moment the policy starts (the pre-write stop check of its first goal
+    passed and the write begins next: never for a blocked goal, always before any byte of the
+    goal can reach the bus, so a process killed mid-write still leaves it), a
     ``trial_started`` row (the record as it would stand if the process died there: a failure,
     fault kind ``session_lost``) goes to ``log_row``; a resume (scripts/wo07_real_eval.load_prior)
     turns one without its ``trial`` row into that failure, so a started slot is never re-rolled.

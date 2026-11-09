@@ -44,19 +44,21 @@ SIGNAL_KIND = {  # the signal -> the stop reason / fault kind the loop records
 }
 
 
-class _HardTimeout(Exception):
-    pass
+class _HardTimeout(BaseException):
+    """A BaseException: no session ``except Exception`` handler (``run_trial``'s client_error
+    path, a prompt's) can swallow it and carry on."""
 
 
 @pytest.fixture(autouse=True)
 def hard_timeout() -> Iterator[None]:
-    """Fail (never hang) past 60 s: SIGALRM, which no session code touches."""
+    """Fail (never hang) past 60 s: SIGALRM, which no session code touches, re-armed every 5 s
+    after that so a swallowed alarm fires again."""
 
     def fire(_signum: int, _frame: Any) -> None:
         raise _HardTimeout("test exceeded its 60 s hard timeout")
 
     prev = signal.signal(signal.SIGALRM, fire)
-    signal.setitimer(signal.ITIMER_REAL, 60.0)
+    signal.setitimer(signal.ITIMER_REAL, 60.0, 5.0)
     try:
         yield
     finally:
@@ -394,15 +396,74 @@ def test_healthy_trial_writes_every_goal_after_a_passing_pre_write_check(
     assert res["shutdown"] == "supported"
 
 
-def test_policy_started_is_stamped_at_the_first_goal_write() -> None:
-    """``policy_started_t``: the loop's clock right after the step that sent the first policy
-    goal, i.e. the first write time (``t_first_write`` on the shared fake clock)."""
-    from test_deploy import INSTRUCTION
+@pytest.mark.parametrize("first_write", ["ok", "serial_fault"])
+def test_start_marker_is_durable_and_stamped_when_the_first_policy_write_begins(
+    first_write: str,
+) -> None:
+    """The durable ``trial_started`` row is already logged when the first policy goal's bus
+    write begins (a process killed mid-write still leaves it, so resume never re-rolls a slot
+    whose goal may have moved the arm), and ``policy_started_t`` is that write's begin time: after
+    the step's joint read (the clock advances inside reads and writes here), not when the step
+    was entered and not after the write returned or a fault mid-write was handled."""
+    from test_deploy import _trials
 
+    rows: list[dict[str, Any]] = []
+    results: list[Any] = []
+    t_step: list[float] = []  # clock at the first policy step's entry
+    at_send: list[tuple[float, int]] = []  # (clock, trial_started rows) at that write's begin
     with rig() as r:
-        res = r.loop.run_trial(INSTRUCTION, max_steps=16)
-        assert res.policy_started and res.policy_started_utc and res.steps == 16
-        assert res.policy_started_t == res.t_first_write
+        policy_phase = [False]
+        real_act, get_obs, send, step = (
+            r.client.act,
+            r.fol.get_observation,
+            r.fol.send_action,
+            r.arm.step,
+        )
+
+        def act(*a: Any, **k: Any) -> Any:
+            policy_phase[0] = True
+            return real_act(*a, **k)
+
+        def get_observation() -> dict[str, Any]:
+            r.clock.advance(0.002)  # a joint read takes time
+            return get_obs()
+
+        def send_action(action: dict[str, Any]) -> dict[str, Any]:
+            if policy_phase[0] and not at_send:
+                at_send.append((r.clock(), sum(row["kind"] == "trial_started" for row in rows)))
+                r.fol.fail_write = first_write == "serial_fault"
+            r.clock.advance(0.003)  # a write takes time
+            return send(action)
+
+        def step_wrapped(*a: Any, **k: Any) -> Any:
+            if policy_phase[0] and not t_step:
+                t_step.append(r.clock())
+            return step(*a, **k)
+
+        real_run = r.loop.run_trial
+
+        def run_trial(*a: Any, **k: Any) -> Any:
+            results.append(real_run(*a, **k))
+            return results[-1]
+
+        r.client.act = act  # type: ignore[method-assign]
+        r.fol.get_observation = get_observation  # type: ignore[method-assign]
+        r.fol.send_action = send_action  # type: ignore[method-assign]
+        r.arm.step = step_wrapped  # type: ignore[method-assign]
+        r.loop.run_trial = run_trial  # type: ignore[method-assign]
+        trials, _end = _trials(r, ScriptedOperator(), log_row=lambda **row: rows.append(row))
+    ((t_send, started_rows),) = at_send
+    assert started_rows == 1  # durable before any byte of the first goal could go out
+    (res,) = results
+    assert res.policy_started_t == t_send > t_step[0]  # the write's begin, after the joint read
+    assert res.policy_started_utc
+    (t,) = trials
+    if first_write == "ok":
+        assert res.t_first_write > res.policy_started_t and t["outcome"] == "success"
+    else:
+        assert t["outcome"] == "failure" and t["fault"]["kind"] == "serial"
+    kinds = [row["kind"] for row in rows if row["kind"] in ("trial_started", "trial")]
+    assert kinds == ["trial_started", "trial"]
 
 
 def test_mutation_without_the_pre_write_check_a_goal_follows_the_stop(
@@ -442,8 +503,13 @@ def test_real_eval_blocked_first_goal_leaves_no_start_and_resume_retries_the_slo
         rec = ev.main(argv)
     (probe,) = probes
     assert probe.fired and probe.goals_after_signal() == 0
+    assert ("write", "hold") in probe.after_signal()  # the hold still runs after the block
     r1 = json.loads(rec.read_text())["results"]
     assert r1["session_end"].startswith("hangup: SIGTERM")
+    # shutdown: held, the (scripted) operator supported the arm, torque off and confirmed
+    assert (r1["shutdown"], r1["support_confirmed"]) == ("supported", True)
+    assert r1["shutdown_detail"]["ack"]["given"] and r1["torque_off_unconfirmed"] is None
+    assert not probe.loop.arm.follower.bus.torque_enabled  # type: ignore[attr-defined]
     (t0,) = r1["trials"]
     assert (t0["trial_idx"], t0["outcome"], t0["policy_started"]) == (0, "not_started", False)
     assert t0["stop_reason"] == "hangup" and "SIGTERM" in t0["stop_detail"]

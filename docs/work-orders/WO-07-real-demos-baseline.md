@@ -106,8 +106,8 @@ selected checkpoints.
   primary real metric is successes / trials whose policy started (the bus write of the first
   policy goal was begun; a first goal blocked before its write, e.g. by the pre-write stop check
   after a Ctrl-C or a closed Terminal, never started and is retried). A servo, serial or safety
-  fault after the start (also with torque off unconfirmed) is a failure, recorded separately (`fault`); the operator judges only clean
-  trials; an unjudged score prompt (Ctrl-C, EOF, timeout) is a failure. Attempts that never
+  fault after the start (also with torque off unconfirmed) is a failure, recorded separately
+  (`fault`); the operator judges only clean trials; an unjudged score prompt (Ctrl-C, EOF, timeout) is a failure. Attempts that never
   started the policy are retried with the same placement, never scored. The success rate
   excluding faulted trials is reported only as a labelled secondary diagnostic.
 - Prompts with torque on are bounded (`deploy.prompt_torque_timeout_s`, 60 s, then support,

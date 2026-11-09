@@ -38,11 +38,20 @@ A score prompt that ends without a judgement (Ctrl-C, closed stdin, no answer in
 (doubt = n applied to a missing judgement; owner check). An attempt whose policy never started
 (the move home failed / faulted / was Ctrl-C'd, a server failure or a stale first chunk before the
 first action, the first goal stopped before its write, a quit) is ``not_started``: kept in the
-attempts log, never scored, and retried with the same placement on a resume. Primary metric: successes / started trials, per cell, with the
-Wilson interval; ``diagnostic_excluding_faulted`` (success rate over started trials without a
-fault) and ``faults_by_kind`` are a clearly labelled SECONDARY diagnostic. The rule's version and
-text hash are in the session fingerprint, so a session scored under real-judge-1 can be neither
-resumed nor pooled with real-judge-2 records.
+attempts log, never scored, and retried with the same placement on a resume. Primary metric:
+successes / started trials, per cell, with the Wilson interval; ``diagnostic_excluding_faulted``
+(success rate over started trials without a fault) and ``faults_by_kind`` are a clearly labelled
+SECONDARY diagnostic. The rule's version and text hash are in the session fingerprint, so a
+session scored under real-judge-1 can be neither resumed nor pooled with real-judge-2 records.
+
+Start-rule wording change inside real-judge-2 (2026-11-09, PR fix/deploy-prewrite-stop; before
+the real-eval protocol is frozen, no real session recorded): "started" moved from "the first
+action reached the safety filter" to "the bus write of the first action was begun". Deliberate
+reclassification: a first step that ends before its write (the pre-write stop check, a deadman
+trip at its frame check or in the filter, a joint-read serial fault) is now ``not_started`` and
+retried instead of a started failure. The text hash changed with it; the first FROZEN real-eval
+protocol (PR #32, ``src/eval/protocol_real.py``) must carry this wording, and real-judge-2 is
+cited only from that frozen version.
 
 Paired placements (owner 2026-11-08): the SFT and the SFT+RL sessions use the SAME slot sequence.
 ``--hardware`` refuses a ``--slot-seed`` other than ``eval.slot_seed``, and the plan is

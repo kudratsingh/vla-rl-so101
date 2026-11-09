@@ -1061,21 +1061,32 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
   The hold at the measured pose and the torque off are not guarded (safe-state actions).
 - "Goal sent" is now explicit: `So101Driver.goal_write_attempted` is set once `step` begins its
   goal write (a write that raises from inside counts: doubt = sent). `policy_started_t` and the
-  durable `trial_started` row are set only after the step that sent the first policy goal.
-  Before, they were set before `step` and in a `finally`, so a blocked first goal would have
-  counted as started. A first step stopped before its write (pre-write check, deadman, joint
-  read fault) is `not_started` and the slot is retried on a resume.
+  durable `trial_started` row are now written inside the first policy goal's `stop_fn`, after
+  the pre-write check passed and right before the write begins (nothing runs in between): the
+  stamp is the first write's begin time, a blocked goal never gets a marker, and a process
+  killed mid-write (SIGKILL, power loss) still leaves its `trial_started` row, so resume never
+  re-rolls a slot whose goal may have moved the arm. Before, the stamp was taken before `step`
+  and the marker written in a `finally` after it, so a blocked first goal would have counted
+  as started. Cost: one log write before the first goal of each trial, inside that decision's
+  `frame_return_to_first_write_ms` and recorded as `policy_start_mark_ms`. A first step stopped
+  before its write (pre-write check, deadman, joint read fault) is `not_started` and the slot
+  is retried on a resume.
 - The real-eval judging text (`JUDGING_GENERAL`) now says "the bus write of its first action
   was begun" instead of "reached the safety filter"; version stays `real-judge-2` (no real
-  session exists), the rule text hash changes. PR #32 moves this text to
-  `src/eval/protocol_real.py`: whichever of the two PRs lands second ports the new wording,
-  syncs with `main` and reruns `tests/test_deploy_prewrite_stop.py` plus the resume tests in
-  `tests/test_real_eval.py` and `tests/test_deploy.py` on the combined code before the real-eval
-  protocol is frozen.
+  session exists, the real-eval protocol is not frozen yet), the rule text hash changes. This
+  is a deliberate reclassification: a first step ending before its write (pre-write stop,
+  deadman trip, joint-read fault) is now `not_started` and retried, no longer a started
+  failure. PR #32 freezes this text in `src/eval/protocol_real.py`; that frozen version must
+  carry the new wording and is the only one `real-judge-2` is cited from. Whichever of the two
+  PRs lands second ports the wording, syncs with `main` and reruns
+  `tests/test_deploy_prewrite_stop.py` plus the resume tests in `tests/test_real_eval.py` and
+  `tests/test_deploy.py` on the combined code before the real-eval protocol is frozen.
 - Tests: `tests/test_deploy_prewrite_stop.py` (real signals through `operator_signals` /
   `job_control`, inside the camera read, the policy query and the servo read; pilot and real
-  eval end to end, including `--resume`). Mutations checked: removing the pre-write `stop_fn`
-  fails 19 tests; restoring the old start-marker ordering fails 10.
+  eval end to end, including `--resume`; the start marker is on disk when the first write
+  begins, also when that write fails part-way). Mutations checked: making the pre-write check
+  always pass fails 19 tests; restoring the old start-marker ordering fails 12; writing the
+  marker after `step` (the first version of this PR) fails 2.
 - Unverified on hardware.
 
 ## Blockers and decisions pending the owner
