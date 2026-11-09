@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 
 from src.config import load_config
+from src.robot.camera import CameraFault, Frame
 from src.robot.units import JOINT_NAMES
 
 
@@ -115,3 +119,63 @@ class FakeFollower:
         if self.track:
             self.pos.update(action)
         return dict(action)
+
+
+class FakeClock:
+    """Shared fake ``perf_counter``: ``sleep`` advances it instantly. Share ONE instance between
+    the driver, the deadman, the camera, the server and the loop, or stamps look stale / future."""
+
+    def __init__(self, t0: float = 100.0):
+        self.t = float(t0)
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            return self.t
+
+    def advance(self, dt: float) -> None:
+        with self._lock:
+            self.t += max(0.0, float(dt))
+
+    def sleep(self, dt: float) -> None:
+        self.advance(dt)
+
+
+class FakeCam:
+    """640x480 RGB frames stamped with ``clock``. Failure switches:
+
+    ``fail`` / ``fail_after`` / ``fail_reads`` (all reads / reads > n / these read numbers):
+    raise CameraFault (a lost frame);
+    ``stall_after`` (reads): keep returning the last frame, old stamp and all (a frozen stream);
+    ``interrupt_after`` (reads): raise KeyboardInterrupt (the operator's Ctrl-C).
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.perf_counter):
+        self.clock = clock
+        h, w = 480, 640
+        yy, xx = np.mgrid[0:h, 0:w]
+        self.image = np.stack([xx % 256, yy % 256, (xx + yy) % 256], axis=-1).astype(np.uint8)
+        self.reads = 0
+        self.fail = False
+        self.fail_after: int | None = None
+        self.fail_reads: set[int] = set()
+        self.stall_after: int | None = None
+        self.interrupt_after: int | None = None
+        self.last: Frame | None = None
+        self.last_fresh_time: float | None = None
+
+    def read(self) -> Frame:
+        self.reads += 1
+        if self.interrupt_after is not None and self.reads > self.interrupt_after:
+            raise KeyboardInterrupt
+        if (
+            self.fail
+            or self.reads in self.fail_reads
+            or (self.fail_after is not None and self.reads > self.fail_after)
+        ):
+            raise CameraFault("timed out waiting for a frame")
+        if self.stall_after is not None and self.reads > self.stall_after and self.last:
+            return self.last
+        self.last = Frame(self.image, self.clock())
+        self.last_fresh_time = self.last.capture_time
+        return self.last
