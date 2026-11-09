@@ -1,6 +1,38 @@
 # Status
 
-Updated: 2026-11-08
+Updated: 2026-11-09
+
+## Pivot to SmolVLA (owner decision 2026-11-09, ADR-0003)
+
+The OpenVLA-OFT / SimpleVLA-RL reproduction is stopped. The project is now SmolVLA on the real
+SO-101 with ACT as the baseline: leader-arm teleop demos, two cameras (wrist + front), fine-tune
+on a 24 GB card, inference on the Mac (MPS). Few-shot stays a sim experiment; the real arm is
+data-first (CLAUDE.md rule 3). Spec: `docs/reviews/2026-11-09-smolvla-pivot-handoff.md`, refined
+by the owner's decisions D1-D6 in `docs/reviews/2026-11-09-pivot-decisions.md`.
+
+- **Current WO: 06 (bring-up)**, new table in CLAUDE.md: 06 bring-up, 07 real demos + SmolVLA/ACT
+  baseline, 08 filtered behaviour cloning in sim, 09 writeup. WO-01–05 are closed (WO-04's
+  benchmark unmet; its numbers stay in `docs/results.md` as a partial result, track stopped
+  2026-11-09).
+- **Real data plan (D1-D5):** 50 PickPlace demos = 10 at each of five seen slots from the 16-slot
+  inner block (one near each corner, one central), bowl at one fixed position, both cameras.
+  Eval: 50 binary trials per cell (seen 10 x 5 slots; shifted balanced over the 20 ring slots;
+  unseen 25 purple cube + 25 green cube at the seen slots, per object and pooled). Slot ids, bowl
+  position and seeded schedule frozen and hashed in a new real protocol version before the first
+  demo; same schedule for both policies. 100 demos only if a development-trial failure analysis
+  shows more data addresses the failures.
+- **Kept:** protocol 0.2, the recorder fixes, the GPU demo-rebuild tooling, the pod backstop
+  (watchdog, launch gate, hard-cap timer, self-delete), `src/rl` (unused), the merged robot code.
+- **Deferred:** PR #25 (recovery SFT), PR #27 (Track C doc). Not touched.
+- **Cancelled spend:** the diagnostics pods (the $7.42 plan and its $8.42 revision, "Pre-run
+  hardening" below) were never approved and never launched: $0 spent on them. In the OFT-era
+  allocation table under "Spend", the higher-LR GRPO diagnostic ($60), confirmatory GRPO ($210),
+  WO-05 ablations ($400) and WO-08 real retraining ($140) lines are void; recovery SFT ($30) is
+  deferred with #25; the WO-07 line ($45) is re-priced for SmolVLA/ACT in PR 2. **Spend to date
+  is unchanged: about $156.10.**
+- **Next paid run:** the first SmolVLA fine-tune on the real demos, after a short probe and the
+  owner's explicit go. PR 2 (`feat/smolvla-real`) carries its cost line; nothing is launched
+  before then.
 
 ## Current work order
 
@@ -12,12 +44,13 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 01 | done, merged | #7 (merged) | See benchmarks. Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). |
 | 02 | closed by owner decision, **below the original target band**; PR open | `wo-02-sft` | OpenVLA-OFT LoRA SFT, 4 attempts, all below the 20-60% band on seen positions (ADR-0001). Owner (2026-10-27): keep OFT, amend rule 3, close with the full protocol table of attempt 4 `step_004000` (25 demos/task): seen PickPlace 17.0%, Push 10.0%, Stack 2.7% (`docs/results.md`). |
 | 03 | done, merged after owner review | #4 (merged) | **Out of order** (started before WO-01/02). CPU only, toy env. |
-| 06 | part 1 merged, kit arrived, physical bring-up pending | #5 (merged), #24 (`wo-06-bringup`, PR open, merged into #29) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
-| 04 | **benchmark not met; next step waits for the owner**, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
-| 07 | code only, **out of order** (started before WO-06 bring-up is verified): pilot client/server and real-eval harness on fakes, **unverified on hardware** | #23 (`wo-07-pilot`), #29 (`fix/robot-safety`), PRs open | Mock pilot, gRPC server, `scripts/wo07_real_eval.py` (protocol 0.2), placement grid. No real trials. |
-| 05, 08, 09 | not started | | |
-| pre-run hardening | PR open, **waits for owner review** (touches the RL loop) | `fix/pre-run-hardening` | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
-| robot safety (PR 2) | PR open against `wo-07-pilot`; merge after #23, #24 and #28 (it merges #24 and #28) | `fix/robot-safety` | Review 3.3 gaps 2, 3, 5 and 7, plus the owner's 2026-11-08 review changes (homing offsets, torque off unconfirmed, real-eval session fingerprint, parking off by default), $0, **unverified on hardware**. See "Robot safety hardening" below. |
+| 06 | **current WO** (bring-up, new table); part 1 merged, kit arrived, physical bring-up pending | #5, #24 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
+| 04 | **benchmark not met; track stopped 2026-11-09 (ADR-0003)**, partial result recorded, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
+| 07 | now "real demos + SmolVLA/ACT baseline"; code only, **out of order** (started before WO-06 bring-up is verified): pilot client/server and real-eval harness on fakes, **unverified on hardware** | #23, #29 (merged); SmolVLA/ACT code is PR 2 (`feat/smolvla-real`) | Mock pilot, gRPC server, `scripts/wo07_real_eval.py` (protocol 0.2), placement grid. No real trials. |
+| 05 | cancelled with the OFT track (ADR-0003) | | |
+| 08, 09 | not started (08 is now filtered behaviour cloning in sim; plan in `docs/work-orders/WO-08-filtered-bc-sim.md`) | | |
+| pre-run hardening | merged | #28 (`fix/pre-run-hardening`) | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
+| robot safety (PR 2) | merged | #29 (`fix/robot-safety`) | Review 3.3 gaps 2, 3, 5 and 7, plus the owner's 2026-11-08 review changes (homing offsets, torque off unconfirmed, real-eval session fingerprint, parking off by default), $0, **unverified on hardware**. See "Robot safety hardening" below. |
 
 ## Benchmarks met
 
@@ -62,6 +95,9 @@ Recorded spend from the rows above is about **$156.10** ($13.56 for WO-02 and $1
 WO-04), including estimated charges. The revised **$1,100 cloud compute cap** leaves about
 **$944** based on that ledger. The first $700 of the cap covers the core plan, leaving about
 $544 for core work. The separate $400 reserve covers the original WO-05 ablations if approved.
+
+Superseded 2026-11-09 by the pivot (ADR-0003; see "Pivot to SmolVLA" at the top): the
+allocations below are the OFT-era plan, kept for the record.
 
 | Remaining work | Planning allowance | Release condition |
 |---|---:|---|
@@ -168,6 +204,9 @@ What changed:
   every current preset.
 - `make setup` = `uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla`
   (`docs/ENVIRONMENT.md`).
+
+**CANCELLED 2026-11-09 (ADR-0003): this diagnostics pass was never approved and will not run.
+The plan below is kept for the record.**
 
 Next paid run (proposed, not launched; each pod needs the owner's explicit go): the review's
 diagnostics.
@@ -1011,13 +1050,22 @@ grid's scale and alignment with the real base.
 
 ## Blockers and decisions pending the owner
 
-- WO-04: GRPO has not produced a clear gain (PickPlace seen +3.7 to +5.7 points across four
+- Resolved 2026-11-09 by the pivot (ADR-0003): the OFT track is stopped, so the WO-04 item below
+  is closed. Open for the owner: the seen slots, bowl position and schedule freeze (PR 2), the
+  servo P gain to use (LeRobot writes 16 at connect, firmware default 32; WO-06 checklist), and
+  amending vishwaroop's ET-M5-1 ("the GRPO-tuned policy") in that repo.
+- (closed) WO-04: GRPO has not produced a clear gain (PickPlace seen +3.7 to +5.7 points across four
   checkpoints, no peak). The 75-step PickPlace-only proposal at lr 5e-4 ($36–50 estimated on
   2026-10-31) remains on hold. The core plan prioritizes the hardware baseline and recovery SFT
   before approving a higher-LR diagnostic. WO-05 paid ablations remain deferred pending the
   sim results and a separate scope decision.
 
 ## Owner decisions in effect
+
+- 2026-11-09 Pivot to SmolVLA + ACT on the real SO-101 (ADR-0003); decisions D1-D6
+  (`docs/reviews/2026-11-09-pivot-decisions.md`): five seen slots x 10 demos, bowl fixed, cells of
+  50 binary trials, freeze before recording, development trials on a disjoint schedule, mock
+  export through vishwaroop's seal and import tools from a scratch copy before the demos.
 
 - 2026-10-26 WO-02 SFT is LoRA only, on the sim.yaml budget (2000 steps), RTX 4090 tier, pinned
   CUDA 12.4.1 image; WO-02 spend cap $15; target 20-60% on seen positions (not max success).

@@ -1,5 +1,8 @@
 # WO-03 — GRPO loop, verified dry (owner reviews this PR)
 
+> **Pivot 2026-11-09 (ADR-0003):** the OpenVLA-OFT / GRPO track is stopped. Benchmark met 2026-10-26; the GRPO loop in `src/rl` stays in the tree, unused. The content below is
+> kept as written for the record; the current work orders are WO-06 to WO-09.
+
 Branch: `wo-03-rl-loop`. Tier: CPU only.
 
 ## Deliverables

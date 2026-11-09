@@ -1,7 +1,8 @@
 # vla-rl-so101 — agent brief
 
-Single-GPU reinforcement-learning post-training of a pre-trained vision-language-action (VLA)
-model, trained in ManiSkill3 simulation and deployed to a real SO-101 arm. The owner is Kudrat
+SmolVLA (with ACT as the baseline) fine-tuned on leader-arm teleop demos for a real SO-101 arm,
+plus a filtered behaviour cloning experiment in ManiSkill3 simulation. The OpenVLA-OFT / GRPO track
+was stopped on 2026-11-09 (`docs/adr/0003-pivot-to-smolvla.md`). The owner is Kudrat
 Singh. You (the coding agent) write all the code. The owner launches every paid run.
 
 Read in this order before any work: this file → `docs/PLAN.md` → `docs/ENVIRONMENT.md` →
@@ -9,13 +10,16 @@ the current work order in `docs/work-orders/`.
 
 ## Goal in one sentence
 
-Reproduce the published few-shot VLA-RL result (≤10 demos + GRPO ≈ full-data SFT; e.g. LIBERO
-48.9% → 96.9% in SimpleVLA-RL) on ONE GPU, then show the same recipe improves real success on a
-$300 arm — with SFT-only vs SFT+RL tables on seen positions, shifted positions and unseen objects.
+Fine-tune SmolVLA and ACT on the same 50 real PickPlace demos (10 at each of five seen positions,
+wrist + front cameras) on one 24 GB GPU, run both on the Mac (MPS), and report 50 binary
+trials per cell (seen positions, shifted positions, unseen objects) for both policies under a
+frozen, hashed real protocol — then test in sim whether filtered behaviour cloning improves the
+SmolVLA checkpoint before trying it on the arm.
 
 ## Operating mode: fast
 
-- Build order is the work orders, WO-01 → WO-09. Do not gold-plate.
+- Build order is the work orders, WO-06 → WO-09 (WO-01–05 are closed: the OFT sim track, ADR-0003).
+  Do not gold-plate.
 - One work order = one branch = one PR. A WO whose inputs don't depend on an unfinished WO may run
   in parallel (owner, 2026-10-26: e.g. WO-03 on the toy env, WO-06 robot-side code). A WO is done
   only when its completion benchmark (below) is met and recorded in `docs/STATUS.md`.
@@ -41,16 +45,22 @@ $300 arm — with SFT-only vs SFT+RL tables on seen positions, shifted positions
    start/end, dollars).
 2. **Pin everything.** Versions in `docs/ENVIRONMENT.md` and `pyproject.toml` are frozen. Upgrading
    any pinned dependency is its own work order with a stated reason.
-3. **Few-shot regime.** SFT uses ≤25 demos per task (amended from ≤10 by the owner on 2026-10-27
-   after three ≤10-demo OpenVLA-OFT SFT attempts stayed below 20% — still few-shot; ADR-0001).
-   RL may start from a checkpoint with ≥10% success on seen positions on at least 2 of 3 tasks
-   (owner amendment 2026-10-27; the 20–60% band stays the target; SimpleVLA-RL (arXiv 2509.09674) failure-mode analysis: RL lifted a 100-trajectory SFT base from 7.3% to 25.4% (numbers as cited by the owner; they match a secondary summary of the paper, the primary table not re-checked)).
-   RL cannot rescue a 0%-success base; if SFT is at 0%, fix SFT, do not launch RL.
+3. **Few-shot is a sim experiment; the real arm is data-first** (owner, 2026-11-09, ADR-0003).
+   In sim, SFT uses ≤25 demos per task (amended from ≤10 on 2026-10-27, ADR-0001). On the real
+   arm, start with 50 PickPlace demos (10 at each of five frozen seen positions, both cameras);
+   go to 100 only if a failure analysis of development trials shows that more data addresses the
+   observed failures. A post-training step (WO-08 filtered behaviour cloning) may start from a
+   checkpoint with ≥10% success on seen positions on at least 2 of 3 tasks (owner amendment
+   2026-10-27, unchanged by the pivot; the 20–60% band stays the target). Post-training cannot
+   rescue a 0%-success base; if the base is at 0%, fix the base, do not launch it.
 4. **Eval protocol is fixed before training.** `src/eval/protocol.py` defines: tasks, 100 episodes
    per cell in sim, 50 trials per cell on the real arm, cells = {seen positions, shifted positions,
    unseen objects}, 3 seeds in sim. Every reported number cites its protocol hash. Never change
-   the protocol to make a number look better; add a new protocol version instead.
-5. **Reward is the environment's success check only.** No shaped rewards, no learned reward
+   the protocol to make a number look better; add a new protocol version instead. The real arm
+   has its own protocol version: the five seen slot ids, the fixed bowl position and the seeded
+   trial schedule are frozen and hashed before the first demo; both policies run the same
+   schedule; binary success is the headline (ADR-0003).
+5. **Reward (and the WO-08 filter) is the environment's success check only.** No shaped rewards, no learned reward
    models in this project. If a success check can be gamed (gripper closed without the object,
    object knocked into the goal), fix the check, not the policy.
 6. **Decode video with torchcodec, never PyAV.** PyAV fallback drops GPU utilization to 3–30%.
@@ -62,25 +72,28 @@ $300 arm — with SFT-only vs SFT+RL tables on seen positions, shifted positions
    Deadman: the deploy loop stops on any lost camera frame or serial error.
 9. **Honest reporting.** Single-run numbers are labelled single-run. Sim numbers are never
    presented as real numbers. Negative results go in `docs/results.md` too.
-10. **Mac is for control, cloud is for training.** The owner's machines are Apple Silicon Macs
-    (zsh, Homebrew Python). Training, ManiSkill3 rendering and VLA inference run on a rented
-    NVIDIA GPU. Commands for the owner are written for macOS; commands for the GPU box for Linux.
+10. **Mac is for control and real-arm inference, cloud is for training.** The owner's machines are
+    Apple Silicon Macs (zsh, Homebrew Python). Training and GPU-sim ManiSkill3 rendering run on a
+    rented NVIDIA GPU; SmolVLA and ACT inference for the real arm runs on the Mac over MPS
+    (ADR-0003). Commands for the owner are written for macOS; commands for the GPU box for Linux.
 
 ## Build order and completion benchmarks
 
+WO-01–05 (sim env, OpenVLA-OFT SFT, GRPO loop, GRPO in sim, ablations) are closed by the pivot
+(ADR-0003): WO-01 and WO-03 met, WO-02 closed below its band, WO-04's benchmark unmet (recorded as a
+partial result in `docs/results.md`), WO-05 not started. Their files stay in `docs/work-orders/`.
+
 | WO | Name | Done when |
 |---|---|---|
-| 01 | Sim env + oracle + demos | One command builds the ManiSkill3 SO-101 scene with 3 tasks; scripted oracle ≥95% on each; 10 demos/task saved as LeRobotDataset; CPU smoke passes |
-| 02 | SFT + eval harness | OpenVLA-OFT (or π0.5 LoRA) few-shot SFT reaches 20–60% on seen positions; eval harness emits the full table (3 cells × 3 seeds) from one command |
-| 03 | RL loop, dry | GRPO loop runs end to end on CPU `tiny` preset; rollout → reward → advantage → update verified on a synthetic env where the optimal policy is known |
-| 04 | RL, real sim | SFT+RL beats SFT by ≥20 points on seen positions on at least 2 of 3 tasks, 3 seeds; shifted-position gain reported; $/run logged |
-| 05 | Ablations + writeup v1 | Demo-count (1/5/10) and samples-per-prompt ablations; unseen-object eval; public README + blog draft "single-GPU VLA RL" |
-| 06 | Hardware bring-up | Arm calibrated; teleop works; real camera frames match sim camera (same intrinsics, pose, crop); randomization retrain if needed |
-| 07 | Deploy + real eval | Policy served over gRPC; 50 real trials per cell, SFT vs SFT+RL; 10-trial unscripted video |
-| 08 | Close the gap | Diagnose WO-07 failures (latency, lighting, actuator); retrain; real success improves on ≥2/3 tasks |
-| 09 | Final writeup | README comparison table, model card, reproduce commands, ADR index, results.md with every number and its protocol hash |
+| 06 | Bring-up | Checklist steps 0–10 complete under supervision: calibration verified, per-session drift check, teleop with the leader arm, both cameras matched and exposure/white balance locked, MPS inference latency measured on the mock rig |
+| 07 | Real demos + SmolVLA/ACT baseline | 50 PickPlace demos (10 per seen position, both cameras); SmolVLA and ACT fine-tuned on the same demos; 50 binary trials per cell (seen, shifted, unseen) for each; immutable export |
+| 08 | Filtered BC in sim | SmolVLA fine-tuned on the 25 sim demos per task; reward-filtered BC against the sim success check; both arms from the same checkpoint, matched budget, held-out seeds; sim gain measured; transfer tested on the arm only after the sim gain is in |
+| 09 | Writeup | README table, model cards, reproduce commands, ADR index, results.md with every number and protocol hash |
 
-A sim-only milestone (WO-01–05) is shippable on its own if hardware is late.
+Push and Stack wait until the PickPlace baseline is in. The LeRobot guide reports 25 demos were
+"not enough" and 50 worked; start at 50. Going to 100 is conditional on a failure analysis from
+development trials showing that more data addresses the observed failures (the Cowling 2026 SmolVLA
+result fell at 100). Reserve the 50-per-cell evaluation for selected checkpoints.
 
 ## Repository layout
 
@@ -95,8 +108,8 @@ docs/work-orders/         WO-01 … WO-09
 configs/                  tiny.yaml (CPU), sim.yaml, rl.yaml, real.yaml
 src/env/                  ManiSkill3 scene, tasks, success checks, randomization
 src/data/                 oracle, demo recording, LeRobotDataset I/O
-src/policy/               VLA wrappers (SmolVLA, OpenVLA-OFT, π0.5), LoRA, action heads
-src/rl/                   GRPO loop, rollout workers, advantage, update
+src/policy/               VLA wrappers (SmolVLA, OpenVLA-OFT), LoRA, action heads
+src/rl/                   GRPO loop (OFT track; kept, unused since ADR-0003), rollout workers
 src/eval/                 protocol.py, sim eval, real eval, report
 src/robot/                SO-101 driver glue, calibration, safety, gRPC serving
 scripts/                  one entry point per WO step
