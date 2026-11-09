@@ -23,15 +23,19 @@ from src.robot import convention as conv
 from src.robot.client import ScriptedOperator
 
 # Pinned: frozen before the first demo (owner D4). A change fails here on purpose: add a new real
-# protocol version instead (CLAUDE.md rule 4). PENDING (PR.FREEZE_STATUS): the current computed
-# value after real-judge-3 (2026-11-09); the bowl fit check, the rubric bump and the PDF follow.
-FROZEN = {"real-0.1": "dca199e6da6275bddc047812e1ea83379a70f21778f564315c5483811c0954f2"}
-# the hash prefix the committed placement-grid PDF prints: real-0.1 before real-judge-3. The PDF
-# is regenerated with the freeze, not before (owner 2026-11-09)
-PDF_HASH12_PENDING = "edee44aa957d"
+# protocol version instead (CLAUDE.md rule 4). FROZEN (PR.FREEZE_STATUS) at bowl B' (0.205, 0.185),
+# rubric version 2 (real-judge-3), 2026-11-09. The schedules moved with the bowl (every item
+# carries planned_bowl_xy_m); slots, yaws, seeds, order and objects did not.
+FROZEN = {"real-0.1": "1d80cea914571f181f6a43b6a7945261fe14c946afcf1cce1cfde1847199d3a7"}
 SCHEDULES = {
-    "eval": "dd1345de09b4595048d6f23f2e38057a65d6e06d39f79d7a554e189fc48d0e71",
-    "dev": "21fe5598a9784ae119960b444a715a3bf36b9510491749c41e965889fe26af59",
+    "eval": "96e38cf931e5559d49def379105a897cbdcc5d7391be5ae5145fdfa4699f3874",
+    "dev": "37a2ce5433a5ed24261dc777b4ac803902b7fa5af88dab072f59fc9dd0eb9b8f",
+}
+# the bowl-free schedule digests (every item without planned_bowl_xy_m): identical before and after
+# the bowl move (computed on 5b9d5d6 and on the freeze)
+SCHEDULES_WITHOUT_BOWL = {
+    "eval": "776801c2a37eefdbc2bb79f8cff9d6475258b9734fdd7dec37b960f42ef3bd52",
+    "dev": "533a963678d9818fdadb89295c45482d47ef90259d14cd39cfbc711f152bcd97",
 }
 
 
@@ -52,7 +56,15 @@ def test_real_protocol_is_frozen_and_sim_protocols_untouched() -> None:
     assert P1.protocol_hash().startswith("e9ce5bb47a88")  # 0.1-draft, cited by every sim number
     comp = PR.hash_components()
     assert comp["convention"] == conv.citation()  # the observation/action convention is pinned
-    assert comp["bowl"]["planned_xy_m"] == [0.195, 0.205]
+    assert comp["bowl"]["planned_xy_m"] == [0.205, 0.185]
+    assert comp["bowl"]["real_only_exception"] == PR.BOWL_EXCEPTION
+    without_bowl = {
+        k: PR._digest(
+            [{f: v for f, v in t.items() if f != "planned_bowl_xy_m"} for t in PR.schedule(k)]
+        )
+        for k in SCHEDULES
+    }
+    assert without_bowl == SCHEDULES_WITHOUT_BOWL  # only the bowl moved in the schedules
 
 
 def test_seen_slots_are_the_inner_corners_and_the_derived_central_slot() -> None:
@@ -66,17 +78,30 @@ def test_seen_slots_are_the_inner_corners_and_the_derived_central_slot() -> None
     assert set(PR.ring_order()) == {s.id for s in G.cell_slots("shifted")}
 
 
-def test_bowl_is_derived_and_valid_for_every_slot() -> None:
+def test_bowl_is_b_prime_with_the_real_only_separation_exception() -> None:
+    """The sim rule still derives (0.195, 0.205) (the safety box rejects it); the frozen bowl is
+    B' (0.205, 0.185): keep-out and reach hold, the sim's 11 cm MIN_SEP does not (9.83 cm to C1
+    and D1), a REAL-ONLY exception (``BOWL_EXCEPTION``); src/env/tasks.py is unchanged."""
     from src.env import tasks as T
 
-    assert PR.derive_bowl() == PR.BOWL_XY_M
+    assert PR.derive_bowl() == PR.BOWL_SIM_RULE_XY_M == (0.195, 0.205)
+    assert PR.BOWL_XY_M == (0.205, 0.185) != PR.BOWL_SIM_RULE_XY_M
+    assert T.MIN_SEP["PickPlace"] == 0.11
+    ex = PR.BOWL_EXCEPTION
     b = np.array(PR.BOWL_XY_M)
-    for s in G.all_slots():  # all 36: also valid if a seen slot were re-chosen
-        assert float(np.linalg.norm(b - [s.x, s.y])) >= T.MIN_SEP["PickPlace"] + PR.BOWL_MARGIN_M
+    d = {s.id: float(np.linalg.norm(b - [s.x, s.y])) for s in G.all_slots()}  # all 36
+    assert min(d.values()) >= ex["real_min_sep_m"]
+    assert min(d.values()) < T.MIN_SEP["PickPlace"]  # the exception is real: the sim rule fails
+    assert (
+        sorted(s for s, v in d.items() if v == pytest.approx(min(d.values())))
+        == ex["nearest_slots"]
+    )
+    assert min(d.values()) == pytest.approx(ex["nearest_slot_distance_m"], abs=1e-4)
     r = float(np.linalg.norm(b))
-    assert T.BASE_KEEPOUT + 0.065 <= r <= T.PUSH_REACH - PR.BOWL_MARGIN_M
+    assert T.BASE_KEEPOUT + 0.065 + PR.BOWL_MARGIN_M <= r <= T.PUSH_REACH - PR.BOWL_MARGIN_M
     rep = PR.bowl_report()
-    assert rep["valid"] and rep["min_slot_distance_m"] == pytest.approx(0.1175, abs=1e-4)
+    assert rep["valid"] and not rep["sim_rule_valid"]
+    assert rep["min_slot_distance_m"] == pytest.approx(0.0983, abs=1e-4)
 
 
 def test_eval_schedule_cells_balance_and_order() -> None:
@@ -131,6 +156,8 @@ def test_rubric_is_binary_with_partial_credit_secondary() -> None:
     assert r["scoring"] == "binary" and r["protocol_hash"] == PR.protocol_hash()
     assert r["judging_rule"] == ev.JUDGING_RULE_VERSION == "real-judge-3"
     assert "bus write of its first action" in r["when"] and "safety filter" not in r["when"]
+    assert r["version"] == PR.RUBRIC_VERSION == "2" and PR.TASK_VERSION.endswith("-2")
+    assert "real-judge-3" in r["rules"]["R0_start"] and "bus write" in r["rules"]["R0_start"]
     assert "never the headline" in r["secondary"]["partial_credit"]
     assert ev.JUDGING_RULE is PR.JUDGING_RULE  # one text, one hash
     rows = PR.cell_tables(
@@ -150,35 +177,36 @@ def test_rubric_is_binary_with_partial_credit_secondary() -> None:
 
 def test_placement_sheet_marks_the_seen_slots_and_the_bowl() -> None:
     grid_pdf = _load("make_placement_grid")
-    pending = PR.FREEZE_STATUS != PR.FROZEN  # stale by the hash prefix only (test below)
-    assert grid_pdf.main(["--preset", "real", "--check"]) == (1 if pending else 0)
+    assert grid_pdf.main(["--preset", "real", "--check"]) == 0  # the committed PDF is current
     ops = grid_pdf.draw()
     assert ops.count("(SEEN)") == 5 and ops.count("(not used)") == 11
-    assert "BOWL LINE" in ops and "centre x = 0.195 m, y = +0.205 m" in ops
+    assert "BOWL LINE \\(B'\\)" in ops and "BOWL B', FIXED" in ops
+    assert "centre x = 0.205 m, y = +0.185 m" in ops and "80.0 mm left" in ops
+    assert "Real-only exception: 9.83 cm from C1 / D1" in ops
     assert PR.protocol_hash()[:12] in ops
 
 
-def test_the_freeze_is_pending_and_every_real_session_and_demo_refuses() -> None:
-    """Owner 2026-11-09: the bowl fit check of B' is pending. The protocol says so
-    (``FREEZE_STATUS``), the bowl and the rubric version are unchanged, the hardware session and
-    the demo schedule refuse on the freeze status (and on the bowl box), and the committed
-    placement-grid PDF differs from what the script draws ONLY in the printed hash prefix (it is
-    regenerated with the freeze)."""
-    assert PR.FREEZE_STATUS == "pending: bowl fit check" and PR.FREEZE_STATUS != PR.FROZEN
-    assert PR.BOWL_XY_M == (0.195, 0.205) and PR.RUBRIC_VERSION == "1"
-    problem = PR.freeze_problem()
-    assert problem is not None and "pending: bowl fit check" in problem
+def test_the_freeze_is_set_and_only_the_frozen_bowl_passes_the_preflights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner 2026-11-09: frozen at B' with rubric 2. The freeze status and the approved-bowl
+    guard no longer refuse the full schedule; a pending status, or any other bowl, still does."""
     from src.config import load_config
+    from src.eval import bowl_fit as BF
 
+    assert PR.FREEZE_STATUS == PR.FROZEN and PR.freeze_problem() is None
+    assert PR.BOWL_XY_M == BF.APPROVED_BOWL_XY_M == (0.205, 0.185) and PR.RUBRIC_VERSION == "2"
     cfg = load_config("real")
     s = {"schedule": "eval", "trials_per_cell": 50, "cells": list(PR.CELLS), "capture": True}
-    assert problem in ev.real_hardware_problems(cfg, s)
-    grid_pdf = _load("make_placement_grid")
-    assert grid_pdf.main(["--preset", "real", "--check"]) == 1  # stale by the hash, on purpose
-    committed = (REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf").read_bytes()
-    ops = grid_pdf.draw()
-    assert PR.protocol_hash()[:12] in ops and PDF_HASH12_PENDING not in ops
-    assert grid_pdf.pdf_bytes(ops.replace(PR.protocol_hash()[:12], PDF_HASH12_PENDING)) == committed
+    out = "\n".join(ev.real_hardware_problems(cfg, s))
+    assert "not frozen" not in out and "approved real-0.1 bowl" not in out
+    assert "outside the safety" not in out
+    monkeypatch.setattr(PR, "FREEZE_STATUS", "pending: bowl fit check")
+    problem = PR.freeze_problem()
+    assert problem is not None and problem in ev.real_hardware_problems(cfg, s)
+    monkeypatch.setattr(PR, "FREEZE_STATUS", PR.FROZEN)
+    monkeypatch.setattr(PR, "BOWL_XY_M", (0.205, 0.180))  # D: inside the box, never approved
+    assert any("approved real-0.1 bowl" in p for p in ev.real_hardware_problems(cfg, s))
 
 
 # ------------------------------------------------------------------------------------------------
@@ -350,4 +378,4 @@ def test_planned_pose_math_matches_the_grid() -> None:
     for t in PR.eval_schedule()[:20]:
         s = {x.id: x for x in G.all_slots()}[t["object_slot"]]
         assert t["planned_object_xy_m"] == [s.x, s.y]
-        assert math.dist(t["planned_object_xy_m"], t["planned_bowl_xy_m"]) >= 0.11
+        assert math.dist(t["planned_object_xy_m"], t["planned_bowl_xy_m"]) >= 0.098  # B' exception

@@ -25,18 +25,18 @@ Needs: a leader arm in ``teleop.leader`` (otherwise exits with a message), both 
 WO-07 demos (``--demo-schedule``; owner 2026-11-09, final2 item 6 / amendments D1, D2, D4): the 50
 PickPlace demos of protocol real-0.1 (``src/eval/protocol_real.py`` ``demo_schedule()``): 10 at each
 of the five frozen seen slots B2 B5 E2 E5 C4, the red cube, the bowl FIXED on its mark at
-(x 0.195, y +0.205) m for every demo (``docs/assets/placement-grid-a3.pdf`` marks the slots and the
+B' (x 0.205, y +0.185) m for every demo (``docs/assets/placement-grid-a3.pdf`` marks the slots and the
 bowl). Never the other 11 inner slots, the 20-slot ring or the unseen objects (purple / green cube),
 and none of them in a camera-match frame either. Each episode's prompt names its slot and yaw (a
 PLANNED pose); a redo keeps the same placement; ``meta/vla_rl_so101.json`` maps every saved episode
 to its placement and cites the protocol hash, the session id, the time, the follower id and the
 calibration copied to ``meta/calibration_follower.json`` (what ``scripts/wo07_export_bundle.py
 demo`` needs; it refuses a dataset recorded without ``--demo-schedule``).
-The bowl is PENDING (owner 2026-11-09): the frozen bowl lies outside the safety filter's TCP
-workspace box once the placement tolerance and the oracle's TCP offset are counted, so every carry
-would be rejected; ``--demo-schedule`` refuses before anything opens while that holds
-(``src/eval/bowl_fit.py`` ``bowl_box_problem``, ``scripts/wo07_bowl_check.py``), and while the
-protocol is not frozen (``src/eval/protocol_real.py`` ``FREEZE_STATUS``, ``freeze_problem``).
+``--demo-schedule`` refuses before anything opens at any bowl but the one the owner approved for
+the freeze (B'), or one outside the safety filter's TCP workspace box once the placement tolerance
+and the oracle's TCP offset are counted (``src/eval/bowl_fit.py`` ``bowl_box_problem``,
+``scripts/wo07_bowl_check.py``), and while the protocol is not frozen
+(``src/eval/protocol_real.py`` ``FREEZE_STATUS``, ``freeze_problem``).
 
 Durable and resumable (review F1 / F5). Every kept episode is saved, its placement written to
 ``meta/vla_rl_so101.json``, then the dataset is finalized and reopened (``src/robot/recording.py``

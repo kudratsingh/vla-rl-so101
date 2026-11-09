@@ -1891,6 +1891,58 @@ max 5 steps, gRPC mock policy, fake checkpoint, Mac M3 Pro local SSD; single run
   `mypy --strict src`: clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/success.py`,
   `protocol_real.py` and the pins unchanged in this round.
 
+### PR 2: placement freeze at bowl B' (prepared; waits for the owner's fit check, 2026-11-09, $0)
+
+Owner 2026-11-09: B' (0.205, 0.185) m picked for an unpowered fit check; if it passes, keep C4
+and document the 9.83 cm separation as a real-only exception. Fit check: owner unpowered fit
+check at the bowl and C1, D1, B2, E2: PASSED <date>.
+
+- `src/eval/protocol_real.py`: `BOWL_XY_M` (0.195, 0.205) -> (0.205, 0.185); `FREEZE_STATUS` =
+  `FROZEN`; `RUBRIC_VERSION` "1" -> "2" (`TASK_VERSION` `so101-real-pickplace-rubric-2`), with
+  the real-judge-3 start rule as rubric rule `R0_start`. `derive_bowl()` still derives the sim
+  rule's position, now named `BOWL_SIM_RULE_XY_M` (the safety box rejects it). `BOWL_RULE`
+  states why B' was chosen instead, and `BOWL_EXCEPTION` records the real-only exception
+  (separation floor 9.8 cm; 9.83 cm to C1 and D1). Both are hash inputs. `bowl_report()` gives
+  `valid` (keep-out, reach and the real-only floor: True) and `sim_rule_valid` (False).
+- **Real-only exception.** The sim's `MIN_SEP["PickPlace"]` is 11 cm, and `derive_bowl` adds a
+  5 mm margin. B' is 9.83 cm from the nearest slots (C1, D1, both ring), 1.67 cm short of
+  11.5 cm. No position satisfies the sim rule and the safety box together. `src/env/tasks.py`,
+  the sim scene and `src/env/success.py` are unchanged.
+- Central slot: `central_slot()` still returns **C4** (corner mean 18.91 cm; C4 / D4 20.29 cm,
+  C3 / D3 16.80 cm; C4 wins the tie in candidate order).
+- Guard (`src/eval/bowl_fit.py`): `APPROVED_BOWL_XY_M = (0.205, 0.185)`. `bowl_box_problem` now
+  refuses every bowl except the approved one. It also refuses the approved bowl when the
+  protocol's bowl differs from it, or when it is outside the box. Tests: D (0.205, 0.180), B
+  (0.115, 0.185) and the -y mirror lie inside the box and are refused. The protocol bowl moved
+  back to the sim-rule position is refused, and so is a pending `FREEZE_STATUS`.
+- Hash: real-0.1 `dca199e6...` -> **`1d80cea914571f181f6a43b6a7945261fe14c946afcf1cce1cfde1847199d3a7`**.
+  The schedules moved too, because every item carries `planned_bowl_xy_m`: eval `dd1345de...` ->
+  `96e38cf931e5...`, dev `21fe5598...` -> `37a2ce5433a5...`. With the bowl field removed, the
+  schedule digests are identical before and after (eval `776801c2...`, dev `533a9636...`, demo
+  `d0c2c0f9...`; pinned in the test). Slots, yaws, seeds, order and objects did not change.
+- Placement grid regenerated (`docs/assets/placement-grid-a3.pdf`). It shows the five SEEN slots,
+  the protocol hash `1d80cea91457`, and a "BOWL LINE (B')" at x = 0.205 m. The bowl centre is
+  80.0 mm left of the line's end tick (y = +0.105 m), 36.5 mm beyond the sheet's left edge. The
+  sheet also prints the real-only exception line.
+- Bowl verification for B' (`scripts/wo07_bowl_check.py --preset real`, run
+  `20261109T144726Z-wo07-bowl-check-real-95a9`, scratch). 25 slots x 7 yaws, real safety filter,
+  offline:
+
+| Check | Safety-bounded IK | Unchanged sim oracle (URDF IK) |
+|---|---|---|
+| Separation (nearest slot, C1 / D1) | 9.83 cm (sim rule 11.5 cm: -1.67 cm, real-only exception) | same |
+| Base distance / keep-out margin / reach margin | 27.61 cm / +12.11 cm / +0.89 cm | same |
+| Cube-only rim clearance (jaws not modelled) | +0.81 cm | same |
+| Box margin, 9.3 mm search offset / own offset | +0.07 cm / +0.12 cm (8.8 mm) | +0.07 cm / +0.20 cm (8.0 mm) |
+| Release window inside / inscribed | 71.1% / 10 mm | 71.1% / 10 mm |
+| Filter at the bowl (carry, lower, release, retreat) | pass at 25/25 slots, gripper floor clip only; no reject | no reject; wrist_flex clipped at carry (3.56 deg, 6 slots) and retreat (5.0 deg, 25 slots) |
+| Cube released over the bowl floor | 175/175 | 175/175 |
+| Central slot | C4 | C4 |
+
+- Gates: full pytest 651 passed + 1 skipped; `ruff check src tests scripts`, `black --check .`,
+  `mypy --strict src` clean. `src/eval/protocol.py`, `protocol_v02.py`,
+  `src/env/success.py`, `src/env/tasks.py`, `pyproject.toml` and `uv.lock` are unchanged.
+
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
 Owner 2026-11-09: the stop check #30 added to teleop and the park now also guards the pilot and
@@ -2011,17 +2063,17 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
 
 ## Blockers and decisions pending the owner
 
-- 2026-11-09 PR 2: the bowl is PENDING. The frozen (0.195, 0.205) is rejected by the safety box
+- (closed) 2026-11-09 PR 2: the bowl was PENDING. The sim-rule (0.195, 0.205) is rejected by the safety box
   from the carry on, and no position satisfies `derive_bowl`'s rule and the box together. The
   options are in "PR 2: owner follow-up" and its round 2 (B (0.115, +-0.185), B' (0.205,
   0.185) and D (0.205, 0.180) pass the filter with separation 10.1 / 9.8 / 9.3 cm and release
   windows 50% / 71% / 81%; every option needs the oracle's wrist_flex clipped in the bowl phases).
-  The hardware eval and the demo schedule refuse the frozen bowl until it is decided. Seen slots B2 B5 E2 E5 + C4, the cubes and the seeded schedules
+  The hardware eval and the demo schedule refuse every bowl but the approved B'. Seen slots B2 B5 E2 E5 + C4, the cubes and the seeded schedules
   are approved. Owner 2026-11-09: B' (0.205, 0.185) m picked for an UNPOWERED fit check (jaws
-  and cube at the bowl and at C1, D1, B2, E2); the placement freeze is held until he confirms
-  (`protocol_real.FREEZE_STATUS` "pending: bowl fit check": hardware and demo schedule refuse).
-  If it passes: keep C4, document the 9.83 cm separation as a real-only exception, then move the
-  bowl, bump the rubric, regenerate the hash and the placement-grid PDF together.
+  and cube at the bowl and at C1, D1, B2, E2). Owner unpowered fit check at the bowl and C1, D1,
+  B2, E2: PASSED <date>. FROZEN at B': C4 kept, the 9.83 cm separation documented as a real-only
+  exception (`protocol_real.BOWL_EXCEPTION`), rubric 2, hash `1d80cea91457...`, placement-grid
+  PDF regenerated ("PR 2: placement freeze at bowl B'").
 - Resolved 2026-11-09 by the pivot (ADR-0003): the OFT track is stopped, so the WO-04 item below
   is closed. Open for the owner: the seen slots, bowl position and schedule freeze (PR 2), the
   servo P gain to use (LeRobot writes 16 at connect, firmware default 32; WO-06 checklist), and

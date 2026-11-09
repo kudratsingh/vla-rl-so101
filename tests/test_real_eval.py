@@ -15,7 +15,6 @@ import pytest
 
 from src.config import REPO_ROOT
 from src.eval import protocol as P1
-from src.eval import protocol_real as PR
 from src.eval import protocol_v02 as P2
 from src.eval import real_grid as G
 from src.robot.client import ScriptedOperator
@@ -70,10 +69,8 @@ def test_sample_plan_is_seeded_balanced_and_feasible(task: str) -> None:
 
 
 def test_placement_pdf_is_committed_a3_and_current() -> None:
-    # the committed PDF is what the script draws now; while the real-0.1 freeze is pending it is
-    # stale by the printed hash prefix only (tests/test_protocol_real.py, PR.FREEZE_STATUS)
-    pending = PR.FREEZE_STATUS != PR.FROZEN
-    assert grid_pdf.main(["--preset", "real", "--check"]) == (1 if pending else 0)
+    # the committed PDF is what the script draws now (regenerated with the real-0.1 freeze)
+    assert grid_pdf.main(["--preset", "real", "--check"]) == 0
     data = (REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf").read_bytes()
     assert data.startswith(b"%PDF-1.4") and b"/MediaBox [0 0 841.89 1190.55]" in data  # A3 pt
     assert b"10 cm scale bar" in data

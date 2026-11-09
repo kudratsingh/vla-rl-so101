@@ -41,28 +41,36 @@ def _load_script(name: str) -> ModuleType:
     return mod
 
 
-def test_frozen_bowl_is_rejected_at_the_bowl_and_a_box_inside_one_passes() -> None:
-    """The frozen (0.195, 0.205) bowl puts the TCP outside workspace_box_m (y <= 0.20) from the
-    carry on: rejected. A bowl 15 mm inside the box face passes every bowl phase (only the
-    gripper's intended -5 deg floor clip). The pick never depends on the bowl."""
+def test_sim_rule_bowl_is_rejected_at_the_bowl_and_the_frozen_b_prime_passes() -> None:
+    """The sim rule's (0.195, 0.205) bowl puts the TCP outside workspace_box_m (y <= 0.20) from
+    the carry on: rejected. The frozen B' (0.205, 0.185), 15 mm inside the box face, passes every
+    bowl phase (only the gripper's intended -5 deg floor clip). The pick never depends on the
+    bowl."""
     cfg = load_config("real")
     fk = load_sim_fk()
-    frozen = bc.verify(cfg, PR.BOWL_XY_M, ["C4"], [0.0], fk, "safety")
-    assert frozen["table"]["C4"]["carry"] == "reject"
-    assert all(frozen["table"]["C4"][p] == "reject" for p in bc.BOWL_PHASES)
-    assert frozen["table"]["C4"]["hover"] == "pass"
-    assert not frozen["passes_carry_and_bowl_phases"]
-    inside = bc.verify(cfg, (0.205, 0.185), ["C4"], [0.0], fk, "safety")
+    sim_rule = bc.verify(cfg, PR.BOWL_SIM_RULE_XY_M, ["C4"], [0.0], fk, "safety")
+    assert sim_rule["table"]["C4"]["carry"] == "reject"
+    assert all(sim_rule["table"]["C4"][p] == "reject" for p in bc.BOWL_PHASES)
+    assert sim_rule["table"]["C4"]["hover"] == "pass"
+    assert not sim_rule["passes_carry_and_bowl_phases"]
+    inside = bc.verify(cfg, PR.BOWL_XY_M, ["C4"], [0.0], fk, "safety")
+    assert PR.BOWL_XY_M == (0.205, 0.185)
     assert inside["passes_carry_and_bowl_phases"]
     assert inside["cube_released_over_bowl_floor"] == "1/1"
 
 
 def test_constraint_helpers_and_tiny_cli(tmp_path: Path) -> None:
     assert bc.central_slot_for(PR.BOWL_XY_M)["central_slot"] == PR.central_slot() == "C4"
-    a = bc.analytic(PR.BOWL_XY_M)
-    assert a["sep_margin_m"] >= 0 and a["reach_margin_m"] >= 0  # the frozen rule holds ...
+    assert bc.central_slot_for(PR.BOWL_SIM_RULE_XY_M)["central_slot"] == "C4"
+    a = bc.analytic(PR.BOWL_SIM_RULE_XY_M)
+    assert a["sep_margin_m"] >= 0 and a["reach_margin_m"] >= 0  # the sim rule holds ...
     cfg = load_config("real")
-    assert bc.box_margin(PR.BOWL_XY_M, cfg, 0.0) < 0  # ... the safety box does not
+    assert bc.box_margin(PR.BOWL_SIM_RULE_XY_M, cfg, 0.0) < 0  # ... the safety box does not
+    b = bc.analytic(PR.BOWL_XY_M)  # B': the box holds, the separation is the real-only exception
+    assert b["sep_margin_m"] == pytest.approx(-0.0167, abs=1e-4) and b["reach_margin_m"] >= 0
+    assert b["min_slot_distance_m"] >= PR.BOWL_EXCEPTION["real_min_sep_m"]
+    assert b["cube_rim_clearance_m"] > 0
+    assert bc.box_margin(PR.BOWL_XY_M, cfg, BF.TCP_TO_BOWL_OFFSET_M) >= 0
     out = bc.main(["--preset", "tiny", "--runs-dir", str(tmp_path), "--ik-limits", "safety"])
     (res,) = out["results"]
     assert set(res["table"]) == {"C4", "A1"} and set(res["table"]["C4"]) == set(bc.PHASES)
@@ -72,12 +80,13 @@ def test_constraint_helpers_and_tiny_cli(tmp_path: Path) -> None:
     )
 
 
-def test_release_window_and_the_pending_bowl_preflights(
+def test_release_window_and_the_bowl_preflights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The release window (the TCP disc over the bowl floor inside the box after the 5 mm
-    tolerance), and the hardware preflights: the eval and the demo schedule refuse the frozen
-    bowl (outside the box) before anything opens; a bowl inside it passes."""
+    tolerance), and the hardware preflights: only the approved B' passes; the sim-rule bowl
+    (outside the box) and any other bowl (even one inside the box) are refused by the eval and the
+    demo schedule before anything opens, and so is a protocol that is not frozen."""
     cfg = load_config("real")
     box = BF.workspace_box(cfg)
     r = bc.RELEASE_RADIUS_M
@@ -88,13 +97,28 @@ def test_release_window_and_the_pending_bowl_preflights(
     }
     b = BF.release_window((0.115, 0.185), box, r)  # two faces 15 mm away, 10 mm after the 5 mm
     assert b["inscribed_radius_m"] == 0.01 and 0.4 < b["inside_fraction"] < 0.6
-    assert BF.release_window(PR.BOWL_XY_M, box, r)["inscribed_radius_m"] == 0.0
+    assert BF.release_window(PR.BOWL_SIM_RULE_XY_M, box, r)["inscribed_radius_m"] == 0.0
+    bp = BF.release_window(PR.BOWL_XY_M, box, r)
+    assert bp["inscribed_radius_m"] == 0.01 and bp["inside_fraction"] == pytest.approx(
+        0.71, abs=0.01
+    )
 
-    problem = BF.bowl_box_problem(cfg)
-    assert problem is not None and "1.93 cm outside" in problem
-    assert BF.bowl_box_problem(cfg, (0.205, 0.185)) is None
+    assert BF.bowl_box_problem(cfg) is None and BF.bowl_box_problem(cfg, (0.205, 0.185)) is None
+    for other in ((0.205, 0.180), (0.115, 0.185), (0.205, -0.185)):  # inside the box, not approved
+        assert BF.box_margin(other, box, BF.TCP_TO_BOWL_OFFSET_M) >= 0
+        other_problem = BF.bowl_box_problem(cfg, other)
+        assert other_problem is not None and "not the approved real-0.1 bowl" in other_problem
     ev = _load_script("wo07_real_eval")
     s = {"schedule": "eval", "trials_per_cell": 2, "cells": ["seen"], "capture": True}
+    assert not any("bowl" in p for p in ev.real_hardware_problems(cfg, s))
+    # the protocol bowl moved off the approved one (an edit without re-approval): refused
+    monkeypatch.setattr(PR, "BOWL_XY_M", PR.BOWL_SIM_RULE_XY_M)
+    problem = BF.bowl_box_problem(cfg)
+    assert problem is not None and "not the approved real-0.1 bowl" in problem
+    assert problem in ev.real_hardware_problems(cfg, s)
+    monkeypatch.setattr(BF, "APPROVED_BOWL_XY_M", PR.BOWL_SIM_RULE_XY_M)  # approved, outside box
+    problem = BF.bowl_box_problem(cfg)
+    assert problem is not None and "1.93 cm outside" in problem
     assert problem in ev.real_hardware_problems(cfg, s)
 
     teleop = _load_script("wo06_teleop_record")
@@ -108,9 +132,10 @@ def test_release_window_and_the_pending_bowl_preflights(
     )  # fmt: skip
     with pytest.raises(SystemExit, match="refusing the real-0.1 demo schedule; nothing was opened"):
         teleop.main()
-    # the freeze status refuses on its own too (the bowl fit check is pending, PR.FREEZE_STATUS):
-    # with a bowl that fits the box, the demo schedule and the hardware session still refuse
+    # the freeze status refuses on its own too (a protocol that is not frozen): with the bowl
+    # guard passing, the demo schedule and the hardware session still refuse
     monkeypatch.setattr(teleop, "bowl_box_problem", lambda *_a, **_k: None)
+    monkeypatch.setattr(PR, "FREEZE_STATUS", "pending: bowl fit check")
     with pytest.raises(SystemExit, match="not frozen \\(pending: bowl fit check\\)"):
         teleop.main()
     monkeypatch.setattr(ev, "bowl_box_problem", lambda *_a, **_k: None)

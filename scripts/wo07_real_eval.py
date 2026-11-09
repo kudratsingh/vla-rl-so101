@@ -112,7 +112,7 @@ run would fork the session and drop the newer runs' scored trials), and warns (`
 Protocol real-0.1 (``--protocol real-0.1``, the default; ``src/eval/protocol_real.py``; owner
 2026-11-09, final2 item 6 and amendments D1-D5). PickPlace only. The frozen schedule (seen = 10 at
 each of B2 B5 E2 E5 C4, shifted = 50 over the 20 ring slots, unseen = 25 purple + 25 green cube at
-the seen slots, the bowl fixed at (0.195, +0.205) m) runs in ONE seeded order across all three
+the seen slots, the bowl fixed at B' (0.205, +0.185) m) runs in ONE seeded order across all three
 cells: the same placements and the same order for every policy (SmolVLA and ACT), every record
 carrying ``schedule_pos``, ``schedule_sha256`` and the real-0.1 composite hash. ``--schedule dev``
 runs the disjoint 30-trial development schedule (checkpoint selection, the 100-demo failure
@@ -1914,10 +1914,10 @@ def real_hardware_problems(cfg: Config, settings: dict[str, Any]) -> list[str]:
         out.append("--trials / --cells: a hardware session runs the whole frozen schedule")
     if not settings.get("capture"):
         out.append("the evaluation capture is required on the arm (final2 hardware floor)")
-    bowl = bowl_box_problem(cfg)  # the bowl is pending (owner 2026-11-09): no session at it
+    bowl = bowl_box_problem(cfg)  # only the approved bowl B', inside the box (owner 2026-11-09)
     if bowl is not None:
         out.append(bowl)
-    frozen = PR.freeze_problem()  # PR.FREEZE_STATUS: pending until the owner confirms the bowl
+    frozen = PR.freeze_problem()  # PR.FREEZE_STATUS: sessions only on the frozen protocol
     if frozen is not None:
         out.append(frozen)
     return out

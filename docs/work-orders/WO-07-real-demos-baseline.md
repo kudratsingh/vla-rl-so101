@@ -28,6 +28,13 @@ demos; 50 binary trials per cell (seen, shifted, unseen) for each; immutable exp
   no point inside the 6 x 6 grid is 11 cm from all 20 ring slot centres (the best is about
   6.5 cm), so the fixed bowl sits beside the printed grid, not on it. PR 2 picks the position,
   checks every constraint in code, checks that the front camera sees it, and freezes it.
+  **Frozen (owner 2026-11-09): bowl B' at (0.205, +0.185) m**, with a **real-only exception** to
+  MIN_SEP: the position the sim rule derives, (0.195, 0.205), lies outside the real safety
+  filter's TCP workspace box (y <= 0.20 m), and no position satisfies both. B' keeps the box, the
+  keep-out and the reach. Its centre is 9.83 cm from the nearest slots (C1, D1), under the sim's
+  11 cm (`protocol_real.BOWL_EXCEPTION`). The sim scene and `src/env/tasks.py` are unchanged.
+  The central slot stays C4. Fit check: owner unpowered fit check at the bowl and C1, D1, B2, E2:
+  PASSED <date>.
 - **Unseen objects:** the purple cube and the green cube, never in a demo or a camera-match frame.
   They replace the green cylinder for the real arm.
 

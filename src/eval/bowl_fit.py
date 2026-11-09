@@ -13,8 +13,10 @@ a demo recording never starts at a bowl the filter would reject on every carry:
   in-bowl releases the filter allows.
 
 ``bowl_box_problem`` is the preflight (``scripts/wo07_real_eval.py`` ``real_hardware_problems``,
-``scripts/wo06_teleop_record.py --demo-schedule``). It reads the protocol's bowl and the config's
-box; it changes neither (nothing here is a protocol hash input, and the filter is never loosened).
+``scripts/wo06_teleop_record.py --demo-schedule``). It refuses every bowl but the one the owner
+approved for the freeze (``APPROVED_BOWL_XY_M``, B'), and that one too unless it is the
+protocol's bowl and fits the config's box. It changes neither (nothing here is a protocol hash
+input, and the filter is never loosened).
 """
 
 from __future__ import annotations
@@ -26,8 +28,13 @@ import numpy as np
 
 from src.eval import protocol_real as PR
 
+# The bowl the owner approved for the real-0.1 freeze: option B' (2026-11-09; the unpowered fit
+# check at the bowl and C1, D1, B2, E2). A session or a demo at any other bowl is refused, so a
+# protocol edit that moves the bowl cannot reach the arm without moving this pin too.
+APPROVED_BOWL_XY_M: tuple[float, float] = (0.205, 0.185)
 # The sim oracle's largest TCP-to-bowl-centre distance at lower / release / retreat, measured by
-# scripts/wo07_bowl_check.py at the frozen bowl over all 25 slots x 7 yaws (2026-11-09: 9.3 mm).
+# scripts/wo07_bowl_check.py at the sim-rule bowl (0.195, 0.205) over all 25 slots x 7 yaws
+# (2026-11-09: 9.3 mm; 8.8 mm at B').
 # The largest of the measured positions; the feasibility search uses it for every candidate.
 TCP_TO_BOWL_OFFSET_M = 0.0093
 TOLERANCE_M = PR.BOWL_MARGIN_M  # the operator's placement tolerance (5 mm), as derive_bowl
@@ -82,8 +89,16 @@ def release_window(
 
 
 def bowl_box_problem(cfg: Mapping[str, Any], bowl: Sequence[float] | None = None) -> str | None:
-    """Why the bowl (default: the protocol's) cannot be used on the arm, None when it fits."""
-    b = tuple(PR.BOWL_XY_M if bowl is None else bowl)
+    """Why the bowl (default: the protocol's) cannot be used on the arm, None when it fits: only
+    the approved bowl, only while it is the protocol's, and only inside the box."""
+    b = tuple(float(v) for v in (PR.BOWL_XY_M if bowl is None else bowl))
+    if b != APPROVED_BOWL_XY_M or tuple(PR.BOWL_XY_M) != APPROVED_BOWL_XY_M:
+        return (
+            f"the bowl ({b[0]:.3f}, {b[1]:.3f}) m is not the approved real-0.1 bowl "
+            f"{APPROVED_BOWL_XY_M} m (src/eval/bowl_fit.py APPROVED_BOWL_XY_M) or the protocol's "
+            f"bowl {tuple(PR.BOWL_XY_M)} m differs from it: a session or a demo only runs at the "
+            "bowl the owner approved for the freeze"
+        )
     box = workspace_box(cfg)
     m = box_margin(b, box, TCP_TO_BOWL_OFFSET_M)
     if m >= 0:
@@ -92,6 +107,6 @@ def bowl_box_problem(cfg: Mapping[str, Any], bowl: Sequence[float] | None = None
         f"the protocol bowl ({b[0]:.3f}, {b[1]:.3f}) m is {-100 * m:.2f} cm outside the safety "
         f"filter's workspace box {box['x']} x {box['y']} m (after the {1000 * TOLERANCE_M:.0f} mm "
         f"placement tolerance and the oracle's {1000 * TCP_TO_BOWL_OFFSET_M:.1f} mm TCP offset): "
-        "every carry to it would be rejected (scripts/wo07_bowl_check.py). The bowl is pending "
-        "the owner's decision; the filter is never loosened"
+        "every carry to it would be rejected (scripts/wo07_bowl_check.py). The filter is never "
+        "loosened"
     )

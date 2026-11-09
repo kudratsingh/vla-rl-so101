@@ -31,8 +31,8 @@ Per bowl candidate it also reports (review, 2026-11-09):
   over the bowl floor (radius floor - cube half) inside the box after the 5 mm tolerance, and its
   inscribed radius. The oracle releases at the centre; a learned or teleop release off centre that
   leaves the box is rejected, so this decides how much of the success region the filter allows;
-* the box margin with BOTH TCP offsets: the search's (measured at the frozen bowl, 9.3 mm, used
-  for feasibility) and the candidate's own measured one.
+* the box margin with BOTH TCP offsets: the search's (measured at the sim-rule bowl (0.195, 0.205),
+  9.3 mm, used for feasibility) and the candidate's own measured one.
 
 ``--search`` adds the constrained re-derivation: the analytic rule of ``protocol_real.derive_bowl``
 (slot separation >= MIN_SEP + 5 mm against all 36 slots, base keep-out + 5 mm, reach - 5 mm) PLUS
@@ -656,9 +656,10 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
                 f"{v['joint_margin_bowl_phases_deg']}"
             )
         if args.search:
-            # the offset measured at the FIRST bowl (the frozen one by default): a far candidate
-            # the IK cannot reach exactly would inflate it for every position
-            off = out["results"][0]["tcp_to_bowl_max_m"]
+            # the offset measured at the FIRST bowl (the frozen B' by default), never below the
+            # 9.3 mm measured at the sim-rule bowl (BF.TCP_TO_BOWL_OFFSET_M): a far candidate the
+            # IK cannot reach exactly would inflate it for every position
+            off = max(out["results"][0]["tcp_to_bowl_max_m"], BF.TCP_TO_BOWL_OFFSET_M)
             out["search"] = search(cfg, off)
             print(f"\nsearch (TCP offset {off} m): passing {out['search']['passing']}")
             for k, r in (out["search"].get("closest") or {}).items():

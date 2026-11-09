@@ -17,23 +17,32 @@ extrapolation in every direction. The other 11 inner slots, the ring and the hel
 never used by demos or camera-match frames.
 
 Bowl (D2). ONE fixed position for every demo and every trial of every cell, so shifted tests object
-position and unseen tests object identity with everything else held constant. Derived by
-``derive_bowl()`` from the scene's placement constraints (``src/env/tasks.py``, read only), against
-all 36 lattice slots (stronger than the 25 used: it also stays valid if a seen slot is ever
-re-chosen):
+position and unseen tests object identity with everything else held constant.
+
+The sim's placement rule, ``derive_bowl()`` (``src/env/tasks.py``, read only), against all 36
+lattice slots:
 
 * every slot centre at least ``MIN_SEP["PickPlace"]`` (11 cm) from the bowl centre,
 * the bowl centre at least ``BASE_KEEPOUT + 0.065`` from the base (the sim's bowl keep-out),
 * the bowl centre within ``PUSH_REACH`` (29 cm; the arm's top-down reach, the only reach constant
   in tasks.py),
 
-each with a 5 mm placement-tolerance margin, on a 5 mm lattice (a position the operator can mark).
-Among the positions that pass, the one nearest the grid centre (shortest carry; keeps the bowl beside
-the grid in the front camera's view); the +y / -y tie goes to +y, the front camera's side: the arm
-then reaches the bowl from the side away from the camera, so the camera sees the release. Result
-``BOWL_XY_M = (0.195, 0.205)``: 11.75 cm from the nearest slot, 28.3 cm from the base. The sim's
-oracle IK reaches it at release, carry and retreat heights (probed 2026-11-09, < 0.1 mm residual,
-tilt <= 20 deg). Nothing else fits in front of the grid: a bowl ahead of it would sit beyond 37 cm.
+each with a 5 mm placement-tolerance margin, on a 5 mm lattice, nearest the grid centre, tie +y.
+It gives ``BOWL_SIM_RULE_XY_M = (0.195, 0.205)`` (11.75 cm from the nearest slot), which the REAL
+safety filter rejects: its TCP workspace box ends at y = 0.20 m, so every carry, lower, release and
+retreat to that bowl is refused (``scripts/wo07_bowl_check.py``, ``src/eval/bowl_fit.py``). No
+position satisfies the rule and the box together (the grid spans y +-8.75 cm, so 11.5 cm of
+separation beside it needs |y| >= 0.2025).
+
+``BOWL_XY_M = (0.205, 0.185)`` is option B' (owner 2026-11-09): the box kept (bowl-centre margin
++0.07 cm after the 5 mm tolerance and the oracle's 9.3 mm TCP offset; 71% of the release window
+inside the box), 27.6 cm from the base (keep-out and reach hold), the central-slot rule still
+picks C4. REAL-ONLY EXCEPTION to the sim's 11 cm ``MIN_SEP["PickPlace"]``: the bowl centre is
+9.83 cm from the nearest slots (C1 and D1, ring; ``BOWL_EXCEPTION``), short of 11 cm + 5 mm by
+1.67 cm. The sim scene, ``src/env/tasks.py`` and ``derive_bowl`` are unchanged; the exception is a
+hash input. Cube-only rim clearance at the nearest slot +0.81 cm (the bowl 5 mm closer, any yaw;
+no collision model, the jaws not modelled), so the jaws and the cube are checked by hand before the
+freeze: owner unpowered fit check at the bowl and C1, D1, B2, E2: PASSED <date> (``docs/STATUS.md``).
 
 Objects (D3). Seen: the red cube (``protocol.RED_CUBE``). Unseen, replacing protocol 0.1's green
 cylinder on the real arm only: the purple cube (``protocol.PURPLE_CUBE``) and a green cube
@@ -73,13 +82,11 @@ judging rule and rubric, the horizon and settle interval, and the observation/ac
 hash (``src/robot/convention.py``). Values, not file bytes, so a comment edit never moves it.
 Pinned in ``tests/test_protocol_real.py``: freeze before the first demo (D4).
 
-Freeze status (``FREEZE_STATUS``): PENDING. The owner is checking bowl option B' (0.205, 0.185) m
-on the bench (unpowered fit check); until he confirms, ``BOWL_XY_M``, ``RUBRIC_VERSION`` and the
-placement-grid PDF stay as they are, the hash pinned in the test is the current computed value
-(it moved with real-judge-3), and ``freeze_problem()`` makes every hardware session and the demo
-schedule refuse (scripts/wo07_real_eval.py ``real_hardware_problems``, scripts/wo06_teleop_record.py
-``--demo-schedule``), next to ``bowl_fit.bowl_box_problem``. The freeze sets ``FREEZE_STATUS`` to
-``FROZEN``, moves the bowl, bumps the rubric and regenerates the PDF and the hash together.
+Freeze status (``FREEZE_STATUS``): FROZEN at bowl B' (0.205, 0.185) m, rubric version 2
+(real-judge-3), with the placement-grid PDF and the hash regenerated together. ``freeze_problem()``
+(scripts/wo07_real_eval.py ``real_hardware_problems``, scripts/wo06_teleop_record.py
+``--demo-schedule``) refuses while the status is anything else, and ``bowl_fit.bowl_box_problem``
+refuses every bowl but the approved B'.
 """
 
 from __future__ import annotations
@@ -96,7 +103,7 @@ from src.eval import real_grid as G
 
 PROTOCOL_VERSION = "real-0.1"
 FROZEN = "frozen"
-FREEZE_STATUS = "pending: bowl fit check"  # module doc; FROZEN once the owner confirms the bowl
+FREEZE_STATUS = FROZEN  # module doc: bowl B', rubric 2, the PDF and the hash frozen together
 TASK = "PickPlace"
 TASK_ID = "so101-real-pickplace"
 CELLS: tuple[str, ...] = P.CELLS  # seen, shifted, unseen_objects
@@ -113,15 +120,35 @@ SEEN_RULE = (
 )
 
 # -- bowl (D2) --------------------------------------------------------------------------------
-BOWL_XY_M: tuple[float, float] = (0.195, 0.205)
+BOWL_XY_M: tuple[float, float] = (0.205, 0.185)  # option B' (owner 2026-11-09), module doc
+BOWL_SIM_RULE_XY_M: tuple[float, float] = (0.195, 0.205)  # derive_bowl(): outside the safety box
 BOWL_MARGIN_M = 0.005  # placement tolerance on every constraint
 BOWL_LATTICE_M = 0.005
 BOWL_SEARCH_M = ((0.0, 0.30), (-0.30, 0.30))  # x, y ranges searched (front half plane)
-BOWL_RULE = (
+BOWL_SIM_RULE = (
     "on a 5 mm lattice, every lattice slot centre >= MIN_SEP[PickPlace] + 5 mm away, >= "
     "BASE_KEEPOUT + 0.065 + 5 mm and <= PUSH_REACH - 5 mm from the base; nearest the grid centre; "
     "tie +y (the front camera's side)"
 )
+BOWL_RULE = (
+    "option B' (owner 2026-11-09): the sim rule's position (derive_bowl, BOWL_SIM_RULE) lies "
+    "outside the real safety filter's TCP workspace box (y <= 0.20 m) and no 5 mm lattice "
+    "position satisfies the rule and the box together; B' keeps the box (after the 5 mm "
+    "tolerance and the oracle's 9.3 mm TCP offset), the base keep-out and the reach, and the "
+    "central-slot rule's C4, with a real-only exception to MIN_SEP[PickPlace] (BOWL_EXCEPTION)"
+)
+# REAL-ONLY exception to the sim's MIN_SEP["PickPlace"] (11 cm; src/env/tasks.py is unchanged).
+# The floor is the bowl's smallest centre distance to the 36 lattice slots, rounded down to 1 mm;
+# the cube-only rim clearance there is +0.81 cm (scripts/wo07_bowl_check.py, jaws not modelled).
+BOWL_EXCEPTION: dict[str, Any] = {
+    "scope": "real arm only (protocol real-0.1); the sim scene and its MIN_SEP are unchanged",
+    "constraint": "MIN_SEP[PickPlace] (11 cm) + the 5 mm placement margin",
+    "real_min_sep_m": 0.098,
+    "nearest_slots": ["C1", "D1"],
+    "nearest_slot_distance_m": 0.0983,
+    "reason": "the real safety filter's TCP workspace box (y <= 0.20 m) excludes every position "
+    "that keeps the sim separation beside the grid",
+}
 BOWL_SPEC: dict[str, Any] = {
     "label": "bowl",
     "planned_xy_m": list(BOWL_XY_M),
@@ -208,7 +235,7 @@ JUDGING_RULE: dict[str, str] = {  # mirrors src/env/success.py, read only
     "cube is still on the table, and the object touches neither gripper jaw",
 }
 RUBRIC_ID = "so101-real-pickplace-rubric"
-RUBRIC_VERSION = "1"
+RUBRIC_VERSION = "2"  # 2: real-judge-3 start rule (R0_start), bowl B'
 TASK_VERSION = f"{RUBRIC_ID}-{RUBRIC_VERSION}"  # vishwaroop task_version = rubric version
 
 
@@ -244,6 +271,10 @@ RUBRIC: dict[str, Any] = {
     "horizon_steps": TRIAL_MAX_STEPS,
     "control_hz": CONTROL_HZ,
     "rules": {
+        "R0_start": "a trial starts when the bus write of its first policy goal was begun "
+        "(real-judge-3), even if that write then failed; a first goal blocked before its write "
+        "(the pre-write stop check, a stop or a stale frame / chunk after the start marker, a "
+        "start marker that could not be saved) never started",
         "R1_end_state": "success iff the success condition holds after the settling interval",
         "R2_fault": "a trial whose policy started and that ended in a fault (servo, serial, "
         "safety / deadman, server, operator abort, client error, torque off unconfirmed, session "
@@ -288,17 +319,17 @@ def shifted_counts() -> dict[str, int]:
     return out
 
 
-def _bowl_ok(x: float, y: float, slots: Sequence[G.Slot], margin: float) -> bool:
+def _bowl_ok(
+    x: float, y: float, slots: Sequence[G.Slot], margin: float, min_sep: float | None = None
+) -> bool:
+    """The sim rule's constraints (``min_sep`` None: MIN_SEP[PickPlace]) with ``margin``."""
     from src.env import tasks as T  # read only
 
     c = np.array([x, y])
     d = min(float(np.linalg.norm(c - np.array([s.x, s.y]))) for s in slots)
     r = float(np.linalg.norm(c))
-    return (
-        d >= T.MIN_SEP["PickPlace"] + margin
-        and r >= T.BASE_KEEPOUT + 0.065 + margin
-        and r <= T.PUSH_REACH - margin
-    )
+    sep = float(T.MIN_SEP["PickPlace"]) if min_sep is None else float(min_sep)
+    return d >= sep + margin and r >= T.BASE_KEEPOUT + 0.065 + margin and r <= T.PUSH_REACH - margin
 
 
 def bowl_constraints() -> dict[str, float]:
@@ -314,7 +345,9 @@ def bowl_constraints() -> dict[str, float]:
 
 
 def derive_bowl() -> tuple[float, float]:
-    """The bowl position by ``BOWL_RULE`` (module doc). Raises if no position passes."""
+    """The bowl position by the SIM rule ``BOWL_SIM_RULE`` (module doc): ``BOWL_SIM_RULE_XY_M``,
+    which the real safety box rejects; ``BOWL_XY_M`` is B' under ``BOWL_EXCEPTION``. Raises if no
+    position passes."""
     k = bowl_constraints()
     m = BOWL_MARGIN_M
     pts = np.array([(s.x, s.y) for s in G.all_slots()])
@@ -327,7 +360,7 @@ def derive_bowl() -> tuple[float, float]:
     r = np.linalg.norm(cand, axis=1)
     ok = (d >= k["min_sep_m"] + m) & (r >= k["bowl_keepout_m"] + m) & (r <= k["reach_m"] - m)
     if not ok.any():
-        raise RuntimeError("no fixed bowl position satisfies every slot (see BOWL_RULE)")
+        raise RuntimeError("no fixed bowl position satisfies every slot (see BOWL_SIM_RULE)")
     good = cand[ok]
     near = np.round(np.linalg.norm(good - np.array(P.SEEN_REGION.center), axis=1), 9)
     i = int(np.lexsort((-good[:, 1], near))[0])  # nearest the grid centre; tie -> +y
@@ -335,7 +368,9 @@ def derive_bowl() -> tuple[float, float]:
 
 
 def bowl_report(slot_ids: Sequence[str] | None = None) -> dict[str, Any]:
-    """Distances of the fixed bowl to every slot used (default: seen + ring) and to the base."""
+    """Distances of the fixed bowl to every slot used (default: seen + ring) and to the base.
+    ``valid``: keep-out, reach and the REAL-ONLY separation floor (``BOWL_EXCEPTION``) hold;
+    ``sim_rule_valid``: the sim's MIN_SEP holds too (False for B')."""
     ids = list(slot_ids) if slot_ids is not None else [*SEEN_SLOTS, *ring_order()]
     b = np.array(BOWL_XY_M)
     dist = {
@@ -349,7 +384,11 @@ def bowl_report(slot_ids: Sequence[str] | None = None) -> dict[str, Any]:
         "nearest_slot": min(dist, key=lambda s: dist[s]),
         "base_distance_m": round(float(np.linalg.norm(b)), 4),
         "constraints": k,
-        "valid": all(_bowl_ok(*BOWL_XY_M, [_slot(s)], 0.0) for s in ids),
+        "valid": all(
+            _bowl_ok(*BOWL_XY_M, [_slot(s)], 0.0, BOWL_EXCEPTION["real_min_sep_m"]) for s in ids
+        ),
+        "sim_rule_valid": all(_bowl_ok(*BOWL_XY_M, [_slot(s)], 0.0) for s in ids),
+        "real_only_exception": BOWL_EXCEPTION,
         "distances_m": dist,
     }
 
@@ -516,7 +555,14 @@ def hash_components() -> dict[str, Any]:
         "task": {"name": TASK, "id": TASK_ID, "version": TASK_VERSION},
         "seen": {"slots": list(SEEN_SLOTS), "rule": SEEN_RULE, "corners": list(CORNER_SLOTS)},
         "shifted": {"slots": ring_order(), "counts": shifted_counts()},
-        "bowl": {**BOWL_SPEC, "rule": BOWL_RULE, "constraints": bowl_constraints()},
+        "bowl": {
+            **BOWL_SPEC,
+            "rule": BOWL_RULE,
+            "sim_rule": BOWL_SIM_RULE,
+            "sim_rule_xy_m": list(BOWL_SIM_RULE_XY_M),
+            "constraints": bowl_constraints(),
+            "real_only_exception": BOWL_EXCEPTION,
+        },
         "objects": {
             "seen": object_spec(SEEN_OBJECT),
             "unseen": [object_spec(o) for o in UNSEEN_OBJECTS],

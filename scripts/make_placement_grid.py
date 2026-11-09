@@ -15,10 +15,12 @@ Content, all derived from code (``src/eval/real_grid.py``, which reads ``src/eva
   was scaled (print at 100% / "Actual size", never "Fit to page");
 * protocol real-0.1 (``src/eval/protocol_real.py``): the five frozen SEEN slots (heavy outline,
   "SEEN"), the 11 other inner slots marked "not used" (never a demo, a camera-match frame or a
-  trial in real-0.1), and the FIXED bowl. The bowl centre (x 0.195, y +0.205 m) lies 56.5 mm beyond
-  the A3 sheet's left edge (the sheet cannot hold the whole 1:1 layout), so the sheet prints a
-  "bowl line" at x = 0.195 m ending in a reference tick at y = +0.105 m: the bowl centre is exactly
-  100 mm further left along that line. Mark it on the table once and keep the bowl on it.
+  trial in real-0.1), and the FIXED bowl B'. The bowl centre (x 0.205, y +0.185 m) lies 36.5 mm
+  beyond the A3 sheet's left edge (the sheet cannot hold the whole 1:1 layout), so the sheet prints
+  a "bowl line" at x = 0.205 m ending in a reference tick at y = +0.105 m: the bowl centre is
+  exactly 80 mm further left along that line. Mark it on the table once and keep the bowl on it.
+  The sheet also prints the bowl's real-only separation exception (9.83 cm to C1 / D1, under the
+  sim's 11 cm MIN_SEP; ``protocol_real.BOWL_EXCEPTION``).
 
     uv run scripts/make_placement_grid.py --preset real          # writes the PDF
     uv run scripts/make_placement_grid.py --preset real --check  # exit 1 if it is stale
@@ -308,11 +310,12 @@ def draw() -> str:
     c.line(lx, ly - 4.0, lx, ly + 4.0)
     off_mm = (by - ref_y) * 1000.0
     edge_mm = -page(bx, by)[0]
-    c.text(2.0, ly + 2.0, "BOWL LINE", 6.0, bold=True)
+    c.text(2.0, ly + 2.0, "BOWL LINE (B')", 6.0, bold=True)
+    ex = PR.BOWL_EXCEPTION
     for i, line in enumerate(
         (
             (
-                f"BOWL, FIXED for every demo and trial ({PR.PROTOCOL_VERSION}): centre x = "
+                f"BOWL B', FIXED for every demo and trial ({PR.PROTOCOL_VERSION}): centre x = "
                 f"{bx:.3f} m, y = {by:+.3f} m."
             ),
             (
@@ -322,6 +325,11 @@ def draw() -> str:
             (
                 f"{edge_mm:.1f} mm beyond this sheet's left edge. Mark it on the table once; the "
                 "bowl stays on the mark."
+            ),
+            (
+                f"Real-only exception: {100 * ex['nearest_slot_distance_m']:.2f} cm from "
+                f"{' / '.join(ex['nearest_slots'])} (the sim's MIN_SEP is 11 cm); the safety box "
+                "allows no position that keeps it."
             ),
         )
     ):
@@ -373,7 +381,7 @@ def draw() -> str:
         380.5,
         f"Protocol {PR.PROTOCOL_VERSION} {PR.protocol_hash()[:12]}: SEEN = {' '.join(PR.SEEN_SLOTS)} "
         "(demos + seen + unseen-object trials); shifted = the shaded ring; 'not used' = never "
-        "in real-0.1; bowl FIXED (bowl line).",
+        "in real-0.1; bowl B' FIXED (bowl line).",
         7.5,
     )
     return "\n".join(c.ops) + "\n"
