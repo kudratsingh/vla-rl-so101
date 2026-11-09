@@ -55,7 +55,12 @@ def checkpoint_identity(ckpt: str | Path) -> dict[str, Any]:
     """Content identity of a checkpoint dir, as ``src.robot.serve.adapter_identity`` does for the
     OFT adapters: ``checkpoint_sha256`` over ``name:sha256`` of every file a load reads, and
     ``checkpoint_revision``, the Hub snapshot commit when the dir is a ``snapshots/<sha>/``
-    download (None for a local dir). Same weights + processors = same hash, wherever they live."""
+    download (None for a local dir). Same weights + processors = same hash, wherever they live.
+
+    The ONE checkpoint identity of PR 2: the trainer's run record, the Mac inference path's
+    ``checkpoint_sha256`` (``src/robot/local_policy.py``), the real eval's ``policy_identity`` and
+    the vishwaroop export's ``checkpoint_id`` (``src/eval/export_bundle.py``, which bundles exactly
+    ``checkpoint_files``) all hash these files this way."""
     path = Path(ckpt)
     h = hashlib.sha256()
     files = checkpoint_files(path)
@@ -71,13 +76,28 @@ def checkpoint_identity(ckpt: str | Path) -> dict[str, Any]:
     }
 
 
-def load_checkpoint(ckpt: str | Path, device: str) -> tuple[Any, Any, Any]:
-    """(policy in eval mode, preprocessor, postprocessor) from a ``pretrained_model`` dir."""
+def load_checkpoint(
+    ckpt: str | Path,
+    device: str,
+    *,
+    config: Any | None = None,
+    n_action_steps: int | None = None,
+    preprocessor_overrides: dict[str, Any] | None = None,
+) -> tuple[Any, Any, Any]:
+    """(policy in eval mode, preprocessor, postprocessor) from a ``pretrained_model`` dir.
+
+    The ONE loader of the trainer's reload check and the Mac inference path
+    (``src/robot/local_policy.py``). ``config``: the dir's ``PreTrainedConfig`` when the caller
+    already read (and checked) it; ``n_action_steps``: override the saved value (the deploy loop
+    executes whole chunks); ``preprocessor_overrides``: extra processor-step overrides (e.g. a
+    rename map), merged with the device override."""
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
     path = Path(ckpt)
-    pcfg = PreTrainedConfig.from_pretrained(path)
+    pcfg = PreTrainedConfig.from_pretrained(path) if config is None else config
+    if n_action_steps is not None:
+        pcfg.n_action_steps = int(n_action_steps)
     if pcfg.type not in POLICY_TYPES:
         raise ValueError(f"{path}: policy type {pcfg.type!r} is not one of {POLICY_TYPES}")
     pcfg.device = device
@@ -90,11 +110,14 @@ def load_checkpoint(ckpt: str | Path, device: str) -> tuple[Any, Any, Any]:
         # 2e-4 per weight, 0.16 rad on a chunk after 3 tiny steps). Re-load them into the fp32 model.
         from safetensors.torch import load_file
 
-        policy.load_state_dict(load_file(str(path / "model.safetensors")), strict=True)
+        # strict=False as LeRobot's own from_pretrained (a Hub base may carry extra buffers)
+        policy.load_state_dict(load_file(str(path / "model.safetensors")), strict=False)
+    overrides: dict[str, Any] = {
+        **(preprocessor_overrides or {}),
+        "device_processor": {"device": device},
+    }
     pre, post = make_pre_post_processors(
-        pcfg,
-        pretrained_path=str(path),
-        preprocessor_overrides={"device_processor": {"device": device}},
+        pcfg, pretrained_path=str(path), preprocessor_overrides=overrides
     )
     return policy, pre, post
 

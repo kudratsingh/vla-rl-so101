@@ -11,7 +11,9 @@ Evaluation capture (``EvalCapture``), one dataset per evaluation session, one ep
 
 * ``RigFrameSource`` hands the deploy loop a ``CameraRig`` (front + wrist) as its frame source: the
   policy camera's image, the OLDEST camera's stamp (the deadman covers every camera) and every
-  camera's image. ``DeployLoop.on_write`` passes each policy write's frame and step result to
+  camera's image (the gRPC path, whose policy takes one camera). The in-process SmolVLA / ACT path
+  (``src/robot/local_policy.py``) reads the ``CameraRig`` itself: its ``RigFrame`` carries the same
+  images and stamps. ``DeployLoop.on_write`` passes each policy write's frame and step result to
   ``EvalCapture.on_write``. Frames are captured only for policy writes (the move home and the
   settle are not recorded, as the demo recorder does not record its sync).
 * ``begin`` opens a trial's episode buffer; ``finish`` (from the trial record, after scoring)
@@ -245,8 +247,11 @@ class EvalCapture:
             "meta": dict(meta or {}),
         }
 
-    def on_write(self, frame: Frame | None, out: Any) -> None:
-        """One policy write: (both camera images, measured state, written command). Never raises."""
+    def on_write(self, frame: Frame | RigFrame | None, out: Any) -> None:
+        """One policy write: (both camera images, measured state, written command). Never raises.
+        ``frame`` is a ``RigCapturedFrame`` (``RigFrameSource``: the gRPC path) or a ``RigFrame``
+        (a ``CameraRig`` read directly: the in-process SmolVLA / ACT path); both carry every
+        camera's image, the same frame the policy was given."""
         cur = self._open
         if cur is None or cur["error"] is not None:
             return

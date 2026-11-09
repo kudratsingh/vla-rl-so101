@@ -13,9 +13,10 @@ seal``); this repo only produces the inputs, per recording session, next to the 
   episode index of each captured trial); ``labels.json`` ONLY from a blinded clip review
   (``scripts/wo07_blind_review.py``): then declared ``blinded_review``; otherwise the ``labels``
   declaration is omitted (``null``), never misdeclared;
-* trained-policy sessions: every checkpoint file (the weights ``model.safetensors`` and the
-  config ``config.json`` declared, the rest alongside) with ``checkpoint_files.json``; the
-  checkpoint id is the content hash over all of them (``checkpoint_identity``), checked against
+* trained-policy sessions: every checkpoint file (``lerobot_ckpt.checkpoint_files``: the weights
+  ``model.safetensors`` and the config ``config.json`` declared, the rest alongside) with
+  ``checkpoint_files.json``; the checkpoint id is the content hash over all of them
+  (``checkpoint_identity``, the trainer's and the deploy path's hash), checked against
   the hash the evaluation session recorded at its start; ``family_id`` is stable per training
   family (``FAMILIES``: SmolVLA and ACT are two) and ``training_run_id`` names the training run.
 * demonstration sessions: ``placements.json`` (each episode's planned placement from the frozen
@@ -97,27 +98,34 @@ def _write(path: Path, value: Any) -> None:
 
 
 def checkpoint_identity(ckpt: Path) -> dict[str, Any]:
-    """Content identity of a checkpoint dir: sha256 over ``<name>:<sha256>`` of every file
-    (sorted). Needs ``model.safetensors`` and ``config.json``; refuses subdirectories (flat, as
-    LeRobot's ``pretrained_model``)."""
+    """Content identity of a checkpoint dir: sha256 over ``<name>:<sha256>`` (sorted by name) of
+    its checkpoint files, ``src.policy.lerobot_ckpt.checkpoint_files`` (config, weights,
+    train_config, the processor pipelines and their stats): the same hash as the trainer's run
+    record and the deploy path's ``checkpoint_sha256``. Exactly those files are bundled. Needs
+    ``model.safetensors`` and ``config.json``."""
+    from src.policy import lerobot_ckpt
+
     ckpt = Path(ckpt)
     if not ckpt.is_dir():
         raise ExportRefused(f"checkpoint dir {ckpt} does not exist")
-    files = sorted(p for p in ckpt.iterdir() if not p.name.startswith("."))
-    nested = [p.name for p in files if not p.is_file()]
-    if nested:
-        raise ExportRefused(f"checkpoint dir {ckpt} has subdirectories {nested}: give the flat dir")
+    try:
+        files = lerobot_ckpt.checkpoint_files(ckpt)
+    except FileNotFoundError as e:
+        raise ExportRefused(str(e)) from None
     names = [p.name for p in files]
     for need in (WEIGHTS_FILE, CONFIG_FILE):
-        if need not in names:
+        if need not in names:  # checkpoint_files refuses this already; kept explicit
             raise ExportRefused(f"checkpoint dir {ckpt} has no {need}")
     clash = sorted(set(names) & RESERVED - {CONFIG_FILE})
     if clash:
         raise ExportRefused(f"checkpoint files {clash} collide with bundle file names")
     shas = {p.name: _sha256(p) for p in files}
     h = hashlib.sha256()
-    for name, sha in shas.items():
+    for name, sha in sorted(shas.items()):
         h.update(f"{name}:{sha}\n".encode())
+    ident = lerobot_ckpt.checkpoint_identity(ckpt)["checkpoint_sha256"]
+    if h.hexdigest() != ident:  # one definition: never let the two drift
+        raise ExportRefused(f"checkpoint hash {h.hexdigest()} != lerobot_ckpt's {ident}")
     return {"sha256": h.hexdigest(), "files": shas}
 
 

@@ -118,8 +118,18 @@ Audit against final2 item 5 (where each requirement lives):
 * resume skips started attempts and retries only never-started slots: ``done_indices``,
   ``load_prior`` (a started trial without a record is a ``session_lost`` failure).
 
---mock      CPU, in-process, safe anywhere: MockPolicy behind gRPC on 127.0.0.1, the fake arm and
-            camera from tests/robot_fakes.py, the real safety filter and sim FK. Scripted scores.
+Policy backend (``--backend``). ``local``: the SmolVLA / ACT checkpoint in ``--checkpoint-dir`` runs
+in process on the Mac (``src/robot/local_policy.py``, MPS with CPU fallback) inside the same
+deploy loop; it is loaded only if it hashes to the session's ``policy_identity.checkpoint_sha256``
+(``src.policy.lerobot_ckpt.checkpoint_identity``, the trainer's hash and the export's
+``checkpoint_id``), it reads the ``CameraRig`` itself (front + wrist, uncropped, through
+``convention.policy_observation``), and its chunk / deadline come from the ``local_policy`` block.
+This is the only backend of a real-0.1 session on the arm. ``grpc``: the policy server (protocol
+0.2, and the mock's default MockPolicy). A resume keeps the session's backend.
+
+--mock      CPU, in-process, safe anywhere: MockPolicy behind gRPC on 127.0.0.1 (or, with
+            ``--backend local``, the checkpoint in process), the fake arm and two fake cameras
+            from tests/robot_fakes.py, the real safety filter and sim FK. Scripted scores.
             NOT a result.
 --hardware  OWNER ONLY, never run by tests or agents: gated exactly like scripts/wo07_pilot.py
             (refuses without --i-am-present, or a null / non-positive
@@ -136,6 +146,9 @@ Audit against final2 item 5 (where each requirement lives):
 
     uv run scripts/wo07_real_eval.py --preset real --mock --fake-clock --trials 2 --max-steps 16 \\
         --task PickPlace
+    uv run scripts/wo07_real_eval.py --preset real --mock --fake-clock --trials 1 --max-steps 8 \\
+        --task PickPlace --backend local --labeler mock --family act \\
+        --training-run-id <train run id> --checkpoint-dir <pretrained_model dir>
     .venv/bin/python scripts/wo07_real_eval.py --preset real --hardware --i-am-present \\
         --task PickPlace --label smolvla-20k --labeler <name> --family smolvla \\
         --training-run-id <train run id> --checkpoint-dir <pretrained_model dir>
@@ -214,7 +227,8 @@ HARDWARE_REFUSAL = """--hardware drives the real SO-101 and refuses to run witho
 
 Only the owner runs it, standing at the arm with a hand on the power switch, after WO-06
 (calibration, intrinsics, camera match), the WO-07 pilot, the placement grid printed and its
-10 cm scale bar measured, and with the policy server reachable through the tunnel."""
+10 cm scale bar measured. Protocol real-0.1 runs the SmolVLA / ACT checkpoint in process on the
+Mac (--backend local); protocol 0.2 needs the policy server reachable through the tunnel."""
 
 PRIOR_TORQUE_OFF_UNCONFIRMED = (
     "WARNING: an earlier run of this session ended with TORQUE OFF UNCONFIRMED (in a trial or "
@@ -976,9 +990,12 @@ def open_capture(
     sid = str(settings["session_id"])
     root = Path(run.dir).parent / sid / "capture"
     cam = loop.cam
-    if not isinstance(cam, RigFrameSource):
-        raise TypeError("the evaluation capture needs the two-camera rig (RigFrameSource)")
-    rig = cam.rig
+    if isinstance(cam, RigFrameSource):  # gRPC path: the policy gets the front view only
+        rig = cam.rig
+    elif isinstance(cam, CameraRig):  # in-process SmolVLA / ACT: the policy gets every camera
+        rig = cam
+    else:
+        raise TypeError("the evaluation capture needs the two-camera rig (CameraRig)")
     provenance: dict[str, Any] = {
         "source": "scripts/wo07_real_eval.py",
         "purpose": "evaluation",
@@ -1083,6 +1100,7 @@ def new_settings(args: argparse.Namespace, cfg: Config) -> dict[str, Any]:
         "labeler": args.labeler,
         "policy_identity": policy_identity(args) if real else None,
         "capture": bool(real and not args.no_capture),
+        "backend": resolve_backend(args, real),
         "policy_id": None,  # from the server's Info
         "settle_s": settle_s_from_config(cfg),
         "protocol": protocol_fields(settle_s_from_config(cfg), protocol, schedule),
@@ -1168,24 +1186,113 @@ def bind_session(
     settings["policy_id"] = info.get("policy_id")
 
 
+def resolve_backend(args: argparse.Namespace, real: bool) -> str:
+    """Where the policy runs. ``local``: SmolVLA / ACT in process on the Mac through
+    ``src/robot/local_policy.py`` (the checkpoint in ``--checkpoint-dir``, both cameras, the
+    convention's preprocessing); the only backend of a real-0.1 hardware session (the gRPC server
+    serves OpenVLA-OFT). ``grpc``: the policy server (protocol 0.2; the mock's MockPolicy).
+    A hardware session's backend and identity are refused later, after the presence gate, by
+    ``real_hardware_problems`` (nothing is opened before)."""
+    backend = args.backend or ("local" if real and args.hardware else "grpc")
+    if backend == "local" and not real:
+        sys.exit("--backend local runs SmolVLA / ACT under protocol real-0.1 only")
+    if backend == "local" and args.checkpoint_dir is None and not args.hardware:
+        sys.exit("--backend local needs --family, --training-run-id and --checkpoint-dir")
+    return backend
+
+
+@contextmanager
+def local_backend(
+    cfg: Config, settings: dict[str, Any], clock: Callable[[], float] = time.perf_counter
+) -> Iterator[tuple[Any, dict[str, Any], DeployConfig]]:
+    """The in-process policy bound to the session's ``policy_identity``: the checkpoint is loaded
+    only if it hashes to the recorded ``checkpoint_sha256`` (one hash definition:
+    ``src.policy.lerobot_ckpt.checkpoint_identity``), then checked against the convention, the
+    chunk and the deploy settings (``check_local``). Runs before the arm is connected."""
+    from src.robot import local_policy as LP
+
+    ident = settings.get("policy_identity") or {}
+    want = ident.get("checkpoint_sha256")
+    spec = LP.LocalPolicySpec.from_config(
+        cfg, base=ident.get("checkpoint_dir"), family=ident.get("family")
+    )
+    if spec.checkpoint_sha256 is not None and spec.checkpoint_sha256 != want:
+        sys.exit(
+            f"local_policy.checkpoint_sha256 {spec.checkpoint_sha256[:12]} != the session's "
+            f"checkpoint {str(want)[:12]}; nothing was opened"
+        )
+    spec = dataclasses.replace(spec, checkpoint_sha256=want)
+    try:
+        policy = LP.load_local_policy(spec, clock=clock)
+    except LP.CheckpointMismatch as e:
+        sys.exit(f"{e}; nothing was opened")
+    dcfg = LP.local_deploy_config(cfg, policy)
+    with LP.LocalPolicyClient(policy, timeout_s=dcfg.request_timeout_s, clock=clock) as client:
+        info = client.info()
+        LP.check_local(info, dcfg, spec)
+        yield client, info, dcfg
+
+
+def _mock_fakes(
+    cfg: Config, args: argparse.Namespace, fk: FkFn | None
+) -> tuple[Callable[[], float], Callable[[float], None], Any, Any]:
+    """(clock, sleep, fake arm factory, fake two-camera rig factory) of a mock session."""
+    sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from robot_fakes import FakeCam, FakeClock, FakeFollower
+
+    clock: Callable[[], float]
+    sleep: Callable[[float], None]
+    if args.fake_clock:
+        fake = FakeClock()
+        clock, sleep = fake, fake.sleep
+    else:
+        clock, sleep = time.perf_counter, time.sleep
+
+    def fake_arm() -> So101Driver:
+        return So101Driver(
+            FakeFollower(),
+            UnitMap.from_config(cfg),
+            make_safety(cfg, fk or load_sim_fk(), clock=clock),
+            clock=clock,
+            monitor=monitor_from_config(cfg),
+            sleep=sleep,
+        )
+
+    def fake_rig() -> CameraRig:
+        wrist = FakeCam(clock)
+        wrist.image = np.ascontiguousarray(255 - wrist.image)  # a swap would show
+        return CameraRig({"front": FakeCam(clock), "wrist": wrist})
+
+    return clock, sleep, fake_arm, fake_rig
+
+
+@contextmanager
+def local_mock_rig(
+    cfg: Config, args: argparse.Namespace, fk: FkFn | None, settings: dict[str, Any]
+) -> Iterator[tuple[DeployLoop, dict[str, Any], Callable[[int], None], bool]]:
+    """``--mock --backend local``: the session's checkpoint in process on the fake arm, reading
+    the fake two-camera rig itself (both cameras to the policy and to the capture)."""
+    from src.robot.local_policy import local_pipe
+
+    clock, sleep, fake_arm, fake_rig = _mock_fakes(cfg, args, fk)
+    with local_backend(cfg, settings, clock) as (client, info, dcfg), fake_arm() as arm:
+        loop = DeployLoop(arm, fake_rig(), local_pipe, client, dcfg, clock=clock, sleep=sleep)
+        yield loop, info, lambda _k: None, False  # raw frames: no undistortion, no crop
+
+
 @contextmanager
 def mock_rig(
     cfg: Config, args: argparse.Namespace, fk: FkFn | None
 ) -> Iterator[tuple[DeployLoop, dict[str, Any], Callable[[int], None], bool]]:
-    sys.path.insert(0, str(REPO_ROOT / "tests"))
-    from robot_fakes import FakeCam, FakeClock, FakeFollower
-
     spec = importlib.util.spec_from_file_location(
         "wo07_pilot", REPO_ROOT / "scripts" / "wo07_pilot.py"
     )
     assert spec is not None and spec.loader is not None
     pilot = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(pilot)
-    if args.fake_clock:
-        fake = FakeClock()
-        clock, sleep = fake, fake.sleep
-    else:
-        clock, sleep = time.perf_counter, time.sleep
+    clock, sleep, fake_arm, fake_rig = _mock_fakes(cfg, args, fk)
+    from robot_fakes import FakeCam
+
     dcfg = DeployConfig.from_config(cfg)
     policy = MockPolicy(
         pilot.mock_waypoints(dcfg.home_qpos), chunk_len=dcfg.chunk_len, infer_s=0.06, sleep=sleep
@@ -1199,14 +1306,7 @@ def mock_rig(
     )
     server, port = build_server(servicer, "127.0.0.1", 0)
     try:
-        arm = So101Driver(
-            FakeFollower(),
-            UnitMap.from_config(cfg),
-            make_safety(cfg, fk or load_sim_fk(), clock=clock),
-            clock=clock,
-            monitor=monitor_from_config(cfg),
-            sleep=sleep,
-        )
+        arm = fake_arm()
         pipe = PolicyImagePipeline.from_config(cfg)
         with (
             PolicyClient(
@@ -1222,9 +1322,7 @@ def mock_rig(
             check_server(info, dcfg)
             cam: Any = FakeCam(clock)
             if getattr(args, "protocol", P2.PROTOCOL_VERSION) == PR.PROTOCOL_VERSION:
-                wrist = FakeCam(clock)
-                wrist.image = np.ascontiguousarray(255 - wrist.image)  # a swap would show
-                cam = RigFrameSource(CameraRig({"front": cam, "wrist": wrist}))
+                cam = RigFrameSource(fake_rig())
             loop = DeployLoop(arm, cam, pipe, client, dcfg, clock=clock, sleep=sleep)
             yield loop, info, lambda _k: policy.reset(), pipe.calibrated
     finally:
@@ -1245,6 +1343,9 @@ def run(
         prior_runs = check_newest(prior_dir, settings)
         resumed_from: str | None = prior_dir.name
         check_identity(settings, args)
+        settings.setdefault("backend", "grpc")  # sessions recorded before --backend
+        if args.backend not in (None, settings["backend"]):
+            sys.exit(f"--resume refused: the session ran --backend {settings['backend']}")
     else:
         if args.task is None:
             sys.exit("--task is required for a new session")
@@ -1252,7 +1353,12 @@ def run(
     if args.hardware:
         return run_hardware(cfg, args, settings, prior, resumed_from, prior_runs)
     torque_wait = TorqueWait.from_config(cfg, "deploy", allow_none=True)  # validated; mock: unused
-    with mock_rig(cfg, args, fk) as (loop, info, on_start, calibrated):
+    rig = (
+        local_mock_rig(cfg, args, fk, settings)
+        if settings["backend"] == "local"
+        else mock_rig(cfg, args, fk)
+    )
+    with rig as (loop, info, on_start, calibrated):
         bind_session(cfg, settings, prior, resumed_from, loop.arm, info, loop.dcfg, args.max_steps)
         return session(
             cfg,
@@ -1275,6 +1381,8 @@ def run(
 def real_hardware_problems(cfg: Config, settings: dict[str, Any]) -> list[str]:
     """Why a real-0.1 hardware session may not start (empty = it may)."""
     out = [f"convention: {p}" for p in conv.check_config(cfg)]  # both cameras, 15 Hz, gripper
+    if settings.get("backend") != "local":
+        out.append("--backend local: a real-0.1 session runs SmolVLA / ACT in process on the Mac")
     if settle_s_from_config(cfg) != PR.SETTLE_S:
         out.append(f"eval.settle_s {settle_s_from_config(cfg)} != the protocol's {PR.SETTLE_S}")
     if not settings.get("labeler"):
@@ -1328,8 +1436,63 @@ def run_hardware(
         )
     from src.robot.camera import OpenCVFrameSource
 
-    dcfg = DeployConfig.from_config(cfg)
     fk = load_sim_fk()
+    with _hardware_backend(cfg, settings) as (client, info, dcfg, pipe, calibrated):
+        # builds the follower (lerobot reads the calibration file; no port is opened) so the
+        # fingerprint and the resume check run before anything can move
+        arm = So101Driver.from_config(cfg, fk)
+        bind_session(
+            cfg, settings, prior, resumed_from, arm, info, dcfg, max_steps, acknowledge=input
+        )
+        print(f"policy OK: {info['policy_id']} (run {info.get('server_run')})")
+        if settings["backend"] == "grpc" and dcfg.policy_checkpoint is None:
+            print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
+        guard = TorqueGuard(arm, torque_wait)
+        operator = JudgeOperator(guard, str(settings["task"]), settle_s_from_config(cfg))
+        # Ctrl-C a flag outside prompts, SIGHUP / SIGTERM / a lost foreground the closed-stdin
+        # path, Ctrl-Z ignored: from before torque on to after the final torque off (prompts.py)
+        cams: Any = (
+            CameraRig.from_config(cfg, conv.CAMERA_NAMES)
+            if real
+            else OpenCVFrameSource(cfg["cameras"]["front"])
+        )
+        with operator_signals() as interrupts, cams as cam, arm:
+            # local: the policy reads the rig itself (every camera); gRPC real-0.1 (mock
+            # only): the front view, the rig for the capture; protocol 0.2: the front camera
+            source: Any = (
+                cam if settings["backend"] == "local" else RigFrameSource(cam) if real else cam
+            )
+            loop = DeployLoop(arm, source, pipe, client, dcfg, interrupts=interrupts)
+            return session(
+                cfg,
+                loop,
+                operator,
+                info,
+                mode="hardware",
+                settings=settings,
+                prior_trials=prior,
+                resumed_from=resumed_from,
+                max_steps=max_steps,
+                camera_calibrated=calibrated,
+                runs_dir=args.runs_dir,
+                prior_runs=prior_runs,
+                torque_wait=torque_wait,
+            )
+
+
+@contextmanager
+def _hardware_backend(
+    cfg: Config, settings: dict[str, Any]
+) -> Iterator[tuple[Any, dict[str, Any], DeployConfig, Any, bool]]:
+    """(client, info, deploy config, image pipe, camera calibrated) of the session's backend,
+    checked before the arm is connected: a wrong policy never moves it."""
+    if settings["backend"] == "local":
+        from src.robot.local_policy import local_pipe
+
+        with local_backend(cfg, settings) as (client, info, dcfg):
+            yield client, info, dcfg, local_pipe, False  # raw frames: no undistortion, no crop
+        return
+    dcfg = DeployConfig.from_config(cfg)
     pipe = PolicyImagePipeline.from_config(cfg)
     target = f"{cfg['server']['host']}:{cfg['server']['port']}"
     with PolicyClient(
@@ -1345,40 +1508,7 @@ def run_hardware(
                 "policy server reports no adapter_sha256: the served weights cannot be bound to "
                 "the session (update the server to this branch); nothing was opened"
             )
-        # builds the follower (lerobot reads the calibration file; no port is opened) so the
-        # fingerprint and the resume check run before anything can move
-        arm = So101Driver.from_config(cfg, fk)
-        bind_session(
-            cfg, settings, prior, resumed_from, arm, info, dcfg, max_steps, acknowledge=input
-        )
-        print(f"policy server OK: {info['policy_id']} (server run {info.get('server_run')})")
-        if dcfg.policy_checkpoint is None:
-            print("WARNING: server.policy_checkpoint is null: the served adapter is not checked")
-        guard = TorqueGuard(arm, torque_wait)
-        operator = JudgeOperator(guard, str(settings["task"]), settle_s_from_config(cfg))
-        # Ctrl-C a flag outside prompts, SIGHUP / SIGTERM / a lost foreground the closed-stdin
-        # path, Ctrl-Z ignored: from before torque on to after the final torque off (prompts.py)
-        cams: Any = (
-            CameraRig.from_config(cfg, conv.CAMERA_NAMES) if real else OpenCVFrameSource(cam_cfg)
-        )
-        with operator_signals() as interrupts, cams as cam, arm:
-            source: Any = RigFrameSource(cam) if real else cam
-            loop = DeployLoop(arm, source, pipe, client, dcfg, interrupts=interrupts)
-            return session(
-                cfg,
-                loop,
-                operator,
-                info,
-                mode="hardware",
-                settings=settings,
-                prior_trials=prior,
-                resumed_from=resumed_from,
-                max_steps=max_steps,
-                camera_calibrated=pipe.calibrated,
-                runs_dir=args.runs_dir,
-                prior_runs=prior_runs,
-                torque_wait=torque_wait,
-            )
+        yield client, info, dcfg, pipe, pipe.calibrated
 
 
 def main(argv: Sequence[str] | None = None) -> Path:
@@ -1402,6 +1532,13 @@ def main(argv: Sequence[str] | None = None) -> Path:
     )
     parser.add_argument(
         "--no-capture", action="store_true", help="mock only: skip the evaluation capture"
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("grpc", "local"),
+        default=None,
+        help="local: SmolVLA / ACT in process from --checkpoint-dir (real-0.1; the hardware "
+        "default); grpc: the policy server (0.2; the mock's default, MockPolicy)",
     )
     parser.add_argument("--i-am-present", action="store_true", help="owner at the arm")
     parser.add_argument("--task", choices=P1.TASKS, default=None)

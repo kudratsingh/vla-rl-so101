@@ -486,7 +486,7 @@ class DeployLoop:
         # runs after every policy write with that tick's frame and step result (the evaluation
         # capture, src/robot/recording.py: both cameras, measured state, written command). A
         # failure in it is logged and never reaches the arm or the trial
-        self.on_write: Callable[[Frame | None, StepResult], None] | None = None
+        self.on_write: Callable[[Frame | RigFrame | None, StepResult], None] | None = None
         # the session's signal flags (src/robot/prompts.operator_signals; hardware only): a
         # Ctrl-C or a hang-up stops motion between ticks, never inside a bus transaction
         self.interrupts = interrupts
@@ -687,7 +687,7 @@ class DeployLoop:
         except Exception:  # a logging failure must not stop the trial
             log.exception("recording the policy start failed")
 
-    def _wrote(self, frame: Frame | None, out: StepResult) -> None:
+    def _wrote(self, frame: Frame | RigFrame | None, out: StepResult) -> None:
         if self.on_write is None:
             return
         try:

@@ -21,11 +21,13 @@ normalizer) -> ``predict_action_chunk`` -> the checkpoint's postprocessor (unnor
 ``convention.action_targets`` -> (C, 6) float64 targets -> ``So101Driver.step`` (deadman ->
 ``SafetyFilter`` -> the bus conversion ``canonical_to_lerobot``).
 
-Checkpoint identity (``checkpoint_identity``), as ``serve.adapter_identity`` does for an OFT
-adapter: ``checkpoint_sha256`` = sha256 over (name + sha256) of every file LeRobot loads from a
-pretrained dir: ``config.json``, ``model.safetensors``, both processor JSONs and every processor
-state file (the normalization stats), and ``checkpoint_revision`` = the Hub snapshot commit (None
-for a local dir). With ``local_policy.checkpoint_sha256`` set, any other hash is refused before the
+Checkpoint identity (``checkpoint_identity`` = ``src.policy.lerobot_ckpt.checkpoint_identity``,
+the trainer's, also used by the real eval and the vishwaroop export), as
+``serve.adapter_identity`` does for an OFT adapter: ``checkpoint_sha256`` = sha256 over
+(name + sha256), sorted by name, of the checkpoint files of a pretrained dir: ``config.json``,
+``model.safetensors``, ``train_config.json`` when present, both processor JSONs and every
+processor state file (the normalization stats), and ``checkpoint_revision`` = the Hub snapshot
+commit (None for a local dir). Loading is the trainer's ``lerobot_ckpt.load_checkpoint``. With ``local_policy.checkpoint_sha256`` set, any other hash is refused before the
 weights are read into the model and again by ``check_local``. A re-saved or retrained checkpoint
 under the same name gets a different hash.
 
@@ -42,7 +44,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
-import hashlib
 import json
 import logging
 import time
@@ -57,6 +58,7 @@ import torch
 
 from src.config import Config
 from src.eval import protocol
+from src.policy import lerobot_ckpt
 from src.robot import convention as conv
 from src.robot.client import ActReply, DeployConfig, ServerFault, ServerMismatch
 from src.robot.units import NUM_JOINTS
@@ -66,15 +68,6 @@ log = logging.getLogger(__name__)
 FAMILIES = ("smolvla", "act")
 DEVICES = ("mps", "cpu")
 TRANSPORT = "in_process"
-# What LeRobot 0.4.4 loads from a pretrained dir (PreTrainedPolicy.from_pretrained +
-# make_pre_post_processors(pretrained_path=...)); processor state files are globbed.
-CHECKPOINT_FILES = (
-    "config.json",
-    "model.safetensors",
-    "policy_preprocessor.json",
-    "policy_postprocessor.json",
-)
-PROCESSOR_STATE_GLOB = "policy_*processor_step_*.safetensors"
 RENAME_STEP = "rename_observations_processor"
 
 
@@ -83,41 +76,11 @@ class CheckpointMismatch(RuntimeError):
 
 
 # ------------------------------------------------------------------------------------------------
-# Checkpoint identity
+# Checkpoint identity: the trainer's (src/policy/lerobot_ckpt.py), one definition for the trainer,
+# this path, the real eval and the vishwaroop export
 # ------------------------------------------------------------------------------------------------
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for block in iter(lambda: fh.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def checkpoint_files(ckpt_dir: Path) -> list[str]:
-    """The files of ``ckpt_dir`` that LeRobot loads, in hashing order."""
-    names = [n for n in CHECKPOINT_FILES if (ckpt_dir / n).is_file()]
-    names += sorted(p.name for p in ckpt_dir.glob(PROCESSOR_STATE_GLOB) if p.is_file())
-    return names
-
-
-def checkpoint_identity(ckpt_dir: Path) -> dict[str, Any]:
-    """``checkpoint_sha256`` over (name, sha256) of every file LeRobot loads from ``ckpt_dir``,
-    ``checkpoint_revision`` (the Hub snapshot commit of a ``snapshots/<sha>/`` download, None for
-    a local dir) and the file list. Refuses a dir without ``config.json`` or the weights."""
-    found = checkpoint_files(ckpt_dir)
-    missing = [n for n in ("config.json", "model.safetensors") if n not in found]
-    if missing:
-        raise FileNotFoundError(f"{ckpt_dir}: no {missing} (not a LeRobot pretrained_model dir)")
-    h = hashlib.sha256()
-    for name in found:
-        h.update(f"{name}:{_sha256_file(ckpt_dir / name)}\n".encode())
-    parts = ckpt_dir.resolve().parts
-    rev = parts[parts.index("snapshots") + 1] if "snapshots" in parts[:-1] else None
-    return {
-        "checkpoint_sha256": h.hexdigest(),
-        "checkpoint_revision": rev,
-        "checkpoint_files": found,
-    }
+checkpoint_files = lerobot_ckpt.checkpoint_files
+checkpoint_identity = lerobot_ckpt.checkpoint_identity
 
 
 def resolve_checkpoint(spec: str) -> Path:
@@ -132,7 +95,7 @@ def resolve_checkpoint(spec: str) -> Path:
     path = snapshot_download(
         repo_id,
         revision=revision or None,
-        allow_patterns=[*CHECKPOINT_FILES, PROCESSOR_STATE_GLOB],
+        allow_patterns=list(lerobot_ckpt.CHECKPOINT_GLOBS),
     )
     return Path(path)
 
@@ -335,7 +298,6 @@ def load_local_policy(
     the convention, load it with its own processors on ``spec.device`` (MPS -> CPU fallback),
     and warm it up."""
     from lerobot.configs.policies import PreTrainedConfig
-    from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
     ckpt = resolve_checkpoint(spec.base)
     identity = checkpoint_identity(ckpt)
@@ -351,19 +313,16 @@ def load_local_policy(
     pcfg = PreTrainedConfig.from_pretrained(ckpt)
     _check_features(pcfg, spec, ckpt)
     rename_map, override_rename = _rename_for(pcfg, ckpt)
-    pcfg.device = device
-    pcfg.pretrained_path = ckpt
-    pcfg.n_action_steps = int(pcfg.chunk_size)
-    policy = get_policy_class(pcfg.type).from_pretrained(ckpt, config=pcfg)
-    policy.to(device)
-    if device == "cpu":
-        policy.to(torch.float32)  # bf16 on the CPU is ~30x slower (wo01_smolvla_smoke._cpu_fp32)
-    policy.eval()
-    overrides: dict[str, Any] = {"device_processor": {"device": device}}
-    if override_rename:
-        overrides[RENAME_STEP] = {"rename_map": rename_map}
-    pre, post = make_pre_post_processors(
-        pcfg, pretrained_path=str(ckpt), preprocessor_overrides=overrides
+    # the trainer's loader (CPU: fp32, the saved weights re-read past LeRobot's bf16 expert);
+    # every chunk is executed whole by the deploy loop, so n_action_steps = chunk_size
+    policy, pre, post = lerobot_ckpt.load_checkpoint(
+        ckpt,
+        device,
+        config=pcfg,
+        n_action_steps=int(pcfg.chunk_size),
+        preprocessor_overrides=(
+            {RENAME_STEP: {"rename_map": rename_map}} if override_rename else None
+        ),
     )
     local = LocalPolicy(
         policy,

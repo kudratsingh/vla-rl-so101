@@ -15,6 +15,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 06 | part 1 merged, kit arrived, physical bring-up pending | #5 (merged), #24 (`wo-06-bringup`, PR open, merged into #29) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
 | 04 | **benchmark not met; next step waits for the owner**, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
 | 07 | code only, **out of order** (started before WO-06 bring-up is verified): pilot client/server and real-eval harness on fakes, **unverified on hardware** | #23 (`wo-07-pilot`), #29 (`fix/robot-safety`), PRs open | Mock pilot, gRPC server, `scripts/wo07_real_eval.py` (protocol 0.2), placement grid. No real trials. |
+| SmolVLA pivot, PR 2 | PR open, code only, $0; merge after PR 1 (`docs/pivot-smolvla`, docs alignment) | `feat/smolvla-real` | Convention, SmolVLA / ACT trainer, Mac in-process inference, protocol real-0.1, eval capture, vishwaroop export. **Unverified on hardware and GPU.** See "PR 2: SmolVLA and ACT on the real arm" below. |
 | 05, 08, 09 | not started | | |
 | pre-run hardening | PR open, **waits for owner review** (touches the RL loop) | `fix/pre-run-hardening` | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
 | robot safety (PR 2) | PR open against `wo-07-pilot`; merge after #23, #24 and #28 (it merges #24 and #28) | `fix/robot-safety` | Review 3.3 gaps 2, 3, 5 and 7, plus the owner's 2026-11-08 review changes (homing offsets, torque off unconfirmed, real-eval session fingerprint, parking off by default), $0, **unverified on hardware**. See "Robot safety hardening" below. |
@@ -1223,6 +1224,76 @@ and every reported number untouched.
 - A capture refusal on resume (unfinalized dataset) happens after the arm is connected; the trial
   records stay intact, but the session's capture cannot continue.
 - vishwaroop's ET-M5-1 wording is the owner's to amend there (final2).
+
+### PR 2: integration
+
+Branch `feat/smolvla-real` (the PR), 2026-11-09, $0, CPU / MPS, fakes and the mock rig only
+(no arm, camera, serial port, Hub push or RunPod action). `feat/smolvla-real-train`
+(`ba99ab2`), `-infer` (`c0362d8`) and `-eval` (`8d2fb2a`) merged as merge commits on Stage A
+(`b7faab8`); the only conflicts were the three STATUS sections, combined here under one heading.
+`src/robot/client.py` auto-merged (the infer branch's `PolicyBackend` / two-camera frame plus the
+eval branch's `on_write` / `object_fn` / `record_hook`).
+
+How the pieces were made to fit (all through `src/robot/convention.py`, `so101-real-obs-action`
+1.0, hash `b8701c57...c912b5`, unchanged):
+- **One checkpoint identity.** There were three (trainer: sorted globs incl. `train_config.json`;
+  local path: a fixed list without it; export: every file in the dir). Now
+  `src/policy/lerobot_ckpt.checkpoint_identity` is the only one: `local_policy.checkpoint_identity`
+  is it, `export_bundle.checkpoint_identity` hashes and bundles exactly `lerobot_ckpt.checkpoint_files`
+  (and refuses if its hash ever differs), and the Hub download of the local path fetches the same
+  globs. Trainer run record = deploy `checkpoint_sha256` = session `policy_identity` = export
+  `checkpoint_id` (`sha256:<same>`).
+- **One loader.** `local_policy.load_local_policy` now loads through the trainer's
+  `lerobot_ckpt.load_checkpoint` (new keyword args `config`, `n_action_steps`,
+  `preprocessor_overrides`), so the CPU fallback gets the train branch's bf16 fix (fp32 weights
+  re-read past LeRobot's bf16 action expert; `strict=False` as LeRobot's own `from_pretrained`).
+- **Real eval through the local path.** `scripts/wo07_real_eval.py --backend {grpc,local}`:
+  `local` loads the `--checkpoint-dir` checkpoint in process, refusing it unless it hashes to the
+  session's `policy_identity.checkpoint_sha256`, then `check_local` (convention, chunk 50,
+  protocol), all before the arm is connected; the loop reads the `CameraRig` itself (front +
+  wrist, uncropped, `local_pipe`), deadline and chunk from `local_policy`. It is the only backend
+  of a real-0.1 session on the arm (`grpc` refused there; the server serves OFT) and opt-in for the
+  mock (default stays the gRPC MockPolicy); protocol 0.2 refuses `local`; a resume keeps the
+  session's backend (older sessions = `grpc`). The evaluation capture (`open_capture`,
+  `EvalCapture.on_write`) takes the rig from either source; `DeployLoop.on_write` is typed for the
+  `RigFrame` the local path delivers. This closes the Stage A / eval open issue "the deploy loop
+  feeds the policy the front camera at the 224 crop" for real-0.1. `scripts/wo07_pilot.py` is
+  still gRPC / front only.
+- **Recorder -> trainer.** The trainer reads a dataset written by the real recorder unchanged
+  (tested: `dataset.synthetic: false` on a recorder session).
+
+New test `tests/test_pr2_pipeline.py` (7; SmolVLA cases skip without the cached base, as on CI):
+two demos through the real recorder on fakes (both cameras) -> `scripts/wo07_train.py --preset
+tiny` ON that dataset (ACT and SmolVLA) -> one identity across trainer / local / export -> the
+saved checkpoint loaded by `LocalPolicy` -> one `run_trials` tick through the real `DeployLoop`
+on the fakes (ACT: the deploy-path chunk equals the trainer loader's `predict_chunk` within 1e-5
+rad) -> `wo07_real_eval --mock --backend local` (1 trial per cell, capture on: 3 episodes, both
+image keys, `check_dataset_info` passes) -> eval bundle of that session + demo bundle of those
+demos through the importer mirror; plus the backend refusals. 6 pipeline cases in 77 s on the M3
+Pro CPU.
+
+**Mock export against the real importer (D6), again, on the integrated pipeline.** Same
+vishwaroop copy (`ba0eef6`, original never written). Scratch builder
+`<scratchpad>/mockexport-tools/make_pr2_bundles.py`: 2 demos (real recorder, fakes) -> tiny ACT
+and tiny SmolVLA trained on them -> one mock real-0.1 session per family through
+`--backend local` with `configs/real.yaml`'s `local_policy` as is (device `mps`) -> bundles; then
+`<scratchpad>/mockexport-tools/run_importer_pr2.sh` (seal, verify, import with split
+`so101-mock-pr2-v1`: demo session `train`, the two eval sessions `dev`). All 3 seals, 3 verifies
+and 3 imports exit 0 (`audit.status: declared_group_and_lineage_checks_passed`); verify reports
+cameras front + wrist for all three; derived eval episodes carry `family_id`
+`so101-real-act` / `so101-real-smolvla` and `checkpoint_id` `sha256:c5348af7...` /
+`sha256:2c6d5afd...`, equal to the training runs' `checkpoint_sha256`; labels undeclared
+(`assessment_method: unknown`, no blinded review in this run). Mock only, never a result.
+
+**Gates:** full pytest 541 passed (+7 in `tests/test_pr2_pipeline.py`), `ruff check src tests scripts`, `black --check .`, `mypy --strict src`
+clean; no shell file changed. `pyproject.toml`, `uv.lock`,
+`src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/eval/protocol_real.py`,
+`src/env/success.py`, `src/robot/convention.py` and every reported number untouched.
+
+**First paid run awaiting approval (provisional, reprice from the probe):** SmolVLA,
+`scripts/pod/wo07_train_job.sh` `POLICY=smolvla`, batch 64 (32 on OOM), 20k steps, estimated
+RTX 4090 (Secure $0.89/h) x 6.35-10.35 h = $5.65-$9.21, plus the probe per pod
+($0.45-$0.89). Needs the 50 demos pushed and `DATASET_REVISION` pinned first. Not launched.
 
 ## Blockers and decisions pending the owner
 
