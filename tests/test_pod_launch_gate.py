@@ -68,6 +68,7 @@ class World:
         self.ssh_calls = 0
         self.ssh_fail_first = 0
         self.on_poll: Any = None  # callable(world) run on each sleep
+        self.gh_fail: list[str] = []  # path substrings: the next matching `gh api` read is a 502
         self.out: list[str] = []
 
     # clock
@@ -172,12 +173,17 @@ class World:
                 return 1, "", "HTTP 404: workflow not found on main"
             inp = body["inputs"]
             rid = self.add_run(inp["pod_id"], inp["dispatch_id"])
-            if self.dispatch_mode == "empty":
+            # like GitHub: 200 + workflow_run_id only with return_run_details true, else 204
+            if self.dispatch_mode == "empty" or body.get("return_run_details") is not True:
                 return 0, "", ""
             if self.dispatch_mode == "other_id":
                 rid = self.add_run(OTHER, "f" * 16)
             return 0, json.dumps({"workflow_run_id": rid, "html_url": "u", "run_url": "u"}), ""
         path = args[0]
+        for k, sub in enumerate(self.gh_fail):
+            if sub in path:
+                del self.gh_fail[k]
+                return 1, "", "gh: HTTP 502: Bad Gateway"
         if "/actions/workflows/" in path and path.split("?")[0].endswith("/runs"):
             # the fake ignores the server-side filters: the gate must filter on its own
             runs = sorted(self.runs.values(), key=lambda r: -r["id"])
@@ -255,6 +261,7 @@ def test_dispatch_captures_and_verifies_the_run_id(w: World) -> None:
     assert _dispatch(w, deadline) == 0
     body = w.dispatched[0]
     assert body["ref"] == "main" and body["inputs"]["pod_id"] == POD
+    assert body["return_run_details"] is True
     nonce = body["inputs"]["dispatch_id"]
     assert lg.NONCE_RE.match(nonce)
     st = json.loads((w.tmp / "wd" / f"{POD}.github.json").read_text())
@@ -372,6 +379,7 @@ def test_github_only_cannot_pass(w: World) -> None:
     assert len(w.cleanups) == 1
     argv, env = w.cleanups[0]
     assert argv[argv.index("--pod-id") + 1] == POD and "--expect-name-prefix" in argv
+    assert argv[argv.index("--created-after") + 1] == str(int(t_req) - 30)
     assert env == {"RUNPOD_API_KEY": KEY} and KEY not in " ".join(argv)
     assert not list(w.ws.iterdir())
     ev = _gate_events(w)[-2]
@@ -486,7 +494,171 @@ def test_no_cleanup_flag_and_bad_input(w: World) -> None:
     deadline, t_req, _ = _launch(w, mac=False)
     assert _gate(w, deadline, t_req, "--no-cleanup") == 12 and w.cleanups == []
     assert w.main("gate", "--deadline-epoch", str(deadline)) == 2  # no --t-req
+    assert _gate(w, deadline, deadline + 1) == 2  # T_req after the deadline
     assert _gate(w, deadline, t_req, "--ssh-host", "x;rm -rf /") == 2
+
+
+# ---- transient read errors are not verdicts; cleanup touches only this launch's pod ----------------
+def test_dispatch_204_is_resolved_later_by_the_gate(w: World) -> None:
+    """GitHub creates the run after dispatch stopped listing (exit 4, pending): the gate keeps
+    resolving it by the exact nonce, with the same checks, and passes."""
+    t_req = w.t
+    deadline = int(t_req) + 13800
+    w.t += 20
+    w.start_mac(deadline=deadline)
+    w.t += 3
+    w.mac_log("confirmed")
+    real = w._gh
+    held: list[dict[str, Any]] = []
+
+    def gh(args: list[str], stdin: str | None) -> tuple[int, str, str]:
+        if args[:2] == ["-X", "POST"]:
+            held.append(json.loads(stdin or "{}"))
+            return 0, "", ""  # 204, and the run does not exist yet
+        return real(args, stdin)
+
+    w._gh = gh  # type: ignore[method-assign]
+    assert _dispatch(w, deadline) == 4
+    st = json.loads((w.tmp / "wd" / f"{POD}.github.json").read_text())
+    assert st["run_id"] is None and st["resolve"] == "pending"
+    rid = w.add_run(POD, held[0]["inputs"]["dispatch_id"])
+    w.add_run(POD, "9" * 16)  # same pod, another nonce: never picked
+    w.t += 30
+    w.confirm_github(rid)
+    assert _gate(w, deadline, t_req) == 0 and w.cleanups == []
+    st = json.loads((w.tmp / "wd" / f"{POD}.github.json").read_text())
+    assert st["run_id"] == rid and st["source"] == "run list (gate)"
+
+
+def test_dispatch_pending_that_never_resolves_fails_at_the_deadline(w: World) -> None:
+    deadline, t_req, _ = _launch(w, github=False)
+    p = w.tmp / "wd" / f"{POD}.github.json"
+    st = json.loads(p.read_text())
+    st.update(run_id=None, resolve="pending", nonce="7" * 16)  # no run carries this nonce
+    p.write_text(json.dumps(st))
+    assert _gate(w, deadline, t_req) == 10 and len(w.cleanups) == 1
+    assert w.t <= t_req + 300 + 30 + 10 + 1
+
+
+@pytest.mark.parametrize("where", ["run", "jobs"])
+def test_transient_github_502_in_step_8_does_not_delete_a_confirmed_pod(
+    w: World, where: str
+) -> None:
+    """Step 5 passed; step 8 runs ~15 min later (past the deadline). One 502 on the run or jobs
+    read is retried, not a failure."""
+    deadline, t_req, rid = _launch(w)
+    assert _gate(w, deadline, t_req) == 0
+    w.t += 900
+    w.gh_fail = [f"/actions/runs/{rid}/jobs" if where == "jobs" else f"/actions/runs/{rid}"]
+    assert _gate(w, deadline, t_req, *_ssh_args()) == 0
+    assert w.cleanups == [] and (w.ws / f"WATCHDOGS_OK.{POD}").exists()
+
+
+def test_transient_502_during_the_ssh_wait_is_retried(w: World) -> None:
+    deadline, t_req, rid = _launch(w)
+    w.t += 900
+    w.ssh_fail_first = 3  # sshd still coming up
+    w.gh_fail = [f"/actions/runs/{rid}/jobs", "/jobs"]  # first two polls (past the deadline)
+    fired: list[bool] = []
+
+    def tick(world: World) -> None:  # one more 502 between the 2nd and 3rd SSH attempt
+        if world.ssh_calls == 2 and not fired:
+            fired.append(True)
+            world.gh_fail = [f"/actions/runs/{rid}"]
+
+    w.on_poll = tick
+    assert _gate(w, deadline, t_req, *_ssh_args()) == 0
+    assert fired and w.gh_fail == [] and w.ssh_calls == 4
+    assert w.cleanups == [] and (w.ws / f"WATCHDOGS_OK.{POD}").exists()
+
+
+def test_github_unreadable_past_the_grace_fails(w: World) -> None:
+    """A layer that cannot be read at all past the deadline is not confirmed: after
+    --read-grace-s the gate fails and cleans up."""
+    deadline, t_req, rid = _launch(w)
+    w.t += 900
+    w.gh_fail = [f"/actions/runs/{rid}"] * 100
+    t0 = w.t
+    assert _gate(w, deadline, t_req) == 10 and len(w.cleanups) == 1
+    assert 60 <= w.t - t0 <= 70
+    assert "unreadable for 60 s" in _gate_events(w)[-2]["reason"]
+
+
+def test_unreadable_after_the_pass_fails_within_the_grace_not_the_ssh_wait(w: World) -> None:
+    """After the pass, the token is never written without a fresh "ok": a layer that stays
+    unreadable fails the gate after --read-grace-s (60 s), long before --ssh-wait-s (120 s)."""
+    deadline, t_req, rid = _launch(w)
+    w.t += 900
+    w.ssh_fail_first = 1
+
+    def tick(world: World) -> None:
+        if not world.gh_fail:
+            world.gh_fail = [f"/actions/runs/{rid}"] * 100
+
+    w.on_poll = tick
+    t0 = w.t
+    assert _gate(w, deadline, t_req, *_ssh_args()) == 10 and w.ssh_calls == 1
+    assert 60 <= w.t - t0 <= 75 and not list(w.ws.iterdir())
+    assert "not readable as confirmed for 60 s" in _gate_events(w)[-2]["reason"]
+
+
+def test_mac_ps_failure_is_retried_not_a_verdict(w: World) -> None:
+    deadline, t_req, _ = _launch(w)
+    real = w.run
+    n = {"ps": 0}
+
+    def run(argv: list[str], stdin: str | None, env: Any, timeout: float) -> tuple[int, str, str]:
+        if argv[0] == "ps" and n["ps"] < 2:
+            n["ps"] += 1
+            return 127, "", "OSError: fork failed"
+        return real(argv, stdin, env, timeout)
+
+    w.run = run  # type: ignore[method-assign]
+    w.t += 900
+    assert _gate(w, deadline, t_req) == 0 and w.cleanups == []
+
+
+def test_gate_on_a_foreign_pod_id_deletes_nothing(w: World) -> None:
+    """A mistyped / older project pod id with no launch evidence: the gate fails at once and
+    never runs the cleanup on it."""
+    t_req = w.t
+    deadline = int(t_req) + 13800
+    rc = w.main(
+        "gate", "--deadline-epoch", str(deadline), "--t-req", str(int(t_req)), "--poll-s", "10"
+    )
+    assert rc == 13 and w.cleanups == []
+    assert any("NOTHING deleted" in x for x in w.out)
+    assert _gate_events(w)[-1]["event"] == "cleanup_refused"
+
+
+@pytest.mark.parametrize("how", ["older_launch", "other_deadline"])
+def test_gate_with_another_launchs_state_deletes_nothing(w: World, how: str) -> None:
+    """State files for this id exist, but from an earlier launch (dispatched / started before this
+    T_req) or with another deadline: not this launch's pod, nothing deleted."""
+    deadline, t_req, _ = _launch(w, github=False)
+    if how == "older_launch":
+        w.t += 3600
+        new_t_req = w.t
+        assert _gate(w, deadline, new_t_req) == 13
+    else:
+        assert _gate(w, deadline + 60, t_req) == 13
+    assert w.cleanups == []
+
+
+def test_cleanup_refusing_an_older_pod_maps_to_13(w: World) -> None:
+    deadline, t_req, _ = _launch(w, mac=False)
+    w.cleanup_rc = 7  # watchdog.py: createdAt before --created-after
+    assert _gate(w, deadline, t_req) == 13 and len(w.cleanups) == 1
+    assert any("NOTHING deleted" in x for x in w.out)
+
+
+def test_pod_mismatch_names_both_pods(w: World) -> None:
+    deadline, t_req, _ = _launch(w)
+    w.env_file.write_text(f"export RUNPOD_POD_ID={OTHER}\n")
+    assert _gate(w, deadline, t_req, *_ssh_args()) == 10
+    assert any(f"is pod {OTHER}, not {POD}" in x and "NOT touched" in x for x in w.out)
+    argv, _ = w.cleanups[0]
+    assert argv[argv.index("--pod-id") + 1] == POD  # only the verified pod, never the SSH target
 
 
 # ---- job side: the token -------------------------------------------------------------------------
@@ -565,7 +737,8 @@ def test_cli_with_stub_gh_on_path(tmp_path: Path) -> None:
         f'echo "$*" >> "{rec}"\n'
         'case "$*" in\n'
         '  *dispatches*) body=$(cat); nonce=$(echo "$body" | sed -E \'s/.*"dispatch_id": "([0-9a-f]+)".*/\\1/\')\n'
-        f'    echo "$nonce" > "{tmp_path}/nonce"; echo \'{{"workflow_run_id": 77}}\' ;;\n'
+        f'    echo "$nonce" > "{tmp_path}/nonce"\n'
+        '    case "$body" in *\'"return_run_details": true\'*) echo \'{"workflow_run_id": 77}\' ;; esac ;;\n'
         f'  *actions/runs/77) n=$(cat "{tmp_path}/nonce")\n'
         f'    printf \'{{"id":77,"display_title":"pod-watchdog pod={POD} dispatch=%s","event":"workflow_dispatch","head_branch":"main","path":"{WF}","status":"queued","created_at":"{now}"}}\' "$n" ;;\n'
         "  *) exit 1 ;;\n"
@@ -579,5 +752,6 @@ def test_cli_with_stub_gh_on_path(tmp_path: Path) -> None:
         capture_output=True, text=True, timeout=30, check=False,
     )  # fmt: skip
     assert p.returncode == 0, p.stdout + p.stderr
-    assert json.loads((tmp_path / "wd" / f"{POD}.github.json").read_text())["run_id"] == 77
+    st = json.loads((tmp_path / "wd" / f"{POD}.github.json").read_text())
+    assert st["run_id"] == 77 and st["source"] == "dispatch response"
     assert "actions/workflows/pod-watchdog.yml/dispatches --input -" in rec.read_text()

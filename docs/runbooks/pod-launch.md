@@ -111,18 +111,20 @@ against a mistyped id on the shared account.
    uv run python scripts/pod/launch_gate.py dispatch --pod-id <id> --deadline-epoch $DEADLINE --cap-s $CAP
    ```
    This sends the dispatch (`gh api POST .../actions/workflows/pod-watchdog.yml/dispatches`, ref
-   `main`) with a fresh nonce `dispatch_id`. The workflow's run-name is
-   `pod-watchdog pod=<id> dispatch=<nonce>`, and its confirm step is named `Confirm pod <id>`.
-   The run id comes from the dispatch response (`workflow_run_id`; GitHub's REST docs list a 200
-   response with it, read 2026-11-08). If the response has no id, the script lists this workflow's
-   `workflow_dispatch` runs on `main` created at or after the dispatch and takes the one run whose
-   run-name is exactly that string; zero or several matches fail. Either way it then checks the
-   run: exact run-name, event `workflow_dispatch`, branch `main`, workflow file
+   `main`) with a fresh nonce `dispatch_id` and `return_run_details: true`. The workflow's
+   run-name is `pod-watchdog pod=<id> dispatch=<nonce>`, and its confirm step is named
+   `Confirm pod <id>`. With `return_run_details`, GitHub answers 200 with `workflow_run_id`
+   (without it, 204 and no body; GitHub REST OpenAPI description, read 2026-11-08). If the response
+   has no id, the script lists this workflow's `workflow_dispatch` runs on `main` created at or
+   after the dispatch and takes the one run whose run-name is exactly that string. Either way it
+   then checks the run: exact run-name, event `workflow_dispatch`, branch `main`, workflow file
    `.github/workflows/pod-watchdog.yml`, and created no earlier than the dispatch minus 30 s. The
    result goes to `runs/watchdog/<id>.github.json`. Exit 0 = captured and verified; 3 = the
-   dispatch failed; 4 = no run, several runs, or a run that is not this pod's. On 3 or 4, go on to
-   step 5 anyway: the gate then fails and cleans up. **Never use `gh workflow run` or
-   `gh run list -L 1`**: the latest run can be another pod's.
+   dispatch failed; 4 = not captured: either `pending` (no run with the nonce within 60 s, or the
+   run was unreadable: the gate keeps resolving it with the same checks until its deadline) or
+   `refused` (several runs, or a run that is not this pod's: the gate fails). On 3 or 4, go on to
+   step 5 anyway. **Never use `gh workflow run` or `gh run list -L 1`**: the latest run can be
+   another pod's.
 5. **Run the gate** (confirmation deadline `T_req` + 300 s by default, `--gate-s`):
    ```zsh
    uv run python scripts/pod/launch_gate.py gate --pod-id <id> --deadline-epoch $DEADLINE --t-req $T_REQ
@@ -140,14 +142,23 @@ against a mistyped id on the shared account.
    finished, or one layer alone never passes. A gate started after the deadline still passes if
    both confirmed in time and both are still running. A layer that reports failure (step
    `failure` or `skipped`, run finished, process gone, run not this pod's) fails the gate at once.
-   **On failure the gate aborts and cleans up**: it writes no token and runs
-   `watchdog.py --terminate-now` with the Keychain key, which deletes the pod only if it confirms
-   the pod under the `vla-rl-so101` name, and verifies it gone from two sources. Exit codes: 0
-   passed; 10 failed, pod verified gone; 11 failed and the cleanup did NOT verify it gone; 12
-   failed with `--no-cleanup`; 2 bad input. **On 10, 11 or 12, delete the pod through the
-   connector and confirm it is gone** (on 10 this is a second check). Then report to the owner. The
-   launch is over; a new launch needs a new go. Each step is logged to
-   `runs/watchdog/<id>.gate.jsonl`.
+   A read that fails (`gh` error such as HTTP 502, `ps` error, unreadable log) is not a verdict:
+   it is retried every poll. Past the deadline it fails the gate only once that layer has been
+   unreadable for 60 s (`--read-grace-s`); a layer that was read and shows no confirmation fails
+   at once.
+   **On failure the gate aborts and cleans up the verified pod only**: it writes no token, then
+   checks that this launch recorded the id (`<id>.github.json` or `<id>.mac.env` naming this pod
+   and `$DEADLINE`, written at or after `T_req` - 30 s). If so it runs
+   `watchdog.py --terminate-now --created-after <T_req - 30>` with the Keychain key, which deletes
+   the pod only if it confirms it under the `vla-rl-so101` name and its `createdAt` is not before
+   that bound, and verifies it gone from two sources. Exit codes: 0 passed; 10 failed, pod verified
+   gone; 11 failed and the cleanup did NOT verify it gone; 12 failed with `--no-cleanup`; 13 failed
+   and the id is NOT verified as this launch's pod (no launch record for it, or its `createdAt` is
+   older): nothing deleted; 2 bad input (`--t-req` is required). **On 10, 11 or 12, delete the pod
+   through the connector and confirm it is gone** (on 10 this is a second check). **On 13, check
+   the id**: find the pod created at `T_req` through the connector (name, `createdAt`), delete that
+   one and confirm it is gone; do not touch any other pod. Then report to the owner. The launch is
+   over; a new launch needs a new go. Each step is logged to `runs/watchdog/<id>.gate.jsonl`.
 6. **Read the pod back** through the connector. The start command must equal the file, the env must
    hold `SPEND_CAP_SECONDS`, `POD_DEADLINE_EPOCH` and `PUBLIC_KEY`, and the volume must be at
    `/workspace`. Note `createdAt` and the SSH address.
@@ -162,7 +173,11 @@ against a mistyped id on the shared account.
    It re-runs the step 5 checks (both layers must still be running), checks that the pod's
    `/root/runpod.env` names this pod, and writes `/workspace/WATCHDOGS_OK.<id>`:
    `pod=<id> github_run=<run id> dispatch=<nonce> mac_pid=<pid> mac_tag=<tag> written=<UTC>`.
-   It retries SSH for up to 900 s (`--ssh-wait-s`). Failure is handled as in step 5. The job scripts
+   It retries SSH for up to 900 s (`--ssh-wait-s`). It writes only right after a fresh check shows
+   both layers `ok`; a failed read is retried, and fails the gate if a layer cannot be read as
+   confirmed for 60 s. If the SSH target's `/root/runpod.env` names another pod, the gate prints
+   both ids, writes nothing there and does not touch that pod (check it through the connector;
+   delete it only if this launch created it). Failure is handled as in step 5. The job scripts
    (`diag_job.sh`, `demo_rebuild_job.sh`, `wo04_job.sh`) check this token right after reading
    `/root/runpod.env`, before setup. A missing token, one written before the pod's first boot, one
    naming another pod, or one without both watchdog ids ends the job with rc 8, and the job's EXIT
@@ -188,12 +203,15 @@ verified gone: `gh run cancel <run>` and `pkill -f 'watchdog.py --pod-id <id>'`.
 ## Limits
 
 - The launch gate checks GitHub through `gh api` with the owner's `gh` login. A GitHub API outage
-  at launch fails the gate, and the pod is deleted: no launch without the GitHub layer. The gate
+  at launch (unreadable past the deadline + 60 s) fails the gate, and the pod is deleted: no launch
+  without the GitHub layer. A short blip is retried. The gate
   can only see that each watchdog was running when it passed. The job inside the pod cannot see
   the watchdogs, so a watchdog that dies later is not noticed by the job; the other layers remain.
-- The run-id capture, the run-name and the step-name match have been checked only against a fake
-  GitHub API (`tests/test_pod_launch_gate.py`), not against a live dispatch: the workflow is not on
-  `main` yet, and dispatching it was out of scope.
+- The run-id capture (`return_run_details`), the run-name and the step-name match have been
+  checked only against a fake GitHub API (`tests/test_pod_launch_gate.py`), not against a live
+  dispatch: the workflow is not on `main` yet, and dispatching it was out of scope. The
+  `--created-after` check relies on REST `createdAt`; if REST cannot be read the cleanup deletes
+  nothing (exit 11: delete through the connector).
 
 - The Mac copy runs under `caffeinate -i -s`. That prevents idle and system sleep only on AC power.
   Closing the lid on battery still sleeps the Mac, and a dead, sleeping or offline laptop runs no

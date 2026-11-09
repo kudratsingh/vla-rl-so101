@@ -7,13 +7,16 @@ that exact pod; if either has not confirmed by the deadline, abort and clean up 
 Runbook: docs/runbooks/pod-launch.md. Python stdlib only; every external command (gh, ps, ssh,
 security, the cleanup watchdog) goes through one injectable runner, so the tests use fakes.
 
-  dispatch  Dispatch .github/workflows/pod-watchdog.yml on main with a fresh nonce (dispatch_id).
-            The run id comes from the dispatch response (`workflow_run_id`, GitHub REST "Create a
-            workflow dispatch event", 200); if the response has none, it is resolved by listing
-            this workflow's workflow_dispatch runs on main created at/after the dispatch whose
-            run-name is exactly "pod-watchdog pod=<pod> dispatch=<nonce>": exactly one match, else
-            exit 4. Either way the run is then verified (title, event, branch main, workflow file,
-            created at/after the dispatch - SKEW_S) and <dir>/<pod>.github.json is written.
+  dispatch  Dispatch .github/workflows/pod-watchdog.yml on main with a fresh nonce (dispatch_id)
+            and `return_run_details: true`, so the run id comes from the dispatch response
+            (`workflow_run_id`, GitHub REST "Create a workflow dispatch event", 200). If the
+            response has none (204), it is resolved by listing this workflow's workflow_dispatch
+            runs on main created at/after the dispatch whose run-name is exactly
+            "pod-watchdog pod=<pod> dispatch=<nonce>": exactly one match. Either way the run is then
+            verified (title, event, branch main, workflow file, created at/after the dispatch -
+            SKEW_S) and <dir>/<pod>.github.json is written. No match within --resolve-wait-s:
+            exit 4 with the state "pending", and the gate keeps resolving it (same checks) until
+            --confirm-by; several matches or a run that fails the checks: exit 4, "refused".
   gate      Poll until both layers confirmed this pod, or fail:
               GitHub: the run with the captured id, re-verified as above, is in progress, its step
                 "Confirm pod <pod>" concluded success no later than --confirm-by (+ SKEW_S), and its
@@ -25,19 +28,27 @@ security, the cleanup watchdog) goes through one injectable runner, so the tests
             Confirmation must happen by --confirm-by (default T_req + 300 s); a gate started later
             still passes if both confirmed in time and are still running. Fails at once if a layer
             reports failure (step failed/skipped, run finished, process gone, run not this pod's).
+            A read that fails (gh/ps error, HTTP 5xx, unreadable log) is not evidence either way:
+            it is retried, and fails the gate only once that layer has been unreadable for
+            --read-grace-s (60 s) after the deadline, or, after a pass, before the token write.
             With --ssh-host it then writes the job's token /workspace/WATCHDOGS_OK.<pod> over SSH
             (only after re-checking both layers, and only if the pod's /root/runpod.env names this
             pod); the job scripts refuse to start without it (scripts/pod/approval_lib.sh,
             require_watchdogs, rc 8). Run it once without --ssh-host right after the dispatch, and
             again with --ssh-host once the pod's SSH address is known.
-            On failure: abort (no token) and clean up: `watchdog.py --terminate-now` with the
-            Keychain key (same name-prefix and two-source "gone" checks as the watchdog), and say
-            what to check by hand.
+            On failure: abort (no token) and clean up the verified pod only: the id must have this
+            launch's evidence (<pod>.github.json or <pod>.mac.env naming this pod and deadline,
+            dispatched / started at or after --t-req - SKEW_S), else nothing is deleted (exit 13).
+            Cleanup = `watchdog.py --terminate-now --created-after <T_req - SKEW_S>` with the
+            Keychain key: same name-prefix and two-source "gone" checks as the watchdog, and it
+            refuses a pod whose createdAt is older than this launch.
 
 Exit codes: 0 dispatched and verified / gate passed (token written with --ssh-host); 2 bad input;
 3 dispatch failed (no run); 4 run id not resolved or not this pod's run; 10 gate failed and the
 cleanup verified the pod gone; 11 gate failed and the cleanup did NOT verify it gone (delete it
-through the connector now and confirm it is gone); 12 gate failed, --no-cleanup given.
+through the connector now and confirm it is gone); 12 gate failed, --no-cleanup given; 13 gate
+failed and this id is NOT verified as this launch's pod (no launch evidence, or createdAt before
+T_req): nothing deleted - find the pod created at T_req through the connector, delete that one.
 Every check is logged as JSONL to <dir>/<pod>.gate.jsonl.
 """
 
@@ -172,8 +183,13 @@ def verify_run(ctx: Ctx, run: Any, nonce: str, dispatched: float) -> str:
     return ""
 
 
-def resolve_run(ctx: Ctx, nonce: str, dispatched: float, wait_s: float) -> tuple[int | None, str]:
-    """The ONE run of this workflow on main, created after the dispatch, titled with this nonce."""
+def resolve_run(
+    ctx: Ctx, nonce: str, dispatched: float, wait_s: float
+) -> tuple[int | None, str, str]:
+    """The ONE run of this workflow on main, created after the dispatch, titled with this nonce.
+
+    Returns (run id, why, kind): kind "found", "pending" (no such run yet; the list may also have
+    failed: `why` says), or "refused" (several runs carry the nonce, or one without an id)."""
     since = quote(">=" + iso(dispatched - SKEW_S), safe="")
     path = (
         f"repos/{ctx.repo}/actions/workflows/{WORKFLOW}/runs"
@@ -187,12 +203,15 @@ def resolve_run(ctx: Ctx, nonce: str, dispatched: float, wait_s: float) -> tuple
             want = expected_title(ctx.pod, nonce)
             hits = [r for r in runs if isinstance(r, dict) and r.get("display_title") == want]
             if len(hits) > 1:
-                return None, f"{len(hits)} runs carry this nonce: ambiguous"
+                return None, f"{len(hits)} runs carry this nonce: ambiguous", "refused"
             if hits:
                 rid = hits[0].get("id")
-                return (rid, "") if isinstance(rid, int) else (None, "run without an id")
+                if isinstance(rid, int):
+                    return rid, "", "found"
+                return None, "run without an id", "refused"
         if ctx.now() >= end:
-            return None, f"no run titled with this nonce after {wait_s:.0f} s ({err or 'listed'})"
+            why = f"no run titled with this nonce after {wait_s:.0f} s ({err or 'listed'})"
+            return None, why, "pending"
         ctx.sleep(5)
 
 
@@ -205,7 +224,8 @@ def cmd_dispatch(ctx: Ctx, a: argparse.Namespace) -> int:
         "lead_s": str(a.lead_s),
         "dispatch_id": nonce,
     }
-    body = json.dumps({"ref": BRANCH, "inputs": inputs})
+    # return_run_details: GitHub answers 200 + workflow_run_id only with it (204 without)
+    body = json.dumps({"ref": BRANCH, "inputs": inputs, "return_run_details": True})
     dispatched = ctx.now()
     rc, j, err = ctx.gh(
         "-X", "POST", f"repos/{ctx.repo}/actions/workflows/{WORKFLOW}/dispatches", "--input", "-",
@@ -218,6 +238,7 @@ def cmd_dispatch(ctx: Ctx, a: argparse.Namespace) -> int:
         "deadline_epoch": a.deadline_epoch,
         "repo": ctx.repo,
         "run_id": None,
+        "resolve": "refused",
     }
     ctx.log("dispatch", rc=rc, nonce=nonce, response=j if isinstance(j, dict) else None, err=err)
     if rc != 0:
@@ -228,30 +249,49 @@ def cmd_dispatch(ctx: Ctx, a: argparse.Namespace) -> int:
     rid = j.get("workflow_run_id") if isinstance(j, dict) else None
     how = "dispatch response"
     if not isinstance(rid, int):
-        rid, why = resolve_run(ctx, nonce, dispatched, a.resolve_wait_s)
+        rid, why, kind = resolve_run(ctx, nonce, dispatched, a.resolve_wait_s)
         how = "run list"
         if rid is None:
+            state["resolve"] = kind
             _write_json(ctx.gh_state, state)
-            ctx.log("run_unresolved", why=why)
-            ctx.out(f"[gate] run id NOT resolved: {why}")
+            ctx.log("run_unresolved", why=why, kind=kind)
+            ctx.out(f"[gate] run id NOT resolved ({kind}): {why}")
+            if kind == "pending":
+                ctx.out("[gate] the gate keeps looking for it (same checks) until its deadline.")
             return 4
-    rc, run, err = ctx.gh(f"repos/{ctx.repo}/actions/runs/{rid}")
-    why = verify_run(ctx, run, nonce, dispatched) if rc == 0 else f"read failed: {err}"
-    ctx.log("run_verify", run_id=rid, source=how, ok=not why, why=why)
+    why = capture_run(ctx, state, rid, how)
     if why:
-        _write_json(ctx.gh_state, state)
         ctx.out(f"[gate] run {rid} is NOT this pod's watchdog run: {why}")
         return 4
-    state.update(run_id=rid, html_url=run.get("html_url"), source=how)
-    _write_json(ctx.gh_state, state)
     ctx.out(
-        f"[gate] GitHub watchdog run {rid} ({how}) belongs to pod {ctx.pod}: {run.get('html_url')}"
+        f"[gate] GitHub watchdog run {rid} ({how}) belongs to pod {ctx.pod}: {state['html_url']}"
     )
     return 0
 
 
+def capture_run(ctx: Ctx, state: dict[str, Any], rid: int, how: str) -> str:
+    """Verify run `rid` against the dispatch `state`; record it in <pod>.github.json if it is this
+    pod's run ("" returned), else mark the state refused and return why not."""
+    rc, run, err = ctx.gh(f"repos/{ctx.repo}/actions/runs/{rid}")
+    nonce, dispatched = str(state["nonce"]), float(state["dispatched"])
+    why = verify_run(ctx, run, nonce, dispatched) if rc == 0 else f"read failed: {err}"
+    ctx.log("run_verify", run_id=rid, source=how, ok=not why, why=why)
+    if why and rc != 0:
+        # unreadable is not a verdict: the gate re-finds the run by its nonce (same checks)
+        state.update(run_id=None, resolve="pending")
+    elif why:
+        state.update(run_id=None, resolve="refused")
+    else:
+        state.update(run_id=rid, html_url=run.get("html_url"), source=how, resolve="found")
+    _write_json(ctx.gh_state, state)
+    return why
+
+
 def github_status(ctx: Ctx, confirm_by: float, deadline: float) -> tuple[str, str, dict[str, Any]]:
-    """("ok" | "wait" | "fail", why, info) for the GitHub layer."""
+    """("ok" | "wait" | "error" | "fail", why, info) for the GitHub layer.
+
+    "wait" = read, not confirmed (yet); "error" = could not read (no evidence either way);
+    "fail" = positive evidence that this layer is not watching this pod."""
     try:
         st = json.loads(ctx.gh_state.read_text())
     except (OSError, ValueError):
@@ -261,12 +301,24 @@ def github_status(ctx: Ctx, confirm_by: float, deadline: float) -> tuple[str, st
         return "fail", "dispatch state is for another pod or has no nonce", {}
     if st.get("deadline_epoch") != deadline:
         return "fail", f"dispatched deadline {st.get('deadline_epoch')} != {deadline}", {}
+    if not isinstance(rid, int) and st.get("resolve") == "pending":
+        # dispatch gave up listing before GitHub created the run: keep resolving, same checks
+        rid, why, kind = resolve_run(ctx, nonce, float(st.get("dispatched") or 0), 0)
+        if rid is None:
+            if kind == "refused":
+                st["resolve"] = "refused"
+                _write_json(ctx.gh_state, st)
+                return "fail", f"run not resolved: {why}", {}
+            return "wait", f"run not resolved yet: {why}", {}
+        why = capture_run(ctx, st, rid, "run list (gate)")
+        if why:
+            return ("error" if why.startswith("read failed") else "fail"), f"run {rid}: {why}", {}
     if not isinstance(rid, int):
         return "fail", "dispatch captured no verified run id", {}
     info = {"github_run": rid, "dispatch": nonce}
     rc, run, err = ctx.gh(f"repos/{ctx.repo}/actions/runs/{rid}")
-    if rc != 0:
-        return "wait", f"run read failed: {err}", info
+    if rc != 0 or not isinstance(run, dict):
+        return "error", f"run read failed: {err}", info
     why = verify_run(ctx, run, nonce, float(st.get("dispatched") or 0))
     if why:
         return "fail", f"run {rid} is not this pod's: {why}", info
@@ -274,7 +326,7 @@ def github_status(ctx: Ctx, confirm_by: float, deadline: float) -> tuple[str, st
         return "fail", f"run {rid} already completed ({run.get('conclusion')}): not watching", info
     rc, jobs, err = ctx.gh(f"repos/{ctx.repo}/actions/runs/{rid}/jobs")
     if rc != 0 or not isinstance(jobs, dict):
-        return "wait", f"jobs read failed: {err}", info
+        return "error", f"jobs read failed: {err}", info
     steps = [
         s
         for jb in jobs.get("jobs") or []
@@ -330,8 +382,10 @@ def mac_status(ctx: Ctx, confirm_by: float, deadline: float) -> tuple[str, str, 
         return "fail", "Mac state has no start epoch", {}
     pid = int(pid_s)
     info = {"mac_pid": pid, "mac_tag": tag}
-    rc, cmdline, _ = ctx.run(["ps", "-p", str(pid), "-o", "command="], None, None, 10.0)
+    rc, cmdline, err = ctx.run(["ps", "-p", str(pid), "-o", "command="], None, None, 10.0)
     cl = f" {cmdline.strip()} "
+    if rc not in (0, 1):  # ps itself failed (1 = no such process)
+        return "error", f"ps failed (rc {rc}): {err.strip()[:120]}", info
     if rc != 0 or not cmdline.strip():
         return "fail", f"Mac watchdog pid {pid} is not running", info
     if (
@@ -344,8 +398,10 @@ def mac_status(ctx: Ctx, confirm_by: float, deadline: float) -> tuple[str, str, 
     exited = None
     try:
         lines = Path(log).read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        lines = []
+    except FileNotFoundError:
+        lines = []  # not written yet: nothing confirmed
+    except OSError as e:
+        return "error", f"Mac watchdog log unreadable: {e}", info
     for line in lines:
         try:
             r = json.loads(line)
@@ -398,8 +454,38 @@ def write_token(ctx: Ctx, a: argparse.Namespace, info: dict[str, Any]) -> tuple[
     return ok, (so + se).strip()[-300:]
 
 
+def launch_evidence(ctx: Ctx, t_req: float, deadline: int) -> str:
+    """ "" if this launch recorded `ctx.pod` (dispatch or Mac watchdog state naming this pod and
+    deadline, written at/after T_req - SKEW_S), else why not. Cleanup needs it: the account is
+    shared and two project pods may run at once, so a mistyped or older id is never deleted."""
+    whys = []
+    try:
+        st = json.loads(ctx.gh_state.read_text())
+        t = st.get("dispatched")
+        if st.get("pod") != ctx.pod or st.get("deadline_epoch") != deadline:
+            whys.append(f"{ctx.gh_state.name} is for another pod / deadline")
+        elif not isinstance(t, (int, float)) or t < t_req - SKEW_S:
+            whys.append(f"{ctx.gh_state.name} dispatched before T_req")
+        else:
+            return ""
+    except (OSError, ValueError, AttributeError):
+        whys.append(f"no {ctx.gh_state.name}")
+    try:
+        ms = read_env_file(ctx.mac_state)
+        if ms.get("pod") != ctx.pod or ms.get("deadline") != str(deadline):
+            whys.append(f"{ctx.mac_state.name} is for another pod / deadline")
+        elif float(ms.get("start") or 0) < t_req - SKEW_S:
+            whys.append(f"{ctx.mac_state.name} started before T_req")
+        else:
+            return ""
+    except (OSError, ValueError):
+        whys.append(f"no {ctx.mac_state.name}")
+    return "; ".join(whys)
+
+
 def cleanup(ctx: Ctx, a: argparse.Namespace) -> int:
-    """watchdog.py --terminate-now with the Keychain key in the child's env only."""
+    """watchdog.py --terminate-now with the Keychain key in the child's env only; it refuses (rc 7)
+    a pod created before this launch's T_req."""
     rc, key, _ = ctx.run(
         ["security", "find-generic-password", "-s", KEYCHAIN_ITEM, "-w"], None, None, 15.0
     )
@@ -411,6 +497,7 @@ def cleanup(ctx: Ctx, a: argparse.Namespace) -> int:
         sys.executable, str(REPO_ROOT / "scripts/pod/watchdog.py"), "--terminate-now",
         "--pod-id", ctx.pod, "--deadline-epoch", str(a.deadline_epoch),
         "--log", str(ctx.dir / f"{ctx.pod}.cleanup.jsonl"), "--expect-name-prefix", NAME_PREFIX,
+        "--created-after", str(int(a.t_req - SKEW_S)),
     ]  # fmt: skip
     rc, so, _ = ctx.run(argv, None, {"RUNPOD_API_KEY": key}, 1500.0)
     del key
@@ -421,6 +508,9 @@ def cleanup(ctx: Ctx, a: argparse.Namespace) -> int:
 def fail(ctx: Ctx, a: argparse.Namespace, reason: str, gh: str, mac: str) -> int:
     ctx.log("gate_failed", reason=reason, github=gh, mac=mac)
     ctx.out(f"[gate] FAILED ({reason}): GitHub: {gh}; Mac: {mac}. NOT launching the job.")
+    ev = launch_evidence(ctx, a.t_req, a.deadline_epoch)
+    if ev:
+        return not_this_launch(ctx, ev)
     if a.no_cleanup:
         ctx.out("[gate] --no-cleanup: the pod is NOT deleted. Delete it through the connector now.")
         return 12
@@ -429,6 +519,8 @@ def fail(ctx: Ctx, a: argparse.Namespace, reason: str, gh: str, mac: str) -> int
     if rc == 0:
         ctx.out(f"[gate] pod {ctx.pod} verified gone (two sources). Confirm via the connector too.")
         return 10
+    if rc == 7:
+        return not_this_launch(ctx, "watchdog.py: the pod's createdAt is before T_req")
     ctx.out(
         f"[gate] cleanup did NOT verify pod {ctx.pod} gone (rc {rc}; see"
         f" {ctx.dir / (ctx.pod + '.cleanup.jsonl')}). Delete it through the connector NOW and"
@@ -437,11 +529,40 @@ def fail(ctx: Ctx, a: argparse.Namespace, reason: str, gh: str, mac: str) -> int
     return 11
 
 
+def not_this_launch(ctx: Ctx, why: str) -> int:
+    ctx.log("cleanup_refused", why=why)
+    ctx.out(
+        f"[gate] pod {ctx.pod} is NOT verified as this launch's pod ({why}): NOTHING deleted."
+        " Wrong --pod-id? Find the pod created at T_req through the connector (name, createdAt)"
+        " and delete THAT one, confirm it is gone; leave any other pod alone."
+    )
+    return 13
+
+
+class Unreadable:
+    """Per-layer streak of reads that gave no verdict; a layer is stuck once its streak is
+    >= grace_s old. Any verdict resets it."""
+
+    def __init__(self, ctx: Ctx, grace_s: float) -> None:
+        self.ctx, self.grace_s = ctx, grace_s
+        self.since: dict[str, float] = {}
+
+    def stuck(self, **bad: bool) -> list[str]:
+        t = self.ctx.now()
+        for k, b in bad.items():
+            if b:
+                self.since.setdefault(k, t)
+            else:
+                self.since.pop(k, None)
+        return [k for k, t0 in self.since.items() if t - t0 >= self.grace_s]
+
+
 def cmd_gate(ctx: Ctx, a: argparse.Namespace) -> int:
-    confirm_by = a.confirm_by if a.confirm_by else a.t_req + a.gate_s
+    confirm_by = a.confirm_by if a.confirm_by is not None else a.t_req + a.gate_s
     ctx.log("gate_start", confirm_by=iso(confirm_by), ssh=bool(a.ssh_host))
     gh = mac = "not checked"
     info: dict[str, Any] = {}
+    unread = Unreadable(ctx, a.read_grace_s)
     while True:
         gs, gh, gi = github_status(ctx, confirm_by, a.deadline_epoch)
         ms, mac, mi = mac_status(ctx, confirm_by, a.deadline_epoch)
@@ -451,8 +572,15 @@ def cmd_gate(ctx: Ctx, a: argparse.Namespace) -> int:
         if gs == ms == "ok":
             info = {**gi, **mi}
             break
+        stuck = unread.stuck(github=gs == "error", mac=ms == "error")
         if ctx.now() > confirm_by + SKEW_S:
-            return fail(ctx, a, f"not both confirmed by {iso(confirm_by)}", gh, mac)
+            # past the deadline only a read that showed "not confirmed" fails at once; a failed
+            # read is retried for --read-grace-s
+            if "wait" in (gs, ms):
+                return fail(ctx, a, f"not both confirmed by {iso(confirm_by)}", gh, mac)
+            if stuck:
+                why = f"{'+'.join(stuck)} unreadable for {a.read_grace_s:.0f} s past the deadline"
+                return fail(ctx, a, why, gh, mac)
         ctx.sleep(a.poll_s)
     ctx.log("gate_passed", **info)
     ctx.out(f"[gate] PASSED: both watchdogs confirmed pod {ctx.pod}. GitHub: {gh}; Mac: {mac}")
@@ -460,19 +588,38 @@ def cmd_gate(ctx: Ctx, a: argparse.Namespace) -> int:
         ctx.out("[gate] no --ssh-host: token not written; rerun with --ssh-host before the job.")
         return 0
     end = ctx.now() + a.ssh_wait_s
+    unread = Unreadable(ctx, a.read_grace_s)
+    detail = "no write attempted"
     while True:
-        # re-check both layers right before the write: a watchdog that died since does not count
+        # re-check both layers right before each write: a watchdog that stopped does not count;
+        # a read that fails (or flickers) is retried for --read-grace-s, never a write without "ok"
         gs, gh, _ = github_status(ctx, confirm_by, a.deadline_epoch)
         ms, mac, _ = mac_status(ctx, confirm_by, a.deadline_epoch)
-        if gs != "ok" or ms != "ok":
+        if "fail" in (gs, ms):
             return fail(ctx, a, "a watchdog stopped before the token was written", gh, mac)
-        ok, detail = write_token(ctx, a, info)
-        ctx.log("token", ok=ok, detail=detail)
-        if ok:
-            ctx.out(f"[gate] token written: /workspace/WATCHDOGS_OK.{ctx.pod}. Launch the job now.")
-            return 0
-        if "POD_MISMATCH" in detail:
-            return fail(ctx, a, f"SSH target is another pod ({detail})", gh, mac)
+        stuck = unread.stuck(github=gs != "ok", mac=ms != "ok")
+        if stuck:
+            why = f"{'+'.join(stuck)} not readable as confirmed for {a.read_grace_s:.0f} s"
+            return fail(ctx, a, why, gh, mac)
+        if gs == ms == "ok":
+            ok, detail = write_token(ctx, a, info)
+            ctx.log("token", ok=ok, detail=detail)
+            if ok:
+                ctx.out(
+                    f"[gate] token written: /workspace/WATCHDOGS_OK.{ctx.pod}. Launch the job now."
+                )
+                return 0
+            if "POD_MISMATCH" in detail:
+                m = re.search(r"POD_MISMATCH (\S+)", detail)
+                other = m.group(1) if m else "?"
+                ctx.out(
+                    f"[gate] {a.ssh_host}:{a.ssh_port} is pod {other}, not {ctx.pod}: no token."
+                    f" Pod {other} is NOT touched here: check it through the connector; delete it"
+                    " only if this launch created it."
+                )
+                return fail(ctx, a, f"SSH target is pod {other}, not {ctx.pod}", gh, mac)
+        else:
+            ctx.log("recheck_unreadable", github=gs, github_why=gh, mac=ms, mac_why=mac)
         if ctx.now() >= end:
             return fail(ctx, a, f"token not written after {a.ssh_wait_s:.0f} s: {detail}", gh, mac)
         ctx.sleep(a.poll_s)
@@ -500,7 +647,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     d.add_argument("--lead-s", type=int, default=400)
     d.add_argument("--resolve-wait-s", type=float, default=60.0)
     g = sub.choices["gate"]
-    g.add_argument("--t-req", type=int, default=None, help="epoch taken just before the create")
+    g.add_argument(
+        "--t-req", type=int, default=None, help="epoch taken just before the create (required)"
+    )
     g.add_argument("--gate-s", type=float, default=300.0, help="confirm by T_req + this")
     g.add_argument("--confirm-by", type=float, default=None, help="absolute; overrides --gate-s")
     g.add_argument("--ssh-host", default="")
@@ -508,6 +657,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g.add_argument("--ssh-user", default="root")
     g.add_argument("--ssh-bin", default="ssh")
     g.add_argument("--ssh-wait-s", type=float, default=900.0)
+    g.add_argument(
+        "--read-grace-s", type=float, default=60.0, help="retry failed reads this long (see doc)"
+    )
     g.add_argument("--no-cleanup", action="store_true", help="never delete (tests / owner's word)")
     return p.parse_args(argv)
 
@@ -517,8 +669,8 @@ def main(argv: list[str] | None = None, **inject: Any) -> int:
     if not POD_ID_RE.match(a.pod_id) or not 1.6e9 < a.deadline_epoch < 4.1e9:
         print("[gate] bad --pod-id or --deadline-epoch", file=sys.stderr)
         return 2
-    if a.cmd == "gate" and a.confirm_by is None and a.t_req is None:
-        print("[gate] gate needs --t-req (or --confirm-by)", file=sys.stderr)
+    if a.cmd == "gate" and (a.t_req is None or not 1.6e9 < a.t_req <= a.deadline_epoch):
+        print("[gate] bad --t-req (epoch before the create, <= --deadline-epoch)", file=sys.stderr)
         return 2
     if a.cmd == "gate" and a.ssh_host and not re.match(r"^[A-Za-z0-9.:-]{1,255}$", a.ssh_host):
         print("[gate] bad --ssh-host", file=sys.stderr)

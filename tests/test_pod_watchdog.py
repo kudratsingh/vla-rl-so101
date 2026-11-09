@@ -518,6 +518,33 @@ def test_terminate_now_never_deletes_an_unverified_pod(
     assert _events(recs, "exit")[-1]["rc"] == want
 
 
+@pytest.mark.parametrize(("created_ago", "want"), [(60, 0), (7200, 7), (None, 6)])
+def test_terminate_now_created_after_spares_an_older_pod(
+    tmp_path: Path, api: Any, created_ago: int | None, want: int
+) -> None:
+    """--created-after (the gate passes T_req - 30 s): a pod created since is deleted; one created
+    before it is another launch's pod (rc 7), and an unreadable createdAt (rc 6) deletes nothing."""
+    state, base = api
+    clock = VClock()
+    if created_ago is not None:
+        state.created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock.now() - created_ago))
+    bound = str(int(clock.now() - 600))
+    rc, recs, _, alerts, _ = _run(
+        tmp_path, base, 13800, "--terminate-now", "--created-after", bound, clock=clock
+    )
+    assert rc == want
+    if want == 0:
+        assert _deletes(state) == ["v2_delete"]
+    else:
+        assert _deletes(state) == [] and alerts and _events(recs, "exit")[-1]["rc"] == want
+
+
+def test_created_after_needs_terminate_now(tmp_path: Path, api: Any) -> None:
+    state, base = api
+    assert _run(tmp_path, base, 3600, "--created-after", str(int(time.time())))[0] == 5
+    assert state.calls == []
+
+
 def test_bad_run_tag_and_exclusive_modes(tmp_path: Path, api: Any) -> None:
     state, base = api
     assert _run(tmp_path, base, 3600, "--run-tag", "bad tag!")[0] == 5

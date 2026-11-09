@@ -23,7 +23,9 @@ Behaviour:
     gate (scripts/pod/launch_gate.py) counts only this run's "confirmed";
   - --terminate-now (the launch gate's cleanup after a failed gate): the same startup confirm, then
     the terminate phase at once, for at most --overrun-s; a pod not confirmed under the expected
-    name is never deleted (exit 3 / 4 / 5 / 6 as below);
+    name is never deleted (exit 3 / 4 / 5 / 6 as below); with --created-after (the gate passes
+    T_req - 30 s) it also deletes nothing unless the pod's createdAt (REST) is known and not
+    earlier: an older pod is another launch's (exit 7), an unknown createdAt exits 6;
   - before the fire time: read the pod every --poll-s; exit 0 early only if it deleted itself:
     every read over >= --gone-confirm-s (120 s) shows it gone;
   - a read is GONE only when two sources agree (404, status TERMINATED, or GraphQL pod null): a
@@ -42,7 +44,8 @@ Behaviour:
 Exit codes: 0 verified gone (--confirm-only: confirmed); 2 not verified by the end of the overrun;
 3 this key never saw the pod; 4 pod name does not match --expect-name-prefix (nothing deleted);
 5 bad input, no key, or key refused; 6 --confirm-only / --terminate-now: pod not confirmed (API
-errors; nothing deleted).
+errors, or createdAt unreadable with --created-after; nothing deleted); 7 --terminate-now
+--created-after: the pod was created before that epoch (not this launch's pod; nothing deleted).
 
 The key comes only from the environment (RUNPOD_API_KEY), never argv, and is redacted from every
 line this script writes. Every attempt is logged as one JSONL line to --log.
@@ -126,6 +129,7 @@ class Cfg:
     jump_s: float = 30.0
     expect_name_prefix: str = ""
     run_tag: str = ""
+    created_after: float | None = None
     api_v2: str = API_V2
     api_v1: str = API_V1
     graphql: str = GRAPHQL
@@ -546,6 +550,9 @@ class Watchdog:
                 if rc == 6:
                     self.log("exit", rc=6, phase="terminate_now", requests=self.requests)
                 return rc
+            refused = self._created_after_refusal()
+            if refused is not None:
+                return refused
             self.log("terminate_now", reason="launch gate failed")
             return self._terminate_phase(end=self.clock.now() + c.overrun_s)
         if rc is not None and rc != 6:
@@ -577,6 +584,41 @@ class Watchdog:
             if rd.state != GONE:
                 streak_t = None
         return self._terminate_phase()
+
+    def _created_after_refusal(self) -> int | None:
+        """--created-after: None if the pod's createdAt is known and >= the bound, else the exit
+        code (7 = older pod, another launch's; 6 = createdAt not readable). Re-reads a few times,
+        since only REST carries createdAt."""
+        c = self.cfg
+        if c.created_after is None:
+            return None
+        for _ in range(3):
+            if self.created is not None:
+                break
+            self._sleep(c.confirm_every_s)
+            self.read()
+            if self.bad_name is not None:
+                return self._refuse_name(self.bad_name)
+        if self.created is None:
+            self.alert(
+                "pod watchdog: createdAt unknown, NOT deleting",
+                f"{c.pod_id}: cannot tell whether this pod is the one just created. Check it"
+                " through the connector and delete it there if it is.",
+            )
+            self.log("exit", rc=6, phase="terminate_now", reason="createdAt unknown")
+            return 6
+        if self.created < c.created_after:
+            self.alert(
+                "pod watchdog: pod older than this launch, NOT deleting",
+                f"{c.pod_id} was created at {_iso(self.created)}, before"
+                f" {_iso(c.created_after)}: another launch's pod (wrong id?).",
+            )
+            self.log(
+                "exit", rc=7, phase="terminate_now", created=_iso(self.created),
+                created_after=_iso(c.created_after),
+            )  # fmt: skip
+            return 7
+        return None
 
     def _terminate_phase(self, end: float | None = None) -> int:
         c = self.cfg
@@ -713,6 +755,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="confirm, then terminate at once and verify gone (launch-gate cleanup)",
     )
     p.add_argument("--run-tag", default="", help="nonce written into every log line")
+    p.add_argument(
+        "--created-after",
+        type=float,
+        default=None,
+        help="--terminate-now: delete only a pod whose createdAt is at/after this epoch",
+    )
     p.add_argument("--no-alerts", action="store_true")
     p.add_argument("--api-v2", default=API_V2, help=argparse.SUPPRESS)
     p.add_argument("--api-v1", default=API_V1, help=argparse.SUPPRESS)
@@ -745,6 +793,8 @@ def main(
         bad.append("--cap-s must be positive")
     if not RUN_TAG_RE.match(a.run_tag):
         bad.append("--run-tag must be 0-64 of [A-Za-z0-9_-]")
+    if a.created_after is not None and (not a.terminate_now or not 1.6e9 < a.created_after < 4.1e9):
+        bad.append("--created-after needs --terminate-now and a plausible epoch")
     if a.confirm_only and a.terminate_now:
         bad.append("--confirm-only and --terminate-now exclude each other")
     if not all(_base_ok(u) for u in (a.api_v2, a.api_v1, a.graphql)):
@@ -766,6 +816,7 @@ def main(
         delete_timeout_s=a.delete_timeout_s,
         expect_name_prefix=a.expect_name_prefix,
         run_tag=a.run_tag if RUN_TAG_RE.match(a.run_tag) else "",
+        created_after=a.created_after,
         confirm_s=a.confirm_s,
         gone_confirm_s=a.gone_confirm_s,
         api_v2=a.api_v2.rstrip("/"),

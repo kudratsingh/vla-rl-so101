@@ -398,17 +398,23 @@ Launch gate (2026-11-08, owner request, $0, checked against a fake GitHub API an
 - **Why.** The old runbook took the newest `pod-watchdog` run (`gh run list -L 1`), which could be
   another pod's, and went on if only one watchdog confirmed.
 - **What.** `scripts/pod/launch_gate.py` (stdlib). `dispatch` sends the workflow with a fresh nonce
-  (`dispatch_id`; run-name `pod-watchdog pod=<id> dispatch=<nonce>`, step `Confirm pod <id>`). It
-  takes the run id from the dispatch response (`workflow_run_id`), or else from the one run of
-  that workflow on `main` created after the dispatch with exactly that run-name. It then verifies
+  (`dispatch_id`; run-name `pod-watchdog pod=<id> dispatch=<nonce>`, step `Confirm pod <id>`) and
+  `return_run_details: true`. It takes the run id from the dispatch response (`workflow_run_id`),
+  or else from the one run of that workflow on `main` created after the dispatch with exactly
+  that run-name; if none exists yet, the gate keeps resolving it until its deadline. It then verifies
   the run: run-name, event, branch `main`, workflow file, created after the dispatch.
   `gate` passes only when the GitHub run is in progress with `Confirm pod <id>` = success by
   `T_req` + 300 s and its `Watchdog` step running, AND the Mac watchdog's log has a `confirmed`
   line for this pod with this run's tag (`--run-tag`, new; `watchdog_mac.sh` writes
   `runs/watchdog/<id>.mac.env`), by the same deadline, from a live process that runs exactly
-  that watchdog. On failure it writes no token and runs the new `watchdog.py --terminate-now`
-  (same name-prefix and two-source checks), then the agent deletes via the connector and confirms
-  the pod gone. On a pass, `gate --ssh-host` writes `/workspace/WATCHDOGS_OK.<id>` over SSH, and
+  that watchdog. On failure it writes no token and cleans up only the verified pod: the id needs
+  this launch's record (`<id>.github.json` / `<id>.mac.env` with this deadline, written after
+  `T_req` - 30 s), and the new `watchdog.py --terminate-now --created-after <T_req - 30>` (same
+  name-prefix and two-source checks) refuses a pod created before it (gate exit 13, nothing
+  deleted). Then the agent deletes via the connector and confirms the pod gone. A failed read
+  (`gh` 5xx, `ps` error) is retried, not a verdict: it fails the gate only after 60 s unreadable
+  past the deadline, or before a token write (review fix, 2026-11-08: one GitHub 502 in step 8
+  had deleted a confirmed pod in the fake). On a pass, `gate --ssh-host` writes `/workspace/WATCHDOGS_OK.<id>` over SSH, and
   only if the pod's `runpod.env` names this pod. `diag_job.sh`, `demo_rebuild_job.sh` and
   `wo04_job.sh` refuse to start without a valid token (rc 8, checked before setup; the EXIT trap
   then deletes the pod). The in-container backstop (`pod_start_cmd.sh`, `delete_self.sh`,
@@ -418,8 +424,8 @@ Launch gate (2026-11-08, owner request, $0, checked against a fake GitHub API an
   ~6.5 min after `T_req` (5.5 min + ~1 min of cleanup): ~$0.20 on the A100 ($1.80/h with
   storage), ~$0.10 on the 4090. A token write that fails after the full 900 s SSH wait costs up to
   ~$0.70 on the A100. Both are inside the firm cap.
-- **Not verified live:** the dispatch response shape, the run-name and step-name expressions on
-  GitHub, and `ps` on the caffeinate pid. Checking them needs a dispatch once the workflow is on
+- **Not verified live:** the dispatch response shape with `return_run_details`, the run-name and
+  step-name expressions on GitHub, REST `createdAt` in the cleanup, and `ps` on the caffeinate pid. Checking them needs a dispatch once the workflow is on
   `main`; it was not done here.
 
 Outside our control:
