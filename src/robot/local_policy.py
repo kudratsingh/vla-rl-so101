@@ -367,6 +367,7 @@ def load_local_policy(
     ``UnitMap``), load it with its own processors on ``spec.device`` (MPS -> CPU fallback, refused
     with ``strict_device``) and, for SmolVLA with a provenance, the pinned VLM snapshot; warm up."""
     from lerobot.configs.policies import PreTrainedConfig
+    from lerobot.policies import factory  # noqa: F401 - registers every policy config type
 
     ckpt = resolve_checkpoint(spec.base)
     identity = checkpoint_identity(ckpt)

@@ -401,3 +401,22 @@ def test_resolve_checkpoint_never_fetches_a_mistyped_path(tmp_path: Path, monkey
     for spec in ("checkpoints/smolvla", "./ckpt", "/no/such/dir", "~/nope", "a/b/c"):
         with pytest.raises(FileNotFoundError, match="not a directory"):
             lp.resolve_checkpoint(spec)
+
+
+def test_a_fresh_process_resolves_a_smolvla_config(tmp_path: Path) -> None:
+    """A load in a new process must register LeRobot's policy config types first (the latency
+    script failed with "Couldn't find a choice class for 'smolvla'" when nothing else had)."""
+    import subprocess
+    import sys
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"type": "smolvla"}))
+    (tmp_path / "model.safetensors").write_bytes(b"x")
+    code = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from src.robot import local_policy as lp\n"
+        "try:\n    lp.load_local_policy(lp.LocalPolicySpec('smolvla', %r, 'cpu', None, 1.0, None, 0))\n"
+        "except Exception as e:\n    print(type(e).__name__, e)\n"
+    ) % (str(REPO_ROOT), str(tmp_path))
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert "choice class" not in out.stdout + out.stderr
