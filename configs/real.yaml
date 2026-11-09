@@ -110,6 +110,25 @@ server:
   policy_checkpoint: null             # HF id of SFT or SFT+RL LoRA; when set, the server's
                                       # policy_id (its --adapter string) must equal it exactly
 
+# In-process SmolVLA / ACT on the Mac (src/robot/local_policy.py), the alternative to the gRPC
+# server above, inside the same deploy loop (deadman, safety filter, prompts, trial records).
+# Observations and actions go through src/robot/convention.py (front + wrist, uncropped).
+local_policy:
+  family: smolvla                    # smolvla | act; chunk = convention CHUNK_SIZE (50 each)
+  base: null                         # policy.base for a real trial: fine-tuned pretrained_model dir
+                                     # or Hub user/repo[@rev]. null = nothing to deploy
+  checkpoint_sha256: null            # expected checkpoint_identity hash; set -> any other refused
+                                     # before the weights load (and again before the arm opens)
+  device: mps                        # mps | cpu; mps falls back to cpu when unavailable (logged)
+  exec_steps: null                   # actions run per chunk; null = whole chunk. deploy.max_chunk_age_ms
+                                     # (800) drops the rest earlier: (800 - query ms) / 66.7 actions
+  request_timeout_ms: 700            # ms, in-process chunk deadline -> deadman (hold); must stay
+                                     # < deploy.max_chunk_age_ms. SmolVLA on an M3 Pro MPS: ~0.42 s
+  warmup: 2                          # synthetic-observation calls at load (MPS kernel compilation)
+  latency_bases:                     # scripts/wo07_local_latency.py only (mock rig, never the arm)
+    smolvla: lerobot/smolvla_base    # pretrained base: timing only, its actions are not ours
+    act: null                        # null = a freshly initialised ACT (no trained checkpoint yet)
+
 # WO-07 client (src/robot/client.py). Stop semantics are documented at the top of that file.
 deploy:
   chunk_len: 8                       # actions per policy query; must equal the server's Info

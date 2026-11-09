@@ -1,0 +1,999 @@
+{
+  "run_id": "20261109T055550Z-wo07-local-latency-real-e73b",
+  "work_order": "WO-07",
+  "script": "scripts/wo07_local_latency.py",
+  "argv": [
+    "--preset",
+    "real",
+    "--family",
+    "smolvla"
+  ],
+  "preset": "real",
+  "config_hash": "0d912ade77518dec9d16bc3bf6ac58b8e15bd6a15d60d07b7563cf2ec017b19a",
+  "config": {
+    "preset": "real",
+    "robot": {
+      "type": "so101_follower",
+      "id": "so101_follower",
+      "port": "/dev/tty.usbmodemXXXX",
+      "calibration_dir": "~/.cache/huggingface/lerobot/calibration/robots/so_follower",
+      "use_degrees": true,
+      "control_hz": 15,
+      "units": {
+        "arm_sign": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "arm_offset_deg": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "gripper_closed_rad": -0.174533,
+        "gripper_open_rad": 1.74533
+      },
+      "safety": {
+        "joint_limits_deg": {},
+        "urdf_limit_margin_deg": 5.0,
+        "workspace_box_m": {
+          "x": [
+            0.1,
+            0.4
+          ],
+          "y": [
+            -0.2,
+            0.2
+          ],
+          "z": [
+            0.0,
+            0.25
+          ]
+        },
+        "max_joint_step_deg": 4.0,
+        "max_velocity_deg_s": 60.0,
+        "max_tracking_error_deg": 20.0,
+        "deadman_frame_timeout_ms": 300,
+        "torque_enable_tol_deg": {
+          "calibrated_range": 1.0,
+          "safety_limits": 6.0
+        }
+      },
+      "park": {
+        "enabled": false,
+        "qpos": null,
+        "tol_deg": 3.0,
+        "timeout_s": 20
+      },
+      "servo_monitor": {
+        "read_every_ticks": 4,
+        "max_temperature_c": 55,
+        "max_current_ma": 1500,
+        "current_trip_s": 1.0,
+        "current_ma_per_count": 6.5,
+        "bus_budget_ms": 10
+      }
+    },
+    "teleop": {
+      "leader": null,
+      "episodes_per_task": 5,
+      "episode_time_s": 30,
+      "prompt_torque_timeout_s": 60,
+      "prompt_support_grace_s": 10,
+      "dataset_root": "data/real_teleop",
+      "hub_repo": "KudratSingh22/vla-rl-so101-real-teleop",
+      "instructions": {
+        "PickPlace": "pick up the cube and place it in the bowl",
+        "Push": "push the cube to the target",
+        "Stack": "stack the red cube on the blue cube"
+      }
+    },
+    "cameras": {
+      "front": {
+        "index": 0,
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "intrinsics": null,
+        "pose": "front_left_45",
+        "crop_to": 224,
+        "fov_deg": 40
+      },
+      "wrist": {
+        "index": 1,
+        "width": 640,
+        "height": 480,
+        "fps": 30
+      }
+    },
+    "server": {
+      "host": "127.0.0.1",
+      "port": 50051,
+      "policy_checkpoint": null
+    },
+    "local_policy": {
+      "family": "smolvla",
+      "base": null,
+      "checkpoint_sha256": null,
+      "device": "mps",
+      "exec_steps": null,
+      "request_timeout_ms": 700,
+      "warmup": 2,
+      "latency_bases": {
+        "smolvla": "lerobot/smolvla_base",
+        "act": null
+      }
+    },
+    "deploy": {
+      "chunk_len": 8,
+      "action_dim": 6,
+      "exec_steps": null,
+      "request_timeout_ms": 400,
+      "max_chunk_age_ms": 800,
+      "trial_max_steps": 150,
+      "home_qpos": [
+        0.0,
+        -1.3,
+        0.6,
+        1.3,
+        0.0,
+        0.0
+      ],
+      "home_tol_deg": 3.0,
+      "home_timeout_s": 20,
+      "latency_target_ms": 150,
+      "capture_offset_ms": null,
+      "stop_on_reject": false,
+      "prompt_torque_timeout_s": 60,
+      "prompt_support_grace_s": 10,
+      "pilot": {
+        "task": "PickPlace",
+        "cell": "seen",
+        "trials": 5
+      }
+    },
+    "eval": {
+      "trials_per_cell": 50,
+      "cells": [
+        "seen",
+        "shifted",
+        "unseen_objects"
+      ],
+      "grid": "docs/assets/placement-grid-a3.pdf",
+      "slot_seed": 0,
+      "settle_s": 3.0
+    }
+  },
+  "git": {
+    "commit": "32f057db40a6ce02b1d651848579db39fb13801b",
+    "branch": "pr2-infer",
+    "dirty": false
+  },
+  "device": {
+    "device": "mps",
+    "host": "Kudrats-MacBook-Pro-3.local",
+    "os": "macOS-26.5.2-arm64-arm-64bit",
+    "torch": "2.6.0",
+    "name": "Apple M3 Pro",
+    "runpod_pod_id": null
+  },
+  "start_utc": "2026-11-09T05:55:50Z",
+  "end_utc": "2026-11-09T05:56:52Z",
+  "wall_clock_s": 62.1,
+  "hourly_usd": 0.0,
+  "estimated_usd": 0.0,
+  "actual_usd": 0.0,
+  "status": "ok",
+  "results": {
+    "label": "MOCK RIG, single run: fake arm + two fake cameras, real deploy loop / safety filter / model on this Mac. EXCLUDES camera capture (exposure, USB, driver buffering). Not an arm number",
+    "policy_info": {
+      "transport": "in_process",
+      "chunk_len": 50,
+      "action_dim": 6,
+      "protocol_version": "0.1-draft",
+      "protocol_hash": "e9ce5bb47a88da03d3cad77c4084b32d7184eeb2d30efa4f93f6f487be7e517c",
+      "policy_id": "lerobot/smolvla_base",
+      "describe": {
+        "kind": "local",
+        "family": "smolvla",
+        "type": "smolvla",
+        "base": "lerobot/smolvla_base",
+        "device": "mps",
+        "dtype": "torch.bfloat16",
+        "chunk_size": 50,
+        "n_action_steps": 50,
+        "image_features": [
+          "observation.images.camera1",
+          "observation.images.camera2",
+          "observation.images.camera3"
+        ],
+        "rename_map": {
+          "observation.images.front": "observation.images.camera1",
+          "observation.images.wrist": "observation.images.camera2"
+        },
+        "warmup_ms": [
+          734.276,
+          422.787
+        ]
+      },
+      "server_run": {
+        "run_id": "20261109T055550Z-wo07-local-latency-real-e73b",
+        "device": "mps"
+      },
+      "convention": {
+        "module": "src/robot/convention.py",
+        "id": "so101-real-obs-action",
+        "version": "1.0",
+        "hash": "b8701c5784f73dc0fec0fc12bf695be8c7b7db826c2f8faae460716fe1c912b5"
+      },
+      "checkpoint_sha256": "8b576bb5a44b6ecee19aae5dc9348d814ff4bb193ccbe6df8b5378e1149d74f3",
+      "checkpoint_revision": "5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6"
+    },
+    "latency": {
+      "label": "MOCK RIG, single run: fake arm + two fake cameras, real deploy loop / safety filter / model on this Mac. EXCLUDES camera capture (exposure, USB, driver buffering). Not an arm number",
+      "family": "smolvla",
+      "checkpoint": "lerobot/smolvla_base",
+      "fresh_init": false,
+      "device": "mps",
+      "dtype": "torch.bfloat16",
+      "mac": {
+        "chip": "Apple M3 Pro",
+        "model": "Mac15,7",
+        "memory_gb": 36.0,
+        "macos": "26.5.2",
+        "platform": "macOS-26.5.2-arm64-arm-64bit"
+      },
+      "load_s": 10.11,
+      "warmup_ms": [
+        734.276,
+        422.787
+      ],
+      "chunk_ms": {
+        "n": 60,
+        "p50": 448.374,
+        "p95": 463.469,
+        "max": 471.794
+      },
+      "model_ms": {
+        "n": 60,
+        "p50": 441.799,
+        "p95": 453.325,
+        "max": 468.31
+      },
+      "command_gap_ms": {
+        "n": 298,
+        "p50": 76.532,
+        "p95": 526.757,
+        "max": 547.875
+      },
+      "ticks": 300,
+      "decisions": 60,
+      "actions_per_chunk_mean": 5.0,
+      "trials": 2,
+      "stop_reasons": {
+        "max_steps": 2
+      },
+      "chunk_len": 50,
+      "exec_steps": 50,
+      "request_timeout_ms": 700.0,
+      "max_chunk_age_ms": 800.0,
+      "control_hz": 15.0,
+      "stop_on_reject": false,
+      "safety_status": {
+        "clipped": 193,
+        "rejected": 106,
+        "pass": 1
+      }
+    },
+    "summary": {
+      "protocol_version": "0.1-draft",
+      "protocol_hash": "e9ce5bb47a88da03d3cad77c4084b32d7184eeb2d30efa4f93f6f487be7e517c",
+      "cells": {
+        "PickPlace/seen": {
+          "task": "PickPlace",
+          "cell": "seen",
+          "n": 2,
+          "successes": 2,
+          "not_started": 0,
+          "faulted": 0,
+          "unjudged": 0,
+          "stop_reasons": {
+            "max_steps": 2
+          },
+          "faults_by_kind": {},
+          "success_rate": 1.0,
+          "wilson_95": [
+            0.3424,
+            1.0
+          ],
+          "diagnostic_excluding_faulted": {
+            "n": 2,
+            "successes": 2,
+            "success_rate": 1.0,
+            "note": "SECONDARY diagnostic, not the result: success rate over started trials that did not end in a fault. The primary metric (success_rate) counts every faulted trial as a failure."
+          }
+        }
+      },
+      "frame_return_to_first_write_ms": {
+        "n": 60,
+        "median": 449.423,
+        "p95": 464.496,
+        "max": 472.597
+      },
+      "write_hz": {
+        "n": 2,
+        "median": 6.204,
+        "p95": 6.217,
+        "max": 6.218
+      },
+      "primary_metric": "success_rate = successes / trials whose policy started (each slot scored once); a fault after the start (servo, serial, safety / deadman stop, server, torque off unconfirmed, Ctrl-C during motion) and an unjudged score prompt count as failures",
+      "latency_target_ms": 150.0,
+      "frame_return_p95_under_target": false,
+      "latency_note": "frame_return_to_first_write_ms: LeRobot's frame stamp (perf_counter in its read thread, after VideoCapture.read() returned and the BGR->RGB conversion) to the first bus write. EXCLUDES capture: exposure, sensor readout, USB transfer, AVFoundation buffering, decode. Not end-to-end; see docs/bringup/latency-measurement.md",
+      "end_to_end_estimate_ms": null,
+      "torque_off_unconfirmed": false
+    },
+    "session_end": "completed",
+    "trials": [
+      {
+        "task": "PickPlace",
+        "cell": "seen",
+        "trial_idx": 0,
+        "instruction": "pick up the red cube and place it in the bowl",
+        "protocol_version": "0.1-draft",
+        "protocol_hash": "e9ce5bb47a88da03d3cad77c4084b32d7184eeb2d30efa4f93f6f487be7e517c",
+        "policy_id": "lerobot/smolvla_base",
+        "server_describe": {
+          "kind": "local",
+          "family": "smolvla",
+          "type": "smolvla",
+          "base": "lerobot/smolvla_base",
+          "device": "mps",
+          "dtype": "torch.bfloat16",
+          "chunk_size": 50,
+          "n_action_steps": 50,
+          "image_features": [
+            "observation.images.camera1",
+            "observation.images.camera2",
+            "observation.images.camera3"
+          ],
+          "rename_map": {
+            "observation.images.front": "observation.images.camera1",
+            "observation.images.wrist": "observation.images.camera2"
+          },
+          "warmup_ms": [
+            734.276,
+            422.787
+          ]
+        },
+        "start_utc": "2026-11-09T05:56:00Z",
+        "end_utc": "2026-11-09T05:56:26Z",
+        "outcome": "success",
+        "outcome_source": "scripted",
+        "policy_started": true,
+        "policy_started_utc": "2026-11-09T05:56:02Z",
+        "fault": null,
+        "unjudged": null,
+        "steps": 150,
+        "decisions": 30,
+        "stop_reason": "max_steps",
+        "stop_detail": "",
+        "deadman_response": null,
+        "stale_chunk_drops": 29,
+        "home": {
+          "reached": true,
+          "rejected": false,
+          "steps": 19,
+          "residual_deg": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "safety": {
+          "status_counts": {
+            "clipped": 99,
+            "rejected": 50,
+            "pass": 1
+          },
+          "interventions_by_kind": {
+            "joint_limit": 171,
+            "step_clip": 197,
+            "workspace_reject": 50
+          },
+          "interventions_by_group": {
+            "gripper": 149,
+            "arm": 219,
+            "pose": 50
+          },
+          "first_interventions": [
+            {
+              "step": 1,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -21.671555028857647,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 1,
+              "kind": "step_clip",
+              "joint": "shoulder_pan",
+              "requested_deg": 4.795843792707487,
+              "applied_deg": 3.999999999999999,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 1,
+              "kind": "step_clip",
+              "joint": "elbow_flex",
+              "requested_deg": 38.80193925972184,
+              "applied_deg": 38.37746770784939,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 1,
+              "kind": "step_clip",
+              "joint": "wrist_flex",
+              "requested_deg": 66.44466081196349,
+              "applied_deg": 70.48451336700703,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 1,
+              "kind": "step_clip",
+              "joint": "wrist_roll",
+              "requested_deg": 6.805964623460832,
+              "applied_deg": 3.999999999999999,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 1,
+              "kind": "step_clip",
+              "joint": "gripper",
+              "requested_deg": -5.000004285756797,
+              "applied_deg": -3.999999999999999,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 2,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -28.279600833852196,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 3,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -33.246314615252246,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 4,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -31.78640266129704,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 5,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -32.927273064026366,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 6,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -13.935844991893994,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 6,
+              "kind": "step_clip",
+              "joint": "shoulder_pan",
+              "requested_deg": 16.125142602031104,
+              "applied_deg": 12.44481942282073,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 6,
+              "kind": "step_clip",
+              "joint": "elbow_flex",
+              "requested_deg": 44.1199177173046,
+              "applied_deg": 44.00299045922815,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 6,
+              "kind": "step_clip",
+              "joint": "wrist_roll",
+              "requested_deg": 11.15043323043391,
+              "applied_deg": 10.057450168734658,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 7,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -22.865871661842323,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 7,
+              "kind": "step_clip",
+              "joint": "shoulder_pan",
+              "requested_deg": 17.92277838213947,
+              "applied_deg": 16.44481942282073,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 8,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -36.57672168473963,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 8,
+              "kind": "step_clip",
+              "joint": "wrist_flex",
+              "requested_deg": 61.817043724739776,
+              "applied_deg": 62.12722094009798,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 9,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -34.5918755421231,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 10,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -27.868606153377726,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            }
+          ]
+        },
+        "latency": {
+          "frame_return_to_first_write_ms": {
+            "n": 30,
+            "median": 447.864,
+            "p95": 459.646,
+            "max": 472.597
+          },
+          "rtt_ms": {
+            "n": 30,
+            "median": 447.107,
+            "p95": 458.859,
+            "max": 471.878
+          },
+          "infer_ms": {
+            "n": 30,
+            "median": 440.542,
+            "p95": 452.331,
+            "max": 468.31
+          },
+          "boundary_gap_ms": {
+            "n": 29,
+            "median": 518.027,
+            "p95": 529.967,
+            "max": 547.849
+          },
+          "write_hz": 6.218,
+          "max_frame_age_ms": 0.068,
+          "per_decision_frame_return_to_first_write_ms": [
+            449.606,
+            450.279,
+            433.813,
+            443.767,
+            448.294,
+            447.434,
+            454.21,
+            437.742,
+            447.234,
+            437.53,
+            454.148,
+            446.284,
+            436.733,
+            453.547,
+            424.958,
+            436.909,
+            446.855,
+            443.769,
+            447.18,
+            451.75,
+            449.239,
+            439.894,
+            446.707,
+            457.417,
+            451.497,
+            455.282,
+            472.597,
+            461.47,
+            451.302,
+            452.996
+          ],
+          "note": "frame_return_to_first_write_ms: LeRobot's frame stamp (perf_counter in its read thread, after VideoCapture.read() returned and the BGR->RGB conversion) to the first bus write. EXCLUDES capture: exposure, sensor readout, USB transfer, AVFoundation buffering, decode. Not end-to-end; see docs/bringup/latency-measurement.md"
+        },
+        "servo_health": {
+          "reads": 42,
+          "read_ms": {
+            "mean": 0.005,
+            "max": 0.016,
+            "over_budget": 0,
+            "budget": 10.0
+          },
+          "read_every_ticks": 4,
+          "register_period_s": 0.5333,
+          "max_temperature_c": {
+            "shoulder_pan": 35.0,
+            "shoulder_lift": 35.0,
+            "elbow_flex": 35.0,
+            "wrist_flex": 35.0,
+            "wrist_roll": 35.0,
+            "gripper": 35.0
+          },
+          "max_current_ma": {
+            "shoulder_pan": 97.5,
+            "shoulder_lift": 97.5,
+            "elbow_flex": 97.5,
+            "wrist_flex": 97.5,
+            "wrist_roll": 97.5,
+            "gripper": 97.5
+          }
+        },
+        "camera_calibrated": false,
+        "torque_off_unconfirmed": false
+      },
+      {
+        "task": "PickPlace",
+        "cell": "seen",
+        "trial_idx": 1,
+        "instruction": "pick up the red cube and place it in the bowl",
+        "protocol_version": "0.1-draft",
+        "protocol_hash": "e9ce5bb47a88da03d3cad77c4084b32d7184eeb2d30efa4f93f6f487be7e517c",
+        "policy_id": "lerobot/smolvla_base",
+        "server_describe": {
+          "kind": "local",
+          "family": "smolvla",
+          "type": "smolvla",
+          "base": "lerobot/smolvla_base",
+          "device": "mps",
+          "dtype": "torch.bfloat16",
+          "chunk_size": 50,
+          "n_action_steps": 50,
+          "image_features": [
+            "observation.images.camera1",
+            "observation.images.camera2",
+            "observation.images.camera3"
+          ],
+          "rename_map": {
+            "observation.images.front": "observation.images.camera1",
+            "observation.images.wrist": "observation.images.camera2"
+          },
+          "warmup_ms": [
+            734.276,
+            422.787
+          ]
+        },
+        "start_utc": "2026-11-09T05:56:26Z",
+        "end_utc": "2026-11-09T05:56:52Z",
+        "outcome": "success",
+        "outcome_source": "scripted",
+        "policy_started": true,
+        "policy_started_utc": "2026-11-09T05:56:28Z",
+        "fault": null,
+        "unjudged": null,
+        "steps": 150,
+        "decisions": 30,
+        "stop_reason": "max_steps",
+        "stop_detail": "",
+        "deadman_response": null,
+        "stale_chunk_drops": 29,
+        "home": {
+          "reached": true,
+          "rejected": false,
+          "steps": 16,
+          "residual_deg": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "safety": {
+          "status_counts": {
+            "clipped": 94,
+            "rejected": 56
+          },
+          "interventions_by_kind": {
+            "joint_limit": 157,
+            "step_clip": 206,
+            "workspace_reject": 56
+          },
+          "interventions_by_group": {
+            "gripper": 151,
+            "arm": 212,
+            "pose": 56
+          },
+          "first_interventions": [
+            {
+              "step": 1,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -25.919084041601206,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 1,
+              "kind": "step_clip",
+              "joint": "shoulder_pan",
+              "requested_deg": 6.379775333404022,
+              "applied_deg": 3.999999999999999,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 1,
+              "kind": "step_clip",
+              "joint": "elbow_flex",
+              "requested_deg": 39.42583605926749,
+              "applied_deg": 38.37746770784939,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 1,
+              "kind": "step_clip",
+              "joint": "wrist_flex",
+              "requested_deg": 69.1748445175685,
+              "applied_deg": 70.48451336700703,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 1,
+              "kind": "step_clip",
+              "joint": "gripper",
+              "requested_deg": -5.000004285756797,
+              "applied_deg": -3.999999999999999,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 2,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -31.18967293917512,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 2,
+              "kind": "step_clip",
+              "joint": "elbow_flex",
+              "requested_deg": 42.83135130396292,
+              "applied_deg": 42.37746770784939,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 3,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -27.84055798155107,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 4,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -30.955165224211903,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 5,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -30.279396553014596,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 5,
+              "kind": "step_clip",
+              "joint": "shoulder_pan",
+              "requested_deg": 11.256617912591867,
+              "applied_deg": 10.595254141339584,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 5,
+              "kind": "step_clip",
+              "joint": "wrist_flex",
+              "requested_deg": 66.20353464369454,
+              "applied_deg": 66.3667876598166,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 6,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -11.325904205306122,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 6,
+              "kind": "step_clip",
+              "joint": "shoulder_pan",
+              "requested_deg": 16.136890527403526,
+              "applied_deg": 14.595254141339582,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 6,
+              "kind": "step_clip",
+              "joint": "elbow_flex",
+              "requested_deg": 45.60278593706022,
+              "applied_deg": 44.38204205250176,
+              "reason": "|step| limited to 4.00 deg (dt 67 ms)"
+            },
+            {
+              "step": 7,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -16.72908671146385,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 8,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -22.975964065979174,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 9,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -23.62832055624897,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 10,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -23.508619783497203,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            },
+            {
+              "step": 11,
+              "kind": "joint_limit",
+              "joint": "gripper",
+              "requested_deg": -33.82652552486649,
+              "applied_deg": -5.000004285756797,
+              "reason": "outside [-5.0, 95.0] deg"
+            }
+          ]
+        },
+        "latency": {
+          "frame_return_to_first_write_ms": {
+            "n": 30,
+            "median": 451.26,
+            "p95": 465.608,
+            "max": 472.344
+          },
+          "rtt_ms": {
+            "n": 30,
+            "median": 450.497,
+            "p95": 464.76,
+            "max": 471.652
+          },
+          "infer_ms": {
+            "n": 30,
+            "median": 443.314,
+            "p95": 454.076,
+            "max": 456.097
+          },
+          "boundary_gap_ms": {
+            "n": 29,
+            "median": 521.121,
+            "p95": 532.551,
+            "max": 538.805
+          },
+          "write_hz": 6.191,
+          "max_frame_age_ms": 0.079,
+          "per_decision_frame_return_to_first_write_ms": [
+            472.344,
+            444.539,
+            452.675,
+            447.734,
+            440.794,
+            453.467,
+            434.52,
+            459.146,
+            456.454,
+            448.528,
+            441.031,
+            434.133,
+            460.849,
+            455.381,
+            454.264,
+            446.193,
+            436.782,
+            464.385,
+            447.644,
+            448.431,
+            451.304,
+            457.75,
+            453.909,
+            466.609,
+            450.284,
+            451.216,
+            441.39,
+            461.892,
+            452.314,
+            443.927
+          ],
+          "note": "frame_return_to_first_write_ms: LeRobot's frame stamp (perf_counter in its read thread, after VideoCapture.read() returned and the BGR->RGB conversion) to the first bus write. EXCLUDES capture: exposure, sensor readout, USB transfer, AVFoundation buffering, decode. Not end-to-end; see docs/bringup/latency-measurement.md"
+        },
+        "servo_health": {
+          "reads": 83,
+          "read_ms": {
+            "mean": 0.006,
+            "max": 0.024,
+            "over_budget": 0,
+            "budget": 10.0
+          },
+          "read_every_ticks": 4,
+          "register_period_s": 0.5333,
+          "max_temperature_c": {
+            "shoulder_pan": 35.0,
+            "shoulder_lift": 35.0,
+            "elbow_flex": 35.0,
+            "wrist_flex": 35.0,
+            "wrist_roll": 35.0,
+            "gripper": 35.0
+          },
+          "max_current_ma": {
+            "shoulder_pan": 97.5,
+            "shoulder_lift": 97.5,
+            "elbow_flex": 97.5,
+            "wrist_flex": 97.5,
+            "wrist_roll": 97.5,
+            "gripper": 97.5
+          }
+        },
+        "camera_calibrated": false,
+        "torque_off_unconfirmed": false
+      }
+    ]
+  }
+}
