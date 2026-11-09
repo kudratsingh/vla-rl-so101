@@ -1,8 +1,11 @@
 """Paired comparison of two rollout arms on the same groups (the clip probe, owner 2026-11-08).
 
-`src/eval/paired.py` is not on this branch, so this is the simple paired count table the owner
-asked for in that case. Inputs are (G, K) binary rewards whose row g and column k are the same
-prompt (env reset seed) and the same sample slot (sampling seed) in both arms.
+Written while `src/eval/paired.py` (recovery SFT, PR #25) was not on main; both now exist and
+serve different inputs. `src/eval/paired.py` reads two protocol eval run dirs (`episodes.jsonl`,
+independent protocol episodes, one-sided McNemar as the plan's test, protocol hash checked). This
+module takes two in-memory (G, K) RL rollout reward tensors whose row g and column k are the same
+prompt (env reset seed) and the same sample slot (sampling seed) in both arms; its unit is the
+group, and its two-sided McNemar is a count, not the test. Only the binomial tail is shared.
 
 The unit for the success difference is the GROUP: its K samples share a scene, so episodes within
 a group are not independent. `success_diff_se` is the SE of the mean per-group difference over

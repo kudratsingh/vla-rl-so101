@@ -1,0 +1,204 @@
+{
+  "run_id": "20261108T095637Z-wo01-sim-45cc",
+  "work_order": "WO-01",
+  "script": "scripts/wo01_build_env.py",
+  "argv": [
+    "--preset",
+    "sim",
+    "--config",
+    "configs/demos_v2.yaml",
+    "--device",
+    "cpu"
+  ],
+  "preset": "sim",
+  "config_hash": "e81062727a77794c39a88fb9a43a2988d9bf72eff2d154b00614da835b9e13c3",
+  "config": {
+    "preset": "sim",
+    "device": "cpu",
+    "seed": 0,
+    "env": {
+      "name": "so101_tabletop",
+      "tasks": [
+        "PickPlace",
+        "Push",
+        "Stack"
+      ],
+      "num_envs": 64,
+      "image_size": 224,
+      "max_episode_steps": 150,
+      "randomize": false,
+      "randomization": {
+        "object_color_jitter": 0.08,
+        "object_physics": true,
+        "lighting": true,
+        "camera_pos_jitter_m": 0.02,
+        "camera_target_jitter_m": 0.01,
+        "camera_roll_jitter_rad": 0.02,
+        "camera_fov_jitter_deg": 1.5,
+        "robot_color": true,
+        "action_latency_max_steps": 2,
+        "reconfigure_every": 10
+      },
+      "camera": {
+        "pose": "front_left_45",
+        "fov_deg": 40,
+        "eye": [
+          0.555,
+          0.35,
+          0.495
+        ],
+        "target": [
+          0.205,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    "data": {
+      "demos_per_task": 25,
+      "dataset_root": "data/demos",
+      "hub_repo": "KudratSingh22/vla-rl-so101-demos-25-v2",
+      "oracle_profile": "v2",
+      "post_success_steps": 15,
+      "post_success_max_steps": 45,
+      "require_final_success": true,
+      "chunk_pad": "drop"
+    },
+    "policy": {
+      "base": "openvla_oft",
+      "checkpoint": null,
+      "lora_rank": 32,
+      "action_chunk": 8,
+      "precision": "bf16"
+    },
+    "sft": {
+      "steps": 2000,
+      "batch_size": 8,
+      "lr": 5e-05,
+      "warmup_steps": 100
+    },
+    "eval": {
+      "episodes_per_cell": 100,
+      "seeds": [
+        0,
+        1,
+        2
+      ],
+      "cells": [
+        "seen",
+        "shifted",
+        "unseen_objects"
+      ],
+      "protocol_hash": null
+    },
+    "render_gap": {
+      "dataset": "KudratSingh22/vla-rl-so101-demos-25",
+      "adapter": "KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000",
+      "policy_config": "configs/sft_a4.yaml",
+      "episodes_per_task": 25,
+      "token_stride": 1
+    },
+    "cost": {
+      "gpu": "RTX-4090",
+      "usd_per_hour": 0.89,
+      "est_hours": 0.75
+    }
+  },
+  "git": {
+    "commit": "f834018c9d5bec9ff6050f78ba3832c72a0058ed",
+    "branch": "sync-25",
+    "dirty": true
+  },
+  "device": {
+    "device": "cpu",
+    "host": "Kudrats-MacBook-Pro-3.local",
+    "os": "macOS-26.5.2-arm64-arm-64bit",
+    "torch": "2.6.0",
+    "name": "Apple M3 Pro",
+    "runpod_pod_id": null
+  },
+  "start_utc": "2026-11-08T09:56:37Z",
+  "end_utc": "2026-11-08T10:17:16Z",
+  "wall_clock_s": 1239.82,
+  "hourly_usd": 0.0,
+  "estimated_usd": 0.0,
+  "actual_usd": 0.0,
+  "status": "ok",
+  "results": {
+    "image_hw": [
+      224,
+      224
+    ],
+    "tasks": {
+      "PickPlace": {
+        "episodes": 100,
+        "oracle_successes": 100,
+        "oracle_success_rate": 1.0,
+        "demos_recorded": 25,
+        "failed_demos_filled": 0,
+        "mean_episode_len": 78.95,
+        "mean_demo_frames": 94.48,
+        "mean_post_success_frames": 15.0,
+        "demos_oracle_finished": 25,
+        "demos_rejected_tail_lost_success": 0,
+        "oracle_profile": "v2",
+        "tail": {
+          "min_steps": 15,
+          "max_steps": 45,
+          "require_final_success": true
+        },
+        "env_steps": 8270,
+        "num_envs": 1,
+        "wall_s": 662.43
+      },
+      "Push": {
+        "episodes": 100,
+        "oracle_successes": 100,
+        "oracle_success_rate": 1.0,
+        "demos_recorded": 25,
+        "failed_demos_filled": 0,
+        "mean_episode_len": 64.12,
+        "mean_demo_frames": 101.24,
+        "mean_post_success_frames": 36.28,
+        "demos_oracle_finished": 11,
+        "demos_rejected_tail_lost_success": 6,
+        "oracle_profile": "v2",
+        "tail": {
+          "min_steps": 15,
+          "max_steps": 45,
+          "require_final_success": true
+        },
+        "env_steps": 7589,
+        "num_envs": 1,
+        "wall_s": 297.62
+      },
+      "Stack": {
+        "episodes": 100,
+        "oracle_successes": 100,
+        "oracle_success_rate": 1.0,
+        "demos_recorded": 25,
+        "failed_demos_filled": 0,
+        "mean_episode_len": 76.87,
+        "mean_demo_frames": 91.24,
+        "mean_post_success_frames": 15.0,
+        "demos_oracle_finished": 25,
+        "demos_rejected_tail_lost_success": 0,
+        "oracle_profile": "v2",
+        "tail": {
+          "min_steps": 15,
+          "max_steps": 45,
+          "require_final_success": true
+        },
+        "env_steps": 8062,
+        "num_envs": 1,
+        "wall_s": 279.41
+      }
+    },
+    "dataset": {
+      "repo_id": "KudratSingh22/vla-rl-so101-demos-25-v2",
+      "root": "data/demos/vla-rl-so101-demos-25-v2",
+      "episodes": 75,
+      "frames": 7174
+    }
+  }
+}

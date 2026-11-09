@@ -18,6 +18,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 05, 08, 09 | not started | | |
 | pre-run hardening | PR open, **waits for owner review** (touches the RL loop) | `fix/pre-run-hardening` | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
 | robot safety (PR 2) | PR open against `wo-07-pilot`; merge after #23, #24 and #28 (it merges #24 and #28) | `fix/robot-safety` | Review 3.3 gaps 2, 3, 5 and 7, plus the owner's 2026-11-08 review changes (homing offsets, torque off unconfirmed, real-eval session fingerprint, parking off by default), $0, **unverified on hardware**. See "Robot safety hardening" below. |
+| Recovery SFT (owner request 4) | **draft**: plan + local code, CPU tiny smoke passes; synced with `fix/pre-run-hardening` and then with `main` (#28, #24, #23, #29) 2026-11-08; **no paid run approved** | `wo-recovery-sft` (draft PR #25) | `docs/plans/recovery-sft.md`: recovery + matched-control SFT ~$7.3 (4090, protocol 0.2 evals), conditional GRPO diagnostic as an lr sweep + probe ~$5 then a separately approved continuation ~$11-40 (A100, PR 1 shape), conditional 3 seeds ~$119 at 75 steps (~$230 at 150, over the $210 allowance). Few-shot accounting of corrections and whether stage B may stop on its gates (`gate_stop` false inherited) are owner decisions. See "Recovery SFT sync" below. |
 
 ## Benchmarks met
 
@@ -119,8 +120,8 @@ What changed:
   The lr follows the published LoRA recipes (RIPT-VLA, RLinf-VLA), not the logged KL.
   `configs/rl_pickplace.yaml` inherits these settings. RL seeds >= 10 are rejected
   (`src/eval/seed_ranges.py` `check_rl_seed`: an explicit [0, 10) bound, then the overlap check;
-  PR #25's copy has only the overlap check, which lets seeds 11-299 through, so keep this version
-  when #25 merges).
+  PR #25's first copy had only the overlap check, which let seeds 11-299 through; `wo-recovery-sft`
+  carries this version since its 2026-11-08 sync).
 - Rollout timing split (`src/rl/rollout.py`): policy / sim_step / render / obs_fn / host_copy /
   reset / other. It goes to `metrics.jsonl` (`rollout/time/*_s`) and to the PROBE line.
 - Probe modes on `scripts/wo03_rl.py`: `--lr-sweep` (offline, on one stored batch) and
@@ -462,8 +463,82 @@ WO-04.
 The robot items (servo temperature/current fault response, `park()` on healthy shutdown, camera
 timestamp, placement grid, `wo07_real_eval.py`) are in PR 2 (`fix/robot-safety`, on PR #23's
 branch; see "Robot safety hardening" below). The plan
-revision for PR #25 is on `wo-recovery-sft`. PR #25's `configs/rl_pickplace_lr*.yaml` use the
-removed `early_stop_*` / `peak_stop_step` keys and need renaming when it merges, or they fail fast.
+revision for PR #25 is on `wo-recovery-sft`. PR #25's `configs/rl_pickplace_lr*.yaml` used the
+removed `early_stop_*` / `peak_stop_step` keys; on `wo-recovery-sft` they use `gate_check_frac` /
+`gate_window` since 2026-11-08 (see "Recovery SFT sync" below).
+
+## Recovery SFT sync (draft PR #25, branch `wo-recovery-sft`, 2026-11-08, $0)
+
+**Draft, not merged.** PR #25 is synced in two steps: with PR 1 (`fix/pre-run-hardening`) and then
+with `main`. No paid run is approved. The plan is `docs/plans/recovery-sft.md`.
+
+### Sync with main (merge of `origin/main` at `c221114`: #28 final, #24, #23, #29)
+
+Nothing ran on a GPU and no RunPod resource was touched. Protocol `0.1-draft` (`e9ce5bb47a88`),
+`src/eval/protocol.py`, `src/env/success.py` and every reported number are unchanged.
+- `src/data/oft_dataset.py`: main's v2 refusal (a v2 set needs `chunk_pad: drop`) is kept and now
+  checks every part of the mix: the demos and each `data.extra_datasets` entry, on its selected
+  episodes. #25's multi-dataset loading, caps and `match_frames_of` are kept.
+  `configs/sft_a5_*.yaml` (0.1 set, `chunk_pad: repeat`) are not v2 and load as before.
+- `src/eval/sim_eval.py`: main's per-episode `instruction`, `end_reason` without "truncated"
+  (truncation = horizon, raw flag in `flags`) and `instructions_out` are kept, with #25's public
+  `episode_records` (seed -1 for non-protocol episodes) and `run_batch_traced`.
+  `run_batch_traced` also takes `instructions_out`, and the collector passes it, so the
+  collector's `episodes.jsonl` carries the instructions too. Protocol 0.2 records and the clip
+  behave as on main, and 0.1-draft is untouched.
+- `tests/test_sim_eval.py`: both sides' tests. The traced-vs-untraced clip test now also checks
+  that the instructions agree.
+- `configs/rl_pickplace_lr*.yaml`: no key changes needed; they already used `gate_check_frac` /
+  `gate_window` since the PR 1 sync, and the trainer's removed-key check passes. Comments are
+  updated: the flat gate is now a trend over steps 1-20, and the configs inherit `gate_stop: false`
+  and `rollout_action_clip_deg: 4.0`. **So no gate stops stage B.** Whether it should is a new
+  owner decision (plan section 14, decision 5). The agent did not override `gate_stop`.
+  `--estimate` re-run: A100-80GB x 20.6 h = $37 per 75 steps (unchanged); `--lr-sweep` 4 x 8
+  1.15 h = $2.06 (was 1.20 h); the stage A + B worst case ~$44.5 and the ~$46 pod cap are
+  unchanged.
+- Paired statistics: `src/eval/paired.py` (#25) and `src/rl/paired.py` (main) are both kept,
+  because they have different purposes. The first reads two protocol eval run dirs and is the
+  plan's one-sided test. The second compares in-memory RL rollout groups for `--probe-clip`, with
+  the group as its unit. Only the exact binomial tail overlaps. `src/rl/paired.py`'s docstring
+  no longer says the other module is missing. The round-3 note above ("`src/eval/paired.py` is
+  not on this branch") describes PR #28 as it was.
+
+### Sync with PR 1
+
+`fix/pre-run-hardening` (#28) is merged into `wo-recovery-sft` (#25). Nothing ran on a GPU. PR 1's
+fixes win where both branches touched the same code; #25's additions are kept.
+- Seed guard, oracle v2 profiles, recorder tail, `chunk_pad`, the 0.1 Hub-repo denylist, protocol
+  0.2 and its per-episode records are PR 1's. #25's own fix for the `datasets` / torchcodec write
+  failure is dropped in favour of PR 1's scoped `_datasets_write_compat`.
+- Kept from #25: oracle mid-episode start (in-hand phase inference, gripper continuity, now
+  combined with the speed profiles), `run_batch_traced`, env snapshot/restore, the failure
+  taxonomy, capped multi-dataset loading with `match_frames_of`, the collector, and
+  `configs/sft_a5_recovery.yaml` / `sft_a5_control.yaml` (unchanged: 0.1 set, oracle v1, no tail,
+  `chunk_pad: repeat`, so their frame counts are unchanged).
+- `run_batch_traced` takes the 0.2 clip and `end_info` exactly as `run_batch` does (tested for
+  identical executed actions, outcomes and end flags). It lives in `src/eval/sim_eval.py`, which
+  the 0.2 hash covers; 0.2 is not frozen.
+- The collector (`scripts/wo02r_collect_corrections.py`) records corrections and control demos
+  with the config's `data.oracle_profile` and tail (`TailSettings` from `wo01_build_env.py`), mines
+  failures under `--protocol 0.2` (default) and writes `episodes.jsonl` for its rollouts.
+- With `chunk_pad: drop` the correction cap and the control's frame match count trained frames
+  (n - (chunk_len - 1) per episode); `pad_free_indices` handles the mixed (ConcatFrames) set.
+- `src/eval/paired.py` (new): paired readout of two eval runs from their `episodes.jsonl`, with
+  the one-sided exact McNemar test of the plan's section 10; refuses runs with different protocol
+  hashes or episodes.
+- `configs/rl_pickplace_lr*.yaml`: `gate_check_frac: 0.26`, `gate_window: 5` (flat gate at step
+  20, windows 16-20 vs 1-5), replacing the removed `early_stop_*` / `peak_stop_*` keys.
+  `--estimate` on the PR 1 shape (re-run 2026-11-08, identical for the three configs): A100-80GB
+  x 20.6 h = $37 for 75 steps worst case, 5.5 h = $9.8 to the step-20 flat gate (training only,
+  no setup); `--lr-sweep` 4 lrs x 8 Adam steps 1.20 h = $2.15. The plan's cost lines are repriced
+  from it (stage B with setup and the 4090 eval ~$11-40).
+- The collector refuses `--push` to the 0.1 demo repos (PR 1's `PROTECTED_HUB_REPOS`).
+- Frame counts on the v2 recorder were measured once on the Mac CPU sim (run
+  `20261108T095637Z-wo01-sim-45cc`, not pushed): 7,174 frames for 75 demos, 6,649 trained under
+  `chunk_pad: drop`, vs 4,964 in the 0.1 set; plan section 5.
+
+Unverified on GPU: the clipped traced rollout and the tail stepping of restored envs on
+`physx_cuda`, and the +5% eval-time allowance for the clip (PR 1's, not measured).
 
 ### Owner instructions 2026-11-08, round 2 (blocking before any paid run; $0, CPU only)
 
@@ -1092,6 +1167,10 @@ grid's scale and alignment with the real base.
 - 2026-10-27 WO-04 kill switch compares the trained-task mean (`eval/success_train`); Stack is
   evaluated and reported but cannot trip or pass it (owner confirmed on PR #11).
 - 2026-10-27 WO-04 K=16 keeps 128 trajectories per update (8 prompts), not 256 (owner confirmed).
+- 2026-11-07 Recovery SFT plan (docs/plans/recovery-sft.md), fixed before any data: warm start from `step_004000` for both arms (2000 steps, lr 5e-4); corrections capped at 60 episodes / 1650 frames per task; checkpoint selection on protocol seed 7 (never 0-2: the WO-02 sweep used protocol seed-0 seen episodes 0-49); new seed ranges recovery 3.0e9+ and control 3.1e9+, guarded by `src/eval/seed_ranges.py`. Gate precedence (fixed before data): "recovery improves" needs >= +3.0 points pooled seen over protocol seeds 0-2 with p < 0.05 AND recovery minus baseline > 0 on seeds 1-2 alone; anything else fails, and the owner approves spend, not the reading of the gate.
+- 2026-11-07 `datasets` 4.x + torchcodec 0.2.1: a dataset write after any dataset read in one process failed (AudioDecoder import); `src/data/recorder.py` turns off datasets' unused torchcodec features during each write (`_datasets_write_compat`, PR 1; #25's process-wide switch was dropped in the 2026-11-08 sync).
+- 2026-11-08 Recovery SFT sync with PR 1: corrections and control demos are recorded like the config's own demo set (oracle profile, tail); failure mining and the three paired evals run under protocol 0.2 with per-episode records (`src/eval/paired.py`); with `chunk_pad: drop` the extra-dataset budgets count trained frames.
+- 2026-11-08 Recovery SFT sync with main (#25, draft): the v2 `chunk_pad` refusal covers every part of an SFT mix (demos and extra datasets); `configs/rl_pickplace_lr*.yaml` keep the inherited `gate_stop: false` (owner rule: observe first), so a stage B step-20 stop is left to the owner (plan section 14, decision 5); `src/eval/paired.py` and `src/rl/paired.py` both kept (eval run dirs vs RL rollout groups).
 
 ## WO-04 (PR #11, owner-approved 2026-10-27; seed runs from `wo-04-seeds`)
 

@@ -263,3 +263,68 @@ def test_wo02_eval_protocol_v02_tiny(env_standins: Path) -> None:
     assert [(e["task"], e["cell"], e["seed"]) for e in eps] == [("PickPlace", "seen", 0)] * 3
     assert {"success", "is_grasped"} <= set(eps[0]["flags"])
     assert all(e["instruction"] for e in eps)  # names the episode's object (unseen_objects split)
+
+
+@pytest.mark.parametrize("exec_steps", [None, 3])
+def test_traced_rollout_matches_run_batch(exec_steps: int | None) -> None:
+    from src.eval.sim_eval import run_batch_traced
+
+    seeds = [0, 1, 2, 3, 4, 5]
+    s, ln = run_batch(zero_act, FakeEnv("Push", 6), lambda o: o, seeds, 150, exec_steps)
+    calls: list[int] = []
+    st, lt, trace = run_batch_traced(
+        zero_act,
+        FakeEnv("Push", 6),
+        lambda o: o,
+        seeds,
+        150,
+        exec_steps,
+        snapshot_fn=lambda env: calls.append(env.steps) or env.steps,
+    )
+    assert torch.equal(s, st) and torch.equal(ln, lt)
+    stride = 8 if exec_steps is None else exec_steps
+    want = list(range(0, 10, stride))
+    assert [b.step for b in trace.boundaries] == want and [
+        b.state for b in trace.boundaries
+    ] == want
+    assert calls == want and trace.boundaries[0].active.all()
+    assert len(trace.steps) == 11 and "action" not in trace.steps[0]
+    assert "success" not in trace.steps[0]  # the fake's reset info is empty
+    assert torch.stack([x["success"] for x in trace.steps[1:]]).shape == (10, 6)
+    assert torch.equal(trace.boundaries[-1].last_action, trace.steps[want[-1]]["action"])
+
+
+def test_traced_rollout_matches_run_batch_under_the_02_clip() -> None:
+    """Recovery failure mining plays the protocol 0.2 clip exactly as the eval does: same
+    executed actions, outcomes and end flags; the trace holds the clipped (executed) command."""
+    from src.eval.sim_eval import run_batch_traced
+
+    env, env_t = FakeEnv("Push", 3), FakeEnv("Push", 3)
+    end: dict[str, Tensor] = {}
+    end_t: dict[str, Tensor] = {}
+    instr: list[str] = []
+    instr_t: list[str] = []
+    s, ln = run_batch(
+        ones_act,
+        env,
+        lambda o: o,
+        [0, 1, 2],
+        150,
+        action_clip=0.25,
+        end_info=end,
+        instructions_out=instr,
+    )
+    st, lt, trace = run_batch_traced(
+        ones_act,
+        env_t,
+        lambda o: o,
+        [0, 1, 2],
+        150,
+        action_clip=0.25,
+        end_info=end_t,
+        instructions_out=instr_t,
+    )
+    assert torch.equal(s, st) and torch.equal(ln, lt) and instr == instr_t and len(instr) == 3
+    assert torch.equal(torch.stack(env.actions), torch.stack(env_t.actions))
+    assert end.keys() == end_t.keys() and all(torch.equal(end[k], end_t[k]) for k in end)
+    assert torch.equal(trace.steps[1]["action"], torch.full((3, 6), 0.25))

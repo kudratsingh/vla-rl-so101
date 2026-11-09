@@ -1,0 +1,6 @@
+# docs/plans/recovery-sft.md section 11, stage A: configs/rl_pickplace_lr.yaml at lr 1e-3, probed
+# only if rule 1 (the fixed-batch `--lr-sweep`) picks 1e-3. Same base, RL seed, prompts, rollouts.
+inherit: configs/rl_pickplace_lr.yaml
+
+rl:
+  lr: 1e-3

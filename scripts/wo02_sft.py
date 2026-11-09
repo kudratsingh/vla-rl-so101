@@ -4,6 +4,10 @@
     uv run scripts/wo02_sft.py --preset tiny --synthetic        # ... without the WO-01 dataset
     uv run scripts/wo02_sft.py --preset sim --probe-steps 20    # GPU memory/speed probe (~$0.10)
     uv run scripts/wo02_sft.py --preset sim                     # full run (owner-approved only)
+    uv run scripts/wo02_sft.py --preset sim --config configs/sft_a5_recovery.yaml   # recovery SFT
+
+`data.extra_datasets` (configs/sft_a5_*.yaml) mixes capped correction / control datasets into the
+demos (src/data/oft_dataset.py); the bounds coverage check then runs per dataset as well.
 
 Default config: configs/sft_tiny.yaml for --preset tiny, else configs/sft.yaml. Writes
 runs/<id>/record.json (+ metrics.jsonl, checkpoints/step_*/: PEFT adapter + norm_stats.json).
@@ -26,6 +30,7 @@ import torch
 from src.config import REPO_ROOT, Config, add_config_args, load_config
 from src.data.oft_dataset import (
     ChunkedDemoDataset,
+    ConcatFrames,
     all_actions,
     load_sft_frames,
     synthetic_frames,
@@ -72,6 +77,16 @@ def load_data(
     return load_sft_frames(cfg, chunk)
 
 
+def coverage_by_part(bounds: Any, frames: Any) -> dict[str, dict[str, Any]]:
+    """Bounds coverage per dataset of a mixed SFT set (demos, corrections, control demos)."""
+    if not isinstance(frames, ConcatFrames):
+        return {"demo": demo_coverage(bounds, all_actions(frames))}
+    out: dict[str, dict[str, Any]] = {}
+    for i, (name, part) in enumerate(zip(frames.names, frames.parts, strict=True)):
+        out[name if name not in out else f"{name}_{i}"] = demo_coverage(bounds, all_actions(part))
+    return out
+
+
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
@@ -95,6 +110,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     coverage = demo_coverage(policy.pre.action_bounds, all_actions(dataset.frames))
     if coverage["frac_outside"] > args.max_demo_clip_frac:
         raise ValueError(f"demo actions outside the normalisation bounds: {coverage}")
+    by_part = coverage_by_part(policy.pre.action_bounds, dataset.frames)
+    clipped = {k: c for k, c in by_part.items() if c["frac_outside"] > args.max_demo_clip_frac}
+    if clipped:  # e.g. corrections from displaced arm states: clipping would change the labels
+        raise ValueError(f"actions outside the normalisation bounds, by dataset: {clipped}")
     est = estimate_cost(cfg)
     print(
         f"[wo02_sft] {data_info.get('num_frames')} frames, device={device}, "
@@ -112,6 +131,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         run.results.update(
             data=data_info,
             demo_coverage=coverage,
+            coverage_by_dataset=by_part,
             bounds={
                 "low": list(policy.pre.action_bounds.low),
                 "high": list(policy.pre.action_bounds.high),

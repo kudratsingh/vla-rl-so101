@@ -14,6 +14,7 @@ imported lazily here.
 
 from __future__ import annotations
 
+import bisect
 import importlib
 from collections.abc import Sequence
 from pathlib import Path
@@ -63,9 +64,15 @@ def pad_free_indices(
     action (LeRobot `delta_timestamps` clamping, `<action_key>_is_pad`). Training on that pad
     teaches "stop and freeze" at whatever the last recorded command was (review 2026-11-07
     section 3.2). Every recorded action still appears as a target in some kept frame's chunk.
-    A LeRobotDataset is resolved from its parquet columns (no video decode); other sources are
-    read item by item and use their `_is_pad` flags.
+    A LeRobotDataset is resolved from its parquet columns (no video decode), a `ConcatFrames`
+    part by part; other sources are read item by item and use their `_is_pad` flags.
     """
+    if isinstance(frames, ConcatFrames):
+        return [
+            off + i
+            for part, off in zip(frames.parts, frames.offsets, strict=False)
+            for i in pad_free_indices(part, chunk_len, action_key)
+        ]
     hf = getattr(frames, "hf_dataset", None)
     meta = getattr(frames, "meta", None)
     if hf is not None and meta is not None:
@@ -155,8 +162,31 @@ def collate_sft(items: Sequence[dict[str, Any]]) -> SFTBatch:
     )
 
 
+class ConcatFrames:
+    """Several frame sources (the demos + extra datasets) behind one index, in order."""
+
+    def __init__(self, parts: Sequence[FrameSource], names: Sequence[str]) -> None:
+        if len(parts) != len(names) or not parts:
+            raise ValueError("need one name per part and at least one part")
+        self.parts, self.names = list(parts), list(names)
+        self.offsets = [0]
+        for p in self.parts:
+            self.offsets.append(self.offsets[-1] + len(p))
+
+    def __len__(self) -> int:
+        return self.offsets[-1]
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        if not 0 <= idx < len(self):
+            raise IndexError(idx)
+        part = bisect.bisect_right(self.offsets, idx) - 1
+        return self.parts[part][idx - self.offsets[part]]
+
+
 def all_actions(frames: FrameSource, action_key: str = ACTION_KEY) -> Tensor:
     """Every per-frame action (N, D) -- for the normalisation-bounds coverage check."""
+    if isinstance(frames, ConcatFrames):
+        return torch.cat([all_actions(p, action_key) for p in frames.parts])
     hf = getattr(frames, "hf_dataset", None)
     if hf is not None:
         return torch.stack([torch.as_tensor(a) for a in hf[action_key]]).float()
@@ -213,14 +243,117 @@ def _ensure_local(repo_id: str, root: Path) -> None:
     snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=str(root))
 
 
+def select_budget(
+    rows: Sequence[dict[str, Any]],
+    task: str,
+    *,
+    kind: str,
+    cell: str = "seen",
+    max_episodes: int | None = None,
+    max_frames: int | None = None,
+    pad_frames_per_episode: int = 0,
+) -> tuple[list[int], int]:
+    """Episodes of `task` / `kind` (sidecar "kind", default "demo") in recording order: the
+    longest prefix with <= max_episodes episodes and <= max_frames frames. Only oracle-successful
+    episodes count. Returns (episode indices, frames).
+
+    Frames are counted as they enter the SFT loss: with `chunk_pad: drop` each episode loses its
+    last `chunk_len - 1` frames (`pad_frames_per_episode`), so a budget of short corrections and
+    one of long demos stay matched on trained frames, not on recorded ones."""
+    out: list[int] = []
+    frames = 0
+    for r in rows:
+        if r["task_family"] != task or r["cell"] != cell or not r["oracle_success"]:
+            continue
+        if str(r.get("kind", "demo")) != kind:
+            continue
+        if max_episodes is not None and len(out) >= max_episodes:
+            break
+        n = max(0, int(r["num_frames"]) - pad_frames_per_episode)
+        if max_frames is not None and frames + n > max_frames:
+            break
+        out.append(int(r["episode_index"]))
+        frames += n
+    return out, frames
+
+
+def _cap(a: int | None, b: int | None) -> int | None:
+    return b if a is None else a if b is None else min(a, b)
+
+
+def _chunk_pad(cfg: Config) -> str:
+    return str(cfg["data"].get("chunk_pad", DEFAULT_CHUNK_PAD))
+
+
+def _pad_per_episode(cfg: Config, chunk_len: int) -> int:
+    """Frames per episode the loader leaves out of the SFT loss (`chunk_pad: drop`)."""
+    return chunk_len - 1 if _chunk_pad(cfg) == "drop" else 0
+
+
+def _extra_selection(
+    cfg: Config,
+    rec: Any,
+    spec: dict[str, Any],
+    tasks: Sequence[str],
+    cell: str,
+    chunk_len: int,
+) -> tuple[str, Path, dict[str, list[int]], dict[str, int]]:
+    """(repo_id, root, episodes per task, trained frames per task) of one `data.extra_datasets`
+    entry, frames counted as `select_budget` does under the config's `chunk_pad`.
+
+    `match_frames_of: <config>` caps each task's frames at what that config's extra dataset of
+    kind `match_kind` (default "correction") selects: the matched control. Both configs must use
+    the same `chunk_pad`."""
+    repo_id, root = rec.dataset_location(
+        {**cfg, "data": {**cfg["data"], "hub_repo": str(spec["hub_repo"])}}
+    )
+    root = Path(root)
+    _ensure_local(str(repo_id), root)
+    rows = rec.read_sidecar(root)
+    max_eps = spec.get("max_episodes_per_task")
+    max_frames = spec.get("max_frames_per_task")
+    target: dict[str, int] = {}
+    if spec.get("match_frames_of"):
+        from src.config import REPO_ROOT, load_config
+
+        other = load_config(str(cfg["preset"]), REPO_ROOT / str(spec["match_frames_of"]))
+        want = str(spec.get("match_kind", "correction"))
+        refs = [e for e in other["data"].get("extra_datasets") or [] if e.get("kind") == want]
+        if len(refs) != 1:
+            raise ValueError(f"{spec['match_frames_of']}: need exactly one {want!r} extra dataset")
+        if _chunk_pad(other) != _chunk_pad(cfg):
+            raise ValueError(
+                f"{spec['match_frames_of']}: chunk_pad {_chunk_pad(other)!r} != {_chunk_pad(cfg)!r}"
+            )
+        _, _, _, target = _extra_selection(other, rec, refs[0], tasks, cell, chunk_len)
+    eps: dict[str, list[int]] = {}
+    frames: dict[str, int] = {}
+    for task in tasks:
+        eps[task], frames[task] = select_budget(
+            rows,
+            task,
+            kind=str(spec.get("kind", "correction")),
+            cell=cell,
+            max_episodes=None if max_eps is None else int(max_eps),
+            max_frames=_cap(None if max_frames is None else int(max_frames), target.get(task)),
+            pad_frames_per_episode=_pad_per_episode(cfg, chunk_len),
+        )
+    return str(repo_id), root, eps, frames
+
+
 def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, dict[str, Any]]:
-    """The few-shot SFT set: the first `data.demos_per_task` successful `data.cell` demos per task.
+    """The few-shot SFT set: the first `data.demos_per_task` successful `data.cell` demos per task,
+    plus any `data.extra_datasets` (recovery corrections, matched-control demos), each capped per
+    task. Frames are sampled uniformly, so each part's share of the mix is its frame share.
 
     `data.chunk_pad` (default "repeat", the 0.1-era SFT runs, WO-02 attempts 1-4, which trained
     on the pad). `drop`: frames whose chunk is padded past the episode end are left out of the
-    SFT loss. A v2 demo set (`is_v2_demo_set`) is REFUSED unless `chunk_pad: drop` (owner
-    2026-11-08): its long release/retreat tails would otherwise teach "freeze at the last
-    command" from the repeated pad."""
+    SFT loss, in every part; set it in any SFT config for the v2 demo set (configs/demos_v2.yaml
+    does). The extra-dataset caps then count trained frames (`select_budget`). A v2 set
+    (`is_v2_demo_set`: the demos or any extra dataset, e.g. corrections recorded under
+    configs/demos_v2.yaml) is REFUSED unless `chunk_pad: drop` (owner 2026-11-08): its long
+    release/retreat tails would otherwise teach "freeze at the last command" from the repeated
+    pad."""
     from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
     rec: Any = importlib.import_module("src.data.recorder")  # WO-01
@@ -229,28 +362,59 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
     _ensure_local(repo_id, Path(root))
     n = int(cfg["data"]["demos_per_task"])
     cell = str(cfg["data"].get("cell", "seen"))
+    tasks = list(cfg["env"]["tasks"])
     episodes: list[int] = []
     per_task: dict[str, list[int]] = {}
-    for task in cfg["env"]["tasks"]:
+    for task in tasks:
         eps = rec.select_episodes(root, task, n, cell=cell)
         if len(eps) < n:
             raise ValueError(f"{repo_id}: {len(eps)} {cell!r} demos for {task}, need {n}")
         per_task[task] = eps
         episodes.extend(eps)
-    chunk_pad = str(cfg["data"].get("chunk_pad", DEFAULT_CHUNK_PAD))
+    parts: list[tuple[str, str, Path, list[int]]] = [("demo", repo_id, Path(root), episodes)]
+    extra_info: list[dict[str, Any]] = []
+    for spec in cfg["data"].get("extra_datasets") or []:
+        kind = str(spec.get("kind", "correction"))
+        x_repo, x_root, x_eps, x_frames = _extra_selection(cfg, rec, spec, tasks, cell, chunk_len)
+        flat = [e for t in tasks for e in x_eps[t]]
+        if not flat:
+            raise ValueError(f"{x_repo}: no {kind!r} episodes selected")
+        parts.append((kind, x_repo, x_root, flat))
+        extra_info.append(
+            {
+                "kind": kind,
+                "repo_id": x_repo,
+                "episodes_per_task": x_eps,
+                "frames_per_task": x_frames,
+                "num_frames": sum(x_frames.values()),
+            }
+        )
+    chunk_pad = _chunk_pad(cfg)
     read_sidecar = getattr(rec, "read_sidecar", None)
     if read_sidecar is not None and chunk_pad != "drop":
-        chosen = set(episodes)
-        rows = [r for r in read_sidecar(root) if int(r["episode_index"]) in chosen]
-        if is_v2_demo_set(rows):
-            raise ValueError(
-                f"{repo_id} is a v2 demo set (v2 oracle / release-retreat tail): SFT on it needs "
-                f"data.chunk_pad: drop (got {chunk_pad!r}), or padded chunks teach the policy to "
-                "freeze at the last command"
-            )
-    fps = int(LeRobotDatasetMetadata(repo_id, root=root).fps)
-    delta = {rec.ACTION_KEY: [k / fps for k in range(chunk_len)]}
-    frames = rec.load_demo_dataset(repo_id, root, episodes=sorted(episodes), delta_timestamps=delta)
+        for _, p_repo, p_root, p_eps in parts:
+            chosen = set(p_eps)
+            rows = [r for r in read_sidecar(p_root) if int(r["episode_index"]) in chosen]
+            if is_v2_demo_set(rows):
+                raise ValueError(
+                    f"{p_repo} is a v2 demo set (v2 oracle / release-retreat tail): SFT on it "
+                    f"needs data.chunk_pad: drop (got {chunk_pad!r}), or padded chunks teach the "
+                    "policy to freeze at the last command"
+                )
+    sources: list[FrameSource] = []
+    fps_all: set[int] = set()
+    for _, p_repo, p_root, p_eps in parts:
+        fps = int(LeRobotDatasetMetadata(p_repo, root=p_root).fps)
+        fps_all.add(fps)
+        delta = {rec.ACTION_KEY: [k / fps for k in range(chunk_len)]}
+        sources.append(
+            rec.load_demo_dataset(p_repo, p_root, episodes=sorted(p_eps), delta_timestamps=delta)
+        )
+    if len(fps_all) != 1:
+        raise ValueError(f"datasets disagree on fps: {sorted(fps_all)}")
+    frames: FrameSource = (
+        sources[0] if len(sources) == 1 else ConcatFrames(sources, [p[0] for p in parts])
+    )
     ds = ChunkedDemoDataset(
         frames,
         chunk_len=chunk_len,
@@ -259,14 +423,17 @@ def load_sft_frames(cfg: Config, chunk_len: int) -> tuple[ChunkedDemoDataset, di
         action_key=rec.ACTION_KEY,
         chunk_pad=chunk_pad,
     )
-    info = {
+    info: dict[str, Any] = {
         "repo_id": repo_id,
         "root": str(root),
-        "fps": fps,
+        "fps": fps_all.pop(),
         "cell": cell,
         "episodes_per_task": per_task,
         "num_frames": len(ds),
         "chunk_pad": chunk_pad,
         "pad_frames_dropped": ds.pad_frames_dropped,
     }
+    if extra_info:
+        info["demo_frames"] = len(sources[0])
+        info["extra_datasets"] = extra_info
     return ds, info

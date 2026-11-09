@@ -1,0 +1,16 @@
+# Matched control for recovery SFT (docs/plans/recovery-sft.md): identical to
+# sft_a5_recovery.yaml (warm start, steps, lr, seed) except the extra data are fresh oracle demos
+# from reset on control seeds instead of corrections. Per task, the control takes the longest
+# prefix of its demos whose frames do not exceed the corrections' selected frames
+# (`match_frames_of`), so any gain of recovery over control comes from WHERE the expert frames are,
+# not from how many there are. Diagnostic arm only: never an RL base (it holds > 25 demos/task).
+#   uv run scripts/wo02r_collect_corrections.py --preset sim --mode control --push
+#   uv run scripts/wo02_sft.py --preset sim --config configs/sft_a5_control.yaml
+inherit: configs/sft_a5_recovery.yaml
+
+data:
+  extra_datasets:
+    - hub_repo: KudratSingh22/vla-rl-so101-control-a4
+      kind: control_demo
+      max_episodes_per_task: 60
+      match_frames_of: configs/sft_a5_recovery.yaml

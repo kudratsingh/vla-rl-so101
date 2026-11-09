@@ -5,6 +5,8 @@ Env contract (src/env): `make_env(cfg, task, num_envs=, cell=)` -> vector env wi
 `info["success"]` is (N,) bool, and `env.unwrapped.get_instructions()`; `policy_obs(obs)` ->
 {"image", "state"}. An episode succeeds if `success` fires before it ends (same rule as the RL
 rollout in src/rl/rollout.py). A policy decision executes its whole action chunk open loop.
+`run_batch_traced` is the same loop plus per-step privileged data and chunk-boundary snapshots
+(recovery SFT); it is never used for reported numbers.
 
 Protocol constants (tasks, cells, seeds, episodes per cell, Wilson z, hash) come from
 src/eval/protocol.py and are passed in, so this module stays testable on its own.
@@ -132,6 +134,127 @@ def run_batch(
 
 
 @dataclass(frozen=True)
+class ChunkBoundary:
+    """State just before a policy decision. `step` = env steps executed so far (0 = reset);
+    `last_action` (N, 6) = the command last sent (reset qpos at step 0); `state` = the env
+    snapshot from `snapshot_fn` (None without one)."""
+
+    step: int
+    active: Tensor
+    last_action: Tensor
+    state: Any = None
+
+
+@dataclass
+class RolloutTrace:
+    """Per-step privileged data and chunk-boundary snapshots of one `run_batch_traced` batch.
+
+    `steps[t]` holds batched CPU tensors after t env steps (t = 0: reset): "qpos", the env's
+    privileged `obs["extra"]` entries, every per-env `info` flag (success, is_grasped, ...), and
+    "action" (N, 6) = the command that produced step t (absent at t = 0)."""
+
+    seeds: list[int]
+    steps: list[dict[str, Tensor]]
+    boundaries: list[ChunkBoundary]
+
+    def series(self, key: str) -> Tensor:
+        """(T + 1, N, ...) stack of `key` over steps 0..T (missing at a step -> error)."""
+        return torch.stack([s[key] for s in self.steps])
+
+
+def _privileged(raw: Any, info: Any, n: int) -> dict[str, Tensor]:
+    """Batched CPU copies of qpos, obs["extra"] and the per-env entries of `info`."""
+    out: dict[str, Tensor] = {}
+    if isinstance(raw, Mapping):
+        agent = raw.get("agent")
+        if isinstance(agent, Mapping) and "qpos" in agent:
+            out["qpos"] = torch.as_tensor(agent["qpos"]).detach().to("cpu").float()
+        extra = raw.get("extra")
+        if isinstance(extra, Mapping):
+            for k, v in extra.items():
+                t = torch.as_tensor(v).detach().to("cpu")
+                if t.ndim > 0 and t.shape[0] == n:
+                    out[k] = t
+    if isinstance(info, Mapping):
+        for k, v in info.items():
+            if isinstance(v, Tensor) and v.ndim > 0 and v.shape[0] == n:
+                out[k] = v.detach().to("cpu")
+    return out
+
+
+@torch.no_grad()
+def run_batch_traced(
+    act: ActFn,
+    env: Any,
+    obs_fn: ObsFn,
+    seeds: Sequence[int],
+    max_steps: int,
+    exec_steps: int | None = None,
+    snapshot_fn: Callable[[Any], Any] | None = None,
+    *,
+    action_clip: float | None = None,
+    end_info: dict[str, Tensor] | None = None,
+    instructions_out: list[str] | None = None,
+) -> tuple[Tensor, Tensor, RolloutTrace]:
+    """`run_batch` plus a `RolloutTrace` (recovery-SFT failure mining, docs/plans/recovery-sft.md).
+
+    Same episode loop, the same (success, length) outcome rule, and the same `action_clip`
+    (protocol 0.2), `end_info` and `instructions_out` as `run_batch`; the trace only reads the env and records the
+    executed (clipped) action. `snapshot_fn(env)` (e.g. `src.env.state.snapshot`) runs at every
+    chunk boundary. Tests check the outcomes match `run_batch` exactly.
+    """
+    n = len(seeds)
+    raw, info = env.reset(seed=list(seeds))
+    obs = obs_fn(raw)
+    instructions = list(env.unwrapped.get_instructions())
+    if len(instructions) != n:
+        raise ValueError(f"env gave {len(instructions)} instructions for {n} episodes")
+    if instructions_out is not None:
+        instructions_out.extend(instructions)
+    steps = [_privileged(raw, info, n)]
+    # ManiSkill's reset runs no physics step, so its contact query returns the previous episode's
+    # last step: a row that ended holding the object reports is_grasped at t = 0. A fresh episode
+    # is never grasped (arm at rest, object on the table).
+    if "is_grasped" in steps[0]:
+        steps[0]["is_grasped"] = torch.zeros_like(steps[0]["is_grasped"])
+    last = steps[0].get("qpos", torch.zeros(n, 6))
+    boundaries: list[ChunkBoundary] = []
+    active = torch.ones(n, dtype=torch.bool)
+    success = torch.zeros(n, dtype=torch.bool)
+    length = torch.zeros(n, dtype=torch.long)
+    clipped = torch.zeros(n, dtype=torch.long)
+    ref = obs["state"].detach().float().clone() if action_clip is not None else None
+    while bool(active.any()):
+        state = snapshot_fn(env) if snapshot_fn is not None else None
+        boundaries.append(ChunkBoundary(len(steps) - 1, active.clone(), last.clone(), state))
+        chunk = act(obs, instructions)
+        horizon = chunk.shape[1] if exec_steps is None else min(exec_steps, chunk.shape[1])
+        for c in range(horizon):
+            if not bool(active.any()):
+                break
+            action = chunk[:, c]
+            if ref is not None and action_clip is not None:
+                ref = ref.to(action.device, action.dtype)
+                safe = clip_joint_step(action, ref, action_clip)
+                clipped += (safe != action).any(-1).to("cpu") & active
+                action = ref = safe
+            raw, _, terminated, truncated, info = env.step(action)
+            last = torch.as_tensor(action).detach().to("cpu").float()
+            steps.append({**_privileged(raw, info, n), "action": last})
+            length += active.long()
+            hit = _flag(info["success"], n) & active
+            success |= hit
+            ended = hit | _flag(terminated, n) | _flag(truncated, n) | (length >= max_steps)
+            if end_info is not None and bool((ended & active).any()):
+                _record_end(end_info, info, ended & active, n, terminated, truncated)
+            active &= ~ended
+        obs = obs_fn(raw)
+    if end_info is not None:
+        end_info["clipped_steps"] = clipped
+    return success, length, RolloutTrace(list(seeds), steps, boundaries)
+
+
+@dataclass(frozen=True)
 class CellSeedResult:
     task: str
     cell: str
@@ -143,15 +266,16 @@ class CellSeedResult:
 
 @dataclass(frozen=True)
 class EpisodeRecord:
-    """One evaluated episode (runs/<id>/episodes.jsonl). `seed` is the protocol seed;
-    `instruction` the reset's language instruction (it names the manipulated object, so the
-    unseen_objects cell splits by object). `end_reason`: success | terminated | horizon, where
-    horizon is the time limit, whether the env's truncation or the eval's `max_steps` cap ended
-    it (scripts/wo02_eval.py sets both to env.max_episode_steps, so ManiSkill truncates on that
-    same step; the raw flag stays in `flags["truncated"]`). With the current tasks "terminated"
-    does not occur: none defines a fail state, so ManiSkill's terminated equals success. `flags`:
-    the env's bool info flags at the last step (see `run_batch` end_info) + truncated;
-    `clipped_steps` is 0 without an action clip."""
+    """One evaluated episode (runs/<id>/episodes.jsonl). `seed` is the protocol seed (-1 for
+    episodes on non-protocol seeds, e.g. recovery failure mining); `instruction` the reset's
+    language instruction (it names the manipulated object, so the unseen_objects cell splits by
+    object). `end_reason`: success | terminated | horizon, where horizon is the time limit,
+    whether the env's truncation or the eval's `max_steps` cap ended it (scripts/wo02_eval.py sets
+    both to env.max_episode_steps, so ManiSkill truncates on that same step; the raw flag stays in
+    `flags["truncated"]`). With the current tasks "terminated" does not occur: none defines a fail
+    state, so ManiSkill's terminated equals success. `flags`: the env's bool info flags at the
+    last step (see `run_batch` end_info) + truncated; `clipped_steps` is 0 without an action
+    clip."""
 
     task: str
     cell: str
@@ -165,7 +289,7 @@ class EpisodeRecord:
     flags: dict[str, bool]
 
 
-def _episode_records(
+def episode_records(
     task: str,
     cell: str,
     seed: int,
@@ -175,6 +299,7 @@ def _episode_records(
     end: dict[str, Any],
     instructions: Sequence[str],
 ) -> list[EpisodeRecord]:
+    """EpisodeRecords of one `run_batch` / `run_batch_traced` batch (`end` = its end_info)."""
     out = []
     skip = {"terminated", "clipped_steps"}
     for i, ep in enumerate(seeds):
@@ -248,7 +373,7 @@ def evaluate(
                             instructions_out=instr,
                         )
                         if log_episode is not None:
-                            recs = _episode_records(task, cell, seed, chunk, s, ln, end, instr)
+                            recs = episode_records(task, cell, seed, chunk, s, ln, end, instr)
                             for rec in recs:
                                 log_episode(rec)
                         succ.append(s[: len(chunk)])

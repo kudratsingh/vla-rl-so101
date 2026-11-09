@@ -6,7 +6,9 @@ started) and every commanded joint moves at most MAX_JOINT_STEP rad per control 
 real-arm safety cap is 4°/step, configs/real.yaml), so demos are executable on the real arm.
 
 Observation keys used: obs["agent"]["qpos"], obs["extra"]{tcp_pose, obj_pose, goal_pose,
-obj_half_height} — the privileged state the env exposes for this purpose only.
+obj_half_height} — the privileged state the env exposes for this purpose only (plus
+is_grasped for a mid-episode start, `reset(start_phase="infer")`: recovery corrections from a
+restored policy state, src/env/state.py).
 
 Speed profiles (`OracleProfile`, `data.oracle_profile`): "v1" is the oracle that recorded the
 0.1-era demo sets (KudratSingh22/vla-rl-so101-demos, -demos-25): 1.5 cm/step nominal approach
@@ -22,6 +24,7 @@ bit for bit.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -213,14 +216,53 @@ class Oracle:
         best = torch.where(ok.any(0), ok.float().argmax(0), err.argmin(0))
         return tilts[best]
 
+    def start_phases(self, grasped: torch.Tensor) -> list[str]:
+        """Entry phase for a mid-episode start: an object already in hand is lifted and carried
+        on (PickPlace/Stack); anything else starts from hover. Push always re-approaches."""
+        g = torch.as_tensor(grasped).reshape(-1).to("cpu", torch.bool)
+        if self.task == "Push":
+            return ["hover"] * self.n
+        return ["lift" if bool(x) else "hover" for x in g]
+
     # ------------------------------------------------------------------ API
-    def reset(self, obs: dict[str, Any]) -> None:
+    def reset(
+        self,
+        obs: dict[str, Any],
+        *,
+        start_phase: str | Sequence[str] | None = None,
+        grip_cmd: torch.Tensor | None = None,
+        grasped: torch.Tensor | None = None,
+    ) -> None:
+        """Start (or take over) an episode from `obs`.
+
+        Defaults are the episode-start behaviour: every env enters "hover" and the gripper command
+        starts at the measured gripper position. For a mid-episode start (recovery corrections):
+
+        - `start_phase`: one phase name for all envs, one per env, or "infer" (`start_phases`
+          from `grasped`, default `obs["extra"]["is_grasped"]`; right after a state restore that
+          flag is stale, so pass the one recorded with the snapshot).
+        - `grip_cmd` (N,): the gripper command the previous controller last sent. Starting from
+          the measured position instead would drop the squeeze on a held object for a step.
+        """
         st = self._state(obs)
         n, dev = self.n, self.device
-        self.phase = torch.zeros(n, dtype=torch.long, device=dev)
+        if start_phase is None:
+            names = ["hover"] * n
+        elif start_phase == "infer":
+            g = obs["extra"].get("is_grasped") if grasped is None else grasped
+            names = self.start_phases(torch.zeros(n, dtype=torch.bool) if g is None else g)
+        elif isinstance(start_phase, str):
+            names = [start_phase] * n
+        else:
+            names = list(start_phase)
+        if len(names) != n or any(nm not in self.names for nm in names):
+            raise ValueError(f"start_phase {names} is not {n} of {self.names}")
+        self.phase = torch.tensor([self.names.index(nm) for nm in names], device=dev)
         self.t_phase = torch.zeros(n, dtype=torch.long, device=dev)
         self.retries = torch.zeros(n, dtype=torch.long, device=dev)
         self.q_cmd = st["qpos"].clone()
+        if grip_cmd is not None:
+            self.q_cmd[:, 5] = torch.as_tensor(grip_cmd).to(dev).float().reshape(n)
         self.prev_qpos = st["qpos"].clone()
         self.q_ik = st["qpos"][:, :5].clone()
         self.grip_goal = st["qpos"][:, 5].clone()
@@ -238,6 +280,10 @@ class Oracle:
         self.s = torch.ones(n, device=dev)
         self.grasp_off = torch.zeros(n, 3, device=dev)  # obj - tcp while grasped
         self.push_dir = torch.zeros(n, 3, device=dev)
+        # phases after "close" never set the grip goal themselves: keep squeezing a held object
+        closed_phases = {"lift", "carry", "lower"} if self.task != "Push" else set()
+        in_hand = torch.tensor([nm in closed_phases for nm in names], device=dev)
+        self.grip_goal[in_hand] = GRIPPER_CLOSED
         self._enter(torch.ones(n, dtype=torch.bool, device=dev), st)
 
     def _set_segment(
