@@ -98,6 +98,33 @@ def write_durable(path: Path, text: str) -> str:
     return method
 
 
+def sync_tree(root: Path, skip: frozenset[str] = frozenset(), since: float | None = None) -> int:
+    """``sync_path`` on every regular file under ``root`` (with ``since``: only those modified
+    at or after that ``time.time()``, less 2 s of mtime slack), then on every directory (deepest
+    first, ``root`` last): a tree written through the page cache (e.g. a LeRobot episode save) is
+    on stable storage when this returns. Top-level entries named in ``skip`` are left out.
+    Returns the number of files synced. Raises ``OSError`` when a sync fails."""
+    root = Path(root)
+    files = 0
+    dirs: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        if here == root:
+            dirnames[:] = [d for d in dirnames if d not in skip]
+            filenames = [f for f in filenames if f not in skip]
+        dirs.append(here)
+        for name in filenames:
+            f = here / name
+            if not f.is_file() or f.is_symlink():
+                continue
+            if since is None or f.stat().st_mtime >= since - 2.0:
+                sync_path(f)
+                files += 1
+    for d in reversed(dirs):
+        sync_path(d)
+    return files
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 

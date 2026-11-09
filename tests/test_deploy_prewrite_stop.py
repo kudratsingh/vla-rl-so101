@@ -1258,3 +1258,116 @@ def test_real_eval_resumes_after_a_power_loss_took_one_of_the_two_files(
     assert r2["session_end"] == "completed" and r2["summary"]["complete"]
     assert [t["trial_idx"] for t in r2["trials"]] == [0, 1]  # slot 0 never re-run
     assert r2["resumed_from"] == rec.parent.name
+
+
+def _started_idx(trials: list[dict[str, Any]]) -> list[int]:
+    return [int(t["trial_idx"]) for t in trials if t.get("policy_started")]
+
+
+def _two_run_chain(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n: int) -> tuple[Path, Path]:
+    """(run 1, run 2) of an ``n``-trial seen session: run 1 scores slot 0 and quits; run 2
+    resumes it and scores slot 1 and quits (``n`` > 2) or completes."""
+    from test_real_eval import QuitAfter
+
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(2))  # 1 trial, then quit
+    rec1 = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", str(n), "--cells", "seen"))
+    rec2 = ev.main(_args(tmp_path, "--resume", rec1.parent.name))
+    r2 = json.loads(rec2.read_text())["results"]
+    assert _started_idx(r2["trials"]) == [0, 1] and r2["resumed_from"] == rec1.parent.name
+    return rec1.parent, rec2.parent
+
+
+@pytest.mark.parametrize("lost", ["record_missing", "record_truncated"])
+def test_real_eval_power_loss_of_a_resumed_runs_record_keeps_the_earlier_runs_trials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lost: str
+) -> None:
+    """S32-D1: a resumed run's metrics.jsonl never holds the earlier runs' trials (only its
+    record.json does). Its record.json lost, the rebuild takes them from the run it resumed from
+    (``resumed_from`` of its synced session row): slot 0 (run 1) and slot 1 (run 2) stand, and
+    the next resume runs slot 2 only; run 1's score of slot 0 is the session's."""
+    run1, run2 = _two_run_chain(tmp_path, monkeypatch, 3)
+    rec = run2 / "record.json"
+    if lost == "record_missing":
+        rec.unlink()
+    else:
+        rec.write_text(rec.read_text()[: len(rec.read_text()) // 2])
+    settings, prior = ev.load_prior(run2)
+    assert _started_idx(prior) == [0, 1] and settings["prior_torque_off_unconfirmed"]
+    r1 = json.loads((run1 / "record.json").read_text())["results"]
+    assert prior[0]["start_utc"] == r1["trials"][0]["start_utc"]  # run 1's record of slot 0
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    rec3 = ev.main(_args(tmp_path, "--resume", run2.name))
+    r3 = json.loads(rec3.read_text())["results"]
+    assert r3["session_end"] == "completed" and r3["summary"]["complete"]
+    assert _started_idx(r3["trials"]) == [0, 1, 2]  # no slot scored twice
+    assert r3["trials"][0]["start_utc"] == r1["trials"][0]["start_utc"]
+
+
+def test_real_eval_power_loss_rebuild_refuses_when_the_parent_run_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S32-D1: the resumed run's record lost AND the run it resumed from gone: the earlier
+    trials cannot be rebuilt, so the resume refuses (it would re-run them)."""
+    import shutil
+
+    run1, run2 = _two_run_chain(tmp_path, monkeypatch, 3)
+    (run2 / "record.json").unlink()
+    shutil.rmtree(run1)
+    with pytest.raises(SystemExit, match="which is gone"):
+        ev.load_prior(run2)
+
+
+@pytest.mark.parametrize("chain", [1, 2])
+def test_real_eval_resume_needs_only_the_synced_rows_and_the_synced_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chain: int
+) -> None:
+    """S32-D4: power lost right after the last ``trial_started`` sync of the newest run: on disk
+    are metrics.jsonl up to that synced offset (every later decision / trial / capture row gone)
+    and record.json as of its last write before it. ``load_prior`` and ``--resume`` still never
+    re-run a started slot, and the in-flight trial is a ``session_lost`` failure. Over a single
+    run and a two-run chain (the newest run cut)."""
+    snaps: dict[Path, list[tuple[str, int, str]]] = {}
+    last_record: dict[Path, str] = {}
+    real_durable, real_write = Run.log_durable, Run._write
+
+    def write(run: Run) -> None:
+        real_write(run)
+        last_record[run.dir] = run.record_path.read_text()
+
+    def log_durable(run: Run, step: int | None = None, **row: Any) -> str:
+        method = real_durable(run, step, **row)
+        snaps.setdefault(run.dir, []).append(
+            (str(row.get("kind")), run.metrics_path.stat().st_size, last_record[run.dir])
+        )
+        return method
+
+    monkeypatch.setattr(Run, "_write", write)
+    monkeypatch.setattr(Run, "log_durable", log_durable)
+    n, in_flight = chain + 1, 1  # slot 1 is in flight at the cut (run 2's only trial: chain 2)
+    if chain == 1:
+        monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+        rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen"))
+        cut_dir = rec.parent
+    else:
+        _run1, cut_dir = _two_run_chain(tmp_path, monkeypatch, n)
+    _kind, size, record_text = [s for s in snaps[cut_dir] if s[0] == "trial_started"][-1]
+    metrics = cut_dir / "metrics.jsonl"
+    with metrics.open("r+b") as f:  # the unsynced tail is gone
+        f.truncate(size)
+    (cut_dir / "record.json").write_text(record_text)
+    monkeypatch.undo()
+    rows = [json.loads(x) for x in metrics.read_text().splitlines()]
+    assert rows[-1]["kind"] == "trial_started" and rows[-1]["trial_idx"] == in_flight
+    _settings, prior = ev.load_prior(cut_dir)
+    assert _started_idx(prior) == [0, in_flight]
+    lost = prior[-1]
+    assert lost["outcome"] == "failure" and lost["fault"]["kind"] == "session_lost"
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    rec_next = ev.main(_args(tmp_path, "--resume", cut_dir.name))
+    r = json.loads(rec_next.read_text())["results"]
+    assert r["session_end"] == "completed" and r["summary"]["complete"]
+    started = _started_idx(r["trials"])
+    assert sorted(started) == list(range(n)) and len(set(started)) == len(started)
+    assert next(t for t in r["trials"] if t["trial_idx"] == in_flight)["fault"]["kind"] == (
+        "session_lost"
+    )

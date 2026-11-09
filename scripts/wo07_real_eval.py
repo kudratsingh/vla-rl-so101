@@ -96,9 +96,12 @@ is atomic and synced (``src/runs.py``); other metrics rows (decisions, trial and
 are plain appends, each trial / capture row followed by a synced record.json holding it. The
 start marker's sync is part of the marker: a failed sync blocks the first goal like a failed
 write, and the freshness and final stop checks run after it. ``load_prior`` rebuilds the session
-from metrics.jsonl's ``session`` row when record.json is missing or unreadable; a cut
-metrics.jsonl line is skipped, and record.json's trials stand without metrics.jsonl. Closing the Terminal (SIGHUP / SIGTERM) is not a
-kill: the session takes the closed-stdin path (grace period, torque off, released_unconfirmed,
+from metrics.jsonl's ``session`` row when record.json is missing or unreadable, and a resumed
+run's earlier trials from the run it resumed from (recursively, S32-D1); a cut metrics.jsonl
+line is skipped, and record.json's trials stand without metrics.jsonl. A real-0.1 capture
+episode is synced before its staged journal goes and before its ``capture`` row / record.json
+names it, and a resume treats a named episode the dataset no longer holds as missing
+(``reconcile_captures``, S32-D2). Closing the Terminal (SIGHUP / SIGTERM) is not a kill: the session takes the closed-stdin path (grace period, torque off, released_unconfirmed,
 cause hangup) and writes its record. Ctrl-Z never suspends a hardware session (ignored with a
 message); the session must run in the terminal's foreground, and losing it takes the same path
 (cause lost_foreground).
@@ -550,7 +553,9 @@ def plan_sha256(task: str, cell: str, slot_seed: int, n: int = P1.REAL_TRIALS_PE
 SCORED = ("success", "failure")
 
 
-def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def load_prior(
+    run_dir: Path, _below: tuple[str, ...] = ()
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """(session settings, every trial record so far) from an earlier run of the session. Trials
     come from record.json, plus any metrics.jsonl trial rows it lacks (a run killed before exit),
     plus every ``trial_started`` row without its trial: the policy started and the process died
@@ -566,12 +571,17 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     resolution, so a not-started attempt and its in-place retry can share it (review F4). A
     ``capture`` row is merged only into a STARTED record of the same key (a not-started attempt
     never has an episode). A real-0.1 record without ``trial_id`` (rows written before the
-    start marker carried it) gets the one ``trial_id()`` derives (review F1)."""
+    start marker carried it) gets the one ``trial_id()`` derives (review F1).
+
+    record.json missing or cut short (power loss): ``results_from_metrics`` rebuilds the session
+    from the synced ``session`` row, and a resumed run's earlier trials from the run it resumed
+    from (recursively: S32-D1, a resumed run's own metrics.jsonl never holds them). ``_below``:
+    the runs that asked for this one (a cycle exits)."""
     rec_path = run_dir / "record.json"
     try:
         results = json.loads(rec_path.read_text()).get("results", {})
     except (OSError, ValueError) as e:  # missing / cut short (power loss): the synced rows
-        results = results_from_metrics(run_dir, f"{type(e).__name__}: {e}")
+        results = results_from_metrics(run_dir, f"{type(e).__name__}: {e}", _below)
     settings = results.get("session")
     if not settings:
         sys.exit(f"--resume: {rec_path} is not a wo07_real_eval session")
@@ -651,12 +661,14 @@ def _last_session_row(run_dir: Path) -> dict[str, Any] | None:
     return found
 
 
-def results_from_metrics(run_dir: Path, why: str) -> dict[str, Any]:
+def results_from_metrics(run_dir: Path, why: str, _below: tuple[str, ...] = ()) -> dict[str, Any]:
     """The session of a run whose record.json is missing or unreadable (``why``), rebuilt from
-    the last synced ``session`` row of its metrics.jsonl (``DURABLE_ROWS``); its trials then come
-    from the metrics rows alone (``load_prior``). How that run ended is unknown, so a resume
-    treats its torque off as unconfirmed (the operator checks the bus). Exits when neither
-    survives."""
+    the last synced ``session`` row of its metrics.jsonl (``DURABLE_ROWS``). Its trials: those of
+    the run it resumed from (``resumed_from`` of that row: ``load_prior`` of that run, so a lost
+    record there is rebuilt too; S32-D1: a resumed run writes the earlier runs' trials only to
+    its record.json), then ``load_prior`` adds this run's own metrics rows. How that run ended is
+    unknown, so a resume treats its torque off as unconfirmed (the operator checks the bus).
+    Exits when neither file survives, when the parent run is gone, or on a cycle."""
     found = _last_session_row(run_dir)
     if found is None:
         sys.exit(
@@ -669,10 +681,24 @@ def results_from_metrics(run_dir: Path, why: str) -> dict[str, Any]:
     )
     settings = dict(found["session"])
     settings["prior_torque_off_unconfirmed"] = True
+    parent = found.get("resumed_from")
+    base: list[dict[str, Any]] = []
+    if parent:
+        below = (*_below, run_dir.name)
+        if str(parent) in below:
+            sys.exit(f"--resume refused: the session's runs resume each other ({below})")
+        pdir = run_dir.parent / str(parent)
+        if not pdir.is_dir():
+            sys.exit(
+                f"--resume refused: {run_dir.name} resumed from {parent}, which is gone: its "
+                "earlier trials cannot be rebuilt (they would be re-run)"
+            )
+        _, base = load_prior(pdir, below)
+        print(f"--resume: {len(base)} earlier trial records rebuilt from run {parent}")
     return {
         "session": settings,
-        "trials": [],
-        "resumed_from": found.get("resumed_from"),
+        "trials": base,
+        "resumed_from": parent,
         "rebuilt_from": f"metrics.jsonl ({why})",
     }
 
@@ -1223,12 +1249,43 @@ def reconcile_captures(
 
     Only trials that need a recording (``recording.recording_required``: not a trial no policy
     write reached). Each result is logged as a ``capture`` row (merged by ``load_prior``).
-    Returns what it did."""
+
+    First (S32-D2, power loss): a record whose ``episode_index`` the recovered dataset no longer
+    holds (``>= num_episodes``), or whose provenance entry names another trial, has NO episode:
+    its block is cleared (``lost_episode`` keeps what it claimed, ``lost``) and it goes through
+    1-3 above, so it is attached, recovered or flagged ``recording_missing``, never left
+    claiming an index the next save reuses. Returns what it did."""
     by_tid: dict[str, int] = {}
     entries = capture.provenance.get("episodes") or {}
     for idx, entry in entries.items():
         if entry.get("trial_id") is not None:
             by_tid[str(entry["trial_id"])] = int(idx)
+    n_eps = getattr(capture.dataset, "num_episodes", None)
+    lost: list[dict[str, Any]] = []
+    for t in trials:
+        idx = (t.get("capture") or {}).get("episode_index")
+        if idx is None:
+            continue
+        entry = entries.get(str(idx))
+        if n_eps is not None and int(idx) >= int(n_eps):
+            why = f"the dataset holds {int(n_eps)} episodes (lost before it reached the disk)"
+        elif entry is None and n_eps is None:
+            why = "no provenance entry"
+        elif (
+            entry is not None
+            and entry.get("trial_id") is not None
+            and t.get("trial_id") is not None
+            and str(entry["trial_id"]) != str(t["trial_id"])
+        ):
+            why = f"the provenance maps it to trial {entry['trial_id']}"
+        else:
+            continue
+        t["capture"] = {
+            "trial_id": t.get("trial_id"),
+            "episode_index": None,
+            "lost_episode": {"episode_index": int(idx), "reason": why},
+        }
+        lost.append({"trial_id": t.get("trial_id"), "episode_index": int(idx), "reason": why})
     saved_keys = (
         "frames",
         "nominal_fps",
@@ -1248,6 +1305,7 @@ def reconcile_captures(
         "recovery_failed": [],
         "recording_missing": [],
         "discarded": [],
+        "lost": lost,
     }
     started_tids = {str(t.get("trial_id")) for t in trials if t.get("policy_started")}
     for tid in sorted({str(t["trial_id"]) for t in trials if t.get("trial_id") is not None}):
@@ -1305,6 +1363,8 @@ def reconcile_captures(
                 out["recovered"].append(tid)
         if block.get("episode_index") is not None:
             claimed.add(int(block["episode_index"]))
+        if cap.get("lost_episode"):
+            block = {**block, "lost_episode": cap["lost_episode"]}
         t["capture"] = block
         log_row(
             kind="capture",

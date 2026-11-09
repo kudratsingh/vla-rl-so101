@@ -72,6 +72,15 @@ Evaluation capture (``EvalCapture``), one dataset per evaluation session, one ep
   the slot (``STAGED_OTHER_ATTEMPT``), and the resume's reconcile discards any journal of a slot
   none of whose attempts started (``STAGED_NOT_STARTED``), so a not-started attempt's frames can
   never be attached to a later attempt of the same slot.
+* Power loss (S32-D2): a saved episode is synced to stable storage (``src.runs.sync_tree``:
+  every dataset file the save wrote except the frame PNG folder, then every directory;
+  F_FULLFSYNC on macOS) BEFORE its staged journal is deleted and before ``finish`` returns, so
+  the scored record's ``capture`` block (and the synced record.json that holds it) never names
+  an episode the page cache still held. Between trials, never during motion; ``sync_s`` in the
+  block says what it cost. A failed sync keeps the journal and says so (``sync_error``).
+  ``write_json`` (provenance, journals) is atomic and synced. Should an episode a record names
+  still be gone after a power loss, the resume's reconcile treats the trial as having none
+  (scripts/wo07_real_eval.py ``reconcile_captures``).
 """
 
 from __future__ import annotations
@@ -92,6 +101,7 @@ import numpy as np
 
 from src.robot import convention as conv
 from src.robot.camera import CameraFault, CameraRig, Frame, ImageU8, RigFrame
+from src.runs import sync_path, sync_tree, write_durable
 
 log = logging.getLogger(__name__)
 
@@ -366,11 +376,10 @@ def prune_provenance(prov: dict[str, Any], num_episodes: int) -> list[str]:
 
 
 def write_json(path: Path, value: Any) -> None:
-    """Atomic JSON write (temp file + rename): a kill never leaves half a file."""
+    """Atomic, synced JSON write (``src.runs.write_durable``: temp file + sync + rename +
+    directory sync): neither a kill nor a power loss leaves half a file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
-    os.replace(tmp, path)
+    write_durable(path, json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
 
 
 def sha256_file(path: Path) -> str:
@@ -846,6 +855,7 @@ class EvalCapture:
             self.provenance["episodes"][str(index)] = entry
             self._write_provenance()
 
+        t_save = time.time()
         try:
             index = self.dataset.save_episode(before_checkpoint=provenance_entry)
         except CheckpointFailed as e:  # saved, but the dataset could not be made durable
@@ -867,19 +877,34 @@ class EvalCapture:
                 "reason": "save failed" + ("; staged: a resume recovers it" if staged else ""),
                 "error": f"{type(e).__name__}: {e}",
             }
-        self.drop_staged(cur["trial_id"])  # saved and in the provenance: the journal is done
+        t_sync = time.perf_counter()
+        durable: dict[str, Any] = {}
+        try:  # on stable storage before the journal goes and the record names it (module doc)
+            durable["synced_files"] = sync_tree(
+                self.dataset_root, skip=frozenset({"images"}), since=t_save
+            )
+            self.drop_staged(cur["trial_id"])  # saved, synced, in the provenance: done
+        except OSError as e:
+            log.error("eval capture: episode %d saved but not synced: %s", index, e)
+            durable["sync_error"] = f"{type(e).__name__}: {e} (the staged journal is kept)"
+        durable["sync_s"] = round(time.perf_counter() - t_sync, 4)
         stills = self._stills(index, end_images)
         entry.update(end_state=stills, end_state_when=when)
         try:
             self._write_provenance()
+            if isinstance(stills, dict):
+                for rel in stills.values():
+                    sync_path(self.root / rel)
+                sync_path(self.root / END_STATE_DIR)
         except OSError as e:
-            log.error("eval capture: provenance not written: %s", e)
+            log.error("eval capture: provenance / stills not written: %s", e)
         return {
             **base,
             **timing,
             "episode_index": index,
             "end_state": stills,
             "end_state_when": when,
+            **durable,
         }
 
     def close(self) -> None:

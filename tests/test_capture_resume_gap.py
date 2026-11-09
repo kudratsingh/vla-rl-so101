@@ -553,6 +553,7 @@ def test_a_journal_of_another_attempt_or_a_not_started_slot_is_discarded(tmp_pat
         def __init__(self) -> None:
             self.root = tmp_path
             self.provenance: dict[str, Any] = {"episodes": {}}
+            self.dataset = None  # no episode count: nothing claims one here
 
         def drop_staged(self, trial_id: str) -> None:
             shutil.rmtree(recording.staged_path(tmp_path, trial_id), ignore_errors=True)
@@ -595,3 +596,115 @@ def test_a_staged_journal_of_another_attempt_is_not_recovered_into_this_one(
     assert recording.STAGED_OTHER_ATTEMPT in got["capture"]["reason"]
     assert not recording.has_staged(capture_root, third["trial_id"])
     assert rec2["results"]["capture"]["reconciled"]["recording_missing"] == [third["trial_id"]]
+
+
+def _lose_episode(ds_root: Path, idx: int) -> None:
+    """Power loss before episode ``idx`` (the newest) reached the disk: its data / video /
+    episode-metadata files and its provenance entry are gone (the page cache held them)."""
+    import pyarrow.parquet as pq
+
+    info = json.loads((ds_root / "meta" / "info.json").read_text())
+    (meta,) = [
+        f
+        for f in sorted((ds_root / "meta" / "episodes").rglob("*.parquet"))
+        if idx in [int(r["episode_index"]) for r in pq.read_table(f).to_pylist()]
+    ]
+    (ep,) = pq.read_table(meta).to_pylist()  # its own file (one file per saved episode)
+    assert int(ep["episode_index"]) == idx
+    gone = [meta, ds_root / str(info["data_path"]).format(
+        chunk_index=ep["data/chunk_index"], file_index=ep["data/file_index"])]  # fmt: skip
+    for k, v in info["features"].items():
+        if v.get("dtype") == "video":
+            gone.append(ds_root / str(info["video_path"]).format(
+                video_key=k, chunk_index=ep[f"videos/{k}/chunk_index"],
+                file_index=ep[f"videos/{k}/file_index"]))  # fmt: skip
+    for f in gone:
+        f.unlink()
+    prov_path = ds_root / recording.PROVENANCE
+    prov = json.loads(prov_path.read_text())
+    del prov["episodes"][str(idx)]
+    prov_path.write_text(json.dumps(prov))
+
+
+def test_a_recorded_episode_lost_to_a_power_cut_is_flagged_never_claimed_twice(
+    tmp_path: Path, hard_timeout: None
+) -> None:
+    """S32-D2: trial 2's record (synced record.json) names episode 1, but a power cut took the
+    episode (the page cache held it). The resume's reconcile sees the recovered dataset holds 1
+    episode: trial 2 has NO episode (``lost``; no journal: ``recording_missing``), and trial 3's
+    staged journal is recovered as episode 1, so no two records claim one index; the export
+    refuses a complete bundle (never 'claimed by two trial records') and an INCOMPLETE one
+    names trial 2. The session's saves are synced (``sync_s``, ``synced_files``)."""
+    runs, run_dir, _ = _killed_session(tmp_path, "after_record")
+    settings, before = ev.load_prior(run_dir)
+    second, third = before[1], before[2]
+    assert second["capture"]["episode_index"] == 1 and second["capture"]["synced_files"] >= 1
+    assert "sync_error" not in second["capture"] and second["capture"]["sync_s"] >= 0
+    ds_root = runs / settings["session_id"] / "capture" / "dataset"
+    _lose_episode(ds_root, 1)
+
+    rec2 = _resume(runs, run_dir)
+    scored = _check_no_rerun(rec2)
+    by_tid = {t["trial_id"]: t["capture"] for t in scored}
+    assert by_tid[second["trial_id"]]["episode_index"] is None
+    assert by_tid[second["trial_id"]]["recording_missing"] is True
+    assert by_tid[second["trial_id"]]["lost_episode"]["episode_index"] == 1
+    assert (
+        by_tid[third["trial_id"]]["episode_index"] == 1 and by_tid[third["trial_id"]]["recovered"]
+    )
+    rc = rec2["results"]["capture"]["reconciled"]
+    assert [x["trial_id"] for x in rc["lost"]] == [second["trial_id"]]
+    assert rc["recording_missing"] == [second["trial_id"]] and rc["recovered"] == [
+        third["trial_id"]
+    ]
+    claims = [c["episode_index"] for c in by_tid.values() if c["episode_index"] is not None]
+    assert sorted(claims) == [0, 1]
+    prov = json.loads((ds_root / recording.PROVENANCE).read_text())
+    assert prov["episodes"]["1"]["trial_id"] == third["trial_id"]
+
+    with pytest.raises(SystemExit, match="REFUSED: INCOMPLETE"):
+        _export(runs, rec2["path"].parent.name, tmp_path / "export")
+    index = _export(
+        runs, rec2["path"].parent.name, tmp_path / "export2", "--allow-missing-recordings"
+    )
+    assert index["status"] == "INCOMPLETE" and index["episodes"] == 2
+    assert [m["trial_id"] for m in index["recording_missing"]] == [second["trial_id"]]
+
+
+def test_a_saved_episode_is_synced_before_its_journal_is_dropped(
+    tmp_path: Path, hard_timeout: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S32-D2: ``EvalCapture.finish`` syncs the files the save wrote (and every directory) BEFORE
+    it deletes the staged journal; a failed sync keeps the journal and says so."""
+    order: list[str] = []
+    real_tree, real_drop = recording.sync_tree, recording.EvalCapture.drop_staged
+    fail = {"on": False}
+
+    def sync_tree(root: Path, skip: frozenset[str] = frozenset(), since: Any = None) -> int:
+        if fail["on"]:
+            raise OSError(5, "Input/output error")
+        order.append(f"sync:{Path(root).name}")
+        return int(real_tree(root, skip, since))
+
+    def drop(self: Any, trial_id: str) -> None:
+        order.append("drop")
+        real_drop(self, trial_id)
+
+    monkeypatch.setattr(recording, "sync_tree", sync_tree)
+    monkeypatch.setattr(recording.EvalCapture, "drop_staged", drop)
+    rec = _new_session(tmp_path / "runs", _ckpt(tmp_path))
+    r = json.loads(rec.read_text())["results"]
+    saves = [i for i, e in enumerate(order) if e == "sync:dataset"]
+    assert len(saves) == 3 and all(order[i + 1] == "drop" for i in saves)
+    assert all(t["capture"]["episode_index"] is not None for t in r["trials"])
+
+    fail["on"] = True
+    order.clear()
+    rec2 = _new_session(tmp_path / "runs2", tmp_path / "pretrained_model")
+    r2 = json.loads(rec2.read_text())["results"]
+    for t in r2["trials"]:
+        assert t["capture"]["episode_index"] is not None  # saved: the score never changes
+        assert "Input/output error" in t["capture"]["sync_error"]
+        assert recording.has_staged(rec2.parent.parent / r2["session"]["session_id"] / "capture",
+                                    t["trial_id"])  # fmt: skip
+    assert "drop" not in order
