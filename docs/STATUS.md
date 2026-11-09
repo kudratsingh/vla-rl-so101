@@ -1728,6 +1728,95 @@ names it (it said `deploy.trial_max_steps`, 150). `wo07_train.py` writes
 `src/eval/protocol.py`, `protocol_v02.py`, `protocol_real.py` and `src/env/success.py` are
 unchanged; so is the real-0.1 hash `edee44aa...`.
 
+### PR 2: sync with main (#33), durable start rows, real-judge-3 (2026-11-09, $0)
+
+Owner 2026-11-09: #33 merged as `10ced52` (CI green on main); sync #32 and integrate while the
+owner checks the bowl. Merge commit, no rebase or force push.
+
+**Conflicts and resolutions.**
+- `src/robot/client.py` `DeployLoop.__init__`: both hooks kept (#32's `on_write` / `on_settled`,
+  #33's `on_policy_start_retracted`). `_read_frame`: #33's `_pre_write_stop` / `_stopped` added,
+  #32's `Frame | RigFrame | None` signature kept. The step in `_loop`: #33's `stop_fn` selection
+  (`_first_goal_check(res, mark_ms, frame_time, t_capture)`), `try / except MotionStopped`, no
+  `finally`; #32's `self._wrote(frame, out)` after the step. `run_trial`'s retraction net is #33's.
+- `scripts/wo07_real_eval.py`: `JUDGING_GENERAL` stays #32's re-export from
+  `src/eval/protocol_real.py` (#33's wording ported there, see real-judge-3). `load_prior`: #33's
+  retraction handling combined with #32's capture rows, `trial_id` and attempt key (F4); every row,
+  the retraction too, is keyed by (cell, trial_idx, start_utc, attempt).
+- `docs/STATUS.md`: both sections kept.
+
+**Capture x retraction.** The `trial_start_retracted` row carries the attempt's
+`RETRACTION_KEYS` (attempt, trial_id, schedule_pos), so it cancels its own marker and never a
+same-second retry's. A retracted attempt is `not_started`: no policy write reached the capture,
+nothing is staged, `finish` discards its buffer, no recording is required. `load_prior` drops a
+retracted attempt's capture row. A staged journal now records its attempt (`JOURNAL_KEYS`):
+`recover_staged` discards a journal of another attempt (`STAGED_OTHER_ATTEMPT`), and the resume's
+reconcile discards any journal of a slot none of whose attempts started (`STAGED_NOT_STARTED`).
+
+**Durable start rows (`src/runs.py`).**
+- Synced metrics rows: `trial_started`, `trial_start_retracted` (`client.DURABLE_ROW_KINDS`) and a
+  new `session` row (the session settings, written once per run at its start), through
+  `Run.log_durable` (append, then sync metrics.jsonl; the run directory on the first durable row).
+  Not synced: decision rows, trial rows and capture rows (each trial / capture row is followed by a
+  synced record.json that holds it).
+- record.json: every write (start, each flush, the end) is tmp + sync + rename + directory sync;
+  the runs directory is synced once for the new run directory's entry.
+- Sync = `fcntl(F_FULLFSYNC)` where the OS has it (macOS; measured here), `os.fsync` otherwise
+  (Linux CI), and `os.fsync` when a filesystem rejects F_FULLFSYNC as unsupported (ENOTSUP /
+  EINVAL / ENOTTY). `Run.sync_method` and `results.durability` record which ran. Any other
+  `OSError` propagates.
+- Order on the first goal: write the marker, sync it, freshness re-check, final stop check, write.
+  A failed sync blocks the first goal exactly like a failed write (`start_marker_failed`:
+  `not_started`, hold, torque off, the session ends); the retraction row is synced too.
+- Recovery: `load_prior` rebuilds the session from the last `session` row when record.json is
+  missing or cut short (that run's torque off then counts as unconfirmed: the operator checks the
+  bus); `session_runs` reads it for a run whose record is lost. Without metrics.jsonl the trials
+  in record.json stand.
+
+**Latency** (mock `wo07_real_eval`, REAL clock, protocol 0.2, 30 trials, max 5 steps, gRPC mock
+policy, Mac M3 Pro, local SSD; single run each, MOCK RIG):
+
+| `policy_start_mark_ms` | p50 | p95 | max |
+|---|---|---|---|
+| with the sync (F_FULLFSYNC) | 4.32 | 5.86 | 6.69 |
+| without (append only) | 1.01 | 1.80 | 1.93 |
+| added | +3.3 | +4.1 | +4.8 |
+
+One F_FULLFSYNC call: p50 3.4 ms, p95 5.3 ms, max 6.1 ms (99 calls). Frame return to the first
+write of a trial: p50 80.6 ms with the sync, 76.3 ms without. Inside the 300 ms frame deadman and
+the 800 ms chunk limit; the freshness re-check after the sync covers a slow disk.
+
+**real-judge-3** (applied; the freeze stays PENDING).
+- `src/eval/protocol_real.py`: `JUDGING_RULE_VERSION = "real-judge-3"`; `JUDGING_GENERAL` carries
+  #33's start rule (the bus write of the first policy action was begun, even if that write then
+  failed; a first goal blocked before its write, also after the start marker, never started).
+  `protocol_hash()` moves `edee44aa957d...` -> `dca199e6da6275bddc047812e1ea83379a70f21778f564315c5483811c0954f2`
+  (judging version and text only); the test pins the new computed value, labelled PENDING.
+- `FREEZE_STATUS = "pending: bowl fit check"` and `freeze_problem()`: the hardware session and the
+  demo schedule refuse on it, next to `bowl_fit.bowl_box_problem` (which still refuses).
+- Not changed (owner: after the fit confirmation): `BOWL_XY_M`, `RUBRIC_VERSION` "1" and the
+  rubric rules text, the placement-grid PDF. The committed PDF is stale by the printed hash prefix
+  only; the tests check exactly that while the freeze is pending.
+- Literals: `scripts/wo07_real_eval.py`, `src/robot/client.py` (4), `configs/real.yaml`,
+  `docs/PLAN.md`, ADR-0003, WO-06 checklist, WO-07 work order. The resume refusal now covers
+  real-judge-1 and real-judge-2 sessions.
+
+**Reruns on the combined code (final head).**
+- PR #33's stop / resume list (all of `tests/test_deploy_prewrite_stop.py` plus the 10 named ids;
+  the judging test now has 2 cases): 71 passed.
+- Capture / recovery (`tests/test_capture_resume_gap.py`, `tests/test_pr2_review_fixes.py`): 20
+  passed, including the score-before-save interruption (`after_record`, `mid_save`,
+  `after_save`) and the 3 new retraction tests.
+- Export / protocol (`test_export_bundle.py`, `test_pr2_pipeline.py`, `test_protocol_real.py`):
+  58 passed + 1 skipped. `test_runs.py`: 4 passed.
+- vishwaroop importer mock on the final code (scratch copy, `make_pr2r1_bundles.py` +
+  `run_importer_s32b.sh`): 4 seals, 4 verifies, 4 imports exit 0,
+  `declared_group_and_lineage_checks_passed`; 11 episodes, both cameras; the eval rubric extra
+  says real-judge-3, hash `dca199e6da62`; the sessions' record says `F_FULLFSYNC`.
+- Full pytest 644 passed + 1 skipped. `ruff check src tests scripts`, `black --check .`,
+  `mypy --strict src`: clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/success.py`
+  and the pins unchanged.
+
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
 Owner 2026-11-09: the stop check #30 added to teleop and the park now also guards the pilot and
@@ -1799,7 +1888,8 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
     final stop check) median 0.34 ms, max 0.68 ms; the first decision's frame-return-to-
     first-write median 68.3 ms vs 67.9 ms for the other decisions (mock policy). The append is
     not fsynced (`src/runs.Run.log_metrics`): the marker survives SIGKILL; across power loss
-    only as far as the OS flushed it.
+    only as far as the OS flushed it. (Superseded in PR #32's sync: the marker and retraction
+    rows are synced, F_FULLFSYNC on macOS; "PR 2: sync with main (#33)" above.)
   - The judging text is unchanged ("one stopped before its write never started" already covers
     it), so the rule text hash is unchanged.
   - Tests (new, `tests/test_deploy_prewrite_stop.py`): stop during the marker for SIGHUP /
@@ -1853,7 +1943,11 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
   0.185) and D (0.205, 0.180) pass the filter with separation 10.1 / 9.8 / 9.3 cm and release
   windows 50% / 71% / 81%; every option needs the oracle's wrist_flex clipped in the bowl phases).
   The hardware eval and the demo schedule refuse the frozen bowl until it is decided. Seen slots B2 B5 E2 E5 + C4, the cubes and the seeded schedules
-  are approved.
+  are approved. Owner 2026-11-09: B' (0.205, 0.185) m picked for an UNPOWERED fit check (jaws
+  and cube at the bowl and at C1, D1, B2, E2); the placement freeze is held until he confirms
+  (`protocol_real.FREEZE_STATUS` "pending: bowl fit check": hardware and demo schedule refuse).
+  If it passes: keep C4, document the 9.83 cm separation as a real-only exception, then move the
+  bowl, bump the rubric, regenerate the hash and the placement-grid PDF together.
 - Resolved 2026-11-09 by the pivot (ADR-0003): the OFT track is stopped, so the WO-04 item below
   is closed. Open for the owner: the seen slots, bowl position and schedule freeze (PR 2), the
   servo P gain to use (LeRobot writes 16 at connect, firmware default 32; WO-06 checklist), and
@@ -1870,7 +1964,11 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
   for SmolVLA and ACT, synchronous inference, `max_chunk_age_ms` 800; SmolVLA keeps 20,000 steps
   at batch 32 (half the samples, recorded). Placement: seen slots B2 B5 E2 E5 + C4, the cubes and
   the seeded schedules approved; the bowl pending. Judging: real-judge-3 for #33's start rule,
-  applied after #33 lands and the bowl is approved.
+  applied in PR #32 after #33 landed (the rubric bump, bowl and PDF follow the fit check).
+- 2026-11-09 Durable start: the `trial_started` / `trial_start_retracted` rows are synced to
+  stable storage (F_FULLFSYNC on macOS) before the first goal, after-sync freshness and final stop
+  checks kept, a failed sync blocks the first goal; record.json atomic and synced, the session
+  recoverable from metrics.jsonl (PR #32).
 - 2026-11-09 Pivot to SmolVLA + ACT on the real SO-101 (ADR-0003); decisions D1-D6
   (`docs/reviews/2026-11-09-pivot-decisions.md`): five seen slots x 10 demos, bowl fixed, cells of
   50 binary trials, freeze before recording, development trials on a disjoint schedule, mock
