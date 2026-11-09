@@ -436,8 +436,9 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     stood at the start, a FAILURE with fault kind ``session_lost``: the started slot is done and
     is never re-run (real-judge-2). A ``trial_started`` row with a ``trial_start_retracted`` row
     of the same attempt (cell, trial_idx, start_utc) is dropped: the first goal was blocked after
-    the marker (a stop recorded during its I/O, or the marker failed), nothing was sent, the
-    attempt never started and the slot is retried (``DeployLoop._first_goal_check``)."""
+    the marker (a stop recorded during its I/O, a frame / chunk gone stale during it, or the
+    marker failed), nothing was sent, the attempt never started and the slot is retried
+    (``DeployLoop._first_goal_check``)."""
     rec_path = run_dir / "record.json"
     if not rec_path.is_file():
         sys.exit(f"--resume: no {rec_path}")

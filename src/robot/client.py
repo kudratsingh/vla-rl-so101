@@ -63,9 +63,11 @@ the deadman's HOLD response, ``arm.trip``) and the torque off, which are the saf
 not motion goals; the settle writes nothing; the healthy-shutdown park has its own ``stop_fn``.
 The deadman needs no entry in the predicate: ``step`` refuses a latched deadman on entry and the
 filter refuses one right before ``stop_fn``. The trial's FIRST policy goal also writes the durable
-start marker inside ``stop_fn`` and checks the predicate again after that I/O, right before the
-write; a stop recorded during the marker I/O, or a marker that cannot be saved, blocks the goal
-and retracts the marker (``DeployLoop._first_goal_check``): the attempt is not started.
+start marker inside ``stop_fn``, then re-checks the frame age (deadman) and the chunk age on the
+clock after that I/O, and checks the predicate again last, right before the write; a stop
+recorded during the marker I/O, a frame or chunk that went stale during it (HOLD), or a marker
+that cannot be saved, blocks the goal and retracts the marker (``DeployLoop._first_goal_check``):
+the attempt is not started.
 
 Prompts with torque on (``ConsoleOperator`` through ``src/robot/prompts.py``'s ``TorqueGuard``,
 owner 2026-11-08): every prompt answered while the arm holds under torque (between trials, the
@@ -615,6 +617,14 @@ class DeployLoop:
             log.exception("deploy loop failed")
             res.stop_reason = "client_error"
             self.arm.trip(f"client error: {type(e).__name__}: {e}")
+        if (
+            res.policy_started_t is not None
+            and res.steps == 0
+            and not self.arm.goal_write_attempted
+        ):
+            # stamped, but the first goal's write never began (e.g. a Ctrl-C without the flag
+            # handler landed between the final stop check and the write): nothing was sent
+            self._retract_start(res, f"{res.stop_reason}: the first policy goal was not sent")
         if self.arm.deadman.tripped:
             res.stop_detail = res.stop_detail or self.arm.deadman.reason
             response = self.arm.deadman.response
@@ -678,7 +688,9 @@ class DeployLoop:
                 mark_ms: list[float] = []
                 stop_fn: Callable[[], bool] = self._pre_write_stop
                 if res.policy_started_t is None:  # the trial's first policy goal
-                    stop_fn = functools.partial(self._first_goal_check, res, mark_ms)
+                    stop_fn = functools.partial(
+                        self._first_goal_check, res, mark_ms, frame_time, t_capture
+                    )
                 try:
                     out = self.arm.step(action, frame_time=frame_time, stop_fn=stop_fn)
                     t_write = self.clock()
@@ -706,7 +718,9 @@ class DeployLoop:
                     res.stop_detail = "; ".join(iv.reason for iv in out.safety.interventions)
                     return
 
-    def _first_goal_check(self, res: TrialResult, mark_ms: list[float]) -> bool:
+    def _first_goal_check(
+        self, res: TrialResult, mark_ms: list[float], frame_time: float | None, t_capture: float
+    ) -> bool:
         """``stop_fn`` of the step carrying the trial's first policy goal (owner 2026-11-09):
 
         1. the pre-write stop check: a stop recorded before it blocks the goal, no marker;
@@ -714,20 +728,28 @@ class DeployLoop:
            row. If saving it fails (any exception: I/O error, disk full), the goal is blocked
            with ``START_MARKER_FAILED`` (a ``SessionStop``: hold, the session ends), since a
            started slot without its durable marker could be re-rolled by a resume;
-        3. the stop check AGAIN, after the marker I/O: a stop recorded while the marker was saved
-           blocks the goal. ``So101Driver.step`` begins the write right after this returns False
+        3. the freshness checks AGAIN, on the clock after the marker I/O (``_fresh_after_marker``):
+           the deadman's frame age (``deadman_frame_timeout_ms``) of this tick's frame and the
+           chunk age (``max_chunk_age_ms``) of the decision frame. Both passed before the step
+           began, but a slow or stalled marker write (a slow / synced volume, disk pressure)
+           could age them past their limits; a stale one trips the deadman (HOLD), as the same
+           check in ``_loop`` / ``step`` would have one tick later;
+        4. the stop check AGAIN, the last call: a stop recorded while the marker was saved blocks
+           the goal. ``So101Driver.step`` begins the write right after this returns False
            (nothing runs in between but setting ``goal_write_attempted``).
 
-        A goal blocked in 2 or 3 never reached the bus: the attempt is ``not_started`` and a
+        A goal blocked in 2, 3 or 4 never reached the bus: the attempt is ``not_started`` and a
         resume retries the same placement. The marker row may already be on disk, so it is
         neutralised (``_retract_start``): the stamp is cleared and a durable
         ``trial_start_retracted`` row is written, which ``load_prior`` honours. Only a process
         killed between the marker and its retraction leaves a bare marker, which a resume scores
         a ``session_lost`` failure (the logs cannot show that the goal was blocked: doubt =
         started). A write that began counts as started even when it fails part-way. Cost: one
-        log write before the first goal of each trial, inside that decision's ``LATENCY_KEY``
-        and also recorded as ``policy_start_mark_ms``; the stamp is taken when the marker I/O
-        begins, that long before the write."""
+        log write and one clock read before the first goal of each trial, inside that decision's
+        ``LATENCY_KEY``; ``policy_start_mark_ms`` is the stamp + marker I/O + freshness re-check
+        (it excludes only the final stop check, the flag read and ``tcgetpgrp`` poll, so that
+        nothing else runs between that check and the write). The stamp is taken when the marker
+        I/O begins, that long before the write."""
         if self._pre_write_stop():
             return True
         t0 = self.clock()
@@ -744,7 +766,12 @@ class DeployLoop:
         except BaseException:  # e.g. a Ctrl-C without the flag handler: nothing was sent
             self._retract_start(res, "interrupted while the trial_started marker was saved")
             raise
-        mark_ms.append(_ms(t0, self.clock()))
+        try:
+            self._fresh_after_marker(res, frame_time, t_capture, t0)
+            mark_ms.append(_ms(t0, self.clock()))
+        except BaseException as e:  # a stale frame / chunk (held), or a Ctrl-C: nothing was sent
+            self._retract_start(res, f"{type(e).__name__} after the trial_started marker: {e}")
+            raise
         if self._pre_write_stop():  # the final check: the write follows it directly
             stop = self._pending_stop
             assert stop is not None
@@ -758,6 +785,27 @@ class DeployLoop:
             )
             return True
         return False
+
+    def _fresh_after_marker(
+        self, res: TrialResult, frame_time: float | None, t_capture: float, t0: float
+    ) -> None:
+        """The deadman frame check and the chunk-age check of ``_loop`` again, on the clock after
+        the start marker's I/O (``_first_goal_check`` step 3). Raises ``DeadmanTripped`` after
+        the HOLD response when either is now stale (stop reason ``deadman`` / ``stale_chunk``,
+        the detail names the marker's duration)."""
+        now = self.clock()
+        took = f"the start marker took {_ms(t0, now):.0f} ms; the first policy goal was not sent"
+        try:
+            self.arm.check_frame(frame_time, now)
+            if now - t_capture > self.dcfg.max_chunk_age_s:
+                res.stop_reason = "stale_chunk"
+                raise self.arm.trip(
+                    f"chunk stale before its first action: {_ms(t_capture, now):.0f} ms > "
+                    f"{self.dcfg.max_chunk_age_s * 1e3:.0f} ms ({took})"
+                )
+        except DeadmanTripped:
+            res.stop_detail = f"{self.arm.deadman.reason} ({took})"
+            raise
 
     def _policy_started(self, res: TrialResult) -> None:
         """The trial's first policy goal is about to be written (``_first_goal_check``): stamp
@@ -1275,8 +1323,8 @@ def run_trials(
     a started slot is never re-rolled. An exception that ends the session between the start and
     the record (a crash, a Ctrl-C without the flag handler) appends that record before it
     propagates. If the goal is blocked after the marker (a stop recorded during the marker I/O,
-    seen by the stop check right before the write; or the marker failed to save) nothing was
-    sent: a ``trial_start_retracted`` row (same cell, trial_idx, start_utc) goes to ``log_row``,
+    seen by the stop check right before the write; a frame or chunk that went stale during it;
+    or the marker failed to save) nothing was sent: a ``trial_start_retracted`` row (same cell, trial_idx, start_utc) goes to ``log_row``,
     the attempt is ``not_started``, and the resume retries the slot (``DeployLoop.
     _first_goal_check``). A marker that cannot be saved ends the session
     (``start_marker_failed``): without it a started slot could be re-rolled by a resume.

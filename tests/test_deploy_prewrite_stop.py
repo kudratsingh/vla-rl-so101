@@ -22,6 +22,7 @@ Run by name before the real-eval protocol is frozen (PR #32):
 from __future__ import annotations
 
 import errno
+import functools
 import json
 import os
 import signal
@@ -733,7 +734,7 @@ def test_mutation_without_the_post_marker_check_a_goal_follows_the_stop(
     recorded during the marker is followed by the first policy goal and the trial counts as
     started: the test above depends on that check."""
 
-    def no_recheck(self: DeployLoop, res: Any, mark_ms: list[float]) -> bool:
+    def no_recheck(self: DeployLoop, res: Any, *_: Any) -> bool:
         if self._pre_write_stop():
             return True
         self._policy_started(res)
@@ -861,3 +862,276 @@ def test_real_eval_marker_failure_ends_the_session_and_resume_retries_the_slot(
     assert r2["session_end"] == "completed" and r2["summary"]["complete"]
     assert [t["trial_idx"] for t in r2["trials"]] == [0, 0, 1]
     assert r2["trials"][1]["placement"] == t0["placement"] and r2["trials"][1]["policy_started"]
+
+
+# -- review round 3: freshness after the marker, the window after the final check, the pending ---
+STALE_CASES = {  # case -> (rig kwargs, marker delay s, stop reason)
+    "frame_350ms": ({}, 0.35, "deadman"),  # past deadman_frame_timeout_ms (300)
+    "frame_1500ms": ({}, 1.5, "deadman"),  # past both 300 ms and max_chunk_age_ms (800)
+    # the chunk check alone: a slow query (350 ms) + a 200 ms marker > a 500 ms chunk limit,
+    # while this tick's frame is only 200 ms old
+    "chunk_550ms": ({"infer_s": 0.35, "max_chunk_age_ms": 500}, 0.2, "stale_chunk"),
+}
+
+
+def _slow_marker_trial(
+    case: str, *, skip_recheck: bool = False, monkeypatch: pytest.MonkeyPatch | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, Rig, int]:
+    """One mock ``run_trials`` trial whose ``trial_started`` row takes ``delay`` on the fake clock
+    (a slow / stalled log volume). Returns (trials, rows, end, rig, policy goals written)."""
+    from test_deploy import _trials
+
+    kw, delay, _reason = STALE_CASES[case]
+    if skip_recheck:  # the mutation: no freshness re-check after the marker
+        assert monkeypatch is not None
+        monkeypatch.setattr(DeployLoop, "_fresh_after_marker", lambda *a, **k: None)
+    rows: list[dict[str, Any]] = []
+    with rig(**kw) as r:
+
+        def log_row(**row: Any) -> None:
+            if row["kind"] == "trial_started":
+                r.clock.advance(delay)
+            rows.append(row)
+
+        sent_at_query: list[int] = []
+        real_act = r.client.act
+
+        def act(*a: Any, **k: Any) -> Any:
+            sent_at_query.append(len(r.fol.sent))
+            return real_act(*a, **k)
+
+        hold_writes = [0]
+        hold = r.arm.hold
+
+        def hold_counted(*a: Any, **k: Any) -> None:
+            before = len(r.fol.sent)
+            hold(*a, **k)
+            hold_writes[0] += len(r.fol.sent) - before
+
+        r.client.act = act  # type: ignore[method-assign]
+        r.arm.hold = hold_counted  # type: ignore[method-assign]
+        trials, end = _trials(r, ScriptedOperator(), log_row=log_row)
+        goals = len(r.fol.sent) - sent_at_query[0] - hold_writes[0]
+        return trials, rows, end, r, goals
+
+
+@pytest.mark.parametrize("case", list(STALE_CASES))
+def test_a_frame_or_chunk_gone_stale_during_the_marker_blocks_the_first_goal(case: str) -> None:
+    """F33-R2-1: the marker I/O sits between the frame / chunk checks and the write. A marker that
+    takes 350 ms or 1.5 s ages this tick's frame past the deadman's 300 ms; one that takes 200 ms
+    after a 350 ms query ages the chunk past a 500 ms limit. The re-check on the clock after the
+    I/O trips the deadman (HOLD): zero policy goals, the marker retracted, ``not_started`` (the
+    slot is retried on a resume), with the marker's duration in the stop detail."""
+    trials, rows, end, r, goals = _slow_marker_trial(case)
+    reason = STALE_CASES[case][2]
+    assert goals == 0
+    (t,) = trials
+    assert (t["outcome"], t["outcome_source"]) == ("not_started", "not_scored")
+    assert not t["policy_started"] and t["policy_started_utc"] is None and t["steps"] == 0
+    assert t["stop_reason"] == reason and t["fault"] is None
+    assert "start marker took" in t["stop_detail"] and "not sent" in t["stop_detail"]
+    assert t["deadman_response"] == DeadmanResponse.HOLD.value
+    assert _trial_rows(rows) == ["trial_started", "trial_start_retracted", "trial"]
+    retraction = next(row for row in rows if row["kind"] == "trial_start_retracted")
+    assert "DeadmanTripped after the trial_started marker" in retraction["reason"]
+    assert end == "completed"  # the HOLD stop was acknowledged (scripted 'resume')
+    assert not r.arm.goal_write_attempted
+
+
+@pytest.mark.parametrize("case", ["frame_350ms", "chunk_550ms"])
+def test_mutation_without_the_freshness_recheck_a_stale_first_goal_is_sent(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Sensitivity: without the re-check after the marker (the mutation), the same slow marker is
+    followed by the first policy goal on a stale frame / chunk, and the trial counts as started."""
+    trials, rows, _end, _r, goals = _slow_marker_trial(
+        case, skip_recheck=True, monkeypatch=monkeypatch
+    )
+    assert goals >= 1
+    (t,) = trials
+    assert t["policy_started"] and t["steps"] >= 1
+    assert "trial_start_retracted" not in _trial_rows(rows)
+
+
+def test_real_eval_stale_frame_after_the_marker_resume_retries_the_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F33-R2-1 end to end (``wo07_real_eval --mock --fake-clock``): slot 0's ``trial_started``
+    row takes 400 ms. The deadman trips (HOLD) before the first goal, slot 0 is ``not_started``,
+    the scripted operator resumes, slot 1 runs; ``--resume`` retries slot 0 with the same
+    placement."""
+    loops: list[DeployLoop] = []
+
+    class SlowMarkerLoop(DeployLoop):
+        def __init__(self, *a: Any, **k: Any) -> None:
+            super().__init__(*a, **k)
+            loops.append(self)
+
+    real_log = Run.log_metrics
+    slowed = [0]
+
+    def log_metrics(run: Run, step: int | None = None, **row: Any) -> None:
+        if row.get("kind") == "trial_started" and not slowed[0]:
+            slowed[0] = 1
+            loops[0].clock.advance(0.4)  # type: ignore[attr-defined]
+        real_log(run, step, **row)
+
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    monkeypatch.setattr(ev, "DeployLoop", SlowMarkerLoop)
+    monkeypatch.setattr(Run, "log_metrics", log_metrics)
+    rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen"))
+    r1 = json.loads(rec.read_text())["results"]
+    t0, t1 = r1["trials"]
+    assert (t0["trial_idx"], t0["outcome"], t0["stop_reason"]) == (0, "not_started", "deadman")
+    assert not t0["policy_started"] and "start marker took 400 ms" in t0["stop_detail"]
+    assert t1["trial_idx"] == 1 and t1["policy_started"]
+    rows = [json.loads(x) for x in (rec.parent / "metrics.jsonl").read_text().splitlines()]
+    assert _trial_rows(rows)[:3] == ["trial_started", "trial_start_retracted", "trial"]
+    assert ev.done_indices(r1["trials"], "seen") == {1}
+    rec2 = ev.main(_args(tmp_path, "--resume", rec.parent.name))
+    r2 = json.loads(rec2.read_text())["results"]
+    assert r2["session_end"] == "completed" and r2["summary"]["complete"]
+    assert [t["trial_idx"] for t in r2["trials"]] == [0, 1, 0]
+    assert r2["trials"][2]["placement"] == t0["placement"] and r2["trials"][2]["policy_started"]
+
+
+@pytest.mark.parametrize("where", ["final_check", "after_final_check"])
+def test_ctrl_c_after_the_marker_before_the_write_is_not_started(
+    monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    """F33-R2: mock (no flag handler), a Ctrl-C after the marker was saved but before the write
+    began: raised inside the final stop check, or right after ``stop_fn`` returned False (the
+    window before ``goal_write_attempted`` is set). Nothing was sent: the stamp is retracted,
+    the attempt is ``not_started`` (``operator_abort``), not a started failure."""
+    from test_deploy import _trials
+
+    rows: list[dict[str, Any]] = []
+    with rig() as r:
+        if where == "final_check":
+            calls = [0]
+            real_check = r.loop._pre_write_stop
+
+            def check() -> bool:
+                if r.loop.on_policy_start is not None and any(
+                    row["kind"] == "trial_started" for row in rows
+                ):
+                    calls[0] += 1
+                    if calls[0] == 1:
+                        raise KeyboardInterrupt
+                return real_check()
+
+            r.loop._pre_write_stop = check  # type: ignore[method-assign]
+        else:
+            real_step = r.arm.step
+
+            def step(*a: Any, stop_fn: Any = None, **k: Any) -> Any:
+                if not isinstance(stop_fn, functools.partial):  # not the first policy goal
+                    return real_step(*a, stop_fn=stop_fn, **k)
+
+                def then_ctrl_c() -> bool:
+                    if stop_fn():
+                        return True
+                    raise KeyboardInterrupt  # after False, before goal_write_attempted
+
+                return real_step(*a, stop_fn=then_ctrl_c, **k)
+
+            r.arm.step = step  # type: ignore[method-assign]
+        sent_at_query: list[int] = []
+        real_act = r.client.act
+
+        def act(*a: Any, **k: Any) -> Any:
+            sent_at_query.append(len(r.fol.sent))
+            return real_act(*a, **k)
+
+        r.client.act = act  # type: ignore[method-assign]
+        trials, end = _trials(r, ScriptedOperator(), log_row=lambda **row: rows.append(row))
+        assert len(r.fol.sent) == sent_at_query[0] + 1  # only the hold after the first query
+        (t,) = trials
+        assert t["outcome"] == "not_started" and t["stop_reason"] == "operator_abort"
+        assert not t["policy_started"] and not r.arm.goal_write_attempted
+        assert _trial_rows(rows) == ["trial_started", "trial_start_retracted", "trial"]
+        assert end == "operator_abort"
+
+
+def test_a_retracted_start_is_never_recorded_session_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F33-R1: the retraction clears ``run_trials``' pending start. A stop flag recorded during
+    the marker blocks the goal (retracted); then recording the attempt raises (a bug in
+    ``trial_record``). The exception propagates, and no ``session_lost`` / started record is
+    appended or logged for the attempt that never sent a goal."""
+    from test_deploy import _trials
+
+    from src.robot import client
+    from src.robot.prompts import Interrupts
+
+    rows: list[dict[str, Any]] = []
+    with rig() as r:
+        flags = Interrupts()
+        r.loop.interrupts = flags
+
+        def log_row(**row: Any) -> None:
+            rows.append(row)
+            if row["kind"] == "trial_started":
+                flags.ctrl_c = True  # the Ctrl-C flag, recorded during the marker I/O
+
+        real_record = client.trial_record
+        calls = [0]
+
+        def trial_record(*a: Any, **k: Any) -> dict[str, Any]:
+            calls[0] += 1
+            if calls[0] == 2:  # the attempt's own record (the first call is the marker)
+                raise RuntimeError("trial_record bug")
+            return real_record(*a, **k)
+
+        monkeypatch.setattr(client, "trial_record", trial_record)
+        trials: list[dict[str, Any]] = []
+        with pytest.raises(RuntimeError, match="trial_record bug"):
+            _trials(r, ScriptedOperator(), log_row=log_row, trials=trials)
+    assert trials == []  # no session_lost failure for the retracted attempt
+    assert _trial_rows(rows) == ["trial_started", "trial_start_retracted"]
+
+
+def test_real_eval_disk_full_including_record_json_resume_retries_the_slot(
+    tmp_path: Path, terminal: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F33-R5: the disk stays full from slot 0's marker on, for metrics.jsonl AND record.json.
+    The first goal is never written, the hold-and-support shutdown and torque off still run,
+    then the error propagates. The surviving record.json is the last good flush (no attempt in
+    it); once the disk is freed, ``--resume`` retries slot 0 with the same placement."""
+    probes: list[Probe] = []
+
+    class SignalLoop(DeployLoop):
+        def __init__(self, *a: Any, **k: Any) -> None:
+            super().__init__(*a, **{**k, "interrupts": P.INTERRUPTS})
+            probes.append(Probe(self, None, "marker", 1, "marker_fail_all", monkeypatch))
+
+    real_write = Run._write
+
+    def write(run: Run) -> None:
+        if probes and probes[0].fired:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_write(run)
+
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    monkeypatch.setattr(ev, "DeployLoop", SignalLoop)
+    monkeypatch.setattr(Run, "_write", write)
+    argv = _args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen")
+    with P.operator_signals(), pytest.raises(OSError, match="No space left"):
+        P.INTERRUPTS.tty_fd = 0
+        ev.main(argv)
+    (probe,) = probes
+    assert probe.fired and probe.goals_after_signal() == 0
+    assert ("write", "hold") in probe.after_signal()
+    assert not probe.loop.arm.follower.bus.torque_enabled  # type: ignore[attr-defined]
+    (rec,) = tmp_path.glob("*/record.json")
+    r1 = json.loads(rec.read_text())["results"]
+    assert not r1.get("trials")  # the attempt never reached record.json
+    monkeypatch.undo()  # the disk was freed (and the session's patches are gone)
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    rec2 = ev.main(_args(tmp_path, "--resume", rec.parent.name))
+    r2 = json.loads(rec2.read_text())["results"]
+    assert r2["session_end"] == "completed" and r2["summary"]["complete"]
+    assert [t["trial_idx"] for t in r2["trials"]] == [0, 1]
+    plan = ev.G.sample_plan("PickPlace", "seen", 2, int(r1["session"]["slot_seed"]))
+    assert r2["trials"][0]["placement"] == plan[0] and r2["trials"][0]["policy_started"]

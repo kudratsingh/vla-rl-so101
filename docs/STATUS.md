@@ -1110,11 +1110,14 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
     off). Why end the session: the marker is what stops a resume from re-rolling a started slot;
     if it cannot be saved, the next trial's start could not be made durable and the record can
     no longer be trusted. If the disk stays full, the retraction and the attempt's own row fail
-    too; the session then ends on that error after the same hold-and-support shutdown, and
-    record.json (written separately) still holds the not-started attempt. A Ctrl-C raised
+    too; the session then ends on that error after the same hold-and-support shutdown. When only
+    metrics.jsonl fails, record.json (written separately) still holds the not-started attempt;
+    on a truly full disk record.json keeps its last good flush (no attempt in it) and the error
+    propagates after torque off, and the resume still retries the slot (round 3). A Ctrl-C raised
     inside the marker write (mock, no flag handler) also retracts and is `not_started`.
   - Cost on a mock real-clock session (10 trials, Mac M3 Pro, local SSD):
-    `policy_start_mark_ms` median 0.34 ms, max 0.68 ms; the first decision's frame-return-to-
+    `policy_start_mark_ms` (stamp + marker I/O; round 3: + freshness re-check, excluding the
+    final stop check) median 0.34 ms, max 0.68 ms; the first decision's frame-return-to-
     first-write median 68.3 ms vs 67.9 ms for the other decisions (mock policy). The append is
     not fsynced (`src/runs.Run.log_metrics`): the marker survives SIGKILL; across power loss
     only as far as the OS flushed it.
@@ -1128,6 +1131,32 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
     `--resume`; an in-suite mutation without the final check. Mutations run by hand: removing
     the final check fails 8 tests, swallowing the marker failure again fails 3, ignoring
     retractions in `load_prior` fails 1.
+- Round 3 (review of b5cf8c9), `DeployLoop._first_goal_check`:
+  - **Freshness after the marker (F33-R2-1).** The marker I/O sat between the frame / chunk
+    checks and the write, so a stalled log write (slow, external or synced volume) could send
+    the first goal on a frame older than the deadman's 300 ms and a chunk older than 800 ms
+    (reproduced on the fake rig: a 1.5 s marker, the goal written, the trial scored a success).
+    The first goal's `stop_fn` is now: stop check -> stamp + marker -> the deadman frame check
+    and the chunk-age check again on the clock after the I/O -> stop check (last; the write
+    follows it directly). A stale frame / chunk trips the deadman (HOLD) exactly like the same
+    check one tick later: zero goals, marker retracted, `not_started` (stop reason `deadman` /
+    `stale_chunk`, detail names the marker's duration); the session continues after the
+    operator's 'resume' acknowledgement as for any HOLD stop, and `--resume` retries the slot.
+  - **Ctrl-C after the marker, before the write (F33-R2).** `run_trial` now retracts whenever
+    the stamp is set, no step completed and `goal_write_attempted` is False, so a Ctrl-C (mock,
+    no flag handler) landing in the final check or between it and the write is `not_started`.
+  - **Pending start (F33-R1).** New test: a retracted attempt whose own record then fails to
+    write is never appended / logged as a `session_lost` failure.
+  - **Timing (F33-R4).** `policy_start_mark_ms` = stamp + marker I/O + freshness re-check; it
+    excludes only the final stop check (a flag read and `tcgetpgrp`), so nothing else runs
+    between that check and the write. The figures above were measured before round 3.
+  - **Full disk (F33-R5).** The "record.json still holds the attempt" claim is now qualified
+    (only when metrics.jsonl alone fails); a new real-eval test fails both files from the marker
+    on: torque off and the support shutdown still run, the error propagates, record.json has no
+    attempt, and `--resume` retries slot 0 with the same placement.
+  - Not changed (F33-R2-2, refuted): a process killed after the retraction row but before the
+    trial row leaves no record of the attempt; resume retries the slot (same as any not-started
+    attempt killed before its row).
 - Unverified on hardware.
 
 ## Blockers and decisions pending the owner
