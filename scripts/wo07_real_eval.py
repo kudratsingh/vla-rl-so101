@@ -142,7 +142,7 @@ from src.robot.client import (
     trial_object,
 )
 from src.robot.driver import So101Driver
-from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals
+from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals, require_terminal
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
@@ -920,6 +920,7 @@ def run_hardware(
     except ValueError as e:
         sys.exit(f"{e}; nothing was opened")
     assert torque_wait is not None
+    require_terminal("wo07_real_eval --hardware")  # prompts need an operator; before anything opens
     print(HARDWARE_BANNER)
     if input("type 'go' to continue: ").strip() != "go":
         sys.exit("not confirmed; nothing was opened")

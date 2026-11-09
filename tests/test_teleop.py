@@ -407,3 +407,34 @@ def test_end_session_claims_support_only_after_enter(
         assert "STDIN CLOSED" in out and clock() - t0 == pytest.approx(10.0)
     if end == "released_unconfirmed":
         assert sess.torque_released and "support was NOT confirmed" in out
+
+
+def test_teleop_refuses_a_non_tty_stdin_before_the_leader_or_the_follower(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import sys
+
+    opened: list[str] = []
+
+    def no(what: str) -> Any:
+        def f(*_a: Any, **_k: Any) -> Any:
+            opened.append(what)
+            raise AssertionError(f"{what} was reached")
+
+        return f
+
+    monkeypatch.setattr(teleop, "load_config", no("config"))
+    monkeypatch.setattr(teleop, "make_leader", no("leader"))
+    monkeypatch.setattr(teleop.So101Driver, "from_config", no("follower"))
+    monkeypatch.setattr(sys, "argv", ["wo06_teleop_record.py", "--preset", "real"])
+    r, w = os.pipe()
+    piped = open(r, "r")  # noqa: SIM115 - closed below
+    monkeypatch.setattr(sys, "stdin", piped)
+    try:
+        with pytest.raises(SystemExit, match="interactive terminal(.|\n)*nothing was opened"):
+            teleop.main()
+    finally:
+        piped.close()
+        os.close(w)
+    assert opened == []

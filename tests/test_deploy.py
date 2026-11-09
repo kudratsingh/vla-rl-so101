@@ -469,8 +469,9 @@ def test_hardware_mode_refuses_without_the_owner(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(SystemExit) as e:
         pilot.main(["--preset", "real", "--hardware"])
     assert e.value.code == 2
+    monkeypatch.setattr(pilot, "require_terminal", lambda _what: None)  # as if in Terminal
     monkeypatch.setattr("builtins.input", lambda _msg="": "no")
-    with pytest.raises(SystemExit, match="nothing was opened"):
+    with pytest.raises(SystemExit, match="not confirmed; nothing was opened"):
         pilot.main(["--preset", "real", "--hardware", "--i-am-present"])
 
 

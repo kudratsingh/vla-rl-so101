@@ -69,7 +69,7 @@ from src.robot.client import (
     summarize,
 )
 from src.robot.driver import So101Driver
-from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals
+from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals, require_terminal
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
@@ -283,6 +283,7 @@ def run_hardware(cfg: Config, args: argparse.Namespace) -> Path:
         print(HARDWARE_REFUSAL)
         sys.exit(2)
     torque_wait = hardware_torque_wait(cfg)
+    require_terminal("wo07_pilot --hardware")  # prompts need an operator; before anything opens
     print(HARDWARE_BANNER)
     if input("type 'go' to continue: ").strip() != "go":
         sys.exit("not confirmed; nothing was opened")

@@ -384,11 +384,35 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
       `shutdown: "error: ..."`, `support_confirmed: false` then.
     - Teleop with `prompt_torque_timeout_s: null` keeps the grace period on a closed stdin
       (`TorqueWait(None, grace)`); its provenance file records `support_release` (cause).
+- Owner review of 2026-11-08, round 4 (#29, $0, fakes only): the owner reproduced
+  `timed_input()` blocking past its deadline on an open stdin pipe holding a partial line
+  (`select()` said readable, `sys.stdin.readline()` then waited for the newline; a mid-line
+  Ctrl-D on a tty does the same). Both remedies are in:
+  - The deadline covers the whole line: `timed_input` reads fd 0 with `os.read`, each read after
+    `select()` with the time left, until the newline, the deadline or EOF (a pipe one byte at a
+    time, so nothing past the newline is consumed; a canonical-mode tty a line per read, so a
+    mid-line Ctrl-D is a partial line, not EOF). A partial line at the deadline is a timeout
+    and its bytes are dropped; a partial line then EOF is EOF (no confirmation). Ctrl-C (also
+    in mid-line), the hang-up path and typed-ahead discard are unchanged. `prompt_input`
+    (teleop's unbounded `null` wait and torque-off prompts) has no deadline and keeps `input()`.
+  - The hardware entry points (`wo07_pilot.py --hardware`, `wo07_real_eval.py --hardware`,
+    `wo06_teleop_record.py`) refuse to start unless stdin and stdout are a tty
+    (`require_terminal`), after the config checks and before the `type 'go'` prompt, the policy
+    client, the leader or the follower. Mock runs need no terminal. A log needs `script -q`,
+    not `| tee` (stdout must be the terminal so the SUPPORT THE ARM prompts are seen).
+  - Regression tests: a real pipe with a partial line times out within the deadline + 0.5 s
+    (the pre-fix code hangs: checked by running the new tests against `817a0c7`), partial then
+    newline = the whole line, the next line is never consumed, partial + EOF = EOF, Ctrl-C and
+    SIGHUP in mid-line; a pty with a mid-line Ctrl-D times out and never answers the next
+    prompt; the tty check refuses a piped stdin before any driver / client / `go` prompt in the
+    pilot, the real eval and teleop. The timeout / Ctrl-C / EOF tests at the pilot and
+    real-eval prompts (fakes) pass unchanged.
 Unverified on hardware: every item above. In particular: the thresholds, the read cost on the
 Mac's USB-serial link, whether the park pose rests safely with torque off, the refusal
 tolerances against a real calibration, the Homing_Offset read on the real servos, the
-behaviour of a real failed torque-off write, `select()` on the Mac terminal for the bounded
-waits (teleop, pilot, real eval), `tcflush` of typed-ahead input on the Mac terminal, SIGHUP
+behaviour of a real failed torque-off write, `select()` + `os.read` on the Mac terminal for
+the bounded waits (teleop, pilot, real eval; a macOS pty passes in the tests), the terminal
+check under `uv run` in Terminal, `tcflush` of typed-ahead input on the Mac terminal, SIGHUP
 delivery to the Python child under `uv run` when the Terminal window closes, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
 grid's scale and alignment with the real base.
 

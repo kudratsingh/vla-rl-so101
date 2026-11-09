@@ -411,8 +411,12 @@ What happens and what you do:
    the arm: after `teleop.prompt_support_grace_s` (10 s) torque goes off and the session ends
    (saved episodes are kept, an unsaved one is discarded). A Ctrl-C during those 10 s is ignored
    (the grace keeps running). The wait is a `select()` on the terminal in the same single
-   thread; nothing reads the servo bus in the background. Anything typed before a prompt
-   appears is discarded, so press ENTER only once the prompt is on screen. `null` restores the
+   thread; nothing reads the servo bus in the background. The 60 s covers the whole line: a
+   half-typed answer (or a Ctrl-D in mid-line) when the time runs out counts as no answer and
+   is thrown away. Anything typed before a prompt appears is discarded, so press ENTER only
+   once the prompt is on screen. Teleop, the pilot and the real eval refuse to start unless
+   stdin and stdout are the Terminal itself (no `| tee`, no `< file`, no `yes |`): run them
+   directly in Terminal; to keep a log use `script -q log.txt uv run ...`. `null` restores the
    old wait-forever behaviour for teleop only (not recommended; a closed stdin still gets the
    10 s grace); the pilot and real eval refuse it.
 3. **Sync (not recorded):** the follower eases onto the leader's pose, clipped to the safety limits,

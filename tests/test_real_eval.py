@@ -152,8 +152,9 @@ def test_hardware_mode_is_gated_like_the_pilot(monkeypatch: pytest.MonkeyPatch) 
     with pytest.raises(SystemExit) as e:
         ev.main(["--preset", "real", "--hardware", "--task", "PickPlace"])
     assert e.value.code == 2
+    monkeypatch.setattr(ev, "require_terminal", lambda _what: None)  # as if in Terminal
     monkeypatch.setattr("builtins.input", lambda _msg="": "no")
-    with pytest.raises(SystemExit, match="nothing was opened"):
+    with pytest.raises(SystemExit, match="not confirmed; nothing was opened"):
         ev.main(["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"])
 
 
@@ -258,6 +259,7 @@ def test_hardware_refuses_a_slot_seed_other_than_the_config(
 ) -> None:
     intr = {"fx": 500.0, "fy": 500.0, "cx": 320.0, "cy": 240.0, "dist": [0.0] * 5}
     _with_cfg(monkeypatch, lambda c: c["cameras"]["front"].update(intrinsics=intr))
+    monkeypatch.setattr(ev, "require_terminal", lambda _what: None)  # as if in Terminal
     monkeypatch.setattr("builtins.input", lambda _msg="": "go")
     argv = ["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"]
     with pytest.raises(SystemExit, match="must use the same placements"):
@@ -721,3 +723,48 @@ def _with_cfg_in(mod: ModuleType, monkeypatch: pytest.MonkeyPatch, edit: Any) ->
         return cfg
 
     monkeypatch.setattr(mod, "load_config", load)
+
+
+# -- review round 4: the hardware entry points need an interactive terminal --------------------
+def test_hardware_refuses_a_non_tty_stdin_before_any_driver_or_port(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    pilot = _load("wo07_pilot")
+    opened: list[str] = []
+
+    class NoDriver:
+        @classmethod
+        def from_config(cls, *_a: Any, **_k: Any) -> Any:
+            opened.append("driver")
+            raise AssertionError("the driver was constructed")
+
+    def no_client(*_a: Any, **_k: Any) -> Any:
+        opened.append("client")
+        raise AssertionError("the policy client was opened")
+
+    monkeypatch.setattr("builtins.input", lambda msg="": opened.append(f"input {msg}") or "go")
+    r, w = os.pipe()
+    piped = open(r, "r")  # noqa: SIM115 - closed below
+    monkeypatch.setattr("sys.stdin", piped)  # e.g. `yes go | uv run ... --hardware`
+    try:
+        for mod, argv in (
+            (ev, ["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"]),
+            (pilot, ["--preset", "real", "--hardware", "--i-am-present"]),
+        ):
+            monkeypatch.setattr(mod, "So101Driver", NoDriver)
+            monkeypatch.setattr(mod, "PolicyClient", no_client)
+            with pytest.raises(SystemExit, match="interactive terminal(.|\n)*nothing was opened"):
+                mod.main(argv)
+        assert opened == []  # no 'go' prompt, no client, no driver, no port
+        monkeypatch.undo()
+        monkeypatch.setattr("sys.stdin", piped)  # still not a tty: mock runs need no terminal
+        rec = pilot.main(
+            ["--preset", "real", "--mock", "--fake-clock", "--trials", "1"]
+            + ["--runs-dir", str(tmp_path)]
+        )
+        assert rec.exists()
+    finally:
+        piped.close()
+        os.close(w)

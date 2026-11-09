@@ -271,3 +271,131 @@ def test_operator_signals_make_ctrl_c_a_flag_and_a_hangup_the_closed_stdin_path(
     finally:
         f.close()
         os.close(w)
+
+
+# -- review round 4 (owner repro 2026-11-08): the deadline covers the whole line ----------------
+SLACK_S = 0.5  # scheduler slack on a loaded CI runner
+
+
+def _timed(prompt: str, timeout_s: float) -> tuple[str | None, float]:
+    import time
+
+    t0 = time.monotonic()
+    line = P.timed_input(prompt, timeout_s)
+    return line, time.monotonic() - t0
+
+
+def test_a_partial_line_in_an_open_pipe_times_out_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner repro: select() reported the pipe readable, readline() then waited for a newline
+    that never came, far past the deadline."""
+    import os
+
+    r, w = os.pipe()
+    f = _stdin_from(monkeypatch, r)
+    try:
+        os.write(w, b"ab")  # no newline; the writer stays open
+        line, elapsed = _timed("support? ", 0.3)
+        assert line is None and 0.3 <= elapsed < 0.3 + SLACK_S
+        # partial, then the rest of the line within the deadline: the whole line
+        import threading
+
+        os.write(w, b"ab")
+        threading.Timer(0.1, os.write, (w, b"c\n")).start()
+        line, elapsed = _timed("score? ", 5.0)
+        assert line == "abc" and elapsed < 5.0  # the timed-out "ab" was dropped, not carried
+        # nothing past the newline is consumed: the next line is still in the pipe, intact
+        os.write(w, b"y\nn\n")
+        assert P.timed_input("p? ", 1.0) == "y" and P.timed_input("p? ", 1.0) == "n"
+        # a partial line, then EOF: the EOF path (no confirmation), not a line
+        os.write(w, b"partial")
+        os.close(w)
+        w = -1
+        with pytest.raises(EOFError, match="mid-line"):
+            P.timed_input("support? ", 5.0)
+    finally:
+        f.close()
+        if w >= 0:
+            os.close(w)
+
+
+def test_ctrl_c_in_mid_line_still_raises_and_a_hangup_still_ends_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import signal
+    import threading
+
+    monkeypatch.setattr(P, "_detach_stdio", lambda: None)  # keep pytest's capture
+    r, w = os.pipe()
+    f = _stdin_from(monkeypatch, r)
+    try:
+        with P.operator_signals() as flags:
+            os.write(w, b"ab")  # the read is mid-line when the signal lands
+            threading.Timer(0.1, os.kill, (os.getpid(), signal.SIGINT)).start()
+            with pytest.raises(KeyboardInterrupt):
+                P.timed_input("p? ", 5.0)
+            assert not flags.ctrl_c  # inside a read: KeyboardInterrupt, not the flag
+            os.write(w, b"cd")
+            threading.Timer(0.1, os.kill, (os.getpid(), signal.SIGHUP)).start()
+            with pytest.raises(P.Hangup):
+                P.timed_input("p? ", 5.0)
+    finally:
+        f.close()
+        os.close(w)
+
+
+def test_a_partial_line_on_a_tty_times_out_and_never_answers_the_next_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a tty a Ctrl-D in mid-line hands the partial line to read() with no newline: the same
+    blocking readline() as the owner's pipe repro. Now a timeout; the next prompt starts clean."""
+    import os
+    import pty
+    import threading
+
+    master, slave = pty.openpty()
+    f = _stdin_from(monkeypatch, slave)
+    try:
+        threading.Timer(0.1, os.write, (master, b"ab\x04")).start()  # typed after the prompt
+        line, elapsed = _timed("support? ", 0.5)
+        assert line is None and 0.5 <= elapsed < 0.5 + SLACK_S
+        threading.Timer(0.1, os.write, (master, b"y\n")).start()
+        assert P.timed_input("score? ", 5.0) == "y"  # not "aby": the partial bytes were dropped
+        threading.Timer(0.1, os.write, (master, b"ab\x04c\n")).start()  # Ctrl-D, then the rest
+        assert P.timed_input("score? ", 5.0) == "abc"
+        threading.Timer(0.1, os.write, (master, b"\x04")).start()  # Ctrl-D on an empty line
+        with pytest.raises(EOFError):
+            P.timed_input("support? ", 5.0)
+    finally:
+        f.close()
+        os.close(master)
+
+
+def test_require_terminal_wants_a_tty_on_stdin_and_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+    import pty
+
+    master, slave = pty.openpty()
+    r, w = os.pipe()
+    tty_in = open(slave, "r", closefd=False)  # noqa: SIM115 - closed below
+    tty_out = open(slave, "w", closefd=False)  # noqa: SIM115
+    pipe_in, pipe_out = open(r, "r"), open(w, "w")  # noqa: SIM115
+    try:
+        monkeypatch.setattr(P.sys, "stdin", tty_in)
+        monkeypatch.setattr(P.sys, "stdout", tty_out)
+        assert P.not_a_terminal() is None
+        P.require_terminal("x")  # passes
+        monkeypatch.setattr(P.sys, "stdout", pipe_out)  # e.g. `| tee log`: prompts may be unseen
+        assert P.not_a_terminal() == "stdout"
+        monkeypatch.setattr(P.sys, "stdin", pipe_in)
+        with pytest.raises(SystemExit, match="stdin is not a tty(.|\n)*nothing was opened"):
+            P.require_terminal("wo07_pilot --hardware")
+        monkeypatch.setattr(P.sys, "stdin", None)
+        assert P.not_a_terminal() == "stdin"
+    finally:
+        for fh in (tty_in, tty_out, pipe_in, pipe_out):
+            fh.close()
+        os.close(slave)
+        os.close(master)

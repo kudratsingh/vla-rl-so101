@@ -34,9 +34,26 @@ Shared by the teleop recorder (scripts/wo06_teleop_record.py), the WO-07 pilot
   closed-stdin path above), so torque goes off after the grace period instead of the process
   dying with the arm held under torque.
 
-The wait is ``select()`` on stdin in the calling thread (``timed_input``): no reader thread, and
-the servo bus keeps a single owner (the health reads happen in this thread, before and after the
-wait, never during it).
+The wait is ``select()`` on stdin's file descriptor in the calling thread (``timed_input``): no
+reader thread, and the servo bus keeps a single owner (the health reads happen in this thread,
+before and after the wait, never during it). The deadline covers the whole line (owner repro of
+2026-11-08: ``select()`` then ``sys.stdin.readline()`` blocked past the deadline on a partial line
+in an open pipe; on a tty a Ctrl-D in mid-line hands over a partial line the same way): fd 0 is
+read with ``os.read``, each read only after ``select()`` with the time left, until the newline,
+the deadline or EOF. A pipe or file is read one byte at a time, so nothing past the newline is
+ever consumed; a tty in canonical mode is read up to a whole line per read (the kernel returns at
+most one line, ending at the newline or a Ctrl-D, so a mid-line Ctrl-D is a partial line, not
+EOF). Either way no input is held in a private buffer between prompts. A partial line at the
+deadline is a timeout and its bytes are dropped (on a tty the next prompt's ``tcflush`` drops
+anything typed before it appears); a partial line then EOF is EOF. ``sys.stdin``'s own buffered
+reader is
+not used by ``timed_input``; the remaining line reads (``prompt_input``: teleop's unbounded wait
+and torque-off prompts; ``input()`` for "type 'go'" and the resume check) read a tty in canonical
+mode, where one read returns at most one line, so they never leave bytes buffered either.
+
+The hardware entry points (pilot, real eval, teleop) refuse to start unless stdin and stdout are
+a terminal (``require_terminal``), before any port is opened: the prompts need an operator who
+can see them and answer them. Mock / scripted runs need no terminal.
 """
 
 from __future__ import annotations
@@ -192,7 +209,9 @@ def _write_prompt(prompt: str) -> None:
 
 def prompt_input(prompt: str) -> str:
     """``input()`` with Ctrl-C raising KeyboardInterrupt, also under ``operator_signals``; typed-
-    ahead input discarded first."""
+    ahead input discarded first. Unbounded: it has no deadline to enforce (teleop's null
+    ``prompt_torque_timeout_s``, which waits forever by design, and its torque-off prompts; the
+    pilot and real eval refuse a null timeout)."""
     with _reading():
         discard_typeahead()
         try:
@@ -202,25 +221,86 @@ def prompt_input(prompt: str) -> str:
 
 
 def timed_input(prompt: str, timeout_s: float | None) -> str | None:
-    """``prompt_input`` that gives up after ``timeout_s`` (None = never): None. ``select()`` on
-    stdin in this thread (no reader thread; the servo bus is never touched here). Typed-ahead
-    input is discarded first. EOF raises EOFError (``Hangup`` on a hang-up)."""
+    """``prompt_input`` that gives up after ``timeout_s`` (None = never): None. The deadline covers
+    the whole line (module doc): fd 0 is read with ``os.read``, each read after ``select()`` with
+    the time left, in this thread (no reader thread; the servo bus is never touched here). A partial
+    line at the deadline is a timeout (its bytes dropped); EOF, also after a partial line, raises
+    EOFError (``Hangup`` on a hang-up). Typed-ahead input is discarded first."""
     if timeout_s is None:
         return prompt_input(prompt)
     with _reading():
         discard_typeahead()
         _write_prompt(prompt)
+        line = _read_line_by(time.monotonic() + max(0.0, timeout_s))
+        if line is None:
+            _write_prompt("\n")
+        return line
+
+
+def _read_line_by(deadline: float) -> str | None:
+    """One line from fd 0 (no newline), or None once ``deadline`` (``time.monotonic``) passes,
+    also in mid-line. Never reads past the newline (``_read_size``). EOF -> EOFError; OSError
+    (EIO from a hung-up tty) and a closed / fd-less stdin -> EOFError. Ctrl-C and a hang-up raise
+    from ``select`` / ``os.read`` under ``_reading``."""
+    got = bytearray()
+    try:
+        fd = sys.stdin.fileno()
+        encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
+        size = _read_size(fd)
+        while (left := deadline - time.monotonic()) > 0:
+            if not select.select([fd], [], [], left)[0]:
+                break  # the deadline passed, maybe in mid-line
+            chunk = os.read(fd, size)  # readable: returns at once (bytes, or b"" at EOF)
+            if not chunk:
+                raise EOFError("stdin closed" + (" in mid-line" if got else ""))
+            end = chunk.find(b"\n")
+            if end >= 0:  # canonical tty / 1 byte: the newline ends the chunk
+                got += chunk[:end]
+                return got.decode(encoding, errors="replace").rstrip("\r")
+            got += chunk
+    except (OSError, ValueError) as e:  # EIO from a hung-up tty; a closed or fd-less stdin
+        raise EOFError(f"stdin: {e}") from e
+    return None  # timeout: the partial line (if any) is dropped
+
+
+def _read_size(fd: int) -> int:
+    """Bytes per ``os.read``: a tty in canonical mode returns at most one line per read (up to the
+    newline or a Ctrl-D), so read it whole: a mid-line Ctrl-D then hands over a partial line, as
+    for any program, instead of a 1-byte read stopping at it and seeing EOF. Anything else (a
+    pipe, a file, a raw tty): 1 byte, so nothing past the newline is consumed."""
+    try:
+        if os.isatty(fd) and termios.tcgetattr(fd)[3] & termios.ICANON:
+            return 4096
+    except termios.error:
+        pass
+    return 1
+
+
+NOT_A_TERMINAL = (
+    "{what}: stdin and stdout must be an interactive terminal for the real arm ({bad} is not a "
+    "tty): the torque-on prompts need an operator who sees them and answers them. Run it "
+    "directly in Terminal (no pipe, no redirect; to keep a log use `script -q log.txt uv run "
+    "...`); nothing was opened"
+)
+
+
+def not_a_terminal() -> str | None:
+    """The first of stdin / stdout that is not a tty, or None when both are."""
+    for name, stream in (("stdin", sys.stdin), ("stdout", sys.stdout)):
         try:
-            ready, _, _ = select.select([sys.stdin], [], [], max(0.0, timeout_s))
-            if not ready:
-                _write_prompt("\n")
-                return None
-            line = sys.stdin.readline()
-        except OSError as e:  # EIO from a hung-up tty
-            raise EOFError(f"stdin: {e}") from e
-        if not line:
-            raise EOFError
-        return line.rstrip("\r\n")
+            if stream is None or not stream.isatty():
+                return name
+        except (OSError, ValueError, AttributeError):
+            return name
+    return None
+
+
+def require_terminal(what: str) -> None:
+    """Exit (``NOT_A_TERMINAL``) unless stdin and stdout are a tty. The hardware entry points call
+    it before any port is opened or torque enabled."""
+    bad = not_a_terminal()
+    if bad is not None:
+        sys.exit(NOT_A_TERMINAL.format(what=what, bad=bad))
 
 
 @dataclass(frozen=True)

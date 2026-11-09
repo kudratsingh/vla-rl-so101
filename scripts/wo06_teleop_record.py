@@ -107,6 +107,7 @@ from src.robot.prompts import (
     TorqueWait,
     operator_signals,
     prompt_input,
+    require_terminal,
     timed_input,
 )
 from src.robot.safety import DeadmanResponse, load_sim_fk
@@ -542,6 +543,7 @@ def main() -> None:
         parser.error("WO-06 hardware scripts run with --preset real")
     if args.rehearsal and args.push:
         parser.error("--rehearsal is never pushed")
+    require_terminal("wo06_teleop_record")  # before the leader, the dataset or the follower
     cfg = load_config(args.preset, args.config)
     tcfg = cfg.get("teleop") or {}
     if not tcfg.get("leader"):
