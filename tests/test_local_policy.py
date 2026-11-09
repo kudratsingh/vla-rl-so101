@@ -412,11 +412,14 @@ def test_a_fresh_process_resolves_a_smolvla_config(tmp_path: Path) -> None:
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"type": "smolvla"}))
     (tmp_path / "model.safetensors").write_bytes(b"x")
+    spec = f"lp.LocalPolicySpec('smolvla', {str(tmp_path)!r}, 'cpu', None, 1.0, None, 0)"
     code = (
-        "import sys; sys.path.insert(0, %r)\n"
+        f"import sys; sys.path.insert(0, {str(REPO_ROOT)!r})\n"
         "from src.robot import local_policy as lp\n"
-        "try:\n    lp.load_local_policy(lp.LocalPolicySpec('smolvla', %r, 'cpu', None, 1.0, None, 0))\n"
+        f"try:\n    lp.load_local_policy({spec})\n"
         "except Exception as e:\n    print(type(e).__name__, e)\n"
-    ) % (str(REPO_ROOT), str(tmp_path))
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], check=False, capture_output=True, text=True, timeout=120
+    )
     assert "choice class" not in out.stdout + out.stderr

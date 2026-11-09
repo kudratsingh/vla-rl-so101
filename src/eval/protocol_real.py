@@ -161,6 +161,9 @@ DEV_TRIALS = {"seen": 10, "shifted": 10, "unseen_objects": 10}
 
 # -- trial horizon, settling, rubric ----------------------------------------------------------
 CONTROL_HZ = 15  # = src/robot/convention.FPS
+# A fixed number of policy COMMANDS, not a fixed wall-clock time (review F4): 450 writes are 30 s
+# at the nominal 15 Hz, but an in-process SmolVLA on the Mac writes ~6.2-6.6 per second (~70 s per
+# trial) and ACT ~13 (~35 s); docs/STATUS.md "PR 2: review round 1" has the bench budget.
 TRIAL_MAX_STEPS = (
     450  # 30 s at 15 Hz = the teleop demo cap (configs/real.yaml teleop.episode_time_s)
 )

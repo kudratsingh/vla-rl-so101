@@ -1107,8 +1107,8 @@ SmolVLA and ACT fine-tune code for the real arm (SmolVLA pivot handoff, PR 2 ite
   | Line | Estimate | Assumption |
   |---|---|---|
   | SmolVLA, batch 64 | RTX 4090 × 6.35–10.35 h = $5.65–$9.21 | includes 0.35 h of setup |
-  | SmolVLA, batch 32 (OOM fallback) | RTX 4090 × 3.6–6.4 h = $3.2–$5.7 | steps not rescaled, so half the samples |
-  | ACT | RTX 4090 × 1.75–3.15 h = $1.55–$2.80 | 0.05–0.10 s/step guessed |
+  | SmolVLA, batch 32 (OOM fallback) | RTX 4090 × 3.35–5.35 h = $2.98–$4.76 | 0.54–0.90 s/step (half the batch-64 step), steps not rescaled, so half the samples; corrected in review round 1 (was 3.6–6.4 h = $3.2–$5.7, not derivable) |
+  | ACT | RTX 4090 × 1.75–3.15 h = $1.56–$2.80 | 0.05–0.10 s/step guessed |
   | Probe, per pod | RTX 4090 × 0.5–1.0 h = $0.45–$0.89 | setup, probe and up to 30 min waiting for approval |
 - Open:
   - Pin `dataset.revision` once the 50 demos are pushed.
@@ -1220,8 +1220,9 @@ is a lost frame). A not-started attempt is never an episode; a capture failure n
 arm or the score (recorded in `capture.error`). After the score one frame of each camera is saved as
 end-state stills for the blinded review. Resume appends (LeRobot's own resume path); a dataset left
 unfinalized by a SIGKILL cannot be reopened and the resume says so. Measured on the M3 Pro:
-0.40 ms per control tick, 4.5 s / 7.3 s to save a 10 s / 30 s episode of both cameras. Bench
-budget: 150 trials at up to ~65 s = 2.3-2.7 h per policy.
+0.40 ms per control tick, 4.5 s / 7.3 s to save a 10 s / 30 s episode of both cameras (single
+run, mock rig, synthetic solid-colour / still frames). Bench budget: superseded in review round 1
+(below): ~4.5 h for SmolVLA, ~2.9 h for ACT per 150 trials.
 
 **Label provenance** (6c): `scripts/wo07_blind_review.py` (new) pools the captured episodes of one
 or more sessions, shuffles them (seed recorded), and shows packets named by random ids (contact
@@ -1358,6 +1359,161 @@ clean; no shell file changed. `pyproject.toml`, `uv.lock`,
 `scripts/pod/wo07_train_job.sh` `POLICY=smolvla`, batch 64 (32 on OOM), 20k steps, estimated
 RTX 4090 (Secure $0.89/h) x 6.35-10.35 h = $5.65-$9.21, plus the probe per pod
 ($0.45-$0.89). Needs the 50 demos pushed and `DATASET_REVISION` pinned first. Not launched.
+
+### PR 2: review round 1 (fixer)
+
+2026-11-09, $0, CPU / MPS, fakes and the mock rig only (no arm, camera, serial port, Hub push or
+RunPod action). Commits `dc7d09c` (the fixes) and `02d04ce` (a loader regression found while
+re-measuring). All 18 confirmed findings applied; none skipped.
+
+**Frozen values that changed (nothing was recorded under the old ones):**
+- Convention `so101-real-obs-action` **1.1**, hash `c387f175...b807b30c` (1.0 `b8701c57...` kept
+  pinned in the test as history). It adds one feature, `timing_s`, float32 `[write,
+  camera_frame]`: seconds since the episode's first command write, at the write and at the camera
+  grab (conv-3 / F6). A `[1]`-shaped scalar does not survive LeRobot 0.4.4's `save_episode` with
+  numpy 2, hence the pair. It has no `observation.` / `action` prefix, so LeRobot never makes it a
+  policy input.
+- real-0.1 composite hash is now **`edee44aa...83f279d749`**: it covers the convention hash. The
+  schedules are unchanged (eval `dd1345de...`, dev `21fe5598...`). The placement-grid PDF was
+  regenerated.
+
+**Per finding**
+- **conv-1 / F1 / F8, checkpoint provenance.** The trainer writes `vla_rl_so101.json` into every
+  `pretrained_model` dir, and it is part of the checkpoint hash. It holds the training run id, the
+  dataset's convention citation, `unit_map` (`robot.units`: arm sign / offset), calibration
+  sha256, dataset sha256 and session, the protocol citation and, for SmolVLA, the VLM. The VLM is
+  `HuggingFaceTB/SmolVLM2-500M-Video-Instruct`, resolved to a commit at training with the sha256
+  of every non-weight file (tokenizer, processor, configs), and re-checked after training.
+  - `load_local_policy` refuses another convention hash or `unit_map`.
+  - SmolVLA loads its VLM, processor and tokenizer from that exact snapshot
+    (`lerobot_ckpt.pinned_vlm_path`; `vlm_model_name` and the tokenizer step are pointed at the
+    local snapshot in memory only).
+  - The real arm requires the provenance. `--training-run-id` must equal the provenance's run id
+    (mismatch refused, F8). The real arm refuses an unverified run id; so does the export, except
+    for mock sessions.
+  - `local_mismatches` now compares the CHECKPOINT's cited convention, not this module's own.
+  - The convention docstring now says that `arm_sign` -1 mirrors a joint rather than rescaling
+    it.
+- **conv-2, demo-only training.** `wo07_train.py` refuses any recorded dataset that is not the
+  real-0.1 demo recording: purpose demonstration, `--demo-schedule`, this protocol hash, and every
+  episode placement equal to a demo of the frozen schedule at a seen slot. Only the tiny
+  synthetic dataset is exempt. The protocol citation is in the run record.
+- **conv-4, camera roles.** `camera.confirm_camera_roles` runs before torque, in every demo sitting
+  and every real-0.1 hardware session. It writes one labelled frame of each camera (FRONT /
+  WRIST) as a PNG, opens it in Preview, and requires the operator to type `yes`; anything else
+  ends with nothing recorded. The record (sheet, indices, time) goes into the sitting's provenance,
+  the run record and the capture provenance. macOS gives no stable camera id through OpenCV, so
+  this is an operator check, not an automatic one.
+- **conv-5.** The unused `convention.task_string` was removed. The task string comes only from
+  `protocol.instruction`, whose templates are in the convention hash.
+- **F1 (high) + F5, durable recordings.**
+  - `recording.DurableDataset` finalizes (Parquet footers) and reopens through LeRobot's resume
+    path after every saved episode, so each episode goes to new files.
+  - A kill can cost only the episode being saved. `recover_dataset` quarantines what that kill
+    leaves (a footerless data file, a video no episode references, the frame-PNG folder) and
+    rebuilds `meta/info.json` and `meta/stats.json` from the finalized episodes. Leftover PNGs
+    would otherwise be encoded into the next episode with the same index.
+  - The evaluation capture and the demo recorder both use it, and the provenance entry is written
+    before each checkpoint.
+  - A resumed real-0.1 session recovers and reopens its capture in `precheck_capture` before
+    anything is opened.
+  - `wo06_teleop_record.py --demo-schedule --resume` continues at the next demo after recovery.
+    It refuses a different protocol, convention, `robot.units`, calibration, or a broken prefix of
+    the schedule. The session id is kept and each sitting is listed under `sittings`.
+  - Cost: about 2.3 s per 10-frame episode on the M3 Pro, including the reopen.
+- **F2, device.** On the arm, MPS unavailable is refused (`DeviceUnavailable`), never a silent CPU
+  run. The in-process device and dtype are in the session fingerprint's policy component, and the
+  session run record's `device` is the policy's.
+- **F2 (eval), blinding.** `wo07_blind_review.py` records each session's checkpoint hash. It
+  declares `blinded_review` / `policy_identity_hidden` only when the clips pool at least two
+  different policies; otherwise it writes `unblinded_clip_review`. The export requires at least
+  two policies, this session's among them. The tests now review the SmolVLA and the ACT session
+  together, and a single-session review is refused.
+- **F3, retry in place.** `_run_schedule` re-runs a never-started item before the next one, up to
+  `MAX_START_ATTEMPTS` = 3 per run; after that the run ends and a resume retries the item first.
+  Every record carries `attempt`.
+- **F3 (latency).** `wo07_local_latency.py --capture` measures with the evaluation capture on
+  textured frames (table below).
+- **F4.** A resume loads the checkpoint path it just verified. `resolve_checkpoint` treats
+  anything path-like as local only and refuses it if it is not a directory, so a mistyped path is
+  never fetched from the Hub.
+- **F4 (budget).** The bench budget is now computed from the measured write rates (below).
+- **F6 / conv-3, timing.** Each trial's capture block and `trials.json` carry `write_rate_hz`,
+  `write_time_span_s` and `nominal_fps`. `bundle.json` warns when a rate is more than 10% off
+  15 fps and notes that LeRobot's timestamps are nominal.
+- **F7, capture order.** `DeployLoop.on_settled`, called at the end of the settle and before the
+  servo read and score prompt, reads the end-state stills; the record says when they were taken
+  (a faulted trial has no settle). The episode is saved after the scored record is logged and
+  flushed, then a `capture` row logs its index; `load_prior` merges those rows. The export fills
+  an episode whose capture row a kill lost from the capture provenance.
+- **F9.** Development sessions are declared `protocol_version` `real-0.1-dev`. A rehearsal, or a
+  recording without `--demo-schedule`, is refused by the demo export.
+- **F10.** Cost lines corrected above: batch 32 = 3.35–5.35 h = $2.98–$4.76; ACT $1.56–$2.80.
+- **Found while re-measuring (`02d04ce`).** In a fresh process, `load_local_policy` failed with
+  "Couldn't find a choice class for 'smolvla'". The integration's loader no longer imported
+  `lerobot.policies.factory` before `PreTrainedConfig.from_pretrained`. The tests had not caught
+  it because the trainer had already imported the factory in the same process. Fixed, with a
+  subprocess regression test that fails without the fix.
+
+**Latency, with and without the evaluation capture.** Single run, MOCK RIG (fake arm, two fake
+640×480 cameras; real loop, safety filter, sim FK and model). Excludes camera capture. Apple M3
+Pro (Mac15,7), macOS 26.5.2, commit `02d04ce` (ACT runs at `dc7d09c`, same loop code), 300 bus
+writes at 15 Hz, `max_chunk_age_ms` 800. Capture on = `EvalCapture` with LeRobot's 8 PNG threads,
+on a ring of 30 random-noise frames per camera (the worst case for PNG and AV1), saved and
+checkpointed after each 150-write trial. Untrained ACT and the pretrained `smolvla_base`: their
+actions mean nothing for this arm.
+
+| Policy | Capture | Chunk p50 / p95 / max ms | Gap between writes p50 / p95 / max ms | Actions per chunk | Episode save + checkpoint (150 frames) | Run |
+|---|---|---|---|---|---|---|
+| SmolVLA `smolvla_base` (bf16, MPS) | off | 439.7 / 484.1 / 527.4 | 71.8 / 517.2 / 596.4 | 5.56 | n/a | `...075558Z-...-c7cf` |
+| SmolVLA `smolvla_base` (bf16, MPS) | on | 433.9 / 476.4 / 535.7 | 71.7 / 507.3 / 607.6 | 5.66 | 4.99 / 5.10 s | `...075655Z-...-42ad` |
+| ACT, untrained (fp32, MPS) | off | 53.8 / 62.1 / 74.6 | 71.6 / 121.8 / 130.8 | 10.71 | n/a | `...075342Z-...-564e` |
+| ACT, untrained (fp32, MPS) | on | 45.3 / 61.5 / 70.9 | 71.5 / 114.1 / 139.5 | 10.71 | 5.28 / 5.50 s | `...075412Z-...-9df9` |
+
+In this single run, the capture's PNG threads did not push SmolVLA's chunk p95 toward the
+700 ms deadline. A save of a full 450-frame trial was not measured here; the earlier synthetic
+figure was 7.3 s.
+
+**Bench budget (estimate, from these single-run write rates).** A trial is 450 writes with no
+success latch. SmolVLA writes about 6.2–6.6 per second, so about 70 s of policy; ACT writes about
+12.8–13.2 per second, so about 35 s. Adding home ~5 s, place ~15 s, settle 3 s, score ~5 s and the
+save ~7 s gives:
+- SmolVLA: about 108 s per trial, about 4.5 h for 150 trials.
+- ACT: about 70 s per trial, about 2.9 h for 150 trials.
+
+The 450-step horizon is a fixed number of commands, so it covers different wall-clock times for
+the two families (stated in `scripts/wo07_real_eval.py` and `src/eval/protocol_real.py`). The
+SmolVLA session needs two bench sittings through `--resume`, or a command-rate decision first.
+
+**Mock export through vishwaroop's own tools, re-run on round 1.** Same scratch copy
+(`<scratchpad>/vishwaroop-copy`, vishwaroop `ba0eef6`; the original repo was never written).
+- Commands: `uv run python <scratchpad>/mockexport-tools/make_pr2r1_bundles.py <worktree>
+  <scratchpad>/mockexport-pr2r1`, then `bash <scratchpad>/mockexport-tools/run_importer_pr2r1.sh
+  <scratchpad>`.
+- Inputs: 2 demos through the durable recorder; tiny ACT and tiny SmolVLA trained on them (with
+  provenance); one mock real-0.1 session per family through `--backend local` (MPS, capture on);
+  a blinded review pooling the two sessions (6 clips, reviewer `mock-reviewer`); and one ACT dev
+  session.
+- Results: 4 seals, 4 verifies and 4 imports, all exit 0, `declared_group_and_lineage_checks_passed`.
+  Every bundle has both cameras and streams `state`, `rgb_front`, `rgb_wrist`.
+- The eval episodes import with `assessment_method: blinded_review` and `checkpoint_id`
+  `sha256:60f1845c...` (ACT) / `sha256:2f5846da...` (SmolVLA), equal to the training runs'
+  hashes; the bundled checkpoint files now include `vla_rl_so101.json`.
+- The dev session imports with `protocol_version` `real-0.1-dev`; the demos import as teleop.
+- Mock only, never a result.
+
+**Gates.** Full pytest 563 passed + 1 skipped (the SmolVLA-only case on its ACT parameter), plus
+the regression test added after it. `ruff check src tests scripts`, `black --check .` and
+`mypy --strict src` are clean. No shell file changed. `pyproject.toml`, `uv.lock`,
+`src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/env/success.py` and `docs/results.md`
+are unchanged.
+
+**Owner decisions still open (before the first demo):**
+1. 15 Hz instead of LeRobot's 30 fps (Stage A).
+2. The 450-step horizon and the label rule (blinded verdict AND no recorded fault).
+3. The SmolVLA command rate: overlap inference, raise `max_chunk_age_ms` (a safety parameter),
+   or accept about 6 Hz with a 4.5 h session over two sittings.
+4. Whether to keep 20k steps if SmolVLA drops to batch 32.
 
 ## Blockers and decisions pending the owner
 
