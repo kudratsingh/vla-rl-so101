@@ -94,9 +94,13 @@ cameras:
     pose: front_left_45               # must equal sim camera pose
     crop_to: 224                     # px, policy image side (OpenVLA-OFT input); = sim env.image_size
     fov_deg: 40                      # deg, VERTICAL (SAPIEN fovy); must equal configs/sim.yaml env.camera.fov_deg
-  wrist:
+  wrist:                             # SO-101 kit 32 mm module on the gripper. Recorded in every
+                                     # demo and eval frame with the front camera (owner 2026-11-09;
+                                     # src/robot/convention.py: both 640x480 at 30 fps, uncropped)
     index: 1
-    enabled: false
+    width: 640                       # px
+    height: 480                      # px
+    fps: 30
 
 server:
   # The server binds 127.0.0.1 on the GPU box (src/robot/serve.py); the Mac reaches it through

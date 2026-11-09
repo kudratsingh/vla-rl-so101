@@ -25,7 +25,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Protocol, Self
 
 import cv2
 import numpy as np
@@ -239,6 +239,99 @@ class OpenCVFrameSource:
                 self._cam.disconnect()
             finally:
                 self._cam = None
+
+    def __enter__(self) -> Self:
+        self.connect()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.disconnect()
+
+
+class FrameReader(Protocol):
+    """One camera: ``OpenCVFrameSource`` or a test fake."""
+
+    def connect(self) -> None: ...
+
+    def read(self) -> Frame: ...
+
+    def disconnect(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class RigFrame:
+    """One frame from every camera of a ``CameraRig``, read on the same control tick."""
+
+    images: dict[str, ImageU8]  # camera name -> (H, W, 3) RGB
+    capture_times: dict[str, float]  # camera name -> time.perf_counter() stamp
+
+    @property
+    def capture_time(self) -> float:
+        """The OLDEST camera's stamp: the deadman's frame-age check covers every camera."""
+        return min(self.capture_times.values())
+
+
+class CameraRig:
+    """Named cameras read together (``src/robot/convention.py``: front + wrist).
+
+    ``read`` returns a frame only when EVERY camera delivered one; a fault on any camera raises
+    ``CameraFault`` naming it, so a control loop treats it as a lost frame (deadman) and nothing
+    is recorded or acted on with one camera missing.
+    """
+
+    def __init__(self, sources: Mapping[str, FrameReader]):
+        if not sources:
+            raise ValueError("a camera rig needs at least one camera")
+        self.sources = dict(sources)
+
+    @classmethod
+    def from_config(cls, cfg: Config, names: Sequence[str]) -> CameraRig:
+        cams = cfg.get("cameras") or {}
+        missing = [n for n in names if not cams.get(n) or cams[n].get("enabled", True) is False]
+        if missing:
+            raise ValueError(f"cameras {missing} missing or disabled in the config")
+        return cls({n: OpenCVFrameSource(cams[n]) for n in names})
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self.sources)
+
+    def connect(self) -> None:
+        opened: list[FrameReader] = []
+        try:
+            for src in self.sources.values():
+                src.connect()
+                opened.append(src)
+        except BaseException:
+            for src in opened:
+                src.disconnect()
+            raise
+
+    def read(self) -> RigFrame:
+        images: dict[str, ImageU8] = {}
+        stamps: dict[str, float] = {}
+        for name, src in self.sources.items():
+            try:
+                f = src.read()
+            except CameraFault as e:
+                raise CameraFault(f"{name} camera: {e}") from e
+            images[name], stamps[name] = f.image, float(f.capture_time)
+        return RigFrame(images, stamps)
+
+    def disconnect(self) -> None:
+        errors: list[BaseException] = []
+        for src in self.sources.values():
+            try:
+                src.disconnect()
+            except Exception as e:  # noqa: BLE001 - close every camera, then report
+                errors.append(e)
+        if errors:
+            raise errors[0]
 
     def __enter__(self) -> Self:
         self.connect()

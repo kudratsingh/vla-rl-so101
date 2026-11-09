@@ -1,13 +1,16 @@
 #!/usr/bin/env python
-"""WO-06 item 4: record real teleop episodes (5 per task, sanity only - not training data).
+"""WO-06 item 4 / WO-07: record real teleop episodes (leader arm, front + wrist cameras).
 
 Leader arm (so101_leader) -> canonical radians -> src/robot/safety.py -> follower, at control_hz,
-with the front camera through the policy's image pipeline. Writes one LeRobotDataset (v3.0,
-lerobot 0.4.4) with the SAME schema as WO-01's sim demos: ``observation.images.front``
-(crop_to x crop_to RGB video), ``observation.state`` and ``action`` (float32[6] canonical radians;
-action = the safe command actually sent), per-frame ``task`` = the protocol instruction
-(``src.eval.protocol.instruction(task, RED_CUBE)``, the sim demos' string), also recorded with the
-protocol hash in ``meta/vla_rl_so101.json``.
+with BOTH cameras on every tick. Writes one LeRobotDataset (v3.0, lerobot 0.4.4) in the frozen
+real-arm convention ``src/robot/convention.py`` (``CONVENTION_ID`` + ``convention_hash()``, cited
+in ``meta/vla_rl_so101.json``): ``observation.images.front`` and ``observation.images.wrist``
+(uncropped 480 x 640 RGB video), ``observation.state`` (the measured pose) and ``action`` (the safe
+command actually sent; absolute targets), both float32[6] canonical radians, per-frame ``task`` =
+the protocol instruction (``src.eval.protocol.instruction(task, RED_CUBE)``), also recorded with
+the protocol hash. Every frame goes through ``convention.recording_frame``: a frame without both
+cameras is never written, and the session refuses to start unless ``convention.check_config``
+passes (both cameras configured at 640 x 480 / 30 fps, control_hz 15, the gripper encoding).
 
 Needs: a leader arm in ``teleop.leader`` (otherwise exits with a message), both arms calibrated
 (scripts/wo06_calibrate.py), and the shared FK from WO-01 for the workspace check.
@@ -53,7 +56,7 @@ A failed torque-off write ("TORQUE OFF UNCONFIRMED", ``So101Driver.torque_off_un
 blocks every further goal-position and torque-enable write; the script tells the operator to
 switch off the inline power switch and ends.
 
-Any other error (the dataset, the image pipeline, a bug) holds the follower, discards the
+Any other error (the dataset, a frame outside the convention, a bug) holds the follower, discards the
 episode and goes through the same support prompt before it is re-raised.
 
 A lost frame / stall holds the arm and asks you; a serial error cuts torque; a servo
@@ -66,12 +69,13 @@ while an episode saves. ``--verbose`` also prints the safety filter's per-tick I
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import shutil
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -83,6 +87,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import add_config_args, load_config
+from src.data.recorder import datasets_write_compat
 from src.eval.protocol import (
     PROTOCOL_VERSION,
     RED_CUBE,
@@ -90,10 +95,11 @@ from src.eval.protocol import (
     instruction,
     protocol_hash,
 )
+from src.robot import convention as conv
 from src.robot.camera import (
     CameraFault,
-    OpenCVFrameSource,
-    PolicyImagePipeline,
+    CameraRig,
+    RigFrame,
     sim_mismatches,
 )
 from src.robot.driver import (
@@ -127,9 +133,8 @@ from src.robot.units import JOINT_NAMES, UnitMap
 
 log = logging.getLogger(__name__)
 
-IMAGE_KEY = "observation.images.front"
-STATE_KEY = "observation.state"
-ACTION_KEY = "action"
+STATE_KEY = conv.STATE_KEY
+ACTION_KEY = conv.ACTION_KEY
 SYNC_TOL_RAD = np.radians(3.0)
 SYNC_TIMEOUT_S = 10.0
 QUIT = "q"
@@ -149,17 +154,28 @@ With a leader: set teleop.leader to
 then run scripts/wo06_calibrate.py find-port/calibrate/verify --device leader."""
 
 
-def features(side: int) -> dict[str, dict[str, Any]]:
-    names = list(JOINT_NAMES)
-    return {
-        IMAGE_KEY: {
-            "dtype": "video",
-            "shape": (side, side, 3),
-            "names": ["height", "width", "channels"],
-        },
-        STATE_KEY: {"dtype": "float32", "shape": (6,), "names": names},
-        ACTION_KEY: {"dtype": "float32", "shape": (6,), "names": names},
-    }
+def features() -> dict[str, dict[str, Any]]:
+    """The dataset schema: ``convention.dataset_features`` (both cameras, state, action)."""
+    return conv.dataset_features()
+
+
+def create_dataset(repo_id: str, root: Path) -> Any:
+    """The recording LeRobotDataset (v3.0) in the frozen convention. ``root`` must not exist."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    with datasets_write_compat():
+        return LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=conv.FPS,
+            features=features(),
+            root=root,
+            robot_type=conv.ROBOT_TYPE,
+            use_videos=True,
+            # LeRobot's record default: 4 PNG writer threads per camera, off the control tick
+            image_writer_threads=4 * len(conv.CAMERAS),
+            video_backend=conv.VIDEO_BACKEND,
+            vcodec=conv.VIDEO_CODEC,
+        )
 
 
 def protocol_instructions(tasks: Sequence[str]) -> dict[str, str]:
@@ -200,13 +216,14 @@ class Session:
         self,
         arm: So101Driver,
         leader: Any,
-        cam: OpenCVFrameSource,
+        cam: CameraRig,
         units: UnitMap,
         park: ParkSettings | None = None,
         torque_wait: TorqueWait | None = None,
         read: LineReader = timed_input,
     ):
-        self.arm, self.leader, self.cam, self.units = arm, leader, cam, units
+        self.arm, self.leader, self.units = arm, leader, units
+        self.cam = cam  # every camera of the convention (front + wrist), read together
         self.park = park  # healthy-end park pose; None = hold + support prompt only
         # bounded torque-on prompts (src/robot/prompts.py); torque_wait None = wait forever
         self.guard = TorqueGuard(arm, torque_wait, read=read)
@@ -241,8 +258,9 @@ class Session:
         the loss."""
         return INTERRUPTS.terminal_gone() is not None or self.stop
 
-    def tick(self) -> tuple[Any, StepResult]:
-        """One control step. Returns (camera frame or None, step result). The loops call
+    def tick(self) -> tuple[RigFrame | None, StepResult]:
+        """One control step. Returns (frame of every camera or None, step result). A fault on
+        either camera is no frame: the deadman trips in ``arm.step``. The loops call
         ``stop_requested`` first."""
         try:
             frame = self.cam.read()
@@ -495,16 +513,15 @@ def record_session(
     instructions: dict[str, str],
     n_eps: int,
     ep_time: float,
-    pipe: Callable[[Any], Any],
 ) -> int:
     """The interactive episode loop; returns the number of saved episodes. Ends through
     ``end_session`` unless an exception (serial fault, torque-off deadman) ends it first. Any
-    other exception (a dataset or image-pipeline error, a bug) holds the follower and goes
+    other exception (a dataset or convention error, a bug) holds the follower and goes
     through ``end_session``'s support prompt before it propagates (``_unexpected_error``): the
     driver's ``with`` block would otherwise drop the arm at once."""
     with ctrl_c_as_flag(sess):
         try:
-            return _episodes(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
+            return _episodes(sess, dataset, tasks, instructions, n_eps, ep_time)
         except (DeadmanTripped, SerialFault):
             raise  # torque already off (or not confirmed): nothing to hold or support
         except Exception as e:
@@ -540,7 +557,6 @@ def _episodes(
     instructions: dict[str, str],
     n_eps: int,
     ep_time: float,
-    pipe: Callable[[Any], Any],
 ) -> int:
     arm = sess.arm
     saved = 0
@@ -563,14 +579,11 @@ def _episodes(
                     t0 = time.perf_counter()
                     frame, out = sess.tick()
                     assert frame is not None and out.safety.command is not None
-                    dataset.add_frame(
-                        {
-                            IMAGE_KEY: pipe(frame.image),
-                            STATE_KEY: out.measured.astype(np.float32),
-                            ACTION_KEY: out.safety.command.astype(np.float32),
-                            "task": instructions[task],
-                        }
+                    row = conv.recording_frame(  # refuses a frame without both cameras
+                        frame.images, out.measured, out.safety.command, instructions[task]
                     )
+                    with datasets_write_compat():
+                        dataset.add_frame(row)
                     sess.sleep_to(t0)
                 if sess.stop:
                     print("\nepisode ended")
@@ -602,7 +615,8 @@ def _episodes(
             if n_frames > 0 and keep in ("", "y", "yes"):
                 print("saving episode (encoding video, a few seconds; Ctrl-C is ignored) ...")
                 try:
-                    dataset.save_episode()
+                    with datasets_write_compat():
+                        dataset.save_episode()
                 except Exception as e:  # noqa: BLE001 - the arm holds; never exit through __exit__
                     print(f"saving failed ({type(e).__name__}: {e}); episode discarded, redo it")
                     discard_episode(dataset)
@@ -661,12 +675,17 @@ def main() -> None:
             )
     n_eps = 1 if args.rehearsal else int(args.episodes or tcfg["episodes_per_task"])
     ep_time = float(tcfg["episode_time_s"])
+    problems = conv.check_config(cfg)
+    if problems:
+        sys.exit(
+            f"refusing to record: the config departs from {conv.CONVENTION_ID} "
+            f"{conv.CONVENTION_VERSION} (src/robot/convention.py):\n  " + "\n  ".join(problems)
+        )
     sim_cfg = load_config("sim")
     for m in sim_mismatches(cfg, sim_cfg):
-        print(f"WARNING camera config mismatch, {m}")
+        print(f"WARNING front camera config vs sim (pose / fov for the WO-08 sim match), {m}")
 
     fk = load_sim_fk()  # exits with instructions if WO-01's FK is not on this branch yet
-    pipe = PolicyImagePipeline.from_config(cfg)
     units = UnitMap.from_config(cfg)
     repo_id = str(tcfg["hub_repo"])
     root = REPO_ROOT / str(tcfg["dataset_root"]) / repo_id.split("/")[-1]
@@ -678,21 +697,16 @@ def main() -> None:
         shutil.rmtree(root)
     root.parent.mkdir(parents=True, exist_ok=True)
 
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
     leader = make_leader(dict(tcfg["leader"]))
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=int(cfg["robot"]["control_hz"]),
-        features=features(pipe.out_size),
-        root=root,
-        robot_type="so101_follower",
-        use_videos=True,
-        video_backend="torchcodec",
-        vcodec="libsvtav1",
-    )
+    dataset = create_dataset(repo_id, root)
+    cite = conv.citation()
+    print(f"recording in {cite['id']} {cite['version']} ({cite['module']}, sha256 {cite['hash']})")
     provenance: dict[str, Any] = {
         "source": "scripts/wo06_teleop_record.py",
+        "convention": cite,
+        "units": dict(conv.DECLARED_UNITS),
+        "unit_map": dataclasses.asdict(units),
+        "cameras": {n: dict(cfg["cameras"][n]) for n in conv.CAMERA_NAMES},
         "protocol_version": PROTOCOL_VERSION,
         "protocol_hash": protocol_hash(),
         "instructions": instructions,
@@ -712,7 +726,7 @@ def main() -> None:
         with job_control():
             try:
                 with (
-                    OpenCVFrameSource(cfg["cameras"]["front"]) as cam,
+                    CameraRig.from_config(cfg, conv.CAMERA_NAMES) as cam,  # front + wrist
                     arm,  # torque ON from here, holding the pose
                 ):
                     sess = Session(
@@ -723,7 +737,7 @@ def main() -> None:
                         park=park_from_config(cfg),  # None unless robot.park.enabled
                         torque_wait=TorqueWait.from_config(cfg, "teleop", allow_none=True),
                     )
-                    record_session(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
+                    record_session(sess, dataset, tasks, instructions, n_eps, ep_time)
             finally:
                 _torque_off_unconfirmed(arm)  # also after the driver's own torque-off on exit
                 provenance.update(session_record(arm, sess))

@@ -15,7 +15,7 @@ import pytest
 from robot_fakes import FakeFollower, real_cfg, toy_fk
 
 from src.config import REPO_ROOT
-from src.robot.camera import CameraFault, Frame
+from src.robot.camera import CameraFault, RigFrame
 from src.robot.driver import DeadmanTripped, ParkSettings, ServoFault, So101Driver
 from src.robot.safety import make_safety
 from src.robot.servo_health import monitor_from_config
@@ -42,13 +42,16 @@ class FakeLeader:
 
 
 class FakeCam:
+    """Both convention cameras (front + wrist), read together like ``CameraRig``."""
+
     def __init__(self) -> None:
         self.fail = False
 
-    def read(self) -> Frame:
+    def read(self) -> RigFrame:
         if self.fail:
-            raise CameraFault("timed out")
-        return Frame(np.zeros((480, 640, 3), np.uint8), time.perf_counter())
+            raise CameraFault("wrist camera: timed out")
+        t, img = time.perf_counter(), np.zeros((480, 640, 3), np.uint8)
+        return RigFrame({"front": img, "wrist": img}, {"front": t, "wrist": t})
 
 
 def _input_reader(prompt: str, _timeout_s: float | None) -> str | None:
@@ -70,7 +73,9 @@ def test_follower_eases_onto_leader_through_safety() -> None:
     steps = np.diff([0.0, *(a["wrist_flex.pos"] for a in fol.sent)])
     assert len(fol.sent) >= 3 and steps.max() <= 4.0 + 1e-9  # rate-limited, never a jump
     assert fol.pos["wrist_flex.pos"] == pytest.approx(12.0)
-    assert teleop.features(224)[teleop.IMAGE_KEY]["shape"] == (224, 224, 3)
+    feats = teleop.features()
+    assert feats["observation.images.front"]["shape"] == (480, 640, 3)
+    assert feats["observation.images.wrist"]["shape"] == (480, 640, 3)
 
 
 def test_lost_camera_or_leader_holds_the_follower() -> None:
@@ -161,7 +166,7 @@ def test_redo_then_ctrl_c_at_a_prompt_ends_through_hold(monkeypatch: pytest.Monk
     sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
     data = FakeDataset()
     instr = teleop.protocol_instructions(["Push"])
-    saved = teleop.record_session(sess, data, ["Push"], instr, 1, 0.2, lambda im: im)
+    saved = teleop.record_session(sess, data, ["Push"], instr, 1, 0.2)
     assert saved == 0 and data.saved == 0 and data.episode_buffer["size"] == 0 and not answers
     assert "[n]o, redo / [q]uit" in prompts[1]
     assert "torque goes OFF" in prompts[3] and prompts[4] == prompts[3]  # asked again
@@ -207,7 +212,7 @@ def test_ctrl_c_mid_tick_ends_sync_or_episode_never_a_bus_call(
     sess, fol = _session(CtrlCLeader(at={1}), FakeCam())
     data = FakeDataset(ctrl_c_at_frame=3)
     instr = teleop.protocol_instructions(["Push"])
-    saved = teleop.record_session(sess, data, ["Push"], instr, 2, 5.0, lambda im: im)
+    saved = teleop.record_session(sess, data, ["Push"], instr, 2, 5.0)
     out = capsys.readouterr().out
     assert "sync aborted" in out and "episode ended" in out and not answers
     assert "(3 frames)" in prompts[2] and saved == 1 and data.saved == 1
@@ -224,7 +229,7 @@ def test_failed_save_discards_the_episode_and_keeps_holding(
     sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
     data = FakeDataset(save_fails=True)
     instr = teleop.protocol_instructions(["Push"])
-    saved = teleop.record_session(sess, data, ["Push"], instr, 1, 0.2, lambda im: im)
+    saved = teleop.record_session(sess, data, ["Push"], instr, 1, 0.2)
     assert "saving failed (ValueError" in capsys.readouterr().out and not answers
     assert saved == 0 and data.episode_buffer["size"] == 0
     assert fol.bus.torque_enabled and fol.sent[-1] == pytest.approx(fol.pos)
@@ -238,7 +243,7 @@ def test_healthy_end_parks_the_follower_then_torque_off(
     park = (0.0, 0.0, 0.0, math.radians(10.0), 0.0, math.radians(5.0))
     sess.park = ParkSettings(qpos=park, tol_rad=math.radians(1.0), timeout_s=5.0)
     instr = teleop.protocol_instructions(["Push"])
-    saved = teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2, lambda im: im)
+    saved = teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2)
     assert saved == 0 and len(prompts) == 1  # no "support the arm" prompt: it parked
     assert "follower parked; torque OFF" in capsys.readouterr().out
     assert fol.sent[-1]["wrist_flex.pos"] == pytest.approx(10.0)
@@ -256,7 +261,7 @@ def test_hot_servo_after_a_prompt_cuts_torque_before_any_motion(
     fol.temperature_c["gripper"] = 61.0  # heated up while holding at the scene prompt
     instr = teleop.protocol_instructions(["Push"])
     with pytest.raises(ServoFault):
-        teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2, lambda im: im)
+        teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2)
     assert "SUPPORT THE ARM NOW" in capsys.readouterr().out
     assert not fol.sent and not fol.bus.torque_enabled  # nothing moved, torque off at once
 
@@ -295,7 +300,7 @@ def test_prompt_timeout_under_torque_supports_then_torque_off(
 
     sess.guard.read_line = no_answer
     instr = teleop.protocol_instructions(["Push"])
-    saved = teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2, lambda im: im)
+    saved = teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 0.2)
     assert saved == 0
     # the scene prompt, then the support grace
     assert [w[1] for w in waits] == [60.0, pytest.approx(10.0, abs=0.5)]
@@ -365,7 +370,7 @@ def test_unexpected_error_holds_and_asks_for_support_before_torque_off(
     instr = teleop.protocol_instructions(["Push"])
     with pytest.raises(ValueError, match="dtype float64"):
         try:
-            teleop.record_session(sess, BrokenDataset(), ["Push"], instr, 1, 0.2, lambda im: im)
+            teleop.record_session(sess, BrokenDataset(), ["Push"], instr, 1, 0.2)
         except ValueError as e:
             sess.arm.__exit__(type(e), e, None)  # what the driver's `with` block then does
             raise
@@ -496,7 +501,7 @@ def test_teleop_ctrl_z_mid_episode_continues_and_a_lost_foreground_ends_like_a_h
     instr = teleop.protocol_instructions(["Push"])
     with P.job_control():
         P.INTERRUPTS.tty_fd = 0  # as with stdin on the terminal (teleop.main's job_control)
-        saved = teleop.record_session(sess, data, ["Push"], instr, 1, 30.0, lambda im: im)
+        saved = teleop.record_session(sess, data, ["Push"], instr, 1, 30.0)
     out = capsys.readouterr().out
     assert saved == 0 and data.saved == 0  # the unsaved episode was discarded
     assert data.frames == 5  # the Ctrl-Z did not stop it; the loss stopped the next tick
@@ -576,8 +581,9 @@ def test_teleop_main_ignores_ctrl_z_from_torque_on_until_its_record_is_written(
             pass
 
     class Cam(FakeCam):
-        def __init__(self, _cfg: Any) -> None:
-            super().__init__()
+        @classmethod
+        def from_config(cls, _cfg: Any, _names: Any) -> Cam:
+            return cls()
 
         def __enter__(self) -> Self:
             return self
@@ -604,7 +610,7 @@ def test_teleop_main_ignores_ctrl_z_from_torque_on_until_its_record_is_written(
     monkeypatch.setattr(teleop, "sim_mismatches", lambda *_a: [])
     monkeypatch.setattr(teleop, "load_sim_fk", lambda: toy_fk)
     monkeypatch.setattr(teleop, "make_leader", lambda _lc: Leader(wrist_flex=2.0))
-    monkeypatch.setattr(teleop, "OpenCVFrameSource", Cam)
+    monkeypatch.setattr(teleop, "CameraRig", Cam)
     monkeypatch.setattr(teleop, "record_session", record_session)
     monkeypatch.setattr(teleop, "_torque_off_unconfirmed", torque_off_unconfirmed)
     monkeypatch.setattr(
@@ -957,7 +963,7 @@ def test_teleop_sighup_at_the_scene_prompt_ends_without_a_park(
     instr = teleop.protocol_instructions(["Push"])
     with P.job_control():
         P.INTERRUPTS.tty_fd = 0
-        saved = teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 5.0, lambda i: i)
+        saved = teleop.record_session(sess, FakeDataset(), ["Push"], instr, 1, 5.0)
     assert saved == 0 and fol.motion_writes() == 0
     scene, *rest = sess.reads
     assert "arrange the scene" in scene[0] and scene[1] == "Hangup"

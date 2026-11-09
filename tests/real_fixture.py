@@ -30,6 +30,7 @@ BRINGUP_PLACEHOLDERS: dict[tuple[str, ...], Any] = {
     ("robot", "safety", "joint_limits_deg"): {},
     ("cameras", "front", "index"): 0,
     ("cameras", "front", "intrinsics"): None,
+    ("cameras", "wrist", "index"): 1,
     ("teleop", "leader"): None,
 }
 

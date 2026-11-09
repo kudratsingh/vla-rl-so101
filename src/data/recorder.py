@@ -136,6 +136,9 @@ def _datasets_write_compat() -> Iterator[None]:
         datasets.config.TORCHCODEC_AVAILABLE = prev
 
 
+datasets_write_compat = _datasets_write_compat  # public: the real-arm teleop recorder uses it too
+
+
 def dataset_location(cfg: Config) -> tuple[str, Path]:
     """(repo_id, local root) for the preset's demo dataset.
 
