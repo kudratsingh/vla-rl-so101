@@ -1502,8 +1502,8 @@ SmolVLA session needs two bench sittings through `--resume`, or a command-rate d
 - The dev session imports with `protocol_version` `real-0.1-dev`; the demos import as teleop.
 - Mock only, never a result.
 
-**Gates.** Full pytest 563 passed + 1 skipped (the SmolVLA-only case on its ACT parameter), plus
-the regression test added after it. `ruff check src tests scripts`, `black --check .` and
+**Gates.** Full pytest 564 passed + 1 skipped (the SmolVLA-only case on its ACT parameter) at
+`2afaf5c`; shellcheck on `scripts/pod/wo07_train_job.sh` clean. `ruff check src tests scripts`, `black --check .` and
 `mypy --strict src` are clean. No shell file changed. `pyproject.toml`, `uv.lock`,
 `src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/env/success.py` and `docs/results.md`
 are unchanged.
