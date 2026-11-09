@@ -466,7 +466,10 @@ What happens and what you do:
    Terminal has hung up (window closed, ssh dropped: SIGHUP, or a SIGTERM) or the session has
    lost the terminal's foreground, even if the terminal still lists the process as foreground.
    If that happens during the park, the park stops before its next goal write (`park
-   interrupted: the follower holds`). Either way the follower holds, nobody can answer the
+   interrupted: the follower holds`): the stop is checked right before every write, also when
+   the signal lands while a tick waits on its camera frame or reads the servos, so the arm makes
+   no further step. The same holds during the leader sync and an episode: no further
+   leader-following step once the hang-up or the loss is recorded. Either way the follower holds, nobody can answer the
    support prompt, so it waits the grace period (10 s) and turns torque off with the arm
    unsupported: **keep a hand near the forearm whenever the session ends abnormally.** The
    record (`meta/vla_rl_so101.json`) then says `session_end: released_unconfirmed`,
