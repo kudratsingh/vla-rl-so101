@@ -494,9 +494,8 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
       runs before each tick (`Session.stop_requested`), so the tick that sees the loss no
       longer sends one more goal (F3, test now expects 5 frames, not 6); a lost foreground
       stops the end-of-session park before its first step, as in the pilot and real eval (F4).
-      Known gap, owner's call: after a hang-up (SIGHUP / SIGTERM) teleop's park still runs to
-      the end when `robot.park.enabled` is set (unchanged #29 behaviour; the pilot and real
-      eval stop it).
+      The hang-up gap noted here (teleop's park still ran after SIGHUP / SIGTERM) is closed in
+      round 7 below.
     - Tests: the pty test sends its Ctrl-Z 4 s into the 8 s support wait and bounds the timeout
       at 10.5 s (a reset deadline would give about 12 s); an in-process test sends SIGTSTP
       mid-wait from a thread and checks the original deadline; a pty test types `q`, Ctrl-Z,
@@ -505,6 +504,45 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
       the session handlers checked at torque on, in the session and at the record write, and
       restored after; the uv-like launcher test checks the warning; the pty harness kills its
       shell and child also when its own start fails (F5).
+- Owner decision of 2026-11-08, round 7 (#29, $0, fakes only): no teleop park after a hang-up
+  or a lost foreground.
+  - `end_session` (`scripts/wo06_teleop_record.py`, `_park`) no longer starts the park when a
+    SIGHUP / SIGTERM (`INTERRUPTS.hangup`) or a lost foreground (`INTERRUPTS.lost_foreground`,
+    or the `tcgetpgrp` poll) has been recorded. The recorded signal decides, also while the
+    terminal still reports the process as its foreground. Before, `end_session` cleared
+    `sess.stop` and the stop check looked at the foreground and `stop` only, so a hang-up
+    recorded before the park let it run to the end. The session goes straight to the hold,
+    the support prompt (it ends at once as `hangup` / `lost_foreground`), the grace period
+    without stdin and torque off.
+  - During the park, `Session.stop_requested` (now `Interrupts.terminal_gone()` or `stop`)
+    runs before every goal write (`So101Driver.move_to`: one write per tick, the check first).
+    A hang-up or a lost foreground stops the park before its next write; a write already under
+    way when the signal arrives completes. `So101Driver.park` also checks `stop_fn` once more
+    after the pose is reached, before its torque-off, so a stop during the last write ends in
+    the hold (Goal := measured, no motion) too. That check also applies to the pilot and the
+    real eval, whose `stop_fn` already covers Ctrl-C, hang-up and lost foreground.
+  - Records (`meta/vla_rl_so101.json`, `session_record`): `session_end: released_unconfirmed`,
+    `support_confirmed: false`, `support_release.cause` `hangup` | `lost_foreground` (the
+    existing names; SIGHUP and SIGTERM share `hangup`), and new `park` (`parked`,
+    `skipped_after_hangup`, `skipped_after_lost_foreground`, `interrupted_by_hangup`,
+    `interrupted_by_lost_foreground`, `stopped_by_ctrl_c`, `not_completed`, or null when no park
+    was due), `hangup_signal` (`SIGHUP` | `SIGTERM`) and `lost_foreground` (why). A healthy end
+    still parks to the end and records `parked`.
+  - Tests (`tests/test_teleop.py`; parking on, a fake follower that logs every goal write as
+    motion / hold and every park stop check, in order; real `os.kill` signals through the
+    session's own handlers; the real `end_session`, driver park and `timed_input`; a 30 s
+    SIGALRM hard timeout per test): SIGHUP and SIGTERM before the park, with no terminal and
+    with the terminal still reporting the process as foreground (`tcgetpgrp == getpgrp`): no
+    park goal, no park stop check, hold, `hangup` at the support prompt, the 10 s grace, torque
+    off, unconfirmed. The same four during the park (the signal sent from the fake's write hook
+    after the 3rd park goal): the next stop check sees it, no goal after it but the hold, then
+    the same path. A SIGHUP during the last (converging) write is caught by the driver's new
+    check before torque-off. Lost foreground before the park (`tcgetpgrp` names another group)
+    and during it (a real SIGTTOU, or the poll): the same path, cause `lost_foreground`. A
+    healthy end writes all 8 park goals, each after a stop check, records `parked`, with no
+    prompt. A SIGHUP at the scene prompt runs the whole `record_session` without a park. The
+    before-park and last-write tests fail against `a041e46`. The documented hardware launch
+    command stays `.venv/bin/python scripts/...`.
 Unverified on hardware: every item above. In particular: the thresholds, the read cost on the
 Mac's USB-serial link, whether the park pose rests safely with torque off, the refusal
 tolerances against a real calibration, the Homing_Offset read on the real servos, the

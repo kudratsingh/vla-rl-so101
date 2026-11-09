@@ -766,7 +766,10 @@ class So101Driver:
     ) -> bool:
         """Drive to ``target`` through the full safety filter at control_hz (e.g. a home pose).
         True when every joint is within ``tol_rad``. Stops (False) on a rejection, a timeout or
-        ``stop_fn()`` returning True (checked before every tick)."""
+        ``stop_fn()`` returning True. ``stop_fn`` is checked before every tick, and every tick
+        (``step``) writes at most one goal, so once it returns True no further goal is written
+        here; a goal already being written when the stop arrives (between the check and the
+        write) completes."""
         q = np.asarray(target, dtype=np.float64)
         period = 1.0 / self.safety.config.control_hz
         t_end = self.clock() + timeout_s
@@ -797,7 +800,10 @@ class So101Driver:
         Refuses (False, nothing written) when the deadman has tripped: a fault path never parks.
         Reads servo temperature/current first. False on a rejection, a timeout, ``stop_fn()``
         becoming True or a Ctrl-C; the arm is then holding (or limp after a fault) and the caller
-        falls back to hold + "support the arm" + torque off.
+        falls back to hold + "support the arm" + torque off. ``stop_fn`` is checked before every
+        goal write of the park (``move_to``) and once more after the pose is reached, before the
+        torque-off: a stop that arrived during the last write also ends in the hold (Goal :=
+        the measured pose, no motion) instead of a park.
         """
         if not self._connected or self.torque_off_unconfirmed is not None:
             return False
@@ -822,6 +828,9 @@ class So101Driver:
             self.trip("operator Ctrl-C during park")
             return False
         try:
+            if reached and stop_fn is not None and stop_fn():
+                log.warning("park stopped after the last goal write: holding")
+                reached = False
             if not reached:
                 log.warning("park pose not reached: holding")
                 self.hold()

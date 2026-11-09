@@ -462,7 +462,16 @@ What happens and what you do:
    Keep the path clear; Ctrl-C during the park stops it. If the park cannot finish (Ctrl-C,
    timeout, a rejected pose, a deadman stop), you get `park did not complete: the follower
    holds`, then the support prompt above. After a deadman stop without `resume`, the session
-   never parks: it goes straight to the hold and support prompt.
+   never parks: it goes straight to the hold and support prompt. It also never parks once the
+   Terminal has hung up (window closed, ssh dropped: SIGHUP, or a SIGTERM) or the session has
+   lost the terminal's foreground, even if the terminal still lists the process as foreground.
+   If that happens during the park, the park stops before its next goal write (`park
+   interrupted: the follower holds`). Either way the follower holds, nobody can answer the
+   support prompt, so it waits the grace period (10 s) and turns torque off with the arm
+   unsupported: **keep a hand near the forearm whenever the session ends abnormally.** The
+   record (`meta/vla_rl_so101.json`) then says `session_end: released_unconfirmed`,
+   `support_confirmed: false`, `park: skipped_after_hangup` / `interrupted_by_hangup` (or
+   `..._lost_foreground`) and `hangup_signal: SIGHUP` / `SIGTERM`.
 
 - **Writes:** `data/real_teleop/vla-rl-so101-real-teleop-rehearsal/` (git-ignored, replaced every
   rehearsal, never pushed). The real dataset is untouched.

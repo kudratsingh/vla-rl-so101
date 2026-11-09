@@ -28,6 +28,11 @@ session: the follower holds, the operator supports the arm, ENTER turns torque o
 path, WO-06 checklist step 5) a healthy end PARKS at ``robot.park.qpos`` through the safety filter
 first (it moves; Ctrl-C stops the park). If the park cannot complete, or the session ends after a
 deadman stop (no ``resume``), it holds, asks the operator to support the arm, then torque off.
+After a hang-up (SIGHUP / SIGTERM) or a lost terminal foreground has been recorded it never parks;
+one during the park stops it before the next goal write (owner decision 2026-11-08). It then
+holds, waits the grace period without stdin and turns torque off: ``released_unconfirmed``,
+``support_confirmed: false``, ``park: skipped_after_hangup`` / ``interrupted_by_hangup`` (or
+``..._lost_foreground``) and ``hangup_signal`` in ``meta/vla_rl_so101.json``.
 
 Bounded torque-on waits (``teleop.prompt_torque_timeout_s``, default 60 s; null = wait forever),
 shared with the WO-07 pilot and real eval (``src/robot/prompts.py``): every prompt answered while
@@ -206,6 +211,9 @@ class Session:
         # bounded torque-on prompts (src/robot/prompts.py); torque_wait None = wait forever
         self.guard = TorqueGuard(arm, torque_wait, read=read)
         self.session_end: str | None = None  # end_session's result (provenance file)
+        # what the end-of-session park did (provenance ``park``; ``PARK_OUTCOMES``); None = no
+        # park was due (parking disabled, a deadman stop, torque already off)
+        self.park_outcome: str | None = None
         self.period = 1.0 / arm.safety.config.control_hz
         self.target: np.ndarray | None = None  # last leader pose, canonical rad
         self.stop = False  # Ctrl-C under ctrl_c_as_flag; the loops check it between ticks
@@ -223,11 +231,15 @@ class Session:
             return None
 
     def stop_requested(self) -> bool:
-        """Checked before every tick: a Ctrl-C or a hang-up (``stop``), or the terminal's
-        foreground lost (polled here, ``Interrupts.check_foreground``; on a loss
-        ``ctrl_c_as_flag`` also sets ``stop``, as for a hang-up). Review F3: the poll used to sit
-        inside ``tick``, which then still sent one goal after detecting the loss."""
-        return INTERRUPTS.check_foreground() or self.stop
+        """Checked before every tick and before every goal write of the end-of-session park: a
+        Ctrl-C (``stop``), a RECORDED hang-up (SIGHUP / SIGTERM, ``INTERRUPTS.hangup``: also
+        while the terminal still reports this process as its foreground), or the terminal's
+        foreground lost (recorded, or polled here: ``Interrupts.terminal_gone``). On a hang-up
+        or a loss ``ctrl_c_as_flag`` also sets ``stop``; the recorded flags are checked too, so
+        clearing ``stop`` (``end_session`` does, before the park) never clears them. Review F3:
+        the poll used to sit inside ``tick``, which then still sent one goal after detecting
+        the loss."""
+        return INTERRUPTS.terminal_gone() is not None or self.stop
 
     def tick(self) -> tuple[Any, StepResult]:
         """One control step. Returns (camera frame or None, step result). The loops call
@@ -359,6 +371,11 @@ def end_session(arm: So101Driver, sess: Session | None = None) -> str:
 
     Healthy (deadman clear) with ``sess.park`` set (``robot.park.enabled``): park through the
     safety filter, then torque off (``So101Driver.park``; Ctrl-C during the park stops it).
+    Owner decision 2026-11-08: a hang-up (SIGHUP / SIGTERM) or a lost foreground recorded before
+    the park would start skips it (no park goal written); one during the park stops it before
+    its next goal write (``_park``, ``sess.park_outcome``). Either way the arm holds, the support
+    prompt ends at once as ``hangup`` / ``lost_foreground``, the grace period runs without
+    stdin and torque goes off: ``released_unconfirmed``, never "parked" or "supported".
     Otherwise, or if the park does not complete: hold at the measured pose, then let the operator
     support the arm before torque goes off, when the driver's ``with`` block closes normally.
     The servos are read once after the hold, before the wait. Only ENTER confirms the support
@@ -376,6 +393,49 @@ def end_session(arm: So101Driver, sess: Session | None = None) -> str:
     return end
 
 
+PARK_OUTCOMES = (
+    "parked",
+    "skipped_after_hangup",
+    "skipped_after_lost_foreground",
+    "interrupted_by_hangup",
+    "interrupted_by_lost_foreground",
+    "stopped_by_ctrl_c",
+    "not_completed",
+)
+"""``Session.park_outcome``: ``skipped_after_*`` = a hang-up (SIGHUP / SIGTERM) or a lost
+foreground was recorded before the park would start, so it never started (no park goal written);
+``interrupted_by_*`` = one arrived during the park, which stopped before its next goal write;
+``not_completed`` = a timeout, a rejected pose or a fault. Every outcome but ``parked`` goes on to
+the hold and the support prompt (after a hang-up or a lost foreground: the grace period without
+stdin, torque off, ``released_unconfirmed``)."""
+
+
+def _park(arm: So101Driver, sess: Session, park: ParkSettings) -> bool:
+    """The end-of-session park (owner decision 2026-11-08): never started once a hang-up or a
+    lost foreground is recorded (``Interrupts.terminal_gone``: the recorded SIGHUP / SIGTERM
+    decides, whatever ``tcgetpgrp`` says); during the park ``Session.stop_requested`` runs
+    before every goal write (``So101Driver.move_to``) and stops it on a Ctrl-C, a hang-up or a
+    lost foreground. True only when it parked with torque off. Sets ``sess.park_outcome``."""
+    gone = INTERRUPTS.terminal_gone()
+    if gone is not None:
+        sess.park_outcome = f"skipped_after_{gone[0]}"
+        print(f"\n{gone[1]}: NOT parking; the follower holds", flush=True)
+        return False
+    print("ending the session: the follower PARKS (it moves; Ctrl-C stops it), then torque off")
+    sess.stop = False  # drop a Ctrl-C pressed at the last prompt (the recorded flags stay)
+    if arm.park(park, sess.frame_time, stop_fn=sess.stop_requested):
+        # the driver checked stop_requested after the last goal write too, before the torque
+        # off: a hang-up after that finds the arm parked with torque off
+        sess.park_outcome = "parked"
+        return True
+    gone = INTERRUPTS.terminal_gone()
+    if gone is not None:
+        sess.park_outcome = f"interrupted_by_{gone[0]}"
+    else:
+        sess.park_outcome = "stopped_by_ctrl_c" if sess.stop else "not_completed"
+    return False
+
+
 def _end_session(arm: So101Driver, sess: Session | None) -> str:
     if _torque_off_unconfirmed(arm):
         return TORQUE_OFF_UNCONFIRMED
@@ -384,17 +444,17 @@ def _end_session(arm: So101Driver, sess: Session | None) -> str:
     if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
         return "torque_was_off"
     if sess is not None and sess.park is not None and not arm.deadman.tripped:
-        print("ending the session: the follower PARKS (it moves; Ctrl-C stops it), then torque off")
-        sess.stop = False
-        # a lost foreground stops the park at once, as in the pilot / real eval (review F4)
-        if arm.park(sess.park, sess.frame_time, stop_fn=sess.stop_requested):
+        if _park(arm, sess, sess.park):
             print("follower parked; torque OFF")
             return "parked"
         if _torque_off_unconfirmed(arm):
             return TORQUE_OFF_UNCONFIRMED
         if arm.deadman.response is DeadmanResponse.TORQUE_OFF:
             return "torque_was_off"  # a servo / serial fault during the park
-        print("park did not complete: the follower holds")
+        if sess.park_outcome is not None and sess.park_outcome.startswith("interrupted_by_"):
+            print("park interrupted: the follower holds")
+        elif sess.park_outcome is not None and not sess.park_outcome.startswith("skipped_"):
+            print("park did not complete: the follower holds")
     guard = sess.guard if sess is not None else TorqueGuard(arm, TorqueWait(None), read=timed_input)
     try:
         arm.hold()
@@ -407,6 +467,25 @@ def _end_session(arm: So101Driver, sess: Session | None) -> str:
         return "supported"  # torque goes off when the driver's `with` block closes
     _torque_off_unconfirmed(arm)
     return TORQUE_OFF_UNCONFIRMED if arm.torque_off_unconfirmed else "released_unconfirmed"
+
+
+def session_record(arm: So101Driver, sess: Session | None) -> dict[str, Any]:
+    """How the session ended, for the provenance file (``meta/vla_rl_so101.json``):
+    ``session_end``; ``support_confirmed`` (None after a completed park or no session, True only
+    after ENTER at the support prompt); ``support_release`` (``TorqueGuard.released``: the cause
+    timeout | eof | hangup | lost_foreground); ``park`` (``PARK_OUTCOMES``, None when no park
+    was due); ``hangup_signal`` (SIGHUP | SIGTERM once one was received, else None);
+    ``lost_foreground`` (why, once the foreground was lost); ``torque_off_unconfirmed``."""
+    end = None if sess is None else sess.session_end
+    return {
+        "session_end": end,
+        "support_confirmed": None if end in (None, "parked") else end == "supported",
+        "support_release": None if sess is None else sess.guard.released,
+        "park": None if sess is None else sess.park_outcome,
+        "hangup_signal": INTERRUPTS.hangup,
+        "lost_foreground": INTERRUPTS.lost_foreground,
+        "torque_off_unconfirmed": arm.torque_off_unconfirmed,
+    }
 
 
 def record_session(
@@ -647,13 +726,7 @@ def main() -> None:
                     record_session(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
             finally:
                 _torque_off_unconfirmed(arm)  # also after the driver's own torque-off on exit
-                end = None if sess is None else sess.session_end
-                provenance.update(
-                    session_end=end,
-                    support_confirmed=None if end in (None, "parked") else end == "supported",
-                    support_release=None if sess is None else sess.guard.released,
-                    torque_off_unconfirmed=arm.torque_off_unconfirmed,
-                )
+                provenance.update(session_record(arm, sess))
                 (root / "meta" / "vla_rl_so101.json").write_text(
                     json.dumps(provenance, indent=2) + "\n"
                 )
