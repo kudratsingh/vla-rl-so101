@@ -19,12 +19,31 @@ the joint and kind) / ``reject`` (workspace), worst over the yaws. The gripper's
 2026-11-08 setting: the gripper never closes past it); that clip is reported separately as
 ``clip(gripper floor)`` since it is not a property of the bowl position.
 
+Per bowl candidate it also reports (review, 2026-11-09):
+
+* the bowl-phase clips (carry / lower / release / retreat, the gripper floor excluded) and every
+  arm joint's smallest margin to its safety limit over those phases, as the oracle REQUESTS them
+  (``joint_margin_bowl_phases_deg``; < 0 = the filter clips it). Under ``--ik-limits safety`` the
+  IK is bounded by the filter's limits, so a joint clip cannot appear by construction; the
+  ``urdf`` variant (the unchanged sim oracle, i.e. the motion the sim demos teach) is the one that
+  tests the joint-limit constraint: both are run and reported;
+* the release window (``src/eval/bowl_fit.py`` ``release_window``): the share of the TCP disc
+  over the bowl floor (radius floor - cube half) inside the box after the 5 mm tolerance, and its
+  inscribed radius. The oracle releases at the centre; a learned or teleop release off centre that
+  leaves the box is rejected, so this decides how much of the success region the filter allows;
+* the box margin with BOTH TCP offsets: the search's (measured at the frozen bowl, 9.3 mm, used
+  for feasibility) and the candidate's own measured one.
+
 ``--search`` adds the constrained re-derivation: the analytic rule of ``protocol_real.derive_bowl``
 (slot separation >= MIN_SEP + 5 mm against all 36 slots, base keep-out + 5 mm, reach - 5 mm) PLUS
 the safety filter's workspace box, shrunk by the 5 mm placement tolerance and by the oracle's
 measured TCP-to-bowl offset at lower / release / retreat. When nothing passes it reports the
-closest options and what each violates, each verified through the filter. Nothing here loosens
-the safety filter.
+closest options and what each violates, ranks the box-kept options by separation AND by release
+window, and verifies each option through the filter with both IK variants (joint margins and
+bowl-phase clips as reported constraints). Nothing here loosens the safety filter.
+
+Not modelled: collisions. The separation figures are centre distances; the jaw-to-rim clearance
+of a grasp at the nearest slot (open jaws, any yaw, the 5 mm tolerance) is NOT checked here.
 
     uv run scripts/wo07_bowl_check.py --preset real                    # the frozen bowl
     uv run scripts/wo07_bowl_check.py --preset real --search           # + constrained search
@@ -55,9 +74,11 @@ from src.config import CONFIG_DIR, Config, add_config_args, load_config
 from src.data import oracle as O
 from src.env import success as S
 from src.env.kinematics import ArmKinematics
+from src.eval import bowl_fit as BF
 from src.eval import protocol_real as PR
 from src.eval import real_grid as G
 from src.robot.safety import FkFn, SafetyFilter, load_sim_fk, make_safety
+from src.robot.units import ARM_JOINTS
 from src.runs import RUNS_DIR, Run, new_run_id
 
 PHASES = ("hover", "descend", "close", "lift", "carry", "lower", "release", "retreat")
@@ -67,6 +88,15 @@ GRIP_HOLD_RAD = 0.15  # the gripper reads at least this while it holds the cube
 MAX_STEPS = 700
 BOX_MARGIN_M = PR.BOWL_MARGIN_M  # the operator's placement tolerance (5 mm), as derive_bowl
 STATUS_ORDER = {"pass": 0, "clip(gripper floor)": 1, "clip": 2, "reject": 3, "not reached": 4}
+CARRY_AND_BOWL = ("carry", *BOWL_PHASES)
+RELEASE_RADIUS_M = S.BOWL_FLOOR_RADIUS - CUBE_HALF_M  # TCP over the floor, the cube inside it
+# the sim bowl's outer rim radius (floor + tilted wall + wall thickness) and a 3 cm cube's corner
+RIM_RADIUS_M = (
+    S.BOWL_FLOOR_RADIUS
+    + S.BOWL_WALL_HEIGHT * math.tan(math.radians(S.BOWL_WALL_TILT_DEG))
+    + S.BOWL_WALL_THICKNESS
+)
+CUBE_CORNER_M = CUBE_HALF_M * math.sqrt(2.0)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -219,6 +249,9 @@ def verify(
     clip_slots: dict[str, set[str]] = {}
     outside_m: dict[str, float] = {}  # phase -> largest TCP distance outside the box (rejects)
     tcp_bowl_off = 0.0
+    lim_lo = np.degrees(np.array(filt.config.lower_rad[:5], dtype=np.float64))
+    lim_hi = np.degrees(np.array(filt.config.upper_rad[:5], dtype=np.float64))
+    joint_margin = {j: 1e9 for j in ARM_JOINTS}  # deg, requested arm joints, carry + bowl phases
     box_margin = {"x_lo": 1.0, "x_hi": 1.0, "y_lo": 1.0, "y_hi": 1.0, "z_lo": 1.0, "z_hi": 1.0}
     bowl_box_margin = dict(box_margin)
     reached = torch.zeros(len(rows), dtype=torch.bool)
@@ -268,6 +301,11 @@ def verify(
             if nm in BOWL_PHASES:
                 d = float(np.linalg.norm(pc[:2] - np.array(bowl)))
                 tcp_bowl_off = max(tcp_bowl_off, d)
+            if nm in CARRY_AND_BOWL:
+                qd = np.degrees(q_cmd[i, :5].double().numpy())
+                for j, name in enumerate(ARM_JOINTS):
+                    jm = float(min(qd[j] - lim_lo[j], lim_hi[j] - qd[j]))
+                    joint_margin[name] = min(joint_margin[name], jm)
             if nm == "retreat":
                 reached[i] = True
         scene.step(q_cmd, names)
@@ -302,6 +340,14 @@ def verify(
             tag: {"max_deg": round(v, 2), "slots": sorted(clip_slots[tag])}
             for tag, v in sorted(clip_deg.items())
         },
+        "bowl_phase_clips": {
+            tag: {"max_deg": round(v, 2), "slots": len(clip_slots[tag])}
+            for tag, v in sorted(clip_deg.items())
+            if tag.split(" ")[0] in CARRY_AND_BOWL and not tag.endswith(":gripper")
+        },
+        "joint_margin_bowl_phases_deg": {
+            j: round(v, 2) for j, v in joint_margin.items() if v < 1e8
+        },
         "reject_max_outside_box_m": {k: round(v, 4) for k, v in outside_m.items()},
         "passes_carry_and_bowl_phases": bowl_ok,
         "tcp_to_bowl_max_m": round(tcp_bowl_off, 4),
@@ -326,6 +372,9 @@ def analytic(bowl: Sequence[float]) -> dict[str, float]:
         "sep_margin_m": round(d - (k["min_sep_m"] + m), 4),
         "keepout_margin_m": round(r - (k["bowl_keepout_m"] + m), 4),
         "reach_margin_m": round(k["reach_m"] - m - r, 4),
+        # CUBE ONLY (no gripper, no collision model): the rim to the nearest cube's corner at any
+        # yaw, the bowl placed 5 mm closer. The open jaws reach further: not checked here.
+        "cube_rim_clearance_m": round(d - RIM_RADIUS_M - CUBE_CORNER_M - m, 4),
     }
 
 
@@ -352,19 +401,13 @@ def central_slot_for(bowl: Sequence[float]) -> dict[str, Any]:
 
 def box_margin(bowl: Sequence[float], cfg: Config, tcp_off: float) -> float:
     """Smallest margin (m) of the bowl centre to the workspace box's x / y faces, after the 5 mm
-    placement tolerance and the oracle's TCP-to-bowl offset (>= 0 passes)."""
-    box = cfg["robot"]["safety"]["workspace_box_m"]
-    x, y = float(bowl[0]), float(bowl[1])
-    pad = BOX_MARGIN_M + tcp_off
-    return round(
-        min(
-            x - float(box["x"][0]) - pad,
-            float(box["x"][1]) - x - pad,
-            y - float(box["y"][0]) - pad,
-            float(box["y"][1]) - y - pad,
-        ),
-        4,
-    )
+    placement tolerance and the oracle's TCP-to-bowl offset (>= 0 passes;
+    ``src/eval/bowl_fit.py``, shared with the hardware preflights)."""
+    return round(BF.box_margin(bowl, BF.workspace_box(cfg), tcp_off), 4)
+
+
+def release_window(bowl: Sequence[float], cfg: Config, n: int = 241) -> dict[str, float]:
+    return BF.release_window(bowl, BF.workspace_box(cfg), RELEASE_RADIUS_M, n)
 
 
 def search(cfg: Config, tcp_off: float) -> dict[str, Any]:
@@ -385,6 +428,7 @@ def search(cfg: Config, tcp_off: float) -> dict[str, Any]:
                     "xy": (float(x), float(y)),
                     **a,
                     "box_margin_m": box_margin((x, y), cfg, tcp_off),
+                    "release_window_inside": release_window((x, y), cfg, 61)["inside_fraction"],
                     "grid_centre_m": round(float(np.linalg.norm(np.array([x, y]) - centre)), 4),
                 }
             )
@@ -406,6 +450,15 @@ def search(cfg: Config, tcp_off: float) -> dict[str, Any]:
         (r for r in rows if ok(r, ("sep_margin_m",))),
         key=lambda r: (-r["sep_margin_m"], r["grid_centre_m"], -r["xy"][1]),
     )
+    # the box kept, ranked by the release window, then separation (y >= 0: the mirror is equal)
+    w = sorted(
+        (
+            r
+            for r in rows
+            if ok(r, ("sep_margin_m",)) and r["xy"][1] >= 0 and r["cube_rim_clearance_m"] >= 0
+        ),
+        key=lambda r: (-r["release_window_inside"], -r["sep_margin_m"], r["grid_centre_m"]),
+    )
     c = sorted(
         (r for r in rows if ok(r, ("reach_margin_m", "keepout_margin_m"))),
         key=lambda r: (-min(r["reach_margin_m"], r["keepout_margin_m"]), r["grid_centre_m"]),
@@ -413,9 +466,127 @@ def search(cfg: Config, tcp_off: float) -> dict[str, Any]:
     out["closest"] = {
         "a_rule_kept_box_violated": a[:2],
         "b_box_kept_separation_short": b[:2],
+        "b2_box_kept_largest_release_window_cube_clear": w[:2],
         "c_sep_and_box_kept_reach_or_keepout_violated": c[:2],
     }
     return out
+
+
+def check_bowl(
+    cfg: Config,
+    b: Sequence[float],
+    slots: Sequence[str],
+    yaws: Sequence[float],
+    fk: FkFn,
+    lim: str,
+    search_off: float = BF.TCP_TO_BOWL_OFFSET_M,
+) -> dict[str, Any]:
+    """``verify`` plus the analytic margins, central slot, release window and the box margin
+    with both TCP offsets (the search's and this bowl's own)."""
+    bxy = (float(b[0]), float(b[1]))
+    v = verify(cfg, bxy, slots, yaws, fk, lim)
+    v["analytic"] = analytic(bxy)
+    v["central_slot"] = central_slot_for(bxy)
+    v["box_margin_m"] = box_margin(bxy, cfg, v["tcp_to_bowl_max_m"])
+    v["box_margin_search_offset_m"] = box_margin(bxy, cfg, search_off)
+    v["box_face_margins_m"] = BF.face_margins(bxy, BF.workspace_box(cfg), search_off)
+    v["release_window"] = release_window(bxy, cfg)
+    return v
+
+
+def verify_options(
+    cfg: Config,
+    out: dict[str, Any],
+    slots: Sequence[str],
+    yaws: Sequence[float],
+    fk: FkFn,
+    off: float,
+) -> list[dict[str, Any]]:
+    """Every distinct closest option of the search (and the bowls already checked), verified
+    through the filter with BOTH IK variants: one row per option."""
+    done = {(tuple(v["bowl_xy_m"]), v["ik_limits"]): v for v in out["results"]}
+    seen: list[tuple[float, float]] = [tuple(v["bowl_xy_m"]) for v in out["results"]]
+    for rows in (out["search"].get("closest") or {}).values():
+        for r in rows:
+            xy = (round(float(r["xy"][0]), 4), round(float(r["xy"][1]), 4))
+            if xy not in seen:
+                seen.append(xy)
+    opts = []
+    for xy in dict.fromkeys(seen):
+        per = {}
+        for lim in ("safety", "urdf"):
+            v = done.get((xy, lim)) or check_bowl(cfg, xy, slots, yaws, fk, lim, off)
+            done[(xy, lim)] = v
+            per[lim] = v
+        a = per["safety"]["analytic"]
+        violates = [
+            k.replace("_margin_m", "")
+            for k in ("sep_margin_m", "keepout_margin_m", "reach_margin_m")
+            if a[k] < 0
+        ]
+        if per["safety"]["box_margin_search_offset_m"] < 0:
+            violates.append("box")
+        urdf_joint = {j: m for j, m in per["urdf"]["joint_margin_bowl_phases_deg"].items() if m < 0}
+        if urdf_joint:
+            violates.append("joint limits (urdf IK)")
+        opts.append(
+            {
+                "bowl_xy_m": list(xy),
+                "violates": violates,
+                "min_slot_distance_m": a["min_slot_distance_m"],
+                "sep_margin_m": a["sep_margin_m"],
+                "cube_rim_clearance_m": a["cube_rim_clearance_m"],
+                "box_margin_search_offset_m": per["safety"]["box_margin_search_offset_m"],
+                "box_margin_own_offset_m": per["safety"]["box_margin_m"],
+                "tcp_offset_own_m": per["safety"]["tcp_to_bowl_max_m"],
+                "box_face_margins_m": per["safety"]["box_face_margins_m"],
+                "release_window": per["safety"]["release_window"],
+                "filter_safety_ik": _verdict(per["safety"]),
+                "filter_urdf_ik": _verdict(per["urdf"]),
+                "urdf_bowl_phase_clips": per["urdf"]["bowl_phase_clips"],
+                "urdf_joint_margin_deg": per["urdf"]["joint_margin_bowl_phases_deg"],
+                "placed": per["safety"]["cube_released_over_bowl_floor"],
+                "central_slot": per["safety"]["central_slot"]["central_slot"],
+            }
+        )
+    return opts
+
+
+def _verdict(v: dict[str, Any]) -> str:
+    """Worst carry / bowl-phase status, the gripper floor clip counted as a pass."""
+    worst = max((v["worst_by_phase"][p] for p in CARRY_AND_BOWL), key=STATUS_ORDER.__getitem__)
+    return "pass" if STATUS_ORDER[worst] <= 1 else worst
+
+
+def options_table(opts: Sequence[dict[str, Any]]) -> str:
+    head = (
+        "| bowl xy (m) | violates | nearest slot (rim-cube clearance, cube only) | box margin "
+        "(search / own TCP offset) | "
+        "release window inside / inscribed | filter, safety IK | filter, urdf IK (bowl-phase "
+        "clips) | placed | central |"
+    )
+    lines = [
+        head,
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for o in opts:
+        rw = o["release_window"]
+        clips = ", ".join(  # joint limits only: a reject's later step clips are in the record
+            f"{t} {c['max_deg']} deg x{c['slots']}"
+            for t, c in o["urdf_bowl_phase_clips"].items()
+            if "joint_limit" in t
+        )
+        lines.append(
+            f"| ({o['bowl_xy_m'][0]:.3f}, {o['bowl_xy_m'][1]:.3f}) | "
+            f"{', '.join(o['violates']) or 'none'} | {100 * o['min_slot_distance_m']:.2f} cm "
+            f"({100 * o['cube_rim_clearance_m']:+.2f} cm) | "
+            f"{100 * o['box_margin_search_offset_m']:+.2f} / {100 * o['box_margin_own_offset_m']:+.2f}"
+            f" cm ({1000 * o['tcp_offset_own_m']:.1f} mm) | {100 * rw['inside_fraction']:.0f}% / "
+            f"{1000 * rw['inscribed_radius_m']:.0f} mm | {o['filter_safety_ik']} | "
+            f"{o['filter_urdf_ik']}{f' ({clips})' if clips else ''} | {o['placed']} | "
+            f"{o['central_slot']} |"
+        )
+    return "\n".join(lines)
 
 
 def _fmt_table(v: dict[str, Any]) -> str:
@@ -462,10 +633,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         run_id=new_run_id("WO-07", f"bowl-check-{args.preset}"),
     ) as run:
         for b, lim in [(b, lim) for b in bowls for lim in args.ik_limits]:
-            v = verify(cfg, (float(b[0]), float(b[1])), slots, yaws, fk, lim)
-            v["analytic"] = analytic(b)
-            v["central_slot"] = central_slot_for(b)
-            v["box_margin_m"] = box_margin(b, cfg, v["tcp_to_bowl_max_m"])
+            v = check_bowl(cfg, b, slots, yaws, fk, lim)
             out["results"].append(v)
             print(
                 f"\nbowl {v['bowl_xy_m']} (oracle IK limits: {lim}): {v['analytic']}, box margin "
@@ -482,6 +650,11 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
                     f"  clip {tag}: max {c['max_deg']} deg at {len(c['slots'])} slots {c['slots']}"
                 )
             print(f"  rejects: max TCP outside the box {v['reject_max_outside_box_m']}")
+            print(
+                f"  release window {v['release_window']}; bowl-phase clips "
+                f"{v['bowl_phase_clips'] or 'none'}; joint margins (deg) "
+                f"{v['joint_margin_bowl_phases_deg']}"
+            )
         if args.search:
             # the offset measured at the FIRST bowl (the frozen one by default): a far candidate
             # the IK cannot reach exactly would inflate it for every position
@@ -490,6 +663,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             print(f"\nsearch (TCP offset {off} m): passing {out['search']['passing']}")
             for k, r in (out["search"].get("closest") or {}).items():
                 print(f"  {k}: {r}")
+            out["options"] = verify_options(cfg, out, slots, yaws, fk, off)
+            print("\n" + options_table(out["options"]))
         out["central_slot"] = PR.central_slot()
         run.results["bowl_check"] = out
     return out

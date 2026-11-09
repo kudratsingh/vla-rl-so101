@@ -74,6 +74,24 @@ def test_tiny_act_train_save_reload(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert not chk["explicit_noise"] and chk["rename_map"] == {}  # ACT reads the dataset keys
 
 
+def test_batch_deviation_is_recorded_before_training(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A run at a batch other than the configured one says so in its record even when it never
+    finishes (stopped, OOM, killed): the field is written before the first step (review)."""
+
+    def stopped(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("pod stopped partway")
+
+    monkeypatch.setattr(wo07, "train", stopped)
+    with pytest.raises(RuntimeError, match="stopped partway"):
+        _main(monkeypatch, tmp_path, "--preset", "tiny", "--policy", "act", "--batch-size", "1")
+    (record,) = tmp_path.glob("*/record.json")
+    dev = json.loads(record.read_text())["results"]["batch_deviation"]
+    assert dev["batch_size"] == 1 and dev["reference_batch_size"] != 1
+    assert dev["fraction_of_reference_samples"] < 1
+
+
 def _smolvla_available() -> bool:
     from huggingface_hub import try_to_load_from_cache
 

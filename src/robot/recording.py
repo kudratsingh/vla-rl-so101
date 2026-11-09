@@ -60,7 +60,10 @@ Evaluation capture (``EvalCapture``), one dataset per evaluation session, one ep
   at the session end only when the process lived to run it), a kill while staging (no
   ``staged.json``), a capture error, or a lost / damaged journal. Such a trial is flagged
   ``recording_missing`` (scripts/wo07_real_eval.py ``reconcile_captures``) and its export is
-  refused as complete (``src/eval/export_bundle.py``).
+  refused as complete (``src/eval/export_bundle.py``). A recovery that fails while the journal is
+  whole (e.g. a transient save error) is NOT flagged: the journal stays and the next resume
+  retries it (``recovery_failed``). A started trial that no policy write reached (frames 0, no
+  capture error: the first write faulted) has no recording to miss (``recording_required``).
 """
 
 from __future__ import annotations
@@ -94,6 +97,30 @@ RECOVERED_FROM_STAGE = (
     "staged capture: the run ended after the scored record and before the episode was saved; "
     "rebuilt from the journal written before the record (same frames, same pixels)"
 )
+
+
+NO_POLICY_WRITE = "no policy write was recorded"  # nothing reached the capture: no episode
+STAGED_UNREADABLE = "staged journal unreadable"  # damaged: flagged, never retried or guessed
+SCORED_OUTCOMES = ("success", "failure")
+
+
+def recording_required(t: Mapping[str, Any]) -> bool:
+    """A scored trial (its policy started) needs its episode: the export refuses without one
+    (owner 2026-11-09). Except a trial no policy write ever reached the capture of (frames 0,
+    no capture error: e.g. the first write faulted on the bus before the frame was taken): it
+    cannot have a recording, and is listed as an uncaptured started trial instead. The ONE rule
+    of ``scripts/wo07_real_eval.py`` (reconcile / gaps) and ``src/eval/export_bundle.py``."""
+    if not t.get("policy_started") or t.get("outcome") not in SCORED_OUTCOMES:
+        return False
+    cap = t.get("capture") or {}
+    if cap.get("episode_index") is not None:
+        return True
+    # the save's verdict, or the stage's (a kill between the record and the save: the stage ran
+    # in the record hook, after the trial's last write)
+    return not any(
+        b.get("reason") == NO_POLICY_WRITE and not b.get("frames") and not b.get("error")
+        for b in (cap, cap.get("stage") or {})
+    )
 
 
 def staged_name(trial_id: str) -> str:
@@ -577,8 +604,17 @@ class EvalCapture:
         cur = self._open
         if cur is None:
             return {"staged": None, "reason": "no capture was open"}
-        if not rec.get("policy_started") or cur["frames"] == 0 or cur["error"] is not None:
-            return {"staged": None, "reason": "nothing to save"}
+        if not rec.get("policy_started"):
+            return {"staged": None, "reason": "not started: nothing to save"}
+        if cur["error"] is not None:
+            return {
+                "staged": None,
+                "reason": f"capture error: {cur['error']}",
+                "frames": int(cur["frames"]),
+                "error": cur["error"],
+            }
+        if cur["frames"] == 0:  # the trial is over (record hook): no write will follow
+            return {"staged": None, "reason": NO_POLICY_WRITE, "frames": 0}
         if self.broken is not None:
             return {"staged": None, "reason": f"capture stopped: {self.broken}"}
         t0 = time.perf_counter()
@@ -723,7 +759,7 @@ class EvalCapture:
             return {
                 "trial_id": trial_id,
                 "episode_index": None,
-                "reason": "staged journal unreadable",
+                "reason": STAGED_UNREADABLE,
                 "error": f"{type(e).__name__}: {e}",
             }
         return self.finish({"policy_started": True})
@@ -745,7 +781,7 @@ class EvalCapture:
         elif cur["error"] is not None:
             why = f"capture error: {cur['error']}"
         elif cur["frames"] == 0:
-            why = "no policy write was recorded"
+            why = NO_POLICY_WRITE
         if why is not None:
             self._open = cur
             self._discard()

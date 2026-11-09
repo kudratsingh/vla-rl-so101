@@ -42,7 +42,10 @@ complete evaluation bundle is REFUSED. ``allow_missing_recordings`` builds one a
 ``protocol_version`` ``real-0.1-incomplete`` (the same in-spec mechanism as ``-dev``: the sealed
 declaration itself says it is not the full evaluation), with ``status: INCOMPLETE`` and the
 missing trials in ``bundle.json`` and ``trials.json``. Episodes are never dropped or re-mapped:
-each one keeps the trial id the capture provenance gave it.
+each one keeps the trial id the capture provenance gave it. A started trial that no policy write
+reached (the first write faulted: frames 0, no capture error) cannot have a recording: it is
+listed under ``uncaptured_started_trials`` and does not make the export incomplete
+(``recording.recording_required``, review F2).
 
 Nothing is guessed: a missing or unknown value refuses the export (``ExportRefused``).
 ``validate_bundle`` mirrors the importer's checks of the declaration, the LeRobot tables and the
@@ -774,20 +777,24 @@ def build_eval_bundle(
 def missing_recordings(
     trials: Sequence[Mapping[str, Any]], capture_root: Path
 ) -> list[dict[str, Any]]:
-    """Scored trials (policy started) with no episode index: ``recoverable_on_resume`` when a
-    whole staged journal exists under ``capture_root`` (a resume saves it), else
-    ``recording_missing``."""
-    from src.robot.recording import has_staged
+    """Scored trials that need a recording (``recording.recording_required``: not one no policy
+    write reached, which is listed under ``uncaptured_started_trials`` only) with no episode
+    index: ``recording_missing`` when flagged (no journal, or a damaged one) or nothing is
+    staged, else ``recoverable_on_resume`` (a whole staged journal under ``capture_root``: a
+    resume saves it). The same classification as ``wo07_real_eval.capture_gaps``."""
+    from src.robot.recording import has_staged, recording_required
 
     out = []
     for t in trials:
         cap = t.get("capture") or {}
-        if not t.get("policy_started") or t.get("outcome") not in ("success", "failure"):
-            continue
-        if cap.get("episode_index") is not None:
+        if not recording_required(t) or cap.get("episode_index") is not None:
             continue
         tid = t.get("trial_id")
-        staged = tid is not None and has_staged(capture_root, str(tid))
+        staged = (
+            not cap.get("recording_missing")
+            and tid is not None
+            and has_staged(capture_root, str(tid))
+        )
         out.append(
             {
                 "trial_id": tid,

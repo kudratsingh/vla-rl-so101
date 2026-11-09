@@ -646,6 +646,11 @@ def _run(
             protocol=ds_info["protocol"],
             vlm=vlm,
         )
+        # written BEFORE training (review): a run that OOMs, is stopped or killed partway still
+        # says in its record that it ran at a batch other than the configured one
+        dev = batch_deviation(block, int(block["steps"]) if args.probe else steps, batch)
+        if dev is not None:  # e.g. SmolVLA at batch 32: half the samples of batch 64
+            run.results["batch_deviation"] = dev
         run.flush()
         t0 = time.monotonic()
         try:
@@ -680,9 +685,7 @@ def _run(
         )
         est = projection(cfg, block, step_s, batch)
         run.results["projection_full_run"] = est
-        dev = batch_deviation(block, int(block["steps"]) if args.probe else steps, batch)
-        if dev is not None:  # e.g. SmolVLA at batch 32: half the samples of batch 64
-            run.results["batch_deviation"] = dev
+        if dev is not None:
             print(f"[batch] {dev['note']}")
         check: dict[str, Any] = {"ok": True}
         if args.probe:

@@ -32,6 +32,10 @@ PLANNED pose); a redo keeps the same placement; ``meta/vla_rl_so101.json`` maps 
 to its placement and cites the protocol hash, the session id, the time, the follower id and the
 calibration copied to ``meta/calibration_follower.json`` (what ``scripts/wo07_export_bundle.py
 demo`` needs; it refuses a dataset recorded without ``--demo-schedule``).
+The bowl is PENDING (owner 2026-11-09): the frozen bowl lies outside the safety filter's TCP
+workspace box once the placement tolerance and the oracle's TCP offset are counted, so every carry
+would be rejected; ``--demo-schedule`` refuses before anything opens while that holds
+(``src/eval/bowl_fit.py`` ``bowl_box_problem``, ``scripts/wo07_bowl_check.py``).
 
 Durable and resumable (review F1 / F5). Every kept episode is saved, its placement written to
 ``meta/vla_rl_so101.json``, then the dataset is finalized and reopened (``src/robot/recording.py``
@@ -119,6 +123,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.config import add_config_args, load_config
 from src.data.recorder import datasets_write_compat
 from src.eval import protocol_real as PR
+from src.eval.bowl_fit import bowl_box_problem
 from src.eval.protocol import (
     PROTOCOL_VERSION,
     RED_CUBE,
@@ -850,6 +855,9 @@ def main() -> None:
         if tasks != [PR.TASK]:
             sys.exit(f"--demo-schedule records {PR.TASK} only: pass --task {PR.TASK}")
         placements = PR.demo_schedule()
+        bowl = bowl_box_problem(cfg)  # every demo carries to the bowl (owner 2026-11-09)
+        if bowl is not None:
+            sys.exit(f"refusing the real-0.1 demo schedule; nothing was opened: {bowl}")
         n_eps = 1 if args.rehearsal else int(args.episodes or len(placements))
         if not 1 <= n_eps <= len(placements):
             sys.exit(f"--episodes must be in [1, {len(placements)}] with --demo-schedule")

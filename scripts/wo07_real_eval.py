@@ -187,6 +187,7 @@ from src.eval import protocol as P1
 from src.eval import protocol_real as PR
 from src.eval import protocol_v02 as P2
 from src.eval import real_grid as G
+from src.eval.bowl_fit import bowl_box_problem
 from src.robot import convention as conv
 from src.robot.camera import (
     CameraRig,
@@ -215,10 +216,13 @@ from src.robot.client import (
 from src.robot.driver import So101Driver
 from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals, require_terminal
 from src.robot.recording import (
+    NO_POLICY_WRITE,
+    STAGED_UNREADABLE,
     EvalCapture,
     RigFrameSource,
     check_capture_resumable,
     has_staged,
+    recording_required,
 )
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
@@ -522,7 +526,13 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     plus every ``trial_started`` row without its trial: the policy started and the process died
     before the trial was recorded (killed, crashed, power lost). That row is the record as it
     stood at the start, a FAILURE with fault kind ``session_lost``: the started slot is done and
-    is never re-run (real-judge-2)."""
+    is never re-run (real-judge-2).
+
+    Rows are keyed by (cell, trial_idx, start_utc, attempt): ``start_utc`` has one-second
+    resolution, so a not-started attempt and its in-place retry can share it (review F4). A
+    ``capture`` row is merged only into a STARTED record of the same key (a not-started attempt
+    never has an episode). A real-0.1 record without ``trial_id`` (rows written before the
+    start marker carried it) gets the one ``trial_id()`` derives (review F1)."""
     rec_path = run_dir / "record.json"
     if not rec_path.is_file():
         sys.exit(f"--resume: no {rec_path}")
@@ -533,7 +543,7 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if prior_run_torque_off_unconfirmed(results):  # carried by every later run of the session
         settings["prior_torque_off_unconfirmed"] = True
     trials: list[dict[str, Any]] = list(results.get("trials") or [])
-    seen = {(t["cell"], t["trial_idx"], t["start_utc"]) for t in trials}
+    seen = {_row_key(t) for t in trials}
     metrics = run_dir / "metrics.jsonl"
     started: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
     captures: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
@@ -544,11 +554,11 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             except ValueError:  # a line cut short by the kill
                 continue
             if row.get("kind") == "capture":  # the episode saved after the trial's record
-                captures[(row["cell"], row["trial_idx"], row["start_utc"])] = row["capture"]
+                captures[_row_key(row)] = row["capture"]
                 continue
             if row.get("kind") not in ("trial", "trial_started"):
                 continue
-            key = (row["cell"], row["trial_idx"], row["start_utc"])
+            key = _row_key(row)
             rec = {k: v for k, v in row.items() if k not in ("kind", "t", "step")}
             if row["kind"] == "trial_started":
                 started.setdefault(key, rec)
@@ -563,11 +573,23 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 "has no record (the run ended mid-trial): scored a FAILURE (session_lost)"
             )
             trials.append(rec)
+    real = settings.get("protocol_id") == PR.PROTOCOL_VERSION and settings.get("session_id")
     for t in trials:
-        got = captures.get((t["cell"], t["trial_idx"], t["start_utc"]))
-        if got is not None and (t.get("capture") or {}).get("episode_index") is None:
+        if real and t.get("trial_id") is None:
+            t["trial_id"] = trial_id(str(settings["session_id"]), t["cell"], t["trial_idx"])
+        got = captures.get(_row_key(t))
+        if (
+            got is not None
+            and t.get("policy_started")
+            and (t.get("capture") or {}).get("episode_index") is None
+        ):
             t["capture"] = got
     return settings, trials
+
+
+def _row_key(row: Mapping[str, Any]) -> tuple[Any, Any, Any, Any]:
+    """A trial / attempt's key in the session's rows (``load_prior``)."""
+    return (row["cell"], row["trial_idx"], row["start_utc"], row.get("attempt"))
 
 
 def prior_run_torque_off_unconfirmed(results: dict[str, Any]) -> bool:
@@ -1038,7 +1060,9 @@ def _run_schedule(
                 on_trial_start=start,
                 indices=[k],
                 placement_fn=place,
-                record_extra={**base, "schedule_pos": pos, "attempt": attempt},
+                # trial_id in every row, the start marker too: a session_lost record is
+                # staged at the session end and recovered by its id (review F1)
+                record_extra={**base, "schedule_pos": pos, "attempt": attempt, "trial_id": tid},
                 settle_s=float(settings["settle_s"]),
                 object_fn=lambda _k, obj=obj: obj,
                 record_hook=hook,
@@ -1073,13 +1097,9 @@ def save_capture(capture: EvalCapture, rec: dict[str, Any], log_row: Callable[..
         cell=rec["cell"],
         trial_idx=rec["trial_idx"],
         start_utc=rec["start_utc"],
+        attempt=rec.get("attempt"),
         capture=block,
     )
-
-
-def _needs_recording(t: Mapping[str, Any]) -> bool:
-    """A scored trial (its policy started) needs an episode: the export refuses without one."""
-    return bool(t.get("policy_started")) and t.get("outcome") in SCORED
 
 
 def reconcile_captures(
@@ -1091,11 +1111,16 @@ def reconcile_captures(
     1. its trial id is in the capture provenance: the episode was saved, the run ended before
        its ``capture`` row; attached (``filled_from``);
     2. else its staged journal is whole: the episode is rebuilt and saved under the next free
-       index (``recording.EvalCapture.recover_staged``; ``recovered`` says so);
-    3. else it is flagged ``recording_missing`` with the reason (its score stands; the export
-       refuses a complete bundle).
+       index (``recording.EvalCapture.recover_staged``; ``recovered`` says so); a recovery that
+       fails with the journal still whole and readable (e.g. a transient save error) is
+       ``recovery_failed``: NOT flagged, the journal stays and the next resume retries it
+       (review F3);
+    3. else (no journal, or a damaged one) it is flagged ``recording_missing`` with the reason
+       (sticky: its score stands; the export refuses a complete bundle).
 
-    Each result is logged as a ``capture`` row (merged by ``load_prior``). Returns what it did."""
+    Only trials that need a recording (``recording.recording_required``: not a trial no policy
+    write reached). Each result is logged as a ``capture`` row (merged by ``load_prior``).
+    Returns what it did."""
     by_tid: dict[str, int] = {}
     entries = capture.provenance.get("episodes") or {}
     for idx, entry in entries.items():
@@ -1114,10 +1139,15 @@ def reconcile_captures(
         for t in trials
         if (t.get("capture") or {}).get("episode_index") is not None
     }
-    out: dict[str, list[Any]] = {"attached": [], "recovered": [], "recording_missing": []}
+    out: dict[str, list[Any]] = {
+        "attached": [],
+        "recovered": [],
+        "recovery_failed": [],
+        "recording_missing": [],
+    }
     for t in trials:
         cap = t.get("capture") or {}
-        if not _needs_recording(t) or cap.get("episode_index") is not None:
+        if not recording_required(t) or cap.get("episode_index") is not None:
             continue
         if cap.get("recording_missing"):
             out["recording_missing"].append(t.get("trial_id"))
@@ -1137,7 +1167,21 @@ def reconcile_captures(
             out["attached"].append(tid)
         else:
             block = capture.recover_staged(tid)
-            if block.get("episode_index") is None:
+            if (
+                block.get("episode_index") is None
+                and block.get("reason") != STAGED_UNREADABLE
+                and has_staged(capture.root, tid)
+            ):
+                block = {
+                    "trial_id": tid,
+                    "episode_index": None,
+                    "recovery_failed": True,
+                    "reason": "recovery failed; the staged journal is kept: a resume retries it "
+                    f"({block.get('reason')})",
+                    **({"error": block["error"]} if block.get("error") else {}),
+                }
+                out["recovery_failed"].append(tid)
+            elif block.get("episode_index") is None:
                 block = {
                     "trial_id": tid,
                     "episode_index": None,
@@ -1157,6 +1201,7 @@ def reconcile_captures(
             cell=t["cell"],
             trial_idx=t["trial_idx"],
             start_utc=t["start_utc"],
+            attempt=t.get("attempt"),
             capture=block,
         )
     if any(out.values()):
@@ -1166,27 +1211,53 @@ def reconcile_captures(
 
 def stage_unsaved(capture: EvalCapture, trials: Sequence[dict[str, Any]]) -> None:
     """At the session end: a trial whose episode is still open (the session ended between its
-    start and its save, e.g. a crash after the policy started) is staged, so a resume recovers it
-    instead of flagging it missing. Never raises."""
+    start and its save, e.g. a client error after the policy started: its ``session_lost``
+    record carries its trial id, review F1) is staged, so a resume recovers it instead of
+    flagging it missing; one no policy write reached gets the no-write capture block (it has no
+    recording to miss). Never raises."""
     cur = capture.open_episode
-    if cur is None or not cur[1]:
+    if cur is None:
         return
     for t in reversed(trials):
-        if t.get("trial_id") == cur[0] and _needs_recording(t):
-            if (t.get("capture") or {}).get("episode_index") is None:
-                capture.stage(t)  # never raises
+        if t.get("trial_id") != cur[0]:
+            continue
+        cap = t.get("capture") or {}
+        if not t.get("policy_started") or t.get("outcome") not in SCORED:
             return
+        if cap.get("episode_index") is not None:
+            return
+        st = capture.stage(t)  # never raises
+        if st.get("staged") is None and st.get("reason") == NO_POLICY_WRITE:
+            t["capture"] = {
+                "trial_id": cur[0],
+                "episode_index": None,
+                "frames": 0,
+                "reason": NO_POLICY_WRITE,
+                "error": None,
+            }
+        else:
+            t["capture"] = {
+                **cap,
+                "trial_id": cur[0],
+                "episode_index": None,
+                "reason": cap.get("reason") or "the session ended before the episode was saved",
+                "stage": st,
+            }
+        return
 
 
 def capture_gaps(root: Path, trials: Sequence[dict[str, Any]]) -> dict[str, list[Any]]:
-    """Scored trials without an episode: ``recoverable_on_resume`` (a whole staged journal) and
-    ``recording_missing`` (none: flagged, or nothing staged)."""
+    """Scored trials that need a recording (``recording.recording_required``) without an
+    episode: ``recording_missing`` (flagged: no journal or a damaged one; or nothing staged) and
+    ``recoverable_on_resume`` (a whole staged journal, never flagged). The same classification
+    as ``export_bundle.missing_recordings``."""
     out: dict[str, list[Any]] = {"recoverable_on_resume": [], "recording_missing": []}
     for t in trials:
-        if not _needs_recording(t) or (t.get("capture") or {}).get("episode_index") is not None:
+        cap = t.get("capture") or {}
+        if not recording_required(t) or cap.get("episode_index") is not None:
             continue
         tid = t.get("trial_id")
-        if tid is not None and has_staged(root, str(tid)):
+        if not cap.get("recording_missing") and tid is not None and has_staged(root, str(tid)):
             out["recoverable_on_resume"].append(tid)
         else:
             out["recording_missing"].append(tid)
@@ -1626,8 +1697,11 @@ def run(
         if settings["backend"] == "local"
         else mock_rig(cfg, args, fk)
     )
+    max_steps: int | None = args.max_steps
+    if max_steps is None and settings.get("protocol_id") == PR.PROTOCOL_VERSION:
+        max_steps = PR.TRIAL_MAX_STEPS  # the protocol's shared 450-command cap, as on the arm
     with rig as (loop, info, on_start, calibrated):
-        bind_session(cfg, settings, prior, resumed_from, loop.arm, info, loop.dcfg, args.max_steps)
+        bind_session(cfg, settings, prior, resumed_from, loop.arm, info, loop.dcfg, max_steps)
         return session(
             cfg,
             loop,
@@ -1637,7 +1711,7 @@ def run(
             settings=settings,
             prior_trials=prior,
             resumed_from=resumed_from,
-            max_steps=args.max_steps,
+            max_steps=max_steps,
             camera_calibrated=calibrated,
             runs_dir=args.runs_dir,
             on_trial_start=on_start,
@@ -1669,6 +1743,9 @@ def real_hardware_problems(cfg: Config, settings: dict[str, Any]) -> list[str]:
         out.append("--trials / --cells: a hardware session runs the whole frozen schedule")
     if not settings.get("capture"):
         out.append("the evaluation capture is required on the arm (final2 hardware floor)")
+    bowl = bowl_box_problem(cfg)  # the bowl is pending (owner 2026-11-09): no session at it
+    if bowl is not None:
+        out.append(bowl)
     return out
 
 
@@ -1850,7 +1927,11 @@ def main(argv: Sequence[str] | None = None) -> Path:
         "--resume", default=None, help="run id (or run dir) of the session to continue"
     )
     parser.add_argument(
-        "--max-steps", type=int, default=None, help="default deploy.trial_max_steps"
+        "--max-steps",
+        type=int,
+        default=None,
+        help=f"mock only. Default: real-0.1's shared cap of {PR.TRIAL_MAX_STEPS} policy commands "
+        "per trial (both policies); protocol 0.2 deploy.trial_max_steps",
     )
     parser.add_argument("--fake-clock", action="store_true", help="mock: instant, exact latency")
     parser.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=argparse.SUPPRESS)
@@ -1860,7 +1941,11 @@ def main(argv: Sequence[str] | None = None) -> Path:
             "WO-07 runs with --preset real (configs/real.yaml robot / deploy / eval blocks)"
         )
     if args.hardware and args.max_steps is not None:
-        parser.error("--max-steps is for mock runs; the real eval uses deploy.trial_max_steps")
+        parser.error(
+            f"--max-steps is for mock runs; the real eval's cap is fixed: real-0.1 "
+            f"{PR.TRIAL_MAX_STEPS} policy commands per trial (protocol 0.2: "
+            "deploy.trial_max_steps)"
+        )
     if args.hardware and args.no_capture:
         parser.error("--no-capture is for mock runs: every trial on the arm is captured")
     if args.hardware and args.protocol == PR.PROTOCOL_VERSION and args.slot_seed is not None:
