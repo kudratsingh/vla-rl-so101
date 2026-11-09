@@ -6,7 +6,7 @@ import importlib.util
 import math
 import signal
 import time
-from typing import Any
+from typing import Any, Self
 
 import numpy as np
 import pytest
@@ -497,8 +497,128 @@ def test_teleop_ctrl_z_mid_episode_continues_and_a_lost_foreground_ends_like_a_h
         saved = teleop.record_session(sess, data, ["Push"], instr, 1, 30.0, lambda im: im)
     out = capsys.readouterr().out
     assert saved == 0 and data.saved == 0  # the unsaved episode was discarded
-    assert data.frames == 6  # the Ctrl-Z did not stop it; the tick after the loss did
+    assert data.frames == 5  # the Ctrl-Z did not stop it; the loss stopped the next tick
     assert "episode ended" in out and "LOST THE TERMINAL'S FOREGROUND" in out
     assert sess.session_end == "released_unconfirmed" and sess.guard.released is not None
     assert sess.guard.released["cause"] == "lost_foreground"
     assert not fol.bus.torque_enabled and len(reader.calls) == 1  # only the scene prompt read
+
+
+def test_teleop_park_stops_at_once_after_a_lost_foreground(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review F4: with ``robot.park.enabled``, a session that lost the terminal's foreground
+    never parks (moves) at its end: the park's stop check sees the loss before the first step,
+    as in the pilot and the real eval; the support prompt then ends as ``lost_foreground``."""
+    from robot_fakes import FakeClock, FakeReader
+
+    from src.robot import prompts as P
+
+    monkeypatch.setattr(P, "not_foreground", lambda _fd: "pgrp 1 != 2")
+    sess, fol = _session(FakeLeader(wrist_flex=2.0), FakeCam())
+    park = (0.0, 0.0, 0.0, math.radians(10.0), 0.0, math.radians(5.0))
+    sess.park = ParkSettings(qpos=park, tol_rad=math.radians(1.0), timeout_s=5.0)
+    clock = FakeClock()
+    reader = FakeReader([], clock, fol.bus)
+
+    def read(prompt: str, timeout_s: float | None) -> str | None:
+        with P._reading():  # the real check timed_input makes before every read
+            return reader(prompt, timeout_s)
+
+    sess.guard = teleop.TorqueGuard(
+        sess.arm, teleop.TorqueWait(60.0, 10.0), read=read, clock=clock, sleep=clock.sleep
+    )
+    with P.job_control():
+        P.INTERRUPTS.tty_fd = 0  # as with stdin on the terminal (teleop.main's job_control)
+        end = teleop.end_session(sess.arm, sess)
+    out = capsys.readouterr().out
+    assert end == "released_unconfirmed" and "follower parked" not in out
+    assert sess.guard.released is not None and sess.guard.released["cause"] == "lost_foreground"
+    assert all(a["wrist_flex.pos"] == pytest.approx(0.0, abs=1e-6) for a in fol.sent)  # no park
+    assert not fol.bus.torque_enabled
+
+
+def test_teleop_main_ignores_ctrl_z_from_torque_on_until_its_record_is_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Review F4: teleop's own ``job_control`` in ``main`` covers the follower's torque enable,
+    the session, the TORQUE OFF UNCONFIRMED check and the provenance write after it; every
+    session handler is restored when ``main`` returns."""
+    import sys
+
+    from src.robot import prompts as P
+
+    seen: dict[str, bool] = {}
+
+    def in_session() -> bool:
+        return P.INTERRUPTS.job_control and callable(signal.getsignal(signal.SIGTSTP))
+
+    class MainFollower(FakeFollower):
+        def connect(self, calibrate: bool = True) -> None:
+            seen["torque_on"] = in_session()
+            super().connect(calibrate)
+
+    class Leader(FakeLeader):
+        is_calibrated, is_connected = True, False
+
+        def connect(self, calibrate: bool = False) -> None:
+            self.is_connected = True
+
+        def disconnect(self) -> None:
+            self.is_connected = False
+
+    class Dataset(FakeDataset):
+        num_episodes = 0
+
+        def finalize(self) -> None:
+            pass
+
+    class Cam(FakeCam):
+        def __init__(self, _cfg: Any) -> None:
+            super().__init__()
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    def record_session(sess: Any, *_a: Any) -> int:
+        seen["session"] = in_session()
+        sess.session_end = "supported"
+        return 0
+
+    real_unconfirmed = teleop._torque_off_unconfirmed
+
+    def torque_off_unconfirmed(arm: Any) -> bool:
+        seen.setdefault("record", in_session())  # the finally that writes the provenance
+        return bool(real_unconfirmed(arm))
+
+    cfg = real_cfg()
+    cfg["teleop"] = {**cfg["teleop"], "leader": {"type": "so101_leader"}}
+    monkeypatch.setattr(teleop, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(teleop, "require_terminal", lambda _what: None)
+    monkeypatch.setattr(teleop, "load_config", lambda *_a: cfg)
+    monkeypatch.setattr(teleop, "sim_mismatches", lambda *_a: [])
+    monkeypatch.setattr(teleop, "load_sim_fk", lambda: toy_fk)
+    monkeypatch.setattr(teleop, "make_leader", lambda _lc: Leader(wrist_flex=2.0))
+    monkeypatch.setattr(teleop, "OpenCVFrameSource", Cam)
+    monkeypatch.setattr(teleop, "record_session", record_session)
+    monkeypatch.setattr(teleop, "_torque_off_unconfirmed", torque_off_unconfirmed)
+    monkeypatch.setattr(
+        teleop.So101Driver,
+        "from_config",
+        classmethod(lambda cls, cfg, fk: cls(MainFollower(), UnitMap(), make_safety(cfg, toy_fk))),
+    )
+    import lerobot.datasets.lerobot_dataset as lds
+
+    monkeypatch.setattr(lds.LeRobotDataset, "create", staticmethod(lambda **_k: Dataset()))
+    monkeypatch.setattr(
+        sys, "argv", ["wo06_teleop_record.py", "--preset", "real", "--task", "Push"]
+    )
+    names = ("SIGINT", "SIGHUP", "SIGTERM", "SIGTSTP", "SIGTTIN", "SIGTTOU")
+    before = {n: signal.getsignal(getattr(signal, n)) for n in names}
+    teleop.main()
+    assert seen == {"torque_on": True, "session": True, "record": True}
+    assert {n: signal.getsignal(getattr(signal, n)) for n in names} == before
+    assert not P.INTERRUPTS.job_control

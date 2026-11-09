@@ -29,7 +29,7 @@
 
     uv run scripts/wo07_pilot.py --preset real --mock                     # real-time, ~1 min
     uv run scripts/wo07_pilot.py --preset real --mock --fake-clock --trials 3
-    uv run scripts/wo07_pilot.py --preset real --hardware --i-am-present  # owner at the arm
+    .venv/bin/python scripts/wo07_pilot.py --preset real --hardware --i-am-present  # owner at arm
 
 Writes runs/<id>/record.json (every trial record + the summary with Wilson intervals) and
 runs/<id>/metrics.jsonl (one row per decision and per trial). This is the Mac process (device

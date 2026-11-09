@@ -455,7 +455,8 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
     Ctrl-Z is only a notice; alternatives: disable the terminal's suspend character for the
     session (`termios` VSUSP, restored at the end; then ^Z reaches no process, but becomes an
     input byte the prompt reader must drop), or accept the session end. Not changed here (the
-    approved scope); `uv run` stays in the docs until the owner picks one.
+    approved scope). Superseded by the review round below: the docs now launch the hardware
+    scripts as `.venv/bin/python scripts/...` and the scripts warn under a launcher.
   - Tests: `tests/test_job_control.py` runs the real `--hardware` code of the pilot and the real
     eval (fakes for the follower, camera, FK and policy; `tests/pty_arm_child.py`) under a
     minimal job-control shell on a pseudo-terminal (`tests/pty_shell.py`; the child's process
@@ -476,13 +477,41 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
     foreground). The existing timeout / Ctrl-C / EOF / hang-up / partial-line tests pass
     unchanged; `test_require_terminal_wants_a_tty_on_stdin_and_stdout` now fakes the
     foreground for its passing case (a bare pty is not the test's controlling terminal).
+  - Review of round 5 (same approval, $0, fakes and a pty only):
+    - Ctrl-Z no longer throws away a half-typed answer (F2): the terminal's line discipline
+      flushed the line on Ctrl-Z, so `q`, Ctrl-Z, ENTER at `ENTER starts [ENTER / q]` started a
+      trial. `job_control` now sets NOFLSH on stdin's terminal for the session (the previous
+      bit restored on exit, skipped once the foreground is lost: the terminal is the shell's
+      again). Every prompt read still starts with `tcflush`, so nothing typed between prompts
+      (also around a Ctrl-C) answers the next one. The notice says the typed line is kept.
+    - `uv run` (F1): the checklist and the three scripts' usage lines now start the hardware
+      sessions as `.venv/bin/python scripts/...`, where Ctrl-Z is only the notice;
+      `require_terminal` prints `WARNING: this process ... shares its job with a launcher`
+      when the process is not its job's leader (e.g. `uv run`), before torque on. Not done:
+      disabling the terminal's suspend character (owner's call if wanted).
+    - Teleop: `job_control` now wraps `main`'s whole `try / finally`, so the TORQUE OFF
+      UNCONFIRMED message and the provenance write also run under it (F3); the foreground poll
+      runs before each tick (`Session.stop_requested`), so the tick that sees the loss no
+      longer sends one more goal (F3, test now expects 5 frames, not 6); a lost foreground
+      stops the end-of-session park before its first step, as in the pilot and real eval (F4).
+      Known gap, owner's call: after a hang-up (SIGHUP / SIGTERM) teleop's park still runs to
+      the end when `robot.park.enabled` is set (unchanged #29 behaviour; the pilot and real
+      eval stop it).
+    - Tests: the pty test sends its Ctrl-Z 4 s into the 8 s support wait and bounds the timeout
+      at 10.5 s (a reset deadline would give about 12 s); an in-process test sends SIGTSTP
+      mid-wait from a thread and checks the original deadline; a pty test types `q`, Ctrl-Z,
+      ENTER at the placement prompt and gets `operator_quit` with no policy motion (fails
+      without NOFLSH); NOFLSH set / restored in-process; teleop's `main` runs on fakes with
+      the session handlers checked at torque on, in the session and at the record write, and
+      restored after; the uv-like launcher test checks the warning; the pty harness kills its
+      shell and child also when its own start fails (F5).
 Unverified on hardware: every item above. In particular: the thresholds, the read cost on the
 Mac's USB-serial link, whether the park pose rests safely with torque off, the refusal
 tolerances against a real calibration, the Homing_Offset read on the real servos, the
 behaviour of a real failed torque-off write, `select()` + `os.read` on the Mac terminal for
 the bounded waits (teleop, pilot, real eval; a macOS pty passes in the tests), the terminal
 and foreground checks under `uv run` in Terminal (is `uv`'s Python child in the foreground
-process group?), Ctrl-Z in the Mac Terminal during motion and at a prompt, `tcflush` of typed-ahead input on the Mac terminal, SIGHUP
+process group?), Ctrl-Z in the Mac Terminal during motion and at a prompt (and NOFLSH keeping a half-typed line there), `tcflush` of typed-ahead input on the Mac terminal, SIGHUP
 delivery to the Python child under `uv run` when the Terminal window closes, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
 grid's scale and alignment with the real base.
 

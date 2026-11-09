@@ -53,38 +53,49 @@ class Pty:
     background (``bg``). Output, shell events and the child's marks are collected by threads."""
 
     def __init__(self, mode: str, argv: list[str], mark_w: int, mark_r: int):
-        self.master, slave = os.openpty()
-        ctl_r, self.ctl_w = os.pipe()
-        evt_r, evt_w = os.pipe()
-        env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REPO_ROOT), str(TESTS)])}
-        env.pop("PYTEST_CURRENT_TEST", None)
-        cmd = [sys.executable, str(SHELL), str(ctl_r), str(evt_w), mode, str(mark_w), "--"]
-        self.proc = subprocess.Popen(
-            [*cmd, *argv],
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            start_new_session=True,
-            pass_fds=(ctl_r, evt_w, mark_w),
-            cwd=REPO_ROOT,
-            env=env,
-        )
-        for fd in (slave, ctl_r, evt_w, mark_w):
-            os.close(fd)
         self.out = bytearray()
         self.events: list[str] = []
         self.marks: list[str] = []
         self.lock = threading.Lock()
         self.child_pid: int | None = None
-        self.threads = [
-            threading.Thread(target=self._drain, args=(self.master, None), daemon=True),
-            threading.Thread(target=self._drain, args=(evt_r, self.events), daemon=True),
-            threading.Thread(target=self._drain, args=(mark_r, self.marks), daemon=True),
-        ]
-        for t in self.threads:
-            t.start()
-        started = self.wait_event("STARTED", START_S)
-        self.child_pid = int(started.split()[1])
+        self.proc: subprocess.Popen[bytes] | None = None
+        self.threads: list[threading.Thread] = []
+        self.master, slave = os.openpty()
+        ctl_r, self.ctl_w = os.pipe()
+        evt_r, evt_w = os.pipe()
+        self.undrained = [evt_r, mark_r]  # closed by their drain threads once those run
+        # review F5: whatever fails from here on, close() still kills the shell and the child
+        try:
+            env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(REPO_ROOT), str(TESTS)])}
+            env.pop("PYTEST_CURRENT_TEST", None)
+            cmd = [sys.executable, str(SHELL), str(ctl_r), str(evt_w), mode, str(mark_w), "--"]
+            try:
+                self.proc = subprocess.Popen(
+                    [*cmd, *argv],
+                    stdin=slave,
+                    stdout=slave,
+                    stderr=slave,
+                    start_new_session=True,
+                    pass_fds=(ctl_r, evt_w, mark_w),
+                    cwd=REPO_ROOT,
+                    env=env,
+                )
+            finally:
+                for fd in (slave, ctl_r, evt_w, mark_w):
+                    os.close(fd)
+            self.threads = [
+                threading.Thread(target=self._drain, args=(self.master, None), daemon=True),
+                threading.Thread(target=self._drain, args=(evt_r, self.events), daemon=True),
+                threading.Thread(target=self._drain, args=(mark_r, self.marks), daemon=True),
+            ]
+            self.undrained = []
+            for t in self.threads:
+                t.start()
+            started = self.wait_event("STARTED", START_S)
+            self.child_pid = int(started.split()[1])
+        except BaseException:
+            self.close()
+            raise
 
     def _drain(self, fd: int, lines: list[str] | None) -> None:
         buf = b""
@@ -161,19 +172,22 @@ class Pty:
     def close(self) -> None:
         with contextlib.suppress(OSError):
             os.close(self.ctl_w)  # the shell kills its child on EOF
-        for pg in (self.child_pid, self.proc.pid):
+        for pg in (self.child_pid, None if self.proc is None else self.proc.pid):
             if pg is not None:
                 with contextlib.suppress(OSError):
                     os.killpg(pg, signal.SIGKILL)
-        try:
-            self.proc.wait(10)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait(10)
+        if self.proc is not None:
+            try:
+                self.proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(10)
         for t in self.threads:
             t.join(5)
-        with contextlib.suppress(OSError):
-            os.close(self.master)
+        for fd in (*self.undrained, self.master):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self.undrained = []
 
 
 @contextlib.contextmanager
@@ -257,11 +271,11 @@ def test_pilot_ctrl_z_during_motion_and_at_torque_on_prompts_never_stops_it(
         p.send(b"y\n")
         i = p.expect("support it, then press ENTER to disable torque", i)
         t_prompt = time.monotonic()
-        time.sleep(1.0)
+        time.sleep(4.0)  # late in the 8 s wait: a deadline reset here would end it after 12 s
         i = ctrl_z(p, i)  # the bounded wait keeps running: its deadline is not reset
         i = p.expect("No answer for 8 s with torque ON", i, timeout=TIMEOUT_S + 10)
         waited = time.monotonic() - t_prompt
-        assert TIMEOUT_S - 0.5 <= waited <= TIMEOUT_S + 3.0, waited
+        assert TIMEOUT_S - 0.5 <= waited <= TIMEOUT_S + 2.5, waited  # review F2
         p.expect("torque OFF: the arm is limp", i)
         assert p.wait_event("EXIT") == "EXIT 0"
         assert not [e for e in p.events if e.startswith("STOPPED")]  # exited, never stopped
@@ -297,6 +311,33 @@ def test_real_eval_ctrl_z_during_motion_then_enter_confirms_support(tmp_path: Pa
     res = record(tmp_path)
     (t,) = res["trials"]
     assert t["outcome"] == "failure" and t["outcome_source"] == "operator"
+    assert res["shutdown"] == "supported" and res["support_confirmed"] is True
+
+
+def test_pilot_ctrl_z_keeps_a_half_typed_q_so_enter_quits_instead_of_starting(
+    tmp_path: Path,
+) -> None:
+    """Review F2: ``q``, Ctrl-Z, ENTER at "ENTER starts [ENTER / q]". The terminal keeps the
+    half-typed line (NOFLSH, ``job_control``), so the answer is ``q``: no policy motion, the
+    session ends as ``operator_quit``. Without NOFLSH the terminal dropped the ``q`` and the
+    empty line started the trial."""
+    with arm_session("pilot", tmp_path) as p:
+        i = p.expect("type 'go' to continue", timeout=START_S)
+        p.send(b"go\n")
+        i = p.expect("ENTER moves the arm HOME", i)
+        p.send(b"\n")
+        i = p.expect("ENTER starts", i)
+        home_writes = p.writes()
+        p.send(b"q")
+        i = ctrl_z(p, i)
+        p.send(b"\n")
+        i = p.expect("support it, then press ENTER to disable torque", i)
+        assert p.writes() <= home_writes + 1  # no policy motion (at most the hold write)
+        p.send(b"\n")
+        assert p.wait_event("EXIT") == "EXIT 0"
+    res = record(tmp_path)
+    (t,) = res["trials"]
+    assert t["outcome"] == "not_started" and t["stop_reason"] == "operator_quit"
     assert res["shutdown"] == "supported" and res["support_confirmed"] is True
 
 
@@ -368,6 +409,7 @@ def test_under_a_launcher_like_uv_run_ctrl_z_ends_the_session_through_the_lost_f
     controlled shutdown (motion stops, grace, torque off, ``lost_foreground``)."""
     with arm_session("pilot", tmp_path, mode="zsh", launcher=True) as p:
         i = p.expect("type 'go' to continue", timeout=START_S)
+        assert "shares its job with a launcher" in p.text()  # SHARED_JOB, before torque on
         p.send(b"go\n")
         i = p.expect("ENTER moves the arm HOME", i)
         p.send(b"\n")

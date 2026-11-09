@@ -97,9 +97,9 @@ run would fork the session and drop the newer runs' scored trials), and warns (`
             switch.
 
     uv run scripts/wo07_real_eval.py --preset real --mock --fake-clock --trials 2 --max-steps 16
-    uv run scripts/wo07_real_eval.py --preset real --hardware --i-am-present --task PickPlace \\
-        --label sft
-    uv run scripts/wo07_real_eval.py --preset real --hardware --i-am-present --resume <run id>
+    .venv/bin/python scripts/wo07_real_eval.py --preset real --hardware --i-am-present \\
+        --task PickPlace --label sft
+    .venv/bin/python scripts/wo07_real_eval.py --preset real --hardware --i-am-present --resume <id>
 """
 
 from __future__ import annotations

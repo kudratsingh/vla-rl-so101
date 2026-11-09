@@ -607,3 +607,61 @@ def test_job_control_refuses_a_session_out_of_the_foreground_before_its_body(
         tty_in.close()
         os.close(slave)
         os.close(master)
+
+
+def test_a_ctrl_z_inside_a_bounded_wait_keeps_its_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review F2: SIGTSTP from another thread 0.9 s into a 1.5 s wait. The wait ends at the
+    original deadline (a reset would end it at about 2.4 s), with the line still unanswered."""
+    import os
+    import signal
+    import threading
+
+    r, w = os.pipe()
+    f = _stdin_from(monkeypatch, r)
+    timer = threading.Timer(0.9, os.kill, (os.getpid(), signal.SIGTSTP))
+    try:
+        with P.job_control():
+            assert callable(signal.getsignal(signal.SIGTSTP))  # else the kill would stop pytest
+            timer.start()
+            line, elapsed = _timed("p? ", 1.5)
+        assert line is None and 1.5 <= elapsed < 1.5 + SLACK_S, elapsed
+    finally:
+        timer.cancel()
+        f.close()
+        os.close(w)
+
+
+def test_job_control_keeps_a_half_typed_line_across_ctrl_z_and_restores_noflsh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review F2: without NOFLSH the terminal throws the half-typed line away on Ctrl-Z, and the
+    next ENTER answers with an empty line. ``job_control`` sets NOFLSH on stdin's terminal for
+    the session and puts the previous bit back on exit (not while the foreground is lost)."""
+    import os
+    import termios
+
+    master, slave = os.openpty()
+    tty_in = open(slave, "r", closefd=False)  # noqa: SIM115 - closed below
+    monkeypatch.setattr(P.sys, "stdin", tty_in)
+    fg = [True]
+    monkeypatch.setattr(P.os, "tcgetpgrp", lambda _fd: os.getpgrp() + (0 if fg[0] else 1))
+
+    def noflsh() -> bool:
+        return bool(termios.tcgetattr(slave)[3] & termios.NOFLSH)
+
+    try:
+        assert not noflsh()
+        with P.job_control() as flags:
+            assert flags.tty_fd == slave and noflsh()
+        assert not noflsh()  # restored
+        with P.job_control():
+            fg[0] = False  # the shell took the terminal back: its modes are not ours to set
+        assert noflsh()
+        fg[0] = True
+        with P.job_control():  # already set before the session: left set
+            assert noflsh()
+        assert noflsh()
+    finally:
+        tty_in.close()
+        os.close(slave)
+        os.close(master)

@@ -53,7 +53,16 @@ Shared by the teleop recorder (scripts/wo06_teleop_record.py), the WO-07 pilot
   read fails with EIO and a background write goes through instead of signalling again: the
   kernel never stops the process. Every handler touched (SIGINT, SIGHUP, SIGTERM, SIGTSTP,
   SIGTTIN, SIGTTOU) is restored when the session ends, also on an exception. SIGSTOP (``kill
-  -STOP``) cannot be caught: the inline power switch remains the hard stop.
+  -STOP``) cannot be caught: the inline power switch remains the hard stop. On a terminal,
+  ``job_control`` also sets ``NOFLSH`` for the session (the previous bit restored on exit): a
+  terminal otherwise throws away the half-typed line on Ctrl-Z, and the next ENTER would answer
+  the prompt with an empty line (review F2: ``q``, Ctrl-Z, ENTER started a trial). Every prompt
+  read still starts with ``tcflush`` (``discard_typeahead``), so a Ctrl-C or Ctrl-Z between
+  prompts leaves nothing behind for the next one. Under a launcher that shares the process
+  group (``uv run``), Ctrl-Z also reaches the launcher, which stops; the shell then takes the
+  terminal back and the session ends through the lost-foreground path above (never stopped
+  under torque, but ended): ``require_terminal`` warns (``SHARED_JOB``), and the hardware
+  commands are documented as ``.venv/bin/python scripts/...``.
 
 The wait is ``select()`` on stdin's file descriptor in the calling thread (``timed_input``): no
 reader thread, and the servo bus keeps a single owner (the health reads happen in this thread,
@@ -130,7 +139,7 @@ CTRL_C_IGNORED = (
 CTRL_C_IGNORED_GRACE = "\nCtrl-C ignored: torque goes OFF when the grace period ends (ENTER = now)."
 CTRL_Z_IGNORED = (
     "\nCtrl-Z ignored: the arm session is running (torque may be on); use Ctrl-C to stop motion. "
-    "An open prompt is still waiting for its answer.\n"
+    "An open prompt is still waiting for its answer (anything typed on its line is kept).\n"
 )
 
 T = TypeVar("T")
@@ -248,8 +257,9 @@ def job_control() -> Iterator[Interrupts]:
     the final torque-off: SIGTSTP (Ctrl-Z) prints ``CTRL_Z_IGNORED`` and nothing else; SIGTTIN /
     SIGTTOU mark the loss of the foreground (``Interrupts.lose_foreground``) and are ignored from
     then on, so neither can stop the process. With stdin on a terminal it is watched for the
-    foreground (``Interrupts.check_foreground``), and a process already out of the foreground
-    exits here (``NOT_FOREGROUND``) before anything inside the ``with`` is opened. Nested entries
+    foreground (``Interrupts.check_foreground``) and gets NOFLSH (a Ctrl-Z keeps the half-typed
+    line), and a process already out of the foreground exits here (``NOT_FOREGROUND``) before
+    anything inside the ``with`` is opened. Nested entries
     (teleop's ``operator_signals`` inside its own ``job_control``) change nothing. The previous
     handlers are restored on exit, also on an exception."""
     if INTERRUPTS.job_control:
@@ -259,6 +269,7 @@ def job_control() -> Iterator[Interrupts]:
     tty = _tty_fd(sys.stdin)
     if tty is not None and (why := not_foreground(tty)) is not None:
         sys.exit(NOT_FOREGROUND.format(what="the arm session", why=why))
+    noflsh = _set_noflsh(tty)
     notice = _tty_fd(sys.stdout)
     message = CTRL_Z_IGNORED.encode()
 
@@ -289,9 +300,39 @@ def job_control() -> Iterator[Interrupts]:
         INTERRUPTS.tty_fd, INTERRUPTS.job_control = tty, True
         yield INTERRUPTS
     finally:
+        if noflsh is not None:
+            _restore_noflsh(noflsh)
         for s, h in prev.items():
             signal.signal(s, h)
         INTERRUPTS.tty_fd, INTERRUPTS.job_control = None, False
+
+
+def _set_noflsh(fd: int | None) -> tuple[int, bool] | None:
+    """Set NOFLSH on the session's terminal (module doc): a Ctrl-Z keeps the half-typed line.
+    Returns (fd, the previous NOFLSH bit) to restore, or None (no tty, or tcsetattr failed)."""
+    if fd is None:
+        return None
+    try:
+        attrs = termios.tcgetattr(fd)
+        was = bool(attrs[3] & termios.NOFLSH)
+        if not was:
+            attrs[3] |= termios.NOFLSH
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except (OSError, termios.error):
+        return None
+    return fd, was
+
+
+def _restore_noflsh(saved: tuple[int, bool]) -> None:
+    """Put the NOFLSH bit back, only that bit, and only while this process still has the
+    terminal's foreground (after a lost foreground the terminal is the shell's again)."""
+    fd, was = saved
+    if was or not_foreground(fd) is not None:
+        return
+    with contextlib.suppress(OSError, termios.error):
+        attrs = termios.tcgetattr(fd)
+        attrs[3] &= ~termios.NOFLSH
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
 @contextlib.contextmanager
@@ -460,6 +501,12 @@ NOT_FOREGROUND = (
     "torque-on prompts would not reach it. Run it in the foreground (no '&', not resumed with "
     "'bg'); nothing was opened"
 )
+SHARED_JOB = (
+    "WARNING: this process (pid {pid}) shares its job with a launcher (process group {pgrp}, "
+    "e.g. `uv run`): a Ctrl-Z also reaches the launcher, which stops; the shell then takes the "
+    "Terminal back and the session ends (motion stops, support the arm, torque off after the "
+    "grace period). Start it as `.venv/bin/python scripts/...` to make Ctrl-Z only a notice"
+)
 NOT_A_TERMINAL = (
     "{what}: stdin and stdout must be an interactive terminal for the real arm ({bad} is not a "
     "tty): the torque-on prompts need an operator who sees them and answers them. Run it "
@@ -497,16 +544,27 @@ def foreground_problem() -> str | None:
     return None if fds else "stdin is not a tty"
 
 
+def shared_job() -> str | None:
+    """``SHARED_JOB`` when this process is not the leader of its process group (a launcher such
+    as ``uv run`` shares the job and does not handle Ctrl-Z), else None."""
+    pgrp, pid = os.getpgrp(), os.getpid()
+    return None if pgrp == pid else SHARED_JOB.format(pid=pid, pgrp=pgrp)
+
+
 def require_terminal(what: str) -> None:
     """Exit (``NOT_A_TERMINAL``) unless stdin and stdout are a tty, and (``NOT_FOREGROUND``)
-    unless this process is in that terminal's foreground process group. The hardware entry
-    points call it before any port is opened or torque enabled."""
+    unless this process is in that terminal's foreground process group. Warns (``SHARED_JOB``)
+    when a launcher shares the job. The hardware entry points call it before any port is opened
+    or torque enabled."""
     bad = not_a_terminal()
     if bad is not None:
         sys.exit(NOT_A_TERMINAL.format(what=what, bad=bad))
     why = foreground_problem()
     if why is not None:
         sys.exit(NOT_FOREGROUND.format(what=what, why=why))
+    warn = shared_job()
+    if warn is not None:
+        _say(warn)
 
 
 @dataclass(frozen=True)

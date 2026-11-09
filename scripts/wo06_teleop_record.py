@@ -12,9 +12,12 @@ protocol hash in ``meta/vla_rl_so101.json``.
 Needs: a leader arm in ``teleop.leader`` (otherwise exits with a message), both arms calibrated
 (scripts/wo06_calibrate.py), and the shared FK from WO-01 for the workspace check.
 
-    uv run scripts/wo06_teleop_record.py --preset real --task Push --rehearsal   # 1 throwaway episode
-    uv run scripts/wo06_teleop_record.py --preset real                           # 5 episodes x 3 tasks
-    uv run scripts/wo06_teleop_record.py --preset real --push                    # also upload (private)
+    .venv/bin/python scripts/wo06_teleop_record.py --preset real --task Push --rehearsal  # 1 episode
+    .venv/bin/python scripts/wo06_teleop_record.py --preset real                  # 5 x 3 tasks
+    .venv/bin/python scripts/wo06_teleop_record.py --preset real --push           # also upload
+
+(``.venv/bin/python``, not ``uv run``: under ``uv run`` a Ctrl-Z also stops ``uv`` and the session
+ends; ``src/robot/prompts.py``.)
 
 Torque is ON from connect until the session ends. Per episode: arrange the scene, press ENTER, the
 follower first eases onto the leader's pose clipped to the safety limits (rate-limited, not
@@ -219,11 +222,16 @@ class Session:
             print(f"camera: {e}")
             return None
 
+    def stop_requested(self) -> bool:
+        """Checked before every tick: a Ctrl-C or a hang-up (``stop``), or the terminal's
+        foreground lost (polled here, ``Interrupts.check_foreground``; on a loss
+        ``ctrl_c_as_flag`` also sets ``stop``, as for a hang-up). Review F3: the poll used to sit
+        inside ``tick``, which then still sent one goal after detecting the loss."""
+        return INTERRUPTS.check_foreground() or self.stop
+
     def tick(self) -> tuple[Any, StepResult]:
-        """One control step. Returns (camera frame or None, step result). Polls the terminal's
-        foreground first (``Interrupts.check_foreground``; on a loss ``ctrl_c_as_flag`` sets
-        ``stop``, as for a hang-up)."""
-        INTERRUPTS.check_foreground()
+        """One control step. Returns (camera frame or None, step result). The loops call
+        ``stop_requested`` first."""
         try:
             frame = self.cam.read()
         except CameraFault as e:
@@ -258,7 +266,7 @@ class Session:
         warned = False
         goal = measured = None
         while time.perf_counter() < t_end:
-            if self.stop:
+            if self.stop_requested():
                 print("\nsync aborted")
                 return False
             t0 = time.perf_counter()
@@ -378,7 +386,8 @@ def _end_session(arm: So101Driver, sess: Session | None) -> str:
     if sess is not None and sess.park is not None and not arm.deadman.tripped:
         print("ending the session: the follower PARKS (it moves; Ctrl-C stops it), then torque off")
         sess.stop = False
-        if arm.park(sess.park, sess.frame_time, stop_fn=lambda: sess.stop):
+        # a lost foreground stops the park at once, as in the pilot / real eval (review F4)
+        if arm.park(sess.park, sess.frame_time, stop_fn=sess.stop_requested):
             print("follower parked; torque OFF")
             return "parked"
         if _torque_off_unconfirmed(arm):
@@ -471,7 +480,7 @@ def _episodes(
                     continue
                 t_start = time.perf_counter()
                 print(f"recording ({ep_time:.0f} s max, Ctrl-C to end) ...")
-                while time.perf_counter() - t_start < ep_time and not sess.stop:
+                while time.perf_counter() - t_start < ep_time and not sess.stop_requested():
                     t0 = time.perf_counter()
                     frame, out = sess.tick()
                     assert frame is not None and out.safety.command is not None
@@ -619,33 +628,35 @@ def main() -> None:
             sys.exit("leader motors do not match its calibration file; recalibrate the leader")
         arm = So101Driver.from_config(cfg, fk)
         sess: Session | None = None
-        try:
-            with (
-                job_control(),  # Ctrl-Z ignored, foreground watched: torque on to torque off
-                OpenCVFrameSource(cfg["cameras"]["front"]) as cam,
-                arm,  # torque ON from here, holding the pose
-            ):
-                sess = Session(
-                    arm,
-                    leader,
-                    cam,
-                    units,
-                    park=park_from_config(cfg),  # None unless robot.park.enabled
-                    torque_wait=TorqueWait.from_config(cfg, "teleop", allow_none=True),
+        # Ctrl-Z ignored, foreground watched: from before torque on until the session's record
+        # is written, the TORQUE OFF UNCONFIRMED instruction included (review F3)
+        with job_control():
+            try:
+                with (
+                    OpenCVFrameSource(cfg["cameras"]["front"]) as cam,
+                    arm,  # torque ON from here, holding the pose
+                ):
+                    sess = Session(
+                        arm,
+                        leader,
+                        cam,
+                        units,
+                        park=park_from_config(cfg),  # None unless robot.park.enabled
+                        torque_wait=TorqueWait.from_config(cfg, "teleop", allow_none=True),
+                    )
+                    record_session(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
+            finally:
+                _torque_off_unconfirmed(arm)  # also after the driver's own torque-off on exit
+                end = None if sess is None else sess.session_end
+                provenance.update(
+                    session_end=end,
+                    support_confirmed=None if end in (None, "parked") else end == "supported",
+                    support_release=None if sess is None else sess.guard.released,
+                    torque_off_unconfirmed=arm.torque_off_unconfirmed,
                 )
-                record_session(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
-        finally:
-            _torque_off_unconfirmed(arm)  # also after the driver's own torque-off on exit
-            end = None if sess is None else sess.session_end
-            provenance.update(
-                session_end=end,
-                support_confirmed=None if end in (None, "parked") else end == "supported",
-                support_release=None if sess is None else sess.guard.released,
-                torque_off_unconfirmed=arm.torque_off_unconfirmed,
-            )
-            (root / "meta" / "vla_rl_so101.json").write_text(
-                json.dumps(provenance, indent=2) + "\n"
-            )
+                (root / "meta" / "vla_rl_so101.json").write_text(
+                    json.dumps(provenance, indent=2) + "\n"
+                )
     finally:
         dataset.finalize()
         if leader.is_connected:

@@ -380,8 +380,14 @@ follower's power switch.
 
 ```bash
 source scripts/mac_env.sh
-uv run scripts/wo06_teleop_record.py --preset real --task Push --rehearsal
+.venv/bin/python scripts/wo06_teleop_record.py --preset real --task Push --rehearsal
 ```
+
+The hardware sessions (this one, step 10, the WO-07 pilot and real eval) start as
+`.venv/bin/python scripts/...`, not `uv run scripts/...` (the `uv sync` in step 0 keeps `.venv`
+current): under `uv run`, Ctrl-Z also reaches `uv`, which stops, and the session then ends (see
+below). The script prints `WARNING: this process ... shares its job with a launcher` before the
+`type 'go'` / connect step when it was started that way.
 
 What happens and what you do:
 
@@ -418,10 +424,12 @@ What happens and what you do:
    support, also after a half-typed answer: only ENTER does. Ctrl-Z does not suspend the
    session: it prints `Ctrl-Z ignored: the arm session is running (torque may be on); use
    Ctrl-C to stop motion ...` and nothing else (motion goes on, the prompt keeps waiting and its
-   60 s keep running). Under `uv run` Ctrl-Z also reaches `uv`, which stops: Terminal says
+   60 s keep running; anything you had typed on the prompt's line is kept, so `q`, Ctrl-Z,
+   ENTER still answers `q`). Under `uv run` Ctrl-Z also reaches `uv`, which stops: Terminal says
    "suspended", the session loses the foreground and ends as described below (support the
-   arm; torque off after 10 s). So still do not press Ctrl-Z there; started as
-   `.venv/bin/python scripts/...` it is only the notice. Ctrl-C stops motion; the hard stop
+   arm; torque off after 10 s). That is why the hardware commands here use
+   `.venv/bin/python scripts/...`, where Ctrl-Z is only the notice; if you did start with
+   `uv run`, do not press Ctrl-Z. Ctrl-C stops motion; the hard stop
    is still the inline power switch (Ctrl-\ kills the process at once and leaves the servos
    holding their last goal under torque until the switch is off). Teleop, the pilot and the real eval refuse to start unless
    stdin and stdout are the Terminal itself (no `| tee`, no `< file`, no `yes |`) and the
@@ -503,7 +511,7 @@ base, ±5 cm in x, ±7 cm in y; `src/eval/protocol.py:63`).
 
 ```bash
 source scripts/mac_env.sh
-uv run scripts/wo06_teleop_record.py --preset real              # 3 tasks x 5 episodes, 30 s max each
+.venv/bin/python scripts/wo06_teleop_record.py --preset real    # 3 tasks x 5 episodes, 30 s max each
 ```
 
 For a private Hub copy, decide before you start: run `uv run hf auth login` once, then add `--push`
