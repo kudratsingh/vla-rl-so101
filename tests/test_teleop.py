@@ -42,13 +42,14 @@ class FakeLeader:
 
 
 class FakeCam:
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], float] = time.perf_counter) -> None:
         self.fail = False
+        self.clock = clock  # the frame stamps: the driver's clock
 
     def read(self) -> Frame:
         if self.fail:
             raise CameraFault("timed out")
-        return Frame(np.zeros((480, 640, 3), np.uint8), time.perf_counter())
+        return Frame(np.zeros((480, 640, 3), np.uint8), self.clock())
 
 
 def _input_reader(prompt: str, _timeout_s: float | None) -> str | None:
@@ -663,6 +664,12 @@ class ParkFollower(FakeFollower):
         super().__init__()
         self.log: list[tuple[str, Any]] = []
         self.hook: Callable[[ParkFollower], None] | None = None
+        self.read_hook: Callable[[ParkFollower], None] | None = None  # in get_observation
+
+    def get_observation(self) -> dict[str, Any]:
+        if self.read_hook is not None:
+            self.read_hook(self)
+        return super().get_observation()
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         moved = any(abs(float(v) - self.pos[k]) > 1e-9 for k, v in action.items())
@@ -676,20 +683,33 @@ class ParkFollower(FakeFollower):
         return sum(kind == "motion" for kind, _ in self.log)
 
 
-def _park_session(monkeypatch: pytest.MonkeyPatch, foreground: bool) -> Any:
+def _park_session(
+    monkeypatch: pytest.MonkeyPatch, foreground: bool, fake_arm_clock: bool = True
+) -> Any:
     """A teleop Session with parking enabled on ParkFollower; its stop checks are logged into
     the follower's log as ("stop_check", result). ``foreground``: stdin is watched as the
     session's terminal and ``tcgetpgrp`` keeps naming this process group (``fg["pgrp"]``: set
-    it to another group to take the foreground away); else no terminal is watched."""
+    it to another group to take the foreground away); else no terminal is watched.
+    ``fake_arm_clock``: the driver and the camera stamps share a FakeClock (the park's ticks are
+    exactly 1 / control_hz apart, so each rate-limited step is exactly 4 deg however loaded the
+    machine is); False for the teleop loops, which pace themselves on ``time.perf_counter``."""
     from robot_fakes import FakeClock
 
     from src.robot import prompts as P
 
     monkeypatch.setattr(P, "_detach_stdio", lambda: None)  # keep pytest's capture
     fol = ParkFollower()
-    arm = So101Driver(fol, UnitMap(), make_safety(real_cfg(), toy_fk))
+    arm_clock = FakeClock() if fake_arm_clock else None
+    if arm_clock is not None:
+        arm = So101Driver(
+            fol, UnitMap(), make_safety(real_cfg(), toy_fk), arm_clock, sleep=arm_clock.sleep
+        )
+        cam = FakeCam(arm_clock)
+    else:
+        arm = So101Driver(fol, UnitMap(), make_safety(real_cfg(), toy_fk))
+        cam = FakeCam()
     arm.connect()
-    sess = teleop.Session(arm, FakeLeader(wrist_flex=0.0), FakeCam(), UnitMap())
+    sess = teleop.Session(arm, FakeLeader(wrist_flex=0.0), cam, UnitMap())
     q = [0.0, 0.0, 0.0, math.radians(PARK_WRIST_DEG), 0.0, UnitMap().gripper_pct_to_rad(50.0)]
     sess.park = ParkSettings(qpos=tuple(q), tol_rad=math.radians(1.0), timeout_s=5.0)
     sess.clock = FakeClock()
@@ -761,8 +781,8 @@ def _assert_no_motion_after_stop(fol: ParkFollower) -> int:
     """Every park motion write directly follows a stop check that said go on; nothing moves
     after the first check that said stop. Returns the motion writes before the stop."""
     for i, (kind, _) in enumerate(fol.log):
-        if kind == "motion":
-            assert fol.log[i - 1] == ("stop_check", False), fol.log[: i + 1]
+        if kind == "motion":  # i > 0: the first write too (log[-1] would be the log's tail)
+            assert i > 0 and fol.log[i - 1] == ("stop_check", False), fol.log[: i + 1]
     first_stop = fol.log.index(("stop_check", True))
     assert all(kind != "motion" for kind, _ in fol.log[first_stop:]), fol.log
     return sum(kind == "motion" for kind, _ in fol.log[:first_stop])
@@ -922,9 +942,10 @@ def test_teleop_healthy_end_with_parking_still_parks_to_the_end(
     assert _run_end(sess) == "parked" and sess.park_outcome == "parked"
     assert "follower parked; torque OFF" in capsys.readouterr().out
     assert not any(k == "stop_check" and v for k, v in fol.log)
+    assert fol.log[0] == ("stop_check", False)  # checked before the very first park write
     for i, (kind, _) in enumerate(fol.log):
         if kind == "motion":
-            assert fol.log[i - 1] == ("stop_check", False)
+            assert i > 0 and fol.log[i - 1] == ("stop_check", False), fol.log[: i + 1]
     wrist = [a["wrist_flex.pos"] for a in fol.sent]
     assert fol.motion_writes() == math.ceil(PARK_WRIST_DEG / 4.0)  # 4 deg/step velocity cap
     assert wrist[-1] == pytest.approx(PARK_WRIST_DEG) and np.all(np.diff([0.0, *wrist]) >= 0)
@@ -964,3 +985,229 @@ def test_teleop_sighup_at_the_scene_prompt_ends_without_a_park(
     sess.reads = rest
     assert sess.park_outcome == "skipped_after_hangup"
     _assert_held_then_released(sess, fol, "hangup", t0)
+
+
+# Round 8 (review F1 / F2): the stop is evaluated immediately before every goal write, after the
+# blocking camera read and the servo read, so a hang-up recorded while a tick waits on a frame
+# or reads the servos never produces one more motion goal (park, sync, episode).
+def _assert_nothing_moves_after(fol: ParkFollower, marker: tuple[str, Any]) -> int:
+    """No motion write after ``marker`` (the moment the signal was sent and recorded); the
+    next logged event is a stop check that says stop. Returns the motion writes before it."""
+    at = fol.log.index(marker)
+    assert fol.log[at + 1] == ("stop_check", True), fol.log
+    assert all(kind != "motion" for kind, _ in fol.log[at:]), fol.log
+    return sum(kind == "motion" for kind, _ in fol.log[:at])
+
+
+@pytest.mark.parametrize("where", ["camera_frame", "servo_read"])
+@pytest.mark.parametrize("foreground", [False, True], ids=["no_tty", "tty_still_foreground"])
+def test_teleop_hangup_while_a_park_tick_reads_writes_no_further_goal(
+    monkeypatch: pytest.MonkeyPatch, hard_timeout: None, where: str, foreground: bool
+) -> None:
+    """Review F1 (round 8): a real SIGHUP sent while the park's 4th tick waits on its camera
+    frame (``Session.frame_time``, after that tick's first stop check) or reads the servos
+    (``get_observation`` inside ``step``): the check inside ``step`` right before the goal
+    write sees it, so no 4th goal is written; hold, grace, torque off, unconfirmed. Before
+    round 8 the 4th goal (up to 4 deg) was still written."""
+    from src.robot import prompts as P
+
+    sess, fol = _park_session(monkeypatch, foreground)
+    marker = ("signal", "SIGHUP")
+
+    def send(f: ParkFollower) -> None:
+        if f.motion_writes() == 3 and marker not in f.log:
+            f.log.append(marker)
+            os.kill(os.getpid(), signal.SIGHUP)
+            assert P.INTERRUPTS.hangup == "SIGHUP"  # recorded before the write would happen
+
+    if where == "camera_frame":
+        real_frame_time = sess.frame_time
+
+        def frame_time() -> float | None:
+            send(fol)
+            return real_frame_time()
+
+        sess.frame_time = frame_time
+    else:
+        fol.read_hook = send
+    t0 = sess.clock()
+    assert _run_end(sess) == "released_unconfirmed"
+    assert sess.park_outcome == "interrupted_by_hangup"
+    assert _assert_nothing_moves_after(fol, marker) == 3 and fol.motion_writes() == 3
+    assert fol.log[fol.log.index(marker) - 1] == ("stop_check", False)  # this tick's 1st check
+    assert fol.pos["wrist_flex.pos"] == pytest.approx(12.0)  # 3 x 4 deg, no 4th step
+    _assert_no_motion_after_stop(fol)
+    _assert_held_then_released(sess, fol, "hangup", t0)
+    if foreground:
+        assert P.not_foreground(0) is None  # still foreground: the recorded signal decided
+
+
+def test_teleop_hangup_between_the_skip_check_and_the_park_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], hard_timeout: None
+) -> None:
+    """Review F1 (test gap, round 8): a real SIGHUP after ``_park``'s skip check and before it
+    clears ``sess.stop`` (sent from the "follower PARKS" print, which can block on a tty), the
+    terminal still foreground. ``stop_requested`` reads the RECORDED hang-up, not only
+    ``stop``, so the first park check stops it: zero goal writes, ``interrupted_by_hangup``.
+    With round 6's ``check_foreground() or self.stop`` the arm parked (8 goals)."""
+    from src.robot import prompts as P
+
+    sess, fol = _park_session(monkeypatch, foreground=True)
+
+    def print_then_hang_up(*args: Any, **kwargs: Any) -> None:
+        print(*args, **kwargs)
+        if args and "follower PARKS" in str(args[0]):
+            fol.log.append(("signal", "SIGHUP"))
+            os.kill(os.getpid(), signal.SIGHUP)
+            assert P.INTERRUPTS.hangup == "SIGHUP" and sess.stop  # handler ran
+
+    monkeypatch.setattr(teleop, "print", print_then_hang_up, raising=False)
+    t0 = sess.clock()
+    assert _run_end(sess) == "released_unconfirmed"
+    assert "follower PARKS" in capsys.readouterr().out
+    assert sess.park_outcome == "interrupted_by_hangup" and fol.motion_writes() == 0
+    assert _assert_nothing_moves_after(fol, ("signal", "SIGHUP")) == 0
+    assert fol.log[0] == ("signal", "SIGHUP")  # nothing was written before it either
+    _assert_held_then_released(sess, fol, "hangup", t0)
+    assert P.not_foreground(0) is None
+
+
+def test_teleop_stop_requested_reads_the_recorded_hangup_not_only_stop(
+    monkeypatch: pytest.MonkeyPatch, hard_timeout: None
+) -> None:
+    """The stop check is True for a recorded SIGHUP with ``sess.stop`` cleared (as ``_park``
+    clears it) and the terminal still foreground."""
+    from src.robot import prompts as P
+
+    sess, _ = _park_session(monkeypatch, foreground=True)
+    real_stop = teleop.Session.stop_requested
+    with P.job_control(), teleop.ctrl_c_as_flag(sess):
+        P.INTERRUPTS.tty_fd = 0
+        assert not real_stop(sess)
+        os.kill(os.getpid(), signal.SIGHUP)
+        sess.stop = False
+        assert P.not_foreground(0) is None and real_stop(sess)
+
+
+def test_teleop_sigttou_recorded_before_the_park_skips_it_while_still_foreground(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], hard_timeout: None
+) -> None:
+    """Review F3 (round 8): a lost foreground RECORDED before the park (a real SIGTTOU through
+    ``job_control``'s handler) while ``tcgetpgrp`` still names this process group (e.g. the
+    operator ran ``fg``): the recorded cause alone skips the park. Zero stop checks, zero
+    motion writes, ``skipped_after_lost_foreground``."""
+    from src.robot import prompts as P
+
+    sess, fol = _park_session(monkeypatch, foreground=True)
+
+    def lose() -> None:
+        os.kill(os.getpid(), signal.SIGTTOU)
+        assert P.INTERRUPTS.lost_foreground is not None  # recorded by the handler
+
+    t0 = sess.clock()
+    assert _run_end(sess, lose) == "released_unconfirmed"
+    assert "NOT parking" in capsys.readouterr().out
+    assert fol.motion_writes() == 0 and not any(k == "stop_check" for k, _ in fol.log)
+    assert sess.park_outcome == "skipped_after_lost_foreground"
+    _assert_held_then_released(sess, fol, "lost_foreground", t0)
+    rec = teleop.session_record(sess.arm, sess)
+    assert rec["park"] == "skipped_after_lost_foreground" and rec["lost_foreground"] is not None
+    assert P.not_foreground(0) is None  # the terminal still reports this process as foreground
+
+
+class SignalCam(FakeCam):
+    """Sends a real SIGHUP from inside ``read`` (the tick's blocking frame wait) when ``when()``
+    first returns True, and logs it into the follower's log (real-clock frame stamps)."""
+
+    def __init__(self, fol: ParkFollower, when: Callable[[], bool]) -> None:
+        super().__init__()
+        self.fol, self.when, self.sent = fol, when, False
+
+    def read(self) -> Frame:
+        if not self.sent and self.when():
+            self.sent = True
+            self.fol.log.append(("signal", "SIGHUP"))
+            os.kill(os.getpid(), signal.SIGHUP)
+        return super().read()
+
+
+def test_teleop_hangup_while_a_sync_tick_reads_its_frame_writes_no_goal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], hard_timeout: None
+) -> None:
+    """Review F2 (round 8): a real SIGHUP while ``sync_to_leader``'s 3rd tick waits on its
+    frame (after that tick's first stop check), the terminal still foreground: the check in
+    ``step`` before the write stops it, no 3rd leader-following goal, sync aborted."""
+    from src.robot import prompts as P
+
+    sess, fol = _park_session(monkeypatch, foreground=True, fake_arm_clock=False)
+    sess.leader = FakeLeader(wrist_flex=20.0)  # several rate-limited ticks away
+    sess.cam = SignalCam(fol, lambda: fol.motion_writes() == 2)
+    with P.job_control(), teleop.ctrl_c_as_flag(sess):
+        P.INTERRUPTS.tty_fd = 0
+        assert sess.sync_to_leader(timeout_s=5.0) is False
+    assert "sync aborted" in capsys.readouterr().out
+    assert _assert_nothing_moves_after(fol, ("signal", "SIGHUP")) == 2
+    assert fol.motion_writes() == 2 and fol.pos["wrist_flex.pos"] < 20.0  # not synced
+    assert fol.sent[-1] == pytest.approx(fol.pos)  # the last goal is the 2nd tick's, then hold
+    _assert_no_motion_after_stop(fol)
+    assert P.INTERRUPTS.hangup == "SIGHUP" and P.not_foreground(0) is None
+
+
+def test_teleop_hangup_while_an_episode_tick_reads_its_frame_writes_no_goal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], hard_timeout: None
+) -> None:
+    """Review F2 (round 8), the whole ``record_session``: ENTER at the scene prompt, sync, then
+    a real SIGHUP while the 3rd recording tick waits on its frame (terminal still foreground):
+    no goal and no frame for that tick, the episode ends, the keep prompt ends as ``hangup``,
+    the episode is discarded, the park is skipped, then hold, grace, torque off, unconfirmed."""
+    from src.robot import prompts as P
+
+    sess, fol = _park_session(monkeypatch, foreground=True, fake_arm_clock=False)
+    leader = FakeLeader(wrist_flex=2.0)  # sync converges at 2 deg
+    sess.leader = leader
+    phase = {"recording": False, "ticks": 0}
+
+    def when() -> bool:
+        if not phase["recording"]:
+            return False
+        phase["ticks"] += 1
+        return phase["ticks"] == 3
+
+    sess.cam = SignalCam(fol, when)
+
+    def spy_print(*args: Any, **kwargs: Any) -> None:
+        print(*args, **kwargs)
+        if args and str(args[0]).startswith("recording"):
+            phase["recording"] = True
+            leader.pose["wrist_flex.pos"] = 30.0  # the operator moves the leader
+            fol.log.append(("recording", None))
+
+    monkeypatch.setattr(teleop, "print", spy_print, raising=False)
+    real_read = sess.guard.read_line
+    answers = [""]  # ENTER at the scene prompt; later prompts go through the real reader
+
+    def read(prompt: str, timeout_s: float | None) -> str | None:
+        if answers:
+            return answers.pop(0)
+        return real_read(prompt, timeout_s)
+
+    sess.guard.read_line = read
+    data = FakeDataset()
+    t0 = sess.clock()
+    instr = teleop.protocol_instructions(["Push"])
+    with P.job_control():
+        P.INTERRUPTS.tty_fd = 0
+        saved = teleop.record_session(sess, data, ["Push"], instr, 1, 5.0, lambda i: i)
+    assert saved == 0 and data.saved == 0 and data.episode_buffer["size"] == 0
+    rec_at = fol.log.index(("recording", None))
+    episode_motion = _assert_nothing_moves_after(fol, ("signal", "SIGHUP")) - sum(
+        kind == "motion" for kind, _ in fol.log[:rec_at]
+    )
+    assert episode_motion == 2  # ticks 1 and 2 moved; tick 3 wrote nothing
+    _assert_no_motion_after_stop(fol)
+    keep, *rest = sess.reads
+    assert "keep this episode (2 frames)" in keep[0] and keep[1] == "Hangup"
+    sess.reads = rest
+    assert sess.park_outcome == "skipped_after_hangup"
+    _assert_held_then_released(sess, fol, "hangup", t0)
+    assert P.not_foreground(0) is None

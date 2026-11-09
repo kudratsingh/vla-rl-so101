@@ -974,6 +974,31 @@ Owner-requested changes (owner review of PR #29, 2026-11-08), same PR, $0, fakes
     prompt. A SIGHUP at the scene prompt runs the whole `record_session` without a park. The
     before-park and last-write tests fail against `a041e46`. The documented hardware launch
     command stays `.venv/bin/python scripts/...`.
+- Round 8 (#29, $0, fakes only): review of round 7.
+  - F1: the park's stop check ran before the tick's blocking camera read (`frame_time`, up to
+    ~33 ms) and the servo read, so a hang-up or lost foreground recorded in that window still
+    sent one more motion goal (up to 4 deg). `So101Driver.step` now takes `stop_fn` and calls it
+    after the joint read and the safety filter, immediately before `_write`; True raises
+    `MotionStopped` with nothing written, and `move_to` returns False (park -> hold). The check
+    before each tick stays (it also skips the camera read). Only a goal whose bus write had
+    already started completes. The pilot and the real eval park through the same `move_to`, so
+    they get it too; their own control loops (`src/robot/client.py`) are unchanged.
+  - F2: the teleop sync and episode loops had the same window. `Session.tick` passes
+    `stop_requested` to `arm.step`; on `MotionStopped` the sync aborts and the episode ends (no
+    goal and no frame for that tick), then the existing hold / prompt path. A Ctrl-C mid-tick
+    is now also caught before the write (one goal fewer than before; otherwise unchanged).
+  - Tests: a real SIGHUP from inside the park tick's camera read and from inside its servo read
+    (no terminal, and terminal still foreground): no 4th goal, arm at 12 of 30 deg, hold, grace,
+    torque off, unconfirmed; SIGHUP during a sync tick's and an episode tick's frame read: no
+    goal that tick (the episode keeps 2 frames, discarded at the hang-up). A SIGHUP between
+    `_park`'s skip check and its `sess.stop = False` (sent from the "PARKS" print) writes
+    nothing, and `stop_requested` is True for a recorded SIGHUP with `stop` cleared (both fail
+    with round 6's `check_foreground() or self.stop`). A real SIGTTOU recorded before the park
+    while `tcgetpgrp` still names this process skips it (fails with a live-poll-only skip). The
+    "every motion write follows a go-on check" assertions no longer read `log[-1]` for the first
+    write. The park tests run the driver on a FakeClock shared with the camera stamps, so each
+    step is exactly 4 deg on a loaded machine. The new park/sync/episode window tests fail with
+    the `step` check removed. `tests/test_driver.py`'s park stop sequence counts the extra check.
 Unverified on hardware: every item above. In particular: the thresholds, the read cost on the
 Mac's USB-serial link, whether the park pose rests safely with torque off, the refusal
 tolerances against a real calibration, the Homing_Offset read on the real servos, the

@@ -6,8 +6,9 @@
         ...
         arm.park(ParkSettings.from_config(cfg), frame_time_fn)   # healthy end only
 
-* ``step`` = deadman frame check -> read joints -> ``SafetyFilter`` -> bus write (-> scheduled
-  servo-health read). The only way a policy action reaches the bus.
+* ``step`` = deadman frame check -> read joints -> ``SafetyFilter`` -> optional ``stop_fn``
+  (True: ``MotionStopped``, nothing written) -> bus write (-> scheduled servo-health read). The
+  only way a policy action reaches the bus.
 * On a deadman trip it performs the response (HOLD: write the measured pose as the goal, so the
   servos stop pushing; TORQUE_OFF: disable torque) and raises ``DeadmanTripped``: the loop stops.
   A caller may catch it, ask the operator, ``deadman.reset(...)`` and continue.
@@ -132,6 +133,11 @@ class SerialFault(RuntimeError):
 
 class NotCalibrated(RuntimeError):
     pass
+
+
+class MotionStopped(RuntimeError):
+    """``step``'s ``stop_fn`` returned True right before the goal write: nothing was written
+    this tick (no deadman trip; the arm keeps the previous goal). The caller holds / ends."""
 
 
 class ServoFault(DeadmanTripped):
@@ -731,11 +737,19 @@ class So101Driver:
 
     # -- control --------------------------------------------------------------------------------
     def step(
-        self, action: npt.ArrayLike, *, frame_time: float | None, now: float | None = None
+        self,
+        action: npt.ArrayLike,
+        *,
+        frame_time: float | None,
+        now: float | None = None,
+        stop_fn: Callable[[], bool] | None = None,
     ) -> StepResult:
         """One control tick. ``frame_time``: perf_counter stamp of the frame the action came from
         (None = no frame -> deadman). Raises DeadmanTripped (ServoFault included) / SerialFault;
-        never sends unsafely."""
+        never sends unsafely. ``stop_fn`` is evaluated after the joint read and the safety
+        filter, immediately before the goal write: True raises ``MotionStopped`` with nothing
+        written, so a stop recorded while the caller waited on its camera frame or while this
+        tick read the servos never produces one more goal (review F1, round 8)."""
         if self.torque_off_unconfirmed is not None:
             raise self._refuse_motion("step")
         if not self._connected:
@@ -749,6 +763,8 @@ class So101Driver:
         result = self.safety.filter(action, measured, t)
         if result.command is None:
             raise self._respond_to_deadman(measured)
+        if stop_fn is not None and stop_fn():
+            raise MotionStopped("stop requested before the goal write")
         self._write(result.command)
         if self.monitor is not None:
             reg = self.monitor.due()
@@ -766,10 +782,11 @@ class So101Driver:
     ) -> bool:
         """Drive to ``target`` through the full safety filter at control_hz (e.g. a home pose).
         True when every joint is within ``tol_rad``. Stops (False) on a rejection, a timeout or
-        ``stop_fn()`` returning True. ``stop_fn`` is checked before every tick, and every tick
-        (``step``) writes at most one goal, so once it returns True no further goal is written
-        here; a goal already being written when the stop arrives (between the check and the
-        write) completes."""
+        ``stop_fn()`` returning True. ``stop_fn`` is checked before every tick (so a stop skips
+        the camera read too) and again inside ``step`` immediately before its one goal write,
+        after the frame wait, the joint read and the filter; so once a stop is recorded no
+        further goal is written here. Only a goal whose bus write had already started when the
+        stop arrived completes."""
         q = np.asarray(target, dtype=np.float64)
         period = 1.0 / self.safety.config.control_hz
         t_end = self.clock() + timeout_s
@@ -778,7 +795,11 @@ class So101Driver:
                 log.warning("move_to stopped by the operator")
                 return False
             t0 = self.clock()
-            out = self.step(q, frame_time=frame_time_fn())
+            try:
+                out = self.step(q, frame_time=frame_time_fn(), stop_fn=stop_fn)
+            except MotionStopped:
+                log.warning("move_to stopped by the operator before the goal write")
+                return False
             if out.safety.status == "rejected":
                 log.warning("move_to stopped: target rejected by safety")
                 return False
@@ -800,9 +821,9 @@ class So101Driver:
         Refuses (False, nothing written) when the deadman has tripped: a fault path never parks.
         Reads servo temperature/current first. False on a rejection, a timeout, ``stop_fn()``
         becoming True or a Ctrl-C; the arm is then holding (or limp after a fault) and the caller
-        falls back to hold + "support the arm" + torque off. ``stop_fn`` is checked before every
-        goal write of the park (``move_to``) and once more after the pose is reached, before the
-        torque-off: a stop that arrived during the last write also ends in the hold (Goal :=
+        falls back to hold + "support the arm" + torque off. ``stop_fn`` is checked immediately
+        before every goal write of the park (``move_to`` / ``step``) and once more after the pose
+        is reached, before the torque-off: a stop that arrived during the last write also ends in the hold (Goal :=
         the measured pose, no motion) instead of a park.
         """
         if not self._connected or self.torque_off_unconfirmed is not None:
