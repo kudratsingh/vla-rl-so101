@@ -44,6 +44,23 @@ Evaluation capture (``EvalCapture``), one dataset per evaluation session, one ep
   ``meta/info.json`` / ``meta/stats.json`` from the episodes that were finalized. Used by the
   evaluation capture and the teleop demo recorder alike; ``EvalCapture.open(resume=True)`` and
   ``check_capture_resumable`` (run before the arm is connected) recover first.
+* Staged before the score is logged (owner 2026-11-09, the capture / resume gap): the episode is
+  saved AFTER the scored record, so a kill between the two used to leave a scored trial with no
+  recording (LeRobot keeps state, action and timing in memory until ``save_episode``; only the
+  frame PNGs are on disk, and the recovery quarantines them). ``EvalCapture.stage`` therefore
+  runs in the record hook, BEFORE the record is logged: it waits for LeRobot's PNG writer, writes
+  the episode's state / action / timing (``frames.npz``), hard-links the frame PNGs (a copy if a
+  link fails) and the end-state stills into ``<capture>/staged/<trial id>/``, and writes
+  ``staged.json`` last (the directory is renamed into place: a journal is whole or absent). A
+  successful save deletes it. On a resume, ``EvalCapture.recover_staged`` rebuilds the episode
+  from it (the same frames, PNG is lossless: the same pixels the save would have encoded) and
+  saves it under the NEXT free episode index, mapped to its trial id in the provenance like any
+  other episode (indices follow save order, never trial order). Limits: what was never staged
+  cannot be recovered: a trial the process died in before its record (``session_lost``; staged
+  at the session end only when the process lived to run it), a kill while staging (no
+  ``staged.json``), a capture error, or a lost / damaged journal. Such a trial is flagged
+  ``recording_missing`` (scripts/wo07_real_eval.py ``reconcile_captures``) and its export is
+  refused as complete (``src/eval/export_bundle.py``).
 """
 
 from __future__ import annotations
@@ -70,6 +87,27 @@ log = logging.getLogger(__name__)
 PROVENANCE = "meta/vla_rl_so101.json"
 CALIBRATION_COPY = "meta/calibration_follower.json"
 END_STATE_DIR = "end_state"
+STAGED_DIR = "staged"  # <capture>/staged/<trial id>/: an episode not yet saved (module doc)
+STAGED_INDEX = "staged.json"  # written last: its presence marks a whole journal
+STAGED_FRAMES = "frames.npz"
+RECOVERED_FROM_STAGE = (
+    "staged capture: the run ended after the scored record and before the episode was saved; "
+    "rebuilt from the journal written before the record (same frames, same pixels)"
+)
+
+
+def staged_name(trial_id: str) -> str:
+    """The staged journal's directory name of a trial id (``<session>/<cell>/<idx>``)."""
+    return str(trial_id).replace("/", "__")
+
+
+def staged_path(capture_root: Path, trial_id: str) -> Path:
+    return Path(capture_root) / STAGED_DIR / staged_name(trial_id)
+
+
+def has_staged(capture_root: Path, trial_id: str) -> bool:
+    """A whole staged journal exists for this trial (``staged.json`` is written last)."""
+    return (staged_path(capture_root, trial_id) / STAGED_INDEX).is_file()
 
 
 def create_dataset(repo_id: str, root: Path) -> Any:
@@ -427,6 +465,12 @@ class EvalCapture:
     def _write_provenance(self) -> None:
         write_json(self.dataset_root / PROVENANCE, self.provenance)
 
+    @property
+    def open_episode(self) -> tuple[str, int] | None:
+        """(trial id, frames) of the episode being recorded, None when none is open."""
+        cur = self._open
+        return None if cur is None else (str(cur["trial_id"]), int(cur["frames"]))
+
     def begin(self, trial_id: str, task: str, meta: Mapping[str, Any] | None = None) -> None:
         """Start a trial's episode (an unfinished one is discarded first)."""
         self._discard()
@@ -440,6 +484,7 @@ class EvalCapture:
             "t_last": None,
             "end_images": None,
             "end_state_when": None,
+            "recovered": None,
         }
 
     def on_write(self, frame: Frame | RigFrame | None, out: Any) -> None:
@@ -523,14 +568,177 @@ class EvalCapture:
             out[name] = p.relative_to(self.root).as_posix()
         return out
 
+    # -- the staged journal (module doc) ----------------------------------------------------------
+    def stage(self, rec: Mapping[str, Any]) -> dict[str, Any]:
+        """Journal the open episode to ``<capture>/staged/<trial id>/`` BEFORE its scored record
+        is logged (the record hook), so a kill before the save cannot lose it. Only a started
+        trial with >= 1 frame and no capture error is staged. Never raises: returns
+        ``{"staged": <rel dir> | None, ...}`` for the record."""
+        cur = self._open
+        if cur is None:
+            return {"staged": None, "reason": "no capture was open"}
+        if not rec.get("policy_started") or cur["frames"] == 0 or cur["error"] is not None:
+            return {"staged": None, "reason": "nothing to save"}
+        if self.broken is not None:
+            return {"staged": None, "reason": f"capture stopped: {self.broken}"}
+        t0 = time.perf_counter()
+        final = staged_path(self.root, cur["trial_id"])
+        tmp = final.with_name(f".tmp-{final.name}")
+        try:
+            wait = getattr(self.dataset, "_wait_image_writer", None)
+            if wait is not None:
+                wait()  # every frame PNG is on disk
+            buf = self.dataset.episode_buffer
+            n = int(buf["size"])
+            if n != int(cur["frames"]):
+                raise RuntimeError(
+                    f"episode buffer holds {n} frames, the capture counted {cur['frames']}"
+                )
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            tmp.mkdir(parents=True)
+            np.savez(
+                tmp / STAGED_FRAMES,
+                state=np.stack(buf[conv.STATE_KEY]).astype(np.float32),
+                action=np.stack(buf[conv.ACTION_KEY]).astype(np.float32),
+                timing=np.stack(buf[conv.TIMING_KEY]).astype(np.float32),
+            )
+            linked = 0
+            for name, key in conv.IMAGE_KEYS.items():
+                paths = [Path(p) for p in buf[key]]
+                if len(paths) != n:
+                    raise RuntimeError(f"{key}: {len(paths)} frame files for {n} frames")
+                d = tmp / "images" / name
+                d.mkdir(parents=True)
+                for i, src in enumerate(paths):
+                    dst = d / f"frame-{i:06d}.png"
+                    try:
+                        os.link(src, dst)
+                        linked += 1
+                    except OSError:
+                        shutil.copyfile(src, dst)
+            end = cur["end_images"]
+            if isinstance(end, Mapping):
+                import cv2
+
+                (tmp / END_STATE_DIR).mkdir()
+                for name, img in end.items():
+                    cv2.imwrite(
+                        str(tmp / END_STATE_DIR / f"{name}.png"),
+                        cv2.cvtColor(np.asarray(img, np.uint8), cv2.COLOR_RGB2BGR),
+                    )
+            tasks = sorted({str(t) for t in buf["task"]})
+            if len(tasks) != 1:
+                raise RuntimeError(f"an episode has one task string, got {tasks}")
+            write_json(
+                tmp / STAGED_INDEX,
+                {
+                    "trial_id": cur["trial_id"],
+                    "task": tasks[0],
+                    "frames": n,
+                    "cameras": list(conv.CAMERA_NAMES),
+                    "meta": cur["meta"],
+                    "t0": cur["t0"],
+                    "t_last": cur["t_last"],
+                    "end_state": "end_state" if isinstance(end, Mapping) else end,
+                    "end_state_when": cur["end_state_when"],
+                    "record": {k: rec.get(k) for k in ("cell", "trial_idx", "start_utc")},
+                    "staged_utc": _utc_stamp(),
+                },
+            )
+            if final.exists():
+                shutil.rmtree(final)
+            os.rename(tmp, final)
+        except Exception as e:  # never reaches the arm or the score
+            log.exception("eval capture: staging failed")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return {"staged": None, "error": f"{type(e).__name__}: {e}"}
+        return {
+            "staged": final.relative_to(self.root).as_posix(),
+            "frames": n,
+            "hardlinked_frames": linked,
+            "stage_s": round(time.perf_counter() - t0, 3),
+        }
+
+    def drop_staged(self, trial_id: str) -> None:
+        shutil.rmtree(staged_path(self.root, trial_id), ignore_errors=True)
+
+    def recover_staged(self, trial_id: str) -> dict[str, Any]:
+        """Rebuild and save a staged episode a kill left unsaved (module doc); its ``capture``
+        block (``episode_index`` None with the reason when it cannot be recovered). Never
+        raises."""
+        d = staged_path(self.root, trial_id)
+        if not (d / STAGED_INDEX).is_file():
+            why = "no staged journal" if not d.exists() else "staged journal incomplete"
+            return {"trial_id": trial_id, "episode_index": None, "reason": why}
+        try:
+            from PIL import Image
+
+            meta = json.loads((d / STAGED_INDEX).read_text())
+            if meta.get("trial_id") != trial_id:
+                raise RuntimeError(f"journal names trial {meta.get('trial_id')!r}")
+            n = int(meta["frames"])
+            with np.load(d / STAGED_FRAMES) as z:
+                state, action, timing = z["state"], z["action"], z["timing"]
+            if not (len(state) == len(action) == len(timing) == n):
+                raise RuntimeError("frames.npz does not hold every frame")
+            self.begin(trial_id, str(meta["task"]), meta.get("meta") or {})
+            cur = self._open
+            assert cur is not None
+            from src.data.recorder import datasets_write_compat
+
+            for i in range(n):
+                images = {}
+                for name in conv.CAMERA_NAMES:
+                    with Image.open(d / "images" / name / f"frame-{i:06d}.png") as im:
+                        images[name] = np.asarray(im.convert("RGB"), dtype=np.uint8)
+                row = conv.recording_frame(
+                    images,
+                    state[i],
+                    action[i],
+                    str(meta["task"]),
+                    write_time_s=float(timing[i, 0]),
+                    frame_time_s=float(timing[i, 1]),
+                )
+                with datasets_write_compat():
+                    self.dataset.add_frame(row)
+                cur["frames"] += 1
+            cur["t0"], cur["t_last"] = meta.get("t0"), meta.get("t_last")
+            end = meta.get("end_state")
+            if end == "end_state":
+                stills = {}
+                for name in conv.CAMERA_NAMES:
+                    p = d / END_STATE_DIR / f"{name}.png"
+                    if p.is_file():
+                        with Image.open(p) as im:
+                            stills[name] = np.asarray(im.convert("RGB"), dtype=np.uint8)
+                cur["end_images"] = stills or "staged stills missing"
+            else:
+                cur["end_images"] = end if isinstance(end, str) else "no end-state stills staged"
+            cur["end_state_when"] = meta.get("end_state_when")
+            cur["recovered"] = RECOVERED_FROM_STAGE
+        except Exception as e:  # a damaged journal: flagged, never guessed
+            log.exception("eval capture: staged episode not recoverable")
+            self._discard()
+            return {
+                "trial_id": trial_id,
+                "episode_index": None,
+                "reason": "staged journal unreadable",
+                "error": f"{type(e).__name__}: {e}",
+            }
+        return self.finish({"policy_started": True})
+
     def finish(self, rec: Mapping[str, Any]) -> dict[str, Any]:
         """Save (policy started, >= 1 frame, no capture error) or discard the open episode; the
         trial record's ``capture`` block. Called after the scored record is logged. Never
-        raises."""
+        raises. A saved episode's staged journal is deleted; a failed save keeps it (a resume
+        recovers it)."""
         cur, self._open = self._open, None
         if cur is None:
             return {"episode_index": None, "frames": 0, "reason": "no capture was open"}
         base = {"trial_id": cur["trial_id"], "frames": cur["frames"], "dataset": "dataset"}
+        if cur.get("recovered"):
+            base["recovered"] = cur["recovered"]
         why = None
         if not rec.get("policy_started"):
             why = "not started: an attempt, never an episode"
@@ -558,6 +766,8 @@ class EvalCapture:
             ),
         }
         entry = {"trial_id": cur["trial_id"], "frames": cur["frames"], **timing, **cur["meta"]}
+        if cur.get("recovered"):
+            entry["recovered"] = cur["recovered"]
 
         def provenance_entry(index: int) -> None:  # before the checkpoint: a kill keeps the map
             self.provenance["episodes"][str(index)] = entry
@@ -576,13 +786,15 @@ class EvalCapture:
                 self._discard()
             except Exception:
                 log.exception("eval capture: discarding the unsaved episode failed")
+            staged = has_staged(self.root, cur["trial_id"])
             return {
                 **base,
                 **timing,
                 "episode_index": None,
-                "reason": "save failed",
+                "reason": "save failed" + ("; staged: a resume recovers it" if staged else ""),
                 "error": f"{type(e).__name__}: {e}",
             }
+        self.drop_staged(cur["trial_id"])  # saved and in the provenance: the journal is done
         stills = self._stills(index, end_images)
         entry.update(end_state=stills, end_state_when=when)
         try:

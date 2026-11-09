@@ -171,7 +171,7 @@ import json
 import math
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -214,7 +214,12 @@ from src.robot.client import (
 )
 from src.robot.driver import So101Driver
 from src.robot.prompts import TorqueGuard, TorqueWait, operator_signals, require_terminal
-from src.robot.recording import EvalCapture, RigFrameSource, check_capture_resumable
+from src.robot.recording import (
+    EvalCapture,
+    RigFrameSource,
+    check_capture_resumable,
+    has_staged,
+)
 from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
@@ -796,6 +801,10 @@ def session(
                     "root": str(capture.root),
                     "dataset": str(capture.dataset_root),
                 }
+                if resumed_from is not None:  # before any new trial: earlier runs' gaps
+                    run.results["capture"]["reconciled"] = reconcile_captures(
+                        capture, trials, log_row
+                    )
                 run.flush()
             if real:
                 end = _run_schedule(
@@ -835,11 +844,13 @@ def session(
             shutdown = shutdown_or_record(run.results, loop, operator, end)
             end = final_session_end(loop.arm, end)  # a failed torque-off wins over any end
             if capture is not None:
+                stage_unsaved(capture, trials)  # a trial the session ended in, before its save
                 try:
                     capture.close()  # Parquet footers: the dataset is readable and resumable
                     run.results["capture"]["episodes"] = len(capture.provenance["episodes"])
                 except Exception as e:  # noqa: BLE001 - the trial records stand
                     run.results["capture"]["close_error"] = f"{type(e).__name__}: {e}"
+                run.results["capture"].update(capture_gaps(capture.root, trials))
             run.results.update(
                 session_end=end,
                 **shutdown_results(shutdown),
@@ -851,6 +862,17 @@ def session(
         print_table(run.id, summary, end, shutdown.record())
         if not summary["complete"]:
             print(f"  session incomplete: resume with --resume {run.id}")
+        gaps = (run.results.get("capture") or {}) if capture is not None else {}
+        if gaps.get("recoverable_on_resume"):
+            print(
+                f"  {len(gaps['recoverable_on_resume'])} scored trial(s) have a staged, unsaved "
+                f"recording: --resume {run.id} recovers them before any new trial"
+            )
+        if gaps.get("recording_missing"):
+            print(
+                f"  RECORDING MISSING for {gaps['recording_missing']}: their scores stand; the "
+                "export refuses a complete bundle (src/eval/export_bundle.py)"
+            )
     return run.record_path
 
 
@@ -989,11 +1011,15 @@ def _run_schedule(
 
         def hook(rec: dict[str, Any], tid: str = tid) -> None:
             rec["trial_id"] = tid
-            rec["capture"] = (
-                {"episode_index": None, "reason": "capture off (mock --no-capture)"}
-                if capture is None
-                else {"episode_index": None, "reason": CAPTURE_PENDING}
-            )
+            if capture is None:
+                rec["capture"] = {
+                    "episode_index": None,
+                    "reason": "capture off (mock --no-capture)",
+                }
+                return
+            rec["capture"] = {"episode_index": None, "reason": CAPTURE_PENDING}
+            if rec.get("policy_started"):  # journal it BEFORE the record is logged
+                rec["capture"]["stage"] = capture.stage(rec)
 
         while True:
             n0 = len(trials)
@@ -1049,6 +1075,122 @@ def save_capture(capture: EvalCapture, rec: dict[str, Any], log_row: Callable[..
         start_utc=rec["start_utc"],
         capture=block,
     )
+
+
+def _needs_recording(t: Mapping[str, Any]) -> bool:
+    """A scored trial (its policy started) needs an episode: the export refuses without one."""
+    return bool(t.get("policy_started")) and t.get("outcome") in SCORED
+
+
+def reconcile_captures(
+    capture: EvalCapture, trials: list[dict[str, Any]], log_row: Callable[..., None]
+) -> dict[str, Any]:
+    """On a resume, BEFORE any new trial (owner 2026-11-09, the capture / resume gap): every
+    scored trial of the earlier runs that has no episode gets one, never by re-running it:
+
+    1. its trial id is in the capture provenance: the episode was saved, the run ended before
+       its ``capture`` row; attached (``filled_from``);
+    2. else its staged journal is whole: the episode is rebuilt and saved under the next free
+       index (``recording.EvalCapture.recover_staged``; ``recovered`` says so);
+    3. else it is flagged ``recording_missing`` with the reason (its score stands; the export
+       refuses a complete bundle).
+
+    Each result is logged as a ``capture`` row (merged by ``load_prior``). Returns what it did."""
+    by_tid: dict[str, int] = {}
+    entries = capture.provenance.get("episodes") or {}
+    for idx, entry in entries.items():
+        if entry.get("trial_id") is not None:
+            by_tid[str(entry["trial_id"])] = int(idx)
+    saved_keys = (
+        "frames",
+        "nominal_fps",
+        "write_time_span_s",
+        "write_rate_hz",
+        "end_state",
+        "end_state_when",
+    )
+    claimed = {
+        int(t["capture"]["episode_index"])
+        for t in trials
+        if (t.get("capture") or {}).get("episode_index") is not None
+    }
+    out: dict[str, list[Any]] = {"attached": [], "recovered": [], "recording_missing": []}
+    for t in trials:
+        cap = t.get("capture") or {}
+        if not _needs_recording(t) or cap.get("episode_index") is not None:
+            continue
+        if cap.get("recording_missing"):
+            out["recording_missing"].append(t.get("trial_id"))
+            continue
+        tid = str(t.get("trial_id"))
+        idx = by_tid.get(tid)
+        if t.get("trial_id") is not None and idx is not None and idx not in claimed:
+            entry = entries[str(idx)]
+            block = {
+                **{k: entry[k] for k in saved_keys if k in entry},
+                "dataset": "dataset",
+                "trial_id": tid,
+                "episode_index": idx,
+                "filled_from": "capture provenance (the run ended before its capture row)",
+            }
+            capture.drop_staged(tid)
+            out["attached"].append(tid)
+        else:
+            block = capture.recover_staged(tid)
+            if block.get("episode_index") is None:
+                block = {
+                    "trial_id": tid,
+                    "episode_index": None,
+                    "recording_missing": True,
+                    "reason": f"recording missing: {block.get('reason')}",
+                    **({"error": block["error"]} if block.get("error") else {}),
+                }
+                out["recording_missing"].append(tid)
+            else:
+                out["recovered"].append(tid)
+        if block.get("episode_index") is not None:
+            claimed.add(int(block["episode_index"]))
+        t["capture"] = block
+        log_row(
+            kind="capture",
+            trial_id=t.get("trial_id"),
+            cell=t["cell"],
+            trial_idx=t["trial_idx"],
+            start_utc=t["start_utc"],
+            capture=block,
+        )
+    if any(out.values()):
+        print(f"capture reconciled on resume: {out}")
+    return out
+
+
+def stage_unsaved(capture: EvalCapture, trials: Sequence[dict[str, Any]]) -> None:
+    """At the session end: a trial whose episode is still open (the session ended between its
+    start and its save, e.g. a crash after the policy started) is staged, so a resume recovers it
+    instead of flagging it missing. Never raises."""
+    cur = capture.open_episode
+    if cur is None or not cur[1]:
+        return
+    for t in reversed(trials):
+        if t.get("trial_id") == cur[0] and _needs_recording(t):
+            if (t.get("capture") or {}).get("episode_index") is None:
+                capture.stage(t)  # never raises
+            return
+
+
+def capture_gaps(root: Path, trials: Sequence[dict[str, Any]]) -> dict[str, list[Any]]:
+    """Scored trials without an episode: ``recoverable_on_resume`` (a whole staged journal) and
+    ``recording_missing`` (none: flagged, or nothing staged)."""
+    out: dict[str, list[Any]] = {"recoverable_on_resume": [], "recording_missing": []}
+    for t in trials:
+        if not _needs_recording(t) or (t.get("capture") or {}).get("episode_index") is not None:
+            continue
+        tid = t.get("trial_id")
+        if tid is not None and has_staged(root, str(tid)):
+            out["recoverable_on_resume"].append(tid)
+        else:
+            out["recording_missing"].append(tid)
+    return out
 
 
 MAX_START_ATTEMPTS = 3  # per schedule item and run (review F3)

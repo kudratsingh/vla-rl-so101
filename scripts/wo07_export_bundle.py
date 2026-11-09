@@ -17,7 +17,9 @@ Demo bundle: ``<dataset>.export/``. Evaluation bundle: ``<runs>/<session>/captur
 episode; otherwise the declaration has ``labels: null`` and the live scores stay in
 ``trials.json`` with their own provenance. Mock sessions need ``--allow-mock`` (a format test, not
 data); development sessions ``--include-dev`` (never reported); an incomplete session
-``--allow-incomplete``.
+``--allow-incomplete``. A scored trial without its recording (``recording_missing``, or staged and
+not yet recovered: resume the session first) refuses the export; ``--allow-missing-recordings``
+builds it declared ``real-0.1-incomplete`` with ``status: INCOMPLETE`` (``src/eval/export_bundle.py``).
 """
 
 from __future__ import annotations
@@ -80,6 +82,7 @@ def eval_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         checkpoint_dir=Path(ckpt),
         reviews=reviews,
         mode=mode,
+        allow_missing_recordings=args.allow_missing_recordings,
     )
     return index, out
 
@@ -104,6 +107,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     e.add_argument("--allow-mock", action="store_true")
     e.add_argument("--include-dev", action="store_true")
     e.add_argument("--allow-incomplete", action="store_true")
+    e.add_argument(
+        "--allow-missing-recordings",
+        action="store_true",
+        help="build an INCOMPLETE bundle (declared real-0.1-incomplete) when a scored trial has "
+        "no recording",
+    )
     e.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.preset != "real":
@@ -117,6 +126,11 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     except X.ExportRefused as err:
         sys.exit(f"REFUSED: {err}")
     print(json.dumps(index, indent=2, default=str))
+    if index.get("status") == "INCOMPLETE":
+        print(
+            f"\nINCOMPLETE EXPORT: {len(index['recording_missing'])} scored trial(s) have no "
+            f"recording; declared protocol_version {index['protocol_version']}"
+        )
     print("\nseal it (owner, in the vishwaroop repo):")
     print("  " + X.seal_command(index, out, "<new export id>", "<export root>"))
     return {**index, "bundle": str(out)}

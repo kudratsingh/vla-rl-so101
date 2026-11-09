@@ -32,6 +32,18 @@ yaws), and vishwaroop imports ``object_pose`` as a per-frame stream; a per-frame
 the planned start pose would claim a tracked pose. The planned poses travel in ``placements.json``
 / ``trials.json`` instead.
 
+Missing recordings (owner 2026-11-09): every scored trial (its policy started) needs its episode.
+A trial whose recording is missing (``recording_missing``: a kill between its scored record and
+its save that left nothing to recover, ``src/robot/recording.py``) or still only staged (a resume
+recovers it: resume first) makes the export INCOMPLETE. vishwaroop's declaration has no field for
+an incomplete export (``docs/SO101_EXPORT.md`` section 2; its importer, ``parse_declaration`` /
+``check_export``, only checks that the declared sessions equal the dataset's episodes), so a
+complete evaluation bundle is REFUSED. ``allow_missing_recordings`` builds one anyway, declared
+``protocol_version`` ``real-0.1-incomplete`` (the same in-spec mechanism as ``-dev``: the sealed
+declaration itself says it is not the full evaluation), with ``status: INCOMPLETE`` and the
+missing trials in ``bundle.json`` and ``trials.json``. Episodes are never dropped or re-mapped:
+each one keeps the trial id the capture provenance gave it.
+
 Nothing is guessed: a missing or unknown value refuses the export (``ExportRefused``).
 ``validate_bundle`` mirrors the importer's checks of the declaration, the LeRobot tables and the
 label file (``vishwaroop/src/vishwaroop/data/so101_import.py``: ``parse_declaration``,
@@ -453,6 +465,7 @@ def _protocol(prov: Mapping[str, Any]) -> None:
 
 
 DEV_SUFFIX = "-dev"  # a development session's protocol_version (never reported; review F9)
+INCOMPLETE_SUFFIX = "-incomplete"  # an export missing a scored trial's recording (module doc)
 
 
 def _common(
@@ -579,8 +592,11 @@ def build_eval_bundle(
     checkpoint_dir: Path,
     reviews: Sequence[Mapping[str, Any]] = (),
     mode: str = "hardware",
+    allow_missing_recordings: bool = False,
 ) -> dict[str, Any]:
-    """Bundle one finished evaluation session (``scripts/wo07_real_eval.py``, protocol real-0.1)."""
+    """Bundle one finished evaluation session (``scripts/wo07_real_eval.py``, protocol real-0.1).
+    A scored trial without its episode refuses the export unless ``allow_missing_recordings``
+    (then declared ``-incomplete``; module doc)."""
     prov = _provenance(capture_dataset)
     _protocol(prov)
     sid = str(_need(settings, "session_id", "the session"))
@@ -635,6 +651,21 @@ def build_eval_bundle(
             raise ExportRefused(f"episode {i} is not a scored trial")
         if not t.get("labeler") and t.get("outcome_source") == "operator":
             raise ExportRefused(f"episode {i}: an operator score without a named labeler")
+    missing = missing_recordings(recs, Path(capture_dataset).parent)
+    if missing and not allow_missing_recordings:
+        pending = [m["trial_id"] for m in missing if m["status"] == "recoverable_on_resume"]
+        raise ExportRefused(
+            f"INCOMPLETE: {len(missing)} scored trial(s) have no recording "
+            f"({[m['trial_id'] for m in missing]}); "
+            + (
+                f"{pending} are staged: --resume the session to recover them first; "
+                if pending
+                else ""
+            )
+            + "vishwaroop's declaration cannot say incomplete, so a complete evaluation bundle is "
+            f"refused (allow_missing_recordings declares protocol_version "
+            f"{PR.PROTOCOL_VERSION}{INCOMPLETE_SUFFIX})"
+        )
     _fresh(out)
     _calibration(capture_dataset, prov, out)
     _write(out / RUBRIC_FILE, PR.rubric())
@@ -660,6 +691,8 @@ def build_eval_bundle(
             "provenance (outcome_source operator | scripted | fault | unjudged | not_scored); "
             "the declared labels, if any, come from the blinded review only",
             "uncaptured_started_trials": uncaptured,
+            "export_status": "INCOMPLETE" if missing else "COMPLETE",
+            "recording_missing": missing,
             "trials": recs,
         },
     )
@@ -671,7 +704,9 @@ def build_eval_bundle(
         prov,
         "evaluation",
         {i: sid for i in eps},
-        protocol_version=PR.PROTOCOL_VERSION + (DEV_SUFFIX if dev else ""),
+        protocol_version=PR.PROTOCOL_VERSION
+        + (DEV_SUFFIX if dev else "")
+        + (INCOMPLETE_SUFFIX if missing else ""),
     )
     decl["policy"] = {
         "origin": "trained",
@@ -727,11 +762,43 @@ def build_eval_bundle(
         },
         "labels": decl["labels"],
         "uncaptured_started_trials": len(uncaptured),
+        "status": "INCOMPLETE" if missing else "COMPLETE",
+        "recording_missing": missing,
         "blinded_vs_live_disagreements": disagreements,
         **summary,
     }
     _write(out / BUNDLE_INDEX, index)
     return index
+
+
+def missing_recordings(
+    trials: Sequence[Mapping[str, Any]], capture_root: Path
+) -> list[dict[str, Any]]:
+    """Scored trials (policy started) with no episode index: ``recoverable_on_resume`` when a
+    whole staged journal exists under ``capture_root`` (a resume saves it), else
+    ``recording_missing``."""
+    from src.robot.recording import has_staged
+
+    out = []
+    for t in trials:
+        cap = t.get("capture") or {}
+        if not t.get("policy_started") or t.get("outcome") not in ("success", "failure"):
+            continue
+        if cap.get("episode_index") is not None:
+            continue
+        tid = t.get("trial_id")
+        staged = tid is not None and has_staged(capture_root, str(tid))
+        out.append(
+            {
+                "trial_id": tid,
+                "cell": t.get("cell"),
+                "trial_idx": t.get("trial_idx"),
+                "outcome": t.get("outcome"),
+                "status": "recoverable_on_resume" if staged else "recording_missing",
+                "reason": cap.get("reason"),
+            }
+        )
+    return out
 
 
 def seal_command(index: Mapping[str, Any], bundle: Path, export_id: str, export_root: str) -> str:
