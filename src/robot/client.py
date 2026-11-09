@@ -760,7 +760,9 @@ class DeployLoop:
 
         1. the pre-write stop check: a stop recorded before it blocks the goal, no marker;
         2. the policy start (``_policy_started``): the stamp and the durable ``trial_started``
-           row. If saving it fails (any exception: I/O error, disk full), the goal is blocked
+           row, written AND synced to stable storage before ``on_policy_start`` returns
+           (``DURABLE_ROW_KINDS``; the real eval's ``Run.log_durable``: F_FULLFSYNC on macOS).
+           If saving or syncing it fails (any exception: I/O error, disk full), the goal is blocked
            with ``START_MARKER_FAILED`` (a ``SessionStop``: hold, the session ends), since a
            started slot without its durable marker could be re-rolled by a resume;
         3. the freshness checks AGAIN, on the clock after the marker I/O (``_fresh_after_marker``):
@@ -780,8 +782,9 @@ class DeployLoop:
         killed between the marker and its retraction leaves a bare marker, which a resume scores
         a ``session_lost`` failure (the logs cannot show that the goal was blocked: doubt =
         started). A write that began counts as started even when it fails part-way. Cost: one
-        log write and one clock read before the first goal of each trial, inside that decision's
-        ``LATENCY_KEY``; ``policy_start_mark_ms`` is the stamp + marker I/O + freshness re-check
+        log write, its sync and one clock read before the first goal of each trial, inside that
+        decision's ``LATENCY_KEY``; ``policy_start_mark_ms`` is the stamp + marker I/O and sync +
+        freshness re-check
         (it excludes only the final stop check, the flag read and ``tcgetpgrp`` poll, so that
         nothing else runs between that check and the write). The stamp is taken when the marker
         I/O begins, that long before the write."""
@@ -1591,6 +1594,11 @@ def run_trials(
             arm.safety.reset_reference()
     return trials, "completed"
 
+
+DURABLE_ROW_KINDS = ("trial_started", "trial_start_retracted")
+"""``run_trials``' rows a resume depends on: its ``log_row`` must have them on stable storage
+before it returns (scripts/wo07_real_eval.py: ``Run.log_durable``); an ``OSError`` from that sync
+blocks the first goal like a failed write (``DeployLoop._first_goal_check``)."""
 
 RETRACTION_KEYS = ("attempt", "trial_id", "schedule_pos")
 """``record_extra`` keys a ``trial_start_retracted`` row carries: the attempt it retracts."""

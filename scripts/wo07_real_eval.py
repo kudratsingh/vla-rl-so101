@@ -80,12 +80,22 @@ a slot whose attempts all ended before the policy started is retried with the sa
 The start is durable: the moment the policy starts, a ``trial_started`` row goes to
 metrics.jsonl, and a resume scores a started trial that has no record (the process was killed,
 crashed or lost power mid-trial) as a FAILURE with fault kind ``session_lost`` (``load_prior``).
-A first goal blocked after that row (a stop recorded during its I/O, or the row failed to save:
-the session then ends ``start_marker_failed``) was never sent: a ``trial_start_retracted`` row
-cancels the marker, and the slot is retried with the same placement.
+A first goal blocked after that row (a stop recorded during its I/O, a frame or chunk gone stale
+during it, or the row failed to save or to sync: the session then ends ``start_marker_failed``)
+was never sent: a ``trial_start_retracted`` row cancels the marker, and the slot is retried with
+the same placement.
 Each invocation is its own run record, holding every trial of the session so far; record.json is
 written when the session is bound and after every trial, so a run killed without exiting
-(SIGKILL, power loss) can be resumed itself. Closing the Terminal (SIGHUP / SIGTERM) is not a
+(SIGKILL, power loss) can be resumed itself.
+Power loss (owner 2026-11-09): the ``DURABLE_ROWS`` (``session``, ``trial_started``,
+``trial_start_retracted``) are synced to stable storage before the call that wrote them returns
+(``Run.log_durable``: ``F_FULLFSYNC`` on macOS, ``fsync`` elsewhere), and every record.json write
+is atomic and synced (``src/runs.py``); other metrics rows (decisions, trial and capture rows)
+are plain appends, each trial / capture row followed by a synced record.json holding it. The
+start marker's sync is part of the marker: a failed sync blocks the first goal like a failed
+write, and the freshness and final stop checks run after it. ``load_prior`` rebuilds the session
+from metrics.jsonl's ``session`` row when record.json is missing or unreadable; a cut
+metrics.jsonl line is skipped, and record.json's trials stand without metrics.jsonl. Closing the Terminal (SIGHUP / SIGTERM) is not a
 kill: the session takes the closed-stdin path (grace period, torque off, released_unconfirmed,
 cause hangup) and writes its record. Ctrl-Z never suspends a hardware session (ignored with a
 message); the session must run in the terminal's foreground, and losing it takes the same path
@@ -210,6 +220,7 @@ from src.robot.camera import (
     confirm_camera_roles,
 )
 from src.robot.client import (
+    DURABLE_ROW_KINDS,
     ConsoleOperator,
     DeployConfig,
     DeployLoop,
@@ -248,6 +259,8 @@ from src.runs import RUNS_DIR, Run, new_run_id
 PROTOCOLS = (PR.PROTOCOL_VERSION, P2.PROTOCOL_VERSION)
 
 JUDGING_RULE_VERSION = PR.JUDGING_RULE_VERSION  # "real-judge-2"
+# metrics rows synced to stable storage before log_row returns (module doc, Run.log_durable)
+DURABLE_ROWS: tuple[str, ...] = (*DURABLE_ROW_KINDS, "session")
 DEFAULT_SETTLE_S = 3.0  # eval.settle_s
 # the rule's text lives in src/eval/protocol_real.py (hashed by real-0.1); #33's start wording
 # is ported there with real-judge-3 (the follow-up commit), and protocol 0.2 sessions share it
@@ -553,9 +566,10 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     never has an episode). A real-0.1 record without ``trial_id`` (rows written before the
     start marker carried it) gets the one ``trial_id()`` derives (review F1)."""
     rec_path = run_dir / "record.json"
-    if not rec_path.is_file():
-        sys.exit(f"--resume: no {rec_path}")
-    results = json.loads(rec_path.read_text()).get("results", {})
+    try:
+        results = json.loads(rec_path.read_text()).get("results", {})
+    except (OSError, ValueError) as e:  # missing / cut short (power loss): the synced rows
+        results = results_from_metrics(run_dir, f"{type(e).__name__}: {e}")
     settings = results.get("session")
     if not settings:
         sys.exit(f"--resume: {rec_path} is not a wo07_real_eval session")
@@ -617,6 +631,50 @@ def load_prior(run_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     return settings, trials
 
 
+def _last_session_row(run_dir: Path) -> dict[str, Any] | None:
+    """The last ``session`` row of a run's metrics.jsonl (cut lines skipped), or None."""
+    metrics = run_dir / "metrics.jsonl"
+    found: dict[str, Any] | None = None
+    try:
+        lines = metrics.read_text().splitlines() if metrics.is_file() else []
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("kind") == "session" and isinstance(row.get("session"), dict):
+            found = row
+    return found
+
+
+def results_from_metrics(run_dir: Path, why: str) -> dict[str, Any]:
+    """The session of a run whose record.json is missing or unreadable (``why``), rebuilt from
+    the last synced ``session`` row of its metrics.jsonl (``DURABLE_ROWS``); its trials then come
+    from the metrics rows alone (``load_prior``). How that run ended is unknown, so a resume
+    treats its torque off as unconfirmed (the operator checks the bus). Exits when neither
+    survives."""
+    found = _last_session_row(run_dir)
+    if found is None:
+        sys.exit(
+            f"--resume: {run_dir / 'record.json'} unreadable ({why}) and no session row in "
+            f"{run_dir / 'metrics.jsonl'}"
+        )
+    print(
+        f"--resume: {run_dir / 'record.json'} unreadable ({why}): the session is rebuilt from "
+        "metrics.jsonl; that run's shutdown is unknown, so its torque off counts as unconfirmed"
+    )
+    settings = dict(found["session"])
+    settings["prior_torque_off_unconfirmed"] = True
+    return {
+        "session": settings,
+        "trials": [],
+        "resumed_from": found.get("resumed_from"),
+        "rebuilt_from": f"metrics.jsonl ({why})",
+    }
+
+
 def _row_key(row: Mapping[str, Any]) -> tuple[Any, Any, Any, Any]:
     """A trial / attempt's key in the session's rows (``load_prior``)."""
     return (row["cell"], row["trial_idx"], row["start_utc"], row.get("attempt"))
@@ -634,15 +692,16 @@ def prior_run_torque_off_unconfirmed(results: dict[str, Any]) -> bool:
 
 
 def session_runs(runs_dir: Path, session_id: str) -> dict[str, str | None]:
-    """{run id: the run it resumed from} for every run whose record holds this session."""
+    """{run id: the run it resumed from} for every run whose record holds this session (or,
+    record.json lost, whose synced ``session`` row does)."""
     out: dict[str, str | None] = {}
-    for rec in sorted(runs_dir.glob("*/record.json")):
+    for d in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
         try:
-            results = json.loads(rec.read_text()).get("results") or {}
+            results = json.loads((d / "record.json").read_text()).get("results") or {}
         except (OSError, ValueError):
-            continue
+            results = _last_session_row(d) or {}
         if (results.get("session") or {}).get("session_id") == session_id:
-            out[rec.parent.name] = results.get("resumed_from")
+            out[d.name] = results.get("resumed_from")
     return out
 
 
@@ -834,9 +893,21 @@ def session(
         run.flush()  # the session is on disk before the first motion: a killed run resumes
 
         def log_row(**row: Any) -> None:
-            run.log_metrics(**row)
+            if row.get("kind") in DURABLE_ROWS:  # synced before it returns (module doc)
+                run.log_durable(**row)
+            else:
+                run.log_metrics(**row)
             if row.get("kind") in ("trial", "capture"):
                 run.flush()
+
+        # the session in metrics.jsonl too, synced: load_prior rebuilds from it without
+        # record.json (power loss), and record.json carries which sync ran
+        log_row(kind="session", session=settings, resumed_from=resumed_from, run_id=run.id)
+        run.results["durability"] = {
+            "synced_rows": list(DURABLE_ROWS),
+            "record_json": "atomic: tmp + sync + rename + directory sync, every write",
+            "sync": run.sync_method,
+        }
 
         print(f"{judging_rule(settle_s)['general']}\n  {task} success = {JUDGING_RULE[task]}.")
         real = settings.get("protocol_id") == PR.PROTOCOL_VERSION

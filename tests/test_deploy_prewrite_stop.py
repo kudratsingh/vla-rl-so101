@@ -26,6 +26,7 @@ import functools
 import json
 import os
 import signal
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,7 @@ from robot_fakes import real_cfg
 from test_deploy import Rig, _console, _pilot_kw, _record, pilot, rig
 from test_real_eval import _args, ev
 
+from src import runs as runs_mod
 from src.robot import prompts as P
 from src.robot.client import DeployLoop, ScriptedOperator
 from src.robot.driver import So101Driver
@@ -97,7 +99,10 @@ class Probe:
 
     ``action`` "serial" instead makes the goal write of that tick fail (a bus fault mid-write);
     with ``where="marker"``, "marker_fail" makes that row's write raise ENOSPC (nothing written)
-    and "marker_fail_all" makes it and every later log write raise (the disk stays full)."""
+    and "marker_fail_all" makes it and every later log write raise (the disk stays full);
+    "none" never fires (an order log only); "sync_fail" lets that row reach metrics.jsonl and makes its sync to stable storage
+    (``src.runs.sync_fd``, through ``Run.log_durable``) raise EIO. Every sync is logged as
+    ("sync", method or "EIO")."""
 
     def __init__(
         self,
@@ -186,6 +191,20 @@ class Probe:
             finally:
                 self._in_pre_write = False
 
+        self._sync_fail_armed = False
+        if monkeypatch is not None:
+            real_sync = runs_mod.sync_fd
+
+            def sync_fd(fd: int) -> str:
+                if self._sync_fail_armed:
+                    self._sync_fail_armed = False
+                    self.log.append(("sync", "EIO"))
+                    raise OSError(errno.EIO, os.strerror(errno.EIO))
+                method = real_sync(fd)
+                self.log.append(("sync", method))
+                return method
+
+            monkeypatch.setattr(runs_mod, "sync_fd", sync_fd)
         if where == "marker":
             assert monkeypatch is not None
             real_log = Run.log_metrics
@@ -194,8 +213,14 @@ class Probe:
             def log_metrics(run: Run, step: int | None = None, **row: Any) -> None:
                 if self.fired and self.action == "marker_fail_all":
                     raise OSError(errno.ENOSPC, "No space left on device")
+                self.log.append(("row", row.get("kind")))
                 if row.get("kind") == "trial_started":
                     markers[0] += 1
+                    if self.action == "sync_fail":  # on disk, then its sync fails
+                        real_log(run, step, **row)
+                        if self._maybe_fire("marker", markers[0]):
+                            self._sync_fail_armed = True
+                        return
                     if self.action != "signal" and self._maybe_fire("marker", markers[0]):
                         raise OSError(errno.ENOSPC, "No space left on device")
                     real_log(run, step, **row)
@@ -217,14 +242,14 @@ class Probe:
         loop._pre_write_stop = pre_write_logged  # type: ignore[method-assign]
 
     def _maybe_fire(self, where: str, count: int) -> bool:
-        if self.fired or where != self.where or count != self.n:
+        if self.fired or where != self.where or count != self.n or self.action == "none":
             return False
         self.fired = True
         if self.action == "serial":
             self.loop.arm.follower.fail_write = True  # type: ignore[attr-defined]
             self.log.append(("serial_fault_armed",))
             return True
-        if self.action.startswith("marker_fail"):
+        if self.action.startswith("marker_fail") or self.action == "sync_fail":
             self.log.append(("marker_failed",))
             return True
         assert self.sig is not None
@@ -785,7 +810,8 @@ def test_real_eval_stop_during_the_marker_is_not_started_and_resume_retries_the_
       a ``session_lost`` failure and does not re-run it (doubt = started)."""
     rec, probe = _real_eval_with_probe(tmp_path, monkeypatch, "SIGTERM", "signal")
     assert probe.fired and probe.goals_after_signal() == 0
-    assert probe.after_signal()[0] == ("stop_check", "pre_write", True)
+    assert probe.after_signal()[0][0] == "sync"  # the marker's sync to stable storage, then
+    assert probe.after_signal()[1] == ("stop_check", "pre_write", True)  # the final check
     assert ("write", "hold") in probe.after_signal()
     run_dir = rec.parent
     r1 = json.loads(rec.read_text())["results"]
@@ -1135,3 +1161,100 @@ def test_real_eval_disk_full_including_record_json_resume_retries_the_slot(
     assert [t["trial_idx"] for t in r2["trials"]] == [0, 1]
     plan = ev.G.sample_plan("PickPlace", "seen", 2, int(r1["session"]["slot_seed"]))
     assert r2["trials"][0]["placement"] == plan[0] and r2["trials"][0]["policy_started"]
+
+
+# -- owner 2026-11-09 (PR #32 sync): the start / retraction rows are synced to stable storage ----
+def test_real_eval_start_marker_is_synced_before_the_final_checks_and_the_first_goal(
+    tmp_path: Path, terminal: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``wo07_real_eval --mock``: the ``trial_started`` row is appended, then synced (F_FULLFSYNC
+    on macOS, fsync on Linux), and only then come the final stop check and the first policy goal
+    (the freshness re-check sits between them and logs nothing). The run's record names the
+    synced rows and the method; ordinary rows are never synced."""
+    rec, probe = _real_eval_with_probe(tmp_path, monkeypatch, None, "none")
+    log = probe.log
+    i = log.index(("row", "trial_started"))
+    j = next(k for k in range(i + 1, len(log)) if log[k][0] != "sync")
+    want = "F_FULLFSYNC" if sys.platform == "darwin" else "fsync"
+    assert log[i + 1 : j] == [("sync", want)]  # the marker's own sync (the dir: session row)
+    assert log[j] == ("stop_check", "pre_write", False)  # the final check, after the sync
+    assert log[j + 1] == ("write", "goal")  # the first policy goal
+    r1 = json.loads(rec.read_text())["results"]
+    assert r1["durability"]["sync"] == want
+    assert r1["durability"]["synced_rows"] == ["trial_started", "trial_start_retracted", "session"]
+    decisions = [e for e in log if e == ("row", "decision")]
+    assert decisions and not any(  # no decision row is followed by a sync
+        log[k + 1][0] == "sync" for k, e in enumerate(log[:-1]) if e == ("row", "decision")
+    )
+    rows = [json.loads(x) for x in (rec.parent / "metrics.jsonl").read_text().splitlines()]
+    assert rows[0]["kind"] == "session" and rows[0]["session"]["session_id"]
+    marks = [r["policy_start_mark_ms"] for r in rows if "policy_start_mark_ms" in r]
+    assert len(marks) == 2  # one per trial: its first decision
+
+
+def test_real_eval_a_failed_marker_sync_blocks_the_first_goal_and_resume_retries_the_slot(
+    tmp_path: Path, terminal: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``trial_started`` row reaches metrics.jsonl but its sync raises EIO: handled exactly
+    like a failed marker write. No policy goal, the hold runs, slot 0 is ``not_started``
+    (``start_marker_failed``, the error in the detail), the marker is retracted (that row is
+    synced), the session ends ``start_marker_failed`` with the support shutdown and torque off;
+    ``--resume`` retries slot 0 with the same placement."""
+    rec, probe = _real_eval_with_probe(tmp_path, monkeypatch, None, "sync_fail")
+    assert probe.fired and probe.goals_after_signal() == 0
+    after = probe.after_signal()
+    assert after[0] == ("sync", "EIO") and ("write", "hold") in after
+    k = after.index(("row", "trial_start_retracted"))
+    assert after[k + 1][0] == "sync" and after[k + 1][1] != "EIO"  # the retraction is synced
+    r1 = json.loads(rec.read_text())["results"]
+    assert r1["session_end"].startswith("start_marker_failed: ")
+    assert (r1["shutdown"], r1["support_confirmed"]) == ("supported", True)
+    assert not probe.loop.arm.follower.bus.torque_enabled  # type: ignore[attr-defined]
+    (t0,) = r1["trials"]
+    assert (t0["outcome"], t0["policy_started"], t0["stop_reason"]) == (
+        "not_started",
+        False,
+        "start_marker_failed",
+    )
+    assert "Input/output error" in t0["stop_detail"] and "not sent" in t0["stop_detail"]
+    rows = [json.loads(x) for x in (rec.parent / "metrics.jsonl").read_text().splitlines()]
+    assert _trial_rows(rows) == ["trial_started", "trial_start_retracted", "trial"]
+    _settings, prior = ev.load_prior(rec.parent)
+    assert [t["outcome"] for t in prior] == ["not_started"]  # the retraction cancels the marker
+    rec2 = ev.main(_args(tmp_path, "--resume", rec.parent.name))
+    r2 = json.loads(rec2.read_text())["results"]
+    assert r2["session_end"] == "completed" and r2["summary"]["complete"]
+    assert [t["trial_idx"] for t in r2["trials"]] == [0, 0, 1]
+    assert r2["trials"][1]["placement"] == t0["placement"] and r2["trials"][1]["policy_started"]
+
+
+@pytest.mark.parametrize("lost", ["record_missing", "record_truncated", "metrics_missing"])
+def test_real_eval_resumes_after_a_power_loss_took_one_of_the_two_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lost: str
+) -> None:
+    """Power loss: record.json missing or cut short, the session is rebuilt from metrics.jsonl's
+    synced ``session`` row and the trials from its rows (the torque off of that run counts as
+    unconfirmed: unknown). metrics.jsonl missing: record.json's trials stand. Either way the
+    started slot is not re-run, slot 1 runs, the session completes."""
+    from test_real_eval import QuitAfter
+
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(2))  # 1 trial, then quit
+    rec = ev.main(_args(tmp_path, "--task", "PickPlace", "--trials", "2", "--cells", "seen"))
+    r1 = json.loads(rec.read_text())["results"]
+    assert [t["trial_idx"] for t in r1["trials"]] == [0] and r1["trials"][0]["policy_started"]
+    if lost == "record_missing":
+        rec.unlink()
+    elif lost == "record_truncated":
+        rec.write_text(rec.read_text()[: len(rec.read_text()) // 2])
+    else:
+        (rec.parent / "metrics.jsonl").unlink()
+    settings, prior = ev.load_prior(rec.parent)
+    assert settings["session_id"] == r1["session"]["session_id"]
+    assert [t["trial_idx"] for t in prior] == [0] and prior[0]["policy_started"]
+    assert bool(settings.get("prior_torque_off_unconfirmed")) == (lost != "metrics_missing")
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    rec2 = ev.main(_args(tmp_path, "--resume", rec.parent.name))
+    r2 = json.loads(rec2.read_text())["results"]
+    assert r2["session_end"] == "completed" and r2["summary"]["complete"]
+    assert [t["trial_idx"] for t in r2["trials"]] == [0, 1]  # slot 0 never re-run
+    assert r2["resumed_from"] == rec.parent.name
