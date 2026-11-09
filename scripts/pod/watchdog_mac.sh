@@ -14,6 +14,13 @@
 # under the expected name); 3 no Keychain item; 4 watchdog exited (wrong id, refused key, name
 # mismatch); 5 still unconfirmed after the wait (it keeps running, but the layer is not armed).
 #
+# Launch gate: each run gets a fresh tag (--run-tag, 16 hex chars) that the watchdog writes into
+# every log line, and this script writes <dir>/<pod>.mac.env (pod, pid, tag, start, deadline, log)
+# BEFORE it waits. scripts/pod/launch_gate.py reads it and counts only a "confirmed" line with this
+# pod and this tag, written after this start, while that pid is alive and still runs
+# `watchdog.py --pod-id <pod> ... --run-tag <tag>`: a line from an earlier run or another pod never
+# passes the gate.
+#
 # Limits, honestly: `caffeinate -i -s` keeps the Mac from idle/system sleep while the watchdog
 # runs, but -s only holds on AC power, and closing the lid on battery sleeps the Mac anyway; a
 # sleeping, dead or offline laptop runs no watchdog. That is why the GitHub Actions watchdog
@@ -40,11 +47,14 @@ dir=${WATCHDOG_DIR:-$repo/runs/watchdog}   # runs/ is git-ignored
 mkdir -p "$dir"
 log="$dir/$pod.jsonl"
 out="$dir/$pod.out"
+state="$dir/$pod.mac.env"
 skip=0
 if [ -f "$log" ]; then skip=$(awk 'END { print NR }' "$log"); fi
+tag=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+case "$tag" in ???????????????? ) ;; *) echo "could not read a run tag from /dev/urandom" >&2; exit 2 ;; esac
 # pods are named vla-rl-so101-<purpose> (runbook); a different name means a wrong pod id: no delete
 args=(--pod-id "$pod" --deadline-epoch "$deadline" --lead-s "$lead" --log "$log"
-  --expect-name-prefix "${WATCHDOG_NAME_PREFIX:-vla-rl-so101}")
+  --expect-name-prefix "${WATCHDOG_NAME_PREFIX:-vla-rl-so101}" --run-tag "$tag")
 [ -n "$cap" ] && args+=(--cap-s "$cap")
 # export inside a subshell: the key is in the child's environment only, not in any argv (ps)
 (
@@ -53,6 +63,9 @@ args=(--pod-id "$pod" --deadline-epoch "$deadline" --lead-s "$lead" --log "$log"
 ) &
 pid=$!
 unset key
+# the launch gate's record of THIS run (no key in it); written atomically
+printf 'pod=%s\npid=%s\ntag=%s\nstart=%s\ndeadline=%s\nlog=%s\n' \
+  "$pod" "$pid" "$tag" "$now" "$deadline" "$log" > "$state.tmp.$$" && mv -f "$state.tmp.$$" "$state"
 # Armed only once the watchdog has CONFIRMED this key sees the pod under the expected name (a wrong
 # id or a refused key would otherwise watch nothing until the fire time). Only lines written by this
 # run count: the log is appended per pod id.
@@ -60,8 +73,9 @@ wait_s=${WATCHDOG_CONFIRM_WAIT_S:-150}
 case "$wait_s" in '' | *[!0-9]* | 0?*) wait_s=150 ;; esac
 t0=$(date +%s)
 while :; do
-  if awk -v s="$skip" 'NR > s && /"event": "confirmed"/ { f = 1 } END { exit !f }' "$log" 2>/dev/null; then
+  if awk -v s="$skip" -v t="\"tag\": \"$tag\"" 'NR > s && /"event": "confirmed"/ && index($0, t) { f = 1 } END { exit !f }' "$log" 2>/dev/null; then
     echo "watchdog CONFIRMED the pod; pid $pid (caffeinate -i -s), pod $pod, deadline $(date -r "$deadline" -u +%FT%TZ) (in $((deadline - now)) s), lead $lead s"
+    echo "run tag: $tag; gate state: $state"
     echo "log: $log"
     echo "out: $out"
     echo "stop by hand (only once the pod is verified gone, or on the owner's word): pkill -f 'watchdog.py --pod-id $pod'"

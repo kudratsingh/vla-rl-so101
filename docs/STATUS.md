@@ -355,7 +355,7 @@ Outside watchdog (2026-11-08, owner request, $0, checked against a fake API, not
     `vla-rl-so101*` name (event `confirmed`). A pod that no source shows (wrong id, or not visible
     to the key) gives an alert and exit 3 at once; 401/403 from both REST APIs gives exit 5 at
     once. Both launchers count as armed only after `confirmed` (the Mac launcher waits for it; the
-    GitHub run has a separate "Confirm pod visible" step). It never deletes a pod it has not
+    GitHub run has a separate "Confirm pod <id>" step; the launch gate below checks both). It never deletes a pod it has not
     confirmed, because the RunPod account is shared.
   - **Gone needs two sources.** A REST 404 also means "not accessible to the caller" (v2 OpenAPI),
     so "gone" needs two of REST v2, REST v1 and GraphQL to agree (404, `TERMINATED` or a null
@@ -392,6 +392,35 @@ Outside watchdog (2026-11-08, owner request, $0, checked against a fake API, not
 - **Owner, once:** create the Keychain item, the `pod-watchdog` environment (deployment branch
   `main`) and its secret `RUNPOD_API_KEY`, ideally from a dedicated key. RunPod documents no
   pod-only key scope; Restricted keys are scoped per Serverless endpoint only.
+
+Launch gate (2026-11-08, owner request, $0, checked against a fake GitHub API and fake `ps` /
+`ssh` / Keychain, not live):
+- **Why.** The old runbook took the newest `pod-watchdog` run (`gh run list -L 1`), which could be
+  another pod's, and went on if only one watchdog confirmed.
+- **What.** `scripts/pod/launch_gate.py` (stdlib). `dispatch` sends the workflow with a fresh nonce
+  (`dispatch_id`; run-name `pod-watchdog pod=<id> dispatch=<nonce>`, step `Confirm pod <id>`). It
+  takes the run id from the dispatch response (`workflow_run_id`), or else from the one run of
+  that workflow on `main` created after the dispatch with exactly that run-name. It then verifies
+  the run: run-name, event, branch `main`, workflow file, created after the dispatch.
+  `gate` passes only when the GitHub run is in progress with `Confirm pod <id>` = success by
+  `T_req` + 300 s and its `Watchdog` step running, AND the Mac watchdog's log has a `confirmed`
+  line for this pod with this run's tag (`--run-tag`, new; `watchdog_mac.sh` writes
+  `runs/watchdog/<id>.mac.env`), by the same deadline, from a live process that runs exactly
+  that watchdog. On failure it writes no token and runs the new `watchdog.py --terminate-now`
+  (same name-prefix and two-source checks), then the agent deletes via the connector and confirms
+  the pod gone. On a pass, `gate --ssh-host` writes `/workspace/WATCHDOGS_OK.<id>` over SSH, and
+  only if the pod's `runpod.env` names this pod. `diag_job.sh`, `demo_rebuild_job.sh` and
+  `wo04_job.sh` refuse to start without a valid token (rc 8, checked before setup; the EXIT trap
+  then deletes the pod). The in-container backstop (`pod_start_cmd.sh`, `delete_self.sh`,
+  `job_lib.sh`) and the lr-sweep approval gate are unchanged.
+- **Cost.** $0 now. At launch the gate normally passes within ~1-2 min, while the image is still
+  pulling, so the caps are unchanged. A gate that fails at its deadline deletes the pod
+  ~6.5 min after `T_req` (5.5 min + ~1 min of cleanup): ~$0.20 on the A100 ($1.80/h with
+  storage), ~$0.10 on the 4090. A token write that fails after the full 900 s SSH wait costs up to
+  ~$0.70 on the A100. Both are inside the firm cap.
+- **Not verified live:** the dispatch response shape, the run-name and step-name expressions on
+  GitHub, and `ps` on the caffeinate pid. Checking them needs a dispatch once the workflow is on
+  `main`; it was not done here.
 
 Outside our control:
 - The pod cannot delete itself in four cases:

@@ -78,3 +78,53 @@ await_approval() {
   done
   echo "[job] approved: $(cat "$(approval_file)")"
 }
+
+# ---- launch-gate token (owner 2026-11-08) -------------------------------------------------------
+# A job starts only after the launch gate on the Mac (scripts/pod/launch_gate.py) saw BOTH outside
+# watchdogs (GitHub run and Mac process) confirm THIS pod. On a pass it writes, over SSH,
+#   $WATCHDOG_TOKEN_DIR/WATCHDOGS_OK.<RUNPOD_POD_ID>   (WATCHDOG_TOKEN_DIR = APPROVAL_DIR = /workspace)
+# one line "pod=<id> github_run=<run id> dispatch=<nonce> mac_pid=<pid> mac_tag=<tag> written=<UTC>".
+# It counts only if it is this pod's file, names this pod, carries both watchdog ids, and was
+# written after the pod's first boot (same freshness rule as the approval file above). The job
+# checks it right after pod_env, BEFORE setup: setup is paid GPU time and the gate always runs
+# before the job is launched, so there is nothing to overlap. A missing / stale / foreign token
+# ends the job with rc 8 (the EXIT trap then deletes the pod: a pod without both watchdogs is not
+# launched). This is not the lr-sweep approval: that gate stays separate.
+WATCHDOG_TOKEN_DIR=${WATCHDOG_TOKEN_DIR:-$APPROVAL_DIR}
+
+watchdog_token_file() { echo "$WATCHDOG_TOKEN_DIR/WATCHDOGS_OK.${RUNPOD_POD_ID:-}"; }
+
+# watchdog_token_why FILE: "" if FILE is a valid launch-gate token for this pod, else the reason
+watchdog_token_why() {
+  local f=$1 start m line
+  [ -n "${RUNPOD_POD_ID:-}" ] || { echo "RUNPOD_POD_ID unset"; return; }
+  [ "$f" = "$(watchdog_token_file)" ] || { echo "not this pod's file ($(watchdog_token_file))"; return; }
+  [ -f "$f" ] || { echo "missing"; return; }
+  start=$(_approval_start) || { echo "$POD_START_EPOCH_FILE missing or not an integer"; return; }
+  m=$(_approval_mtime "$f")
+  case "$m" in '' | *[!0-9]*) echo "mtime unreadable"; return ;; esac
+  [ "$m" -gt "$start" ] || { echo "stale: written $((start - m)) s before this pod first booted"; return; }
+  line=" $(head -c 512 "$f" | head -n 1) "
+  case "$line" in *" pod=$RUNPOD_POD_ID "*) ;; *) echo "names another pod"; return ;; esac
+  echo "$line" | grep -Eq ' github_run=[1-9][0-9]* ' || { echo "no GitHub watchdog run id"; return; }
+  echo "$line" | grep -Eq ' mac_pid=[1-9][0-9]* ' || { echo "no Mac watchdog pid"; return; }
+}
+
+# require_watchdogs: rc 0 iff this pod's launch-gate token is valid; else log why (and every
+# other WATCHDOGS_OK* file that does not count) and return 8
+require_watchdogs() {
+  local f why
+  for f in "$WATCHDOG_TOKEN_DIR"/WATCHDOGS_OK*; do
+    [ -e "$f" ] || continue
+    [ "$f" = "$(watchdog_token_file)" ] && continue
+    echo "[job] launch gate IGNORES $f: $(watchdog_token_why "$f")"
+  done
+  why=$(watchdog_token_why "$(watchdog_token_file)")
+  if [ -n "$why" ]; then
+    echo "[job] REFUSING to start: launch-gate token $(watchdog_token_file): $why." \
+      "Both outside watchdogs must confirm this pod first (scripts/pod/launch_gate.py gate," \
+      "docs/runbooks/pod-launch.md)"
+    return 8
+  fi
+  echo "[job] launch gate passed: $(head -n 1 "$(watchdog_token_file)")"
+}

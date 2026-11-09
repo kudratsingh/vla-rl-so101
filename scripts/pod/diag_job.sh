@@ -67,6 +67,8 @@ finish() {
 }
 trap finish EXIT
 pod_env || exit 9
+# both outside watchdogs confirmed THIS pod (launch-gate token), before any paid setup: rc 8
+require_watchdogs || exit 8
 start_watchdog
 
 # cgroup CPU quota, not the host core count (scripts/pod/wo04_job.sh)

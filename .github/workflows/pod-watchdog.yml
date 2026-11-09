@@ -1,16 +1,19 @@
 # Outside-the-pod watchdog on a GitHub-hosted runner: independent of the pod's container and of the
-# owner's laptop. The agent dispatches it right after the pod create call
-# (docs/runbooks/pod-launch.md):
-#   gh workflow run pod-watchdog.yml -f pod_id=<id> -f deadline_epoch=<T_req + cap> -f cap_s=<cap>
+# owner's laptop. The agent dispatches it right after the pod create call, ONLY through the launch
+# gate (docs/runbooks/pod-launch.md), which adds a fresh nonce and captures this run's id:
+#   python scripts/pod/launch_gate.py dispatch --pod-id <id> --deadline-epoch <T_req + cap> --cap-s <cap>
 # It runs scripts/pod/watchdog.py: poll the pod, terminate it at deadline - lead_s, verify it is gone.
 # THE REPO IS PUBLIC, so this log is public: the watchdog prints no key (GitHub also masks secrets)
 # and logs only the pod id, timestamps, HTTP codes and truncated API error bodies.
 # workflow_dispatch works only once this file is on the default branch.
 # The key is an ENVIRONMENT secret of the `pod-watchdog` environment, whose deployment branches are
 # limited to main (runbook, one-time setup): a workflow on any other branch cannot read it.
-# Armed = the "Confirm pod visible" step succeeded (the key sees the pod under the expected name);
-# the agent checks that step with `gh run view --json jobs` before going on (runbook step 3).
+# Armed = the "Confirm pod <pod_id>" step succeeded (the key sees the pod under the expected name)
+# and the "Watchdog" step is running. The run-name carries the pod id and the dispatch nonce, so
+# scripts/pod/launch_gate.py matches exactly this run (title, event, branch main, this workflow
+# file, created after the dispatch) and the step name names the pod it confirmed.
 name: pod-watchdog
+run-name: pod-watchdog pod=${{ inputs.pod_id }} dispatch=${{ inputs.dispatch_id }}
 
 on:
   workflow_dispatch:
@@ -32,6 +35,10 @@ on:
         description: Start terminating this many s before the deadline
         required: false
         default: "400"
+        type: string
+      dispatch_id:
+        description: Launch-gate nonce (16-64 lowercase hex), in the run-name so the gate finds this run
+        required: true
         type: string
 
 permissions:
@@ -60,9 +67,11 @@ jobs:
           DEADLINE: ${{ inputs.deadline_epoch }}
           CAP_S: ${{ inputs.cap_s }}
           LEAD_S: ${{ inputs.lead_s }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
         run: |
           set -eu
           echo "$POD_ID" | grep -Eq '^[A-Za-z0-9_-]{4,64}$' || { echo "::error::bad pod_id"; exit 1; }
+          echo "$DISPATCH_ID" | grep -Eq '^[0-9a-f]{16,64}$' || { echo "::error::bad dispatch_id"; exit 1; }
           echo "$DEADLINE" | grep -Eq '^[1-9][0-9]{9}$' || { echo "::error::deadline_epoch must be epoch seconds"; exit 1; }
           echo "$LEAD_S" | grep -Eq '^(0|[1-9][0-9]{0,4})$' || { echo "::error::bad lead_s"; exit 1; }
           [ -z "$CAP_S" ] || echo "$CAP_S" | grep -Eq '^[1-9][0-9]{0,5}$' || { echo "::error::bad cap_s"; exit 1; }
@@ -73,7 +82,8 @@ jobs:
             exit 1
           fi
           echo "pod $POD_ID, deadline $(date -u -d "@$DEADLINE" +%FT%TZ) (in $((DEADLINE - now)) s), lead $LEAD_S s"
-      - name: Confirm pod visible
+      # the step name carries the pod id: the launch gate requires "Confirm pod <its pod id>"
+      - name: Confirm pod ${{ inputs.pod_id }}
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           POD_ID: ${{ inputs.pod_id }}

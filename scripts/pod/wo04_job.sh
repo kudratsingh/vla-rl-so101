@@ -57,6 +57,8 @@ finish() {
 }
 trap finish EXIT
 pod_env || exit 9
+# both outside watchdogs confirmed THIS pod (launch-gate token), before any paid setup: rc 8
+require_watchdogs || exit 8
 start_watchdog
 # Containers see every host core (128-256 on some A100 hosts) but get a cgroup CPU quota
 # (~14-27); size torch/OpenMP thread pools to the quota or CPU-side work (IK, data loading)

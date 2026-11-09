@@ -15,7 +15,14 @@ At launch the watchdog first confirms that its key sees the pod under a `vla-rl-
 re-reading for up to 120 s (log event `confirmed`). If no source shows the pod (wrong id, or not
 visible to the key), it alerts and exits 3 at once. If both REST APIs refuse the key (401/403), it
 exits 5 at once. It never deletes a pod it has not confirmed. A layer counts as armed only once it
-has confirmed (step 3).
+has confirmed.
+
+**Launch gate (owner 2026-11-08).** The job starts only after BOTH outside watchdogs confirmed THIS
+pod: `T_req` -> create -> start the Mac watchdog -> dispatch the GitHub watchdog with a nonce and
+capture its run id -> run the gate -> on a pass, the gate writes the pod's token -> launch the job.
+If either watchdog has not confirmed by `T_req` + 300 s, the gate aborts the launch and cleans up
+the verified pod (steps 3-8, `scripts/pod/launch_gate.py`). The job refuses to start without the
+token. The in-container backstop and the lr-sweep approval gate are unchanged.
 
 A read counts as "gone" only when two of REST v2, REST v1 and GraphQL agree (404, status
 `TERMINATED`, or a null GraphQL `pod`). A 404 also means "not accessible to the caller", and one
@@ -61,8 +68,8 @@ also after the Mac wakes from sleep), then exits 2.
    ```
    The repo is public, so workflow logs are public too. The watchdog prints no key, and GitHub masks
    secrets in logs. The log shows the pod id, timestamps, HTTP codes and truncated API error bodies.
-4. `.github/workflows/pod-watchdog.yml` has to be on `main` before `gh workflow run` can dispatch
-   it, so it cannot be used until PR #28 merges. A GitHub-hosted job runs for at most 360 min, so the
+4. `.github/workflows/pod-watchdog.yml` has to be on `main` before it can be dispatched
+   (`launch_gate.py dispatch`, ref `main`), so it cannot be used until PR #28 merges. A GitHub-hosted job runs for at most 360 min, so the
    workflow refuses any deadline more than 5.5 h away. A longer pod needs a chain of runs, which is
    not built yet.
 5. The RunPod connector must be connected in the agent's session. It returned ENOTFOUND on
@@ -89,42 +96,89 @@ against a mistyped id on the shared account.
      network volume) and port `22/tcp`.
 
    If the create call returns no id, list pods by name and treat any match as created.
-3. **Start both watchdogs at once**, before anything else (`CAP` is 5940 for the 4090 pod, 13800 or
-   12000 for the A100 pod with the paired clip probe (12660 / 10860 without it, `CLIP_GROUPS=0`;
-   a pod launched at those smaller caps skips the clip probe in-pod so the lr sweep keeps its
-   time; docs/STATUS.md):
+3. **Start the Mac watchdog at once** (`CAP` is 5940 for the 4090 pod, 13800 or 12000 for the
+   A100 pod with the paired clip probe (12660 / 10860 without it, `CLIP_GROUPS=0`; a pod launched
+   at those smaller caps skips the clip probe in-pod so the lr sweep keeps its time;
+   docs/STATUS.md):
    ```zsh
-   gh workflow run pod-watchdog.yml --repo kudratsingh/vla-rl-so101 \
-     -f pod_id=<id> -f deadline_epoch=$DEADLINE -f cap_s=$CAP
-   bash scripts/pod/watchdog_mac.sh <id> $DEADLINE $CAP   # exit 0 only after "confirmed"
-   RUN=$(gh run list --repo kudratsingh/vla-rl-so101 --workflow pod-watchdog.yml -L 1 \
-     --json databaseId --jq '.[0].databaseId')
-   gh run view "$RUN" --repo kudratsingh/vla-rl-so101 --json status,jobs \
-     --jq '.status, (.jobs[0].steps[] | select(.name == "Confirm pod visible") | .conclusion)'
+   bash scripts/pod/watchdog_mac.sh <id> $DEADLINE $CAP   # exit 0 only after THIS run's "confirmed"
    ```
-   Both layers are armed only when the Mac launcher printed `watchdog CONFIRMED the pod` (exit 0)
-   and the GitHub run is `in_progress` with the "Confirm pod visible" step `success`. Allow ~3 min
-   for the GitHub step. If neither confirms, or either reports a wrong id (Mac exit 4, GitHub step
-   `failure` after exit 3/4/5), delete the pod through the connector now: the outside layer is not
-   watching it. If only one confirms, say so to the owner before going on.
-   Each watchdog warns if it starts more than 180 s after `T_req` or after the pod's `createdAt`.
-   With `cap_s` set, each one also tightens its deadline to `createdAt` + cap when that is earlier.
-4. **Read the pod back** through the connector. The start command must equal the file, the env must
+   It gives the run a fresh 16-hex tag (`--run-tag`, written into every log line) and writes
+   `runs/watchdog/<id>.mac.env` (pod, pid, tag, start, deadline, log; no key) for the gate. It
+   normally returns within seconds. Whatever its exit code, go on to step 4: the gate decides.
+4. **Dispatch the GitHub watchdog through the gate script, which captures the run id**:
+   ```zsh
+   uv run python scripts/pod/launch_gate.py dispatch --pod-id <id> --deadline-epoch $DEADLINE --cap-s $CAP
+   ```
+   This sends the dispatch (`gh api POST .../actions/workflows/pod-watchdog.yml/dispatches`, ref
+   `main`) with a fresh nonce `dispatch_id`. The workflow's run-name is
+   `pod-watchdog pod=<id> dispatch=<nonce>`, and its confirm step is named `Confirm pod <id>`.
+   The run id comes from the dispatch response (`workflow_run_id`; GitHub's REST docs list a 200
+   response with it, read 2026-11-08). If the response has no id, the script lists this workflow's
+   `workflow_dispatch` runs on `main` created at or after the dispatch and takes the one run whose
+   run-name is exactly that string; zero or several matches fail. Either way it then checks the
+   run: exact run-name, event `workflow_dispatch`, branch `main`, workflow file
+   `.github/workflows/pod-watchdog.yml`, and created no earlier than the dispatch minus 30 s. The
+   result goes to `runs/watchdog/<id>.github.json`. Exit 0 = captured and verified; 3 = the
+   dispatch failed; 4 = no run, several runs, or a run that is not this pod's. On 3 or 4, go on to
+   step 5 anyway: the gate then fails and cleans up. **Never use `gh workflow run` or
+   `gh run list -L 1`**: the latest run can be another pod's.
+5. **Run the gate** (confirmation deadline `T_req` + 300 s by default, `--gate-s`):
+   ```zsh
+   uv run python scripts/pod/launch_gate.py gate --pod-id <id> --deadline-epoch $DEADLINE --t-req $T_REQ
+   ```
+   It polls every 10 s and passes only when **both** of these hold:
+   - **GitHub:** the run with the captured id is still this pod's run (the step 4 checks), its
+     status is `in_progress`, its step `Confirm pod <id>` concluded `success` by the deadline
+     (+ 30 s clock skew), and its `Watchdog` step is running;
+   - **Mac:** `<id>.mac.env` names this pod and `$DEADLINE`, the log has a `confirmed` line for
+     this pod with this run's tag, written after this run's start and by the deadline, no `exit`
+     line for that tag, and the pid is alive and runs `watchdog.py --pod-id <id> ... --run-tag
+     <tag>`.
+
+   A `confirmed` line from an earlier run or another pod, another pod's GitHub run, a run that has
+   finished, or one layer alone never passes. A gate started after the deadline still passes if
+   both confirmed in time and both are still running. A layer that reports failure (step
+   `failure` or `skipped`, run finished, process gone, run not this pod's) fails the gate at once.
+   **On failure the gate aborts and cleans up**: it writes no token and runs
+   `watchdog.py --terminate-now` with the Keychain key, which deletes the pod only if it confirms
+   the pod under the `vla-rl-so101` name, and verifies it gone from two sources. Exit codes: 0
+   passed; 10 failed, pod verified gone; 11 failed and the cleanup did NOT verify it gone; 12
+   failed with `--no-cleanup`; 2 bad input. **On 10, 11 or 12, delete the pod through the
+   connector and confirm it is gone** (on 10 this is a second check). Then report to the owner. The
+   launch is over; a new launch needs a new go. Each step is logged to
+   `runs/watchdog/<id>.gate.jsonl`.
+6. **Read the pod back** through the connector. The start command must equal the file, the env must
    hold `SPEND_CAP_SECONDS`, `POD_DEADLINE_EPOCH` and `PUBLIC_KEY`, and the volume must be at
-   `/workspace`. Note `createdAt`.
-5. **Over SSH**, `cat /root/backstop_status` must read `KEY_OK http=200 timer=armed
+   `/workspace`. Note `createdAt` and the SSH address.
+7. **Over SSH**, `cat /root/backstop_status` must read `KEY_OK http=200 timer=armed
    cap_from=creation`. Anything else means: delete the pod through the connector now. The watchdogs
    then see it gone and exit 0.
-6. **HF token** to `/root/.hf_token` over SSH (`umask 077`), never as pod env or on a command line.
-7. **Launch the job**: `nohup bash scripts/pod/<job>.sh > /workspace/job.log 2>&1 &`.
-8. **Approval gates**: post the probe numbers. On the owner's explicit go, write THIS pod's
+8. **Write the launch token through the gate**:
+   ```zsh
+   uv run python scripts/pod/launch_gate.py gate --pod-id <id> --deadline-epoch $DEADLINE --t-req $T_REQ \
+     --ssh-host <ip> --ssh-port <port>
+   ```
+   It re-runs the step 5 checks (both layers must still be running), checks that the pod's
+   `/root/runpod.env` names this pod, and writes `/workspace/WATCHDOGS_OK.<id>`:
+   `pod=<id> github_run=<run id> dispatch=<nonce> mac_pid=<pid> mac_tag=<tag> written=<UTC>`.
+   It retries SSH for up to 900 s (`--ssh-wait-s`). Failure is handled as in step 5. The job scripts
+   (`diag_job.sh`, `demo_rebuild_job.sh`, `wo04_job.sh`) check this token right after reading
+   `/root/runpod.env`, before setup. A missing token, one written before the pod's first boot, one
+   naming another pod, or one without both watchdog ids ends the job with rc 8, and the job's EXIT
+   trap deletes the pod (`require_watchdogs`, `scripts/pod/approval_lib.sh`). The older
+   `wo02*_job.sh` scripts do not check it and are not launched under this runbook.
+9. **HF token** to `/root/.hf_token` over SSH (`umask 077`), never as pod env or on a command line.
+10. **Launch the job** (only after step 8 printed `token written`):
+   `nohup bash scripts/pod/<job>.sh > /workspace/job.log 2>&1 &`.
+11. **Approval gates** (separate from the launch gate, unchanged): post the probe numbers. On the owner's explicit go, write THIS pod's
    approval file over SSH, from the repo root on the pod:
    `bash -c '. /root/runpod.env; . scripts/pod/approval_lib.sh; approval_write "owner go <date>: <what>"'`.
    It writes `/workspace/APPROVED.<RUNPOD_POD_ID>`. The gate accepts only that file, and only if
    it was written after the pod's first boot. A stale file from an earlier pod on a reused volume,
    or the old unscoped `/workspace/APPROVED` (`touch` no longer works), is ignored, and the job log
    names it (`scripts/pod/approval_lib.sh`).
-9. **End**: both watchdogs log `verified_gone` (exit 0). Check with `gh run view` and
+12. **End**: both watchdogs log `verified_gone` (exit 0). Check with `gh run view` and
    `runs/watchdog/<id>.jsonl`. Write the run record and spend row.
 
 Deleting a pod early through the connector needs no change to the watchdogs. They have seen the
@@ -132,6 +186,14 @@ pod, so they verify it is gone (two sources, for at least 120 s) and exit 0. To 
 verified gone: `gh run cancel <run>` and `pkill -f 'watchdog.py --pod-id <id>'`.
 
 ## Limits
+
+- The launch gate checks GitHub through `gh api` with the owner's `gh` login. A GitHub API outage
+  at launch fails the gate, and the pod is deleted: no launch without the GitHub layer. The gate
+  can only see that each watchdog was running when it passed. The job inside the pod cannot see
+  the watchdogs, so a watchdog that dies later is not noticed by the job; the other layers remain.
+- The run-id capture, the run-name and the step-name match have been checked only against a fake
+  GitHub API (`tests/test_pod_launch_gate.py`), not against a live dispatch: the workflow is not on
+  `main` yet, and dispatching it was out of scope.
 
 - The Mac copy runs under `caffeinate -i -s`. That prevents idle and system sleep only on AC power.
   Closing the lid on battery still sleeps the Mac, and a dead, sleeping or offline laptop runs no

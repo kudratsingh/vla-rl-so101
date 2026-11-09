@@ -19,6 +19,11 @@ Behaviour:
     visible to this key); 401/403 from both REST APIs -> exit 5; still unreadable -> alert and go
     on, but never delete a pod that was not confirmed (the RunPod account is shared). The launchers
     wait for the "confirmed" event; --confirm-only stops after this step (exit 0 = confirmed);
+    --run-tag (the Mac launcher's per-run nonce) is written into every log line, so the launch
+    gate (scripts/pod/launch_gate.py) counts only this run's "confirmed";
+  - --terminate-now (the launch gate's cleanup after a failed gate): the same startup confirm, then
+    the terminate phase at once, for at most --overrun-s; a pod not confirmed under the expected
+    name is never deleted (exit 3 / 4 / 5 / 6 as below);
   - before the fire time: read the pod every --poll-s; exit 0 early only if it deleted itself:
     every read over >= --gone-confirm-s (120 s) shows it gone;
   - a read is GONE only when two sources agree (404, status TERMINATED, or GraphQL pod null): a
@@ -36,7 +41,8 @@ Behaviour:
     after a clock jump, e.g. a laptop waking), then exit 2.
 Exit codes: 0 verified gone (--confirm-only: confirmed); 2 not verified by the end of the overrun;
 3 this key never saw the pod; 4 pod name does not match --expect-name-prefix (nothing deleted);
-5 bad input, no key, or key refused; 6 --confirm-only: pod not confirmed (API errors).
+5 bad input, no key, or key refused; 6 --confirm-only / --terminate-now: pod not confirmed (API
+errors; nothing deleted).
 
 The key comes only from the environment (RUNPOD_API_KEY), never argv, and is redacted from every
 line this script writes. Every attempt is logged as one JSONL line to --log.
@@ -65,6 +71,7 @@ API_V2 = "https://api.runpod.io"
 API_V1 = "https://rest.runpod.io/v1"
 GRAPHQL = "https://api.runpod.io/graphql"
 POD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
+RUN_TAG_RE = re.compile(r"^[A-Za-z0-9_-]{0,64}$")
 
 PRESENT, GONE, UNKNOWN = "present", "gone", "unknown"
 
@@ -118,6 +125,7 @@ class Cfg:
     gone_confirm_s: float = 120.0
     jump_s: float = 30.0
     expect_name_prefix: str = ""
+    run_tag: str = ""
     api_v2: str = API_V2
     api_v1: str = API_V1
     graphql: str = GRAPHQL
@@ -175,7 +183,10 @@ class Watchdog:
 
     def log(self, event: str, **kw: Any) -> None:
         now = self.clock.now()
-        rec = {"t": _iso(now), "epoch": round(now, 3), "pod": self.cfg.pod_id, "event": event, **kw}
+        rec: dict[str, Any] = {"t": _iso(now), "epoch": round(now, 3), "pod": self.cfg.pod_id}
+        if self.cfg.run_tag:
+            rec["tag"] = self.cfg.run_tag
+        rec.update(event=event, **kw)
         line = self.redact(json.dumps(rec, sort_keys=False, default=str))
         try:
             d = os.path.dirname(self.cfg.log)
@@ -502,7 +513,7 @@ class Watchdog:
         self.log("unconfirmed", state=rd.state, detail=rd.detail)
         return 6
 
-    def run(self, confirm_only: bool = False) -> int:
+    def run(self, confirm_only: bool = False, terminate_now: bool = False) -> int:
         c = self.cfg
         now = self.clock.now()
         self.log(
@@ -513,6 +524,9 @@ class Watchdog:
             cap_s=c.cap_s,
             fire_in_s=round(self.fire - now, 1),
             confirm_only=confirm_only,
+            terminate_now=terminate_now,
+            pid=os.getpid(),
+            ppid=os.getppid(),
         )
         if c.cap_s is not None:
             late = now - (c.deadline - c.cap_s)
@@ -525,6 +539,15 @@ class Watchdog:
             rc = 0 if rc is None else rc
             self.log("exit", rc=rc, phase="confirm", requests=self.requests)
             return rc
+        if terminate_now:
+            # the launch gate failed: delete now, but only a pod confirmed under the expected name
+            # (3 / 4 / 5 already logged their exit; 6 = unreadable, nothing deleted)
+            if rc is not None:
+                if rc == 6:
+                    self.log("exit", rc=6, phase="terminate_now", requests=self.requests)
+                return rc
+            self.log("terminate_now", reason="launch gate failed")
+            return self._terminate_phase(end=self.clock.now() + c.overrun_s)
         if rc is not None and rc != 6:
             return rc
         if self.clock.now() >= self.fire:
@@ -555,11 +578,12 @@ class Watchdog:
                 streak_t = None
         return self._terminate_phase()
 
-    def _terminate_phase(self) -> int:
+    def _terminate_phase(self, end: float | None = None) -> int:
         c = self.cfg
         # the overrun window counts from the later of the deadline and now: a watchdog that starts
         # (or wakes) late still gets a full window, and always makes at least one attempt
-        end = max(self.deadline, self.clock.now()) + c.overrun_s
+        if end is None:
+            end = max(self.deadline, self.clock.now()) + c.overrun_s
         self.log(
             "fire",
             deadline_in_s=round(self.deadline - self.clock.now(), 1),
@@ -683,6 +707,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--gone-confirm-s", type=float, default=120.0, help="self-deleted: gone this long"
     )
     p.add_argument("--confirm-only", action="store_true", help="exit after the startup confirm")
+    p.add_argument(
+        "--terminate-now",
+        action="store_true",
+        help="confirm, then terminate at once and verify gone (launch-gate cleanup)",
+    )
+    p.add_argument("--run-tag", default="", help="nonce written into every log line")
     p.add_argument("--no-alerts", action="store_true")
     p.add_argument("--api-v2", default=API_V2, help=argparse.SUPPRESS)
     p.add_argument("--api-v1", default=API_V1, help=argparse.SUPPRESS)
@@ -713,6 +743,10 @@ def main(
         bad.append("negative lead / gap / overrun or non-positive timeout")
     if a.cap_s is not None and a.cap_s <= 0:
         bad.append("--cap-s must be positive")
+    if not RUN_TAG_RE.match(a.run_tag):
+        bad.append("--run-tag must be 0-64 of [A-Za-z0-9_-]")
+    if a.confirm_only and a.terminate_now:
+        bad.append("--confirm-only and --terminate-now exclude each other")
     if not all(_base_ok(u) for u in (a.api_v2, a.api_v1, a.graphql)):
         bad.append("API URLs must be https (http only on 127.0.0.1)")
     if not key:
@@ -731,6 +765,7 @@ def main(
         timeout_s=a.timeout_s,
         delete_timeout_s=a.delete_timeout_s,
         expect_name_prefix=a.expect_name_prefix,
+        run_tag=a.run_tag if RUN_TAG_RE.match(a.run_tag) else "",
         confirm_s=a.confirm_s,
         gone_confirm_s=a.gone_confirm_s,
         api_v2=a.api_v2.rstrip("/"),
@@ -744,7 +779,7 @@ def main(
         wd.log("exit", rc=5)
         return 5
     try:
-        return wd.run(confirm_only=a.confirm_only)
+        return wd.run(confirm_only=a.confirm_only, terminate_now=a.terminate_now)
     except KeyboardInterrupt:
         wd.alert("pod watchdog stopped by hand", f"pod {cfg.pod_id} is no longer watched")
         wd.log("exit", rc=130)

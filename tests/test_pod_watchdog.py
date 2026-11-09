@@ -484,6 +484,47 @@ def test_confirm_only(tmp_path: Path, api: Any, setup: str, want: int) -> None:
     assert _events(recs, "exit")[-1]["phase"] == "confirm"
 
 
+def test_terminate_now_deletes_a_confirmed_pod_at_once(tmp_path: Path, api: Any) -> None:
+    """--terminate-now (launch-gate cleanup): deadline hours away, the pod is confirmed, deleted
+    and verified gone by two reads at once; every log line carries the run tag."""
+    state, base = api
+    rc, recs, _, alerts, clock = _run(
+        tmp_path, base, 13800, "--terminate-now", "--run-tag", "0123456789abcdef"
+    )
+    assert rc == 0
+    assert _deletes(state) == ["v2_delete"]
+    assert _events(recs, "confirmed") and _events(recs, "terminate_now")
+    assert _events(recs, "verified_gone")[0]["phase"] == "terminate"
+    assert clock.slept <= 10 + 10 + 1  # no waiting for the fire time
+    assert all(r.get("tag") == "0123456789abcdef" for r in recs)
+    assert _events(recs, "start")[0]["pid"] > 0
+    assert not [t for t, _ in alerts if "DEADLINE" in t]
+
+
+@pytest.mark.parametrize(("setup", "want"), [("other_name", 4), ("gone", 3), ("api_down", 6)])
+def test_terminate_now_never_deletes_an_unverified_pod(
+    tmp_path: Path, api: Any, setup: str, want: int
+) -> None:
+    state, base = api
+    if setup == "other_name":
+        state.name = "someone-elses-pod"
+    if setup == "gone":
+        state.present = False
+    if setup == "api_down":
+        state.modes.update(v2_get="fail", v1_get="fail", gql_get="fail")
+    rc, recs, _, _, _ = _run(tmp_path, base, 13800, "--terminate-now")
+    assert rc == want
+    assert _deletes(state) == []
+    assert _events(recs, "exit")[-1]["rc"] == want
+
+
+def test_bad_run_tag_and_exclusive_modes(tmp_path: Path, api: Any) -> None:
+    state, base = api
+    assert _run(tmp_path, base, 3600, "--run-tag", "bad tag!")[0] == 5
+    assert _run(tmp_path, base, 3600, "--confirm-only", "--terminate-now")[0] == 5
+    assert state.calls == []
+
+
 def test_name_mismatch_deletes_nothing(tmp_path: Path, api: Any) -> None:
     state, base = api
     state.name = "someone-elses-pod"
@@ -546,9 +587,11 @@ def test_mac_launcher_keeps_key_out_of_argv_and_waits_for_confirm(tmp_path: Path
     (stubs / "caffeinate").write_text(
         f'#!/bin/bash\necho "argv: $*" > "{rec}"\n'
         f'[ "$RUNPOD_API_KEY" = "{KEY}" ] && echo env-ok >> "{rec}"\n'
-        'log=""; prev=""; for a in "$@"; do [ "$prev" = --log ] && log=$a; prev=$a; done\n'
+        'log=""; tag=""; prev=""\n'
+        'for a in "$@"; do [ "$prev" = --log ] && log=$a; [ "$prev" = --run-tag ] && tag=$a; prev=$a; done\n'
         '[ "${STUB:-ok}" = die ] && exit 4\n'
-        '[ "${STUB:-ok}" = ok ] && echo \'{"event": "confirmed"}\' >> "$log"\n'
+        f'[ "${{STUB:-ok}}" = other_tag ] && echo \'{{"pod": "{POD}", "tag": "ffffffffffffffff", "event": "confirmed"}}\' >> "$log"\n'
+        f'[ "${{STUB:-ok}}" = ok ] && echo "{{\\"pod\\": \\"{POD}\\", \\"tag\\": \\"$tag\\", \\"event\\": \\"confirmed\\"}}" >> "$log"\n'
         "sleep 4\n"
     )
     for f in stubs.iterdir():
@@ -574,6 +617,15 @@ def test_mac_launcher_keeps_key_out_of_argv_and_waits_for_confirm(tmp_path: Path
     assert "env-ok" in r and KEY not in r and "--pod-id fakepod123" in r and "--cap-s 900" in r
     assert "--expect-name-prefix vla-rl-so101" in r
     assert KEY not in p.stdout + p.stderr
+    # the launch gate's record of this run: pod, pid, a fresh 16-hex tag (also in argv), no key
+    st = dict(
+        x.split("=", 1) for x in (tmp_path / "wd" / f"{POD}.mac.env").read_text().splitlines()
+    )
+    assert st["pod"] == POD and st["pid"].isdigit() and len(st["tag"]) == 16
+    assert f"--run-tag {st['tag']}" in r and KEY not in str(st)
+    # a confirmed line with another run's tag does not arm this run
+    o = go(STUB="other_tag")
+    assert o.returncode == 5, o.stdout + o.stderr
     # the confirmed line from the first run does not count for the next one
     s = go(STUB="silent")
     assert s.returncode == 5 and "NOT confirmed" in s.stderr, s.stdout + s.stderr
