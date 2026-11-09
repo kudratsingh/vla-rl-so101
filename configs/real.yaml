@@ -14,7 +14,10 @@ robot:
   # LeRobot 0.4.4 default for a so101_follower; lerobot-calibrate writes here too
   calibration_dir: ~/.cache/huggingface/lerobot/calibration/robots/so_follower
   use_degrees: true                  # LeRobot arm joints in degrees (required by units.py)
-  control_hz: 15                     # Hz; sim CONTROL_HZ
+  control_hz: 15                     # Hz NOMINAL; sim CONTROL_HZ. Owner 2026-11-09: kept at 15 for the
+                                     # SmolVLA / ACT baseline. Achieved rates are measured, not
+                                     # assumed (per trial write_rate_hz; docs/STATUS.md "PR 2: owner
+                                     # follow-up": ~13 writes/s inside a chunk on the mock rig)
   units:                             # LeRobot -> canonical; verify with wo06_calibrate.py verify
     arm_sign: [1, 1, 1, 1, 1]        # q_rad = deg2rad(sign * lerobot_deg + offset_deg)
     arm_offset_deg: [0.0, 0.0, 0.0, 0.0, 0.0]
@@ -89,7 +92,8 @@ cameras:
     index: 0
     width: 640                       # px, streamed resolution
     height: 480                      # px
-    fps: 30
+    fps: 30                          # owner 2026-11-09: cameras at 30 fps, control at 15 Hz (the
+                                     # loop reads the newest frame each tick)
     intrinsics: null                  # filled in WO-06
     pose: front_left_45               # must equal sim camera pose
     crop_to: 224                     # px, policy image side (OpenVLA-OFT input); = sim env.image_size
@@ -123,7 +127,12 @@ local_policy:
   exec_steps: null                   # actions run per chunk; null = whole chunk. deploy.max_chunk_age_ms
                                      # (800) drops the rest earlier: (800 - query ms) / 66.7 actions
   request_timeout_ms: 700            # ms, in-process chunk deadline -> deadman (hold); must stay
-                                     # < deploy.max_chunk_age_ms. SmolVLA on an M3 Pro MPS: ~0.42 s
+                                     # < deploy.max_chunk_age_ms. SmolVLA on an M3 Pro MPS: ~0.44 s
+                                     # p50 / 0.48 s p95 with the capture on (one call in 176 timed
+                                     # out in the 2026-11-09 mock run: docs/STATUS.md)
+  # Inference is SYNCHRONOUS (owner 2026-11-09): the loop asks for a chunk, waits for it, executes
+  # it, then asks again; inference never overlaps execution, for both policies. The wait is the
+  # chunk-boundary gap (SmolVLA ~0.51 s p50, ACT ~0.12 s on the mock rig).
   warmup: 2                          # synthetic-observation calls at load (MPS kernel compilation)
   latency_bases:                     # scripts/wo07_local_latency.py only (mock rig, never the arm)
     smolvla: lerobot/smolvla_base    # pretrained base: timing only, its actions are not ours
@@ -136,8 +145,10 @@ deploy:
   exec_steps: null                   # actions executed per chunk; null = whole chunk (as sim eval)
   request_timeout_ms: 400            # ms, policy server deadline -> deadman (hold)
   max_chunk_age_ms: 800              # ms, source-frame capture -> write; older actions are dropped
-                                     # and the policy re-queried (first action too old -> hold)
-  trial_max_steps: 150               # writes per trial = sim max_episode_steps. Wall time ~10 s
+                                     # and the policy re-queried (first action too old -> hold).
+                                     # Owner 2026-11-09: 800 for both SmolVLA and ACT (real-0.1)
+  trial_max_steps: 150               # protocol 0.2 / the pilot only (real-0.1 uses its own 450, see
+                                     # eval below). writes per trial = sim max_episode_steps. Wall time ~10 s
                                      # at 15 Hz when a query beats the 66.7 ms period, else
                                      # + 19 boundaries x (query - period); see write_hz per trial
   home_qpos: [0.0, -1.30, 0.60, 1.30, 0.0, 0.0]  # rad, sim REST_QPOS (src/env/robot.py)
@@ -163,6 +174,10 @@ deploy:
     trials: 5
 
 eval:                                # scripts/wo07_real_eval.py
+  # real-0.1 horizon (owner 2026-11-09): a SHARED cap of 450 policy COMMANDS per trial for SmolVLA
+  # and ACT alike (protocol_real.TRIAL_MAX_STEPS, in the protocol hash; not deploy.trial_max_steps).
+  # 450 commands are 30 s only at the nominal 15 Hz: the measured policy time per trial is ~72 s
+  # (SmolVLA, ~6.3 writes/s) and ~35 s (ACT, ~12.9 writes/s); docs/STATUS.md has the budget.
   trials_per_cell: 50                # = protocol REAL_TRIALS_PER_CELL
   cells: [seen, shifted, unseen_objects]
   grid: docs/assets/placement-grid-a3.pdf   # scripts/make_placement_grid.py (print at 100%)

@@ -27,6 +27,14 @@ tick, so the loop's pacing and the bus writes are unchanged; the safety status c
     uv run scripts/wo07_local_latency.py --preset real --family act              # fresh ACT
     uv run scripts/wo07_local_latency.py --preset real --family smolvla --capture  # as the eval
     uv run scripts/wo07_local_latency.py --preset tiny                           # CPU, tiny ACT, <2 min
+    # the real-0.1 baseline cadence (owner 2026-11-09): 450-command trials, capture on
+    uv run scripts/wo07_local_latency.py --preset real --family smolvla --capture --trial-steps 450 --ticks 900
+
+Also reports (owner 2026-11-09) the achieved command rate per trial (writes/s = (writes - 1) / the
+first-to-last write span), the chunk-boundary gap (command gaps longer than 1.5 control periods:
+the loop waiting for the next chunk; synchronous inference, no overlap) apart from the gaps inside
+a chunk, the POLICY time per trial (first to last write) and the measured BENCH-side capture time
+per trial (the staged journal written before the score, then the episode save + checkpoint).
 
 Writes runs/<id>/record.json (results.latency: p50 / p95 / max of both, plus every trial record)
 and runs/<id>/metrics.jsonl.
@@ -35,6 +43,7 @@ and runs/<id>/metrics.jsonl.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import itertools
 import platform
 import shutil
@@ -175,6 +184,7 @@ def run(
     fk: FkFn | None = None,
     act_overrides: dict[str, Any] | None = None,
     capture: bool = False,
+    trial_steps: int | None = None,
 ) -> Path:
     sys.path.insert(0, str(REPO_ROOT / "tests"))
     from robot_fakes import FakeFollower
@@ -204,6 +214,8 @@ def run(
         policy = load_local_policy(spec)
         load_s = time.perf_counter() - t_load
         dcfg = local_deploy_config(cfg, policy)
+        if trial_steps is not None:
+            dcfg = dataclasses.replace(dcfg, trial_max_steps=int(trial_steps))
         writes: list[float] = []
         fol = FakeFollower()
         send = fol.send_action
@@ -230,6 +242,7 @@ def run(
             run_.log_metrics(**row)
 
         saves: list[float] = []
+        stages: list[float] = []
         with (
             LocalPolicyClient(policy, timeout_s=dcfg.request_timeout_s, run_id=run_.id) as client,
             mock_rig(moving=capture) as rig,
@@ -274,6 +287,9 @@ def run(
                 )
                 if cap is not None and trials:
                     t0 = time.perf_counter()
+                    cap.stage(trials[-1])  # as the eval: journal before the score is logged
+                    stages.append(time.perf_counter() - t0)
+                    t0 = time.perf_counter()
                     trials[-1]["capture"] = cap.finish(trials[-1])
                     saves.append(time.perf_counter() - t0)
                 k += 1
@@ -282,9 +298,17 @@ def run(
             if cap is not None:
                 cap.close()
         gaps: list[float] = []
+        rates: list[float] = []
+        spans: list[float] = []
         for mark, t in zip(marks, trials, strict=False):
             w = writes[mark : mark + int(t["steps"])]
             gaps += [(b - a) * 1e3 for a, b in itertools.pairwise(w)]
+            if len(w) > 1:
+                spans.append(w[-1] - w[0])
+                rates.append((len(w) - 1) / (w[-1] - w[0]))
+        period_ms = 1e3 / dcfg.control_hz
+        boundary = [g for g in gaps if g > 1.5 * period_ms]
+        within = [g for g in gaps if g <= 1.5 * period_ms]
         summary = summarize(trials, dcfg.latency_target_ms, dcfg.capture_offset_ms)
         server_ms = [float(r["server_ms"]) for r in decisions]
         model_ms = [float(r["infer_ms"]) for r in decisions]
@@ -303,6 +327,12 @@ def run(
             "chunk_ms": pct(server_ms),
             "model_ms": pct(model_ms),
             "command_gap_ms": pct(gaps),
+            "boundary_gap_ms": pct(boundary),
+            "within_chunk_gap_ms": pct(within),
+            "writes_per_s": pct(rates),
+            "policy_s_per_trial": pct(spans),
+            "trial_steps": dcfg.trial_max_steps,
+            "inference": "synchronous: the loop waits for each chunk (no overlap)",
             "ticks": steps,
             "decisions": n_dec,
             "actions_per_chunk_mean": round(steps / n_dec, 2) if n_dec else None,
@@ -322,6 +352,7 @@ def run(
                     "on": True,
                     "frames": "textured: a ring of 30 random-noise 640x480 images per camera",
                     "episode_save_s": pct(saves),
+                    "stage_s": pct(stages),
                     "frames_per_episode": [int(t["steps"]) for t in trials],
                 }
                 if capture
@@ -345,7 +376,15 @@ def run(
 
 def _print(run_id: str, lat: dict[str, Any]) -> None:
     print(f"\nrun {run_id}  {lat['family']} on {lat['device']} ({lat['dtype']})  {LABEL}")
-    for key in ("chunk_ms", "model_ms", "command_gap_ms"):
+    for key in (
+        "chunk_ms",
+        "model_ms",
+        "command_gap_ms",
+        "boundary_gap_ms",
+        "within_chunk_gap_ms",
+        "writes_per_s",
+        "policy_s_per_trial",
+    ):
         s = lat[key]
         print(f"  {key:<15} n={s['n']:<4} p50 {s['p50']}  p95 {s['p95']}  max {s['max']}")
     print(
@@ -365,6 +404,9 @@ def main(argv: Sequence[str] | None = None) -> Path:
     parser.add_argument("--ticks", type=int, default=None, help="bus writes to collect (300)")
     parser.add_argument(
         "--capture", action="store_true", help="with the evaluation capture on textured frames"
+    )
+    parser.add_argument(
+        "--trial-steps", type=int, default=None, help="writes per trial (real-0.1: 450)"
     )
     parser.add_argument("--runs-dir", type=Path, default=RUNS_DIR, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -388,6 +430,7 @@ def main(argv: Sequence[str] | None = None) -> Path:
         runs_dir=args.runs_dir,
         act_overrides=TINY_ACT if tiny else None,
         capture=args.capture,
+        trial_steps=args.trial_steps,
     )
 
 

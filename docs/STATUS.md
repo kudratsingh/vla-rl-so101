@@ -1508,15 +1508,158 @@ SmolVLA session needs two bench sittings through `--resume`, or a command-rate d
 `src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/env/success.py` and `docs/results.md`
 are unchanged.
 
-**Owner decisions still open (before the first demo):**
-1. 15 Hz instead of LeRobot's 30 fps (Stage A).
-2. The 450-step horizon and the label rule (blinded verdict AND no recorded fault).
-3. The SmolVLA command rate: overlap inference, raise `max_chunk_age_ms` (a safety parameter),
-   or accept about 6 Hz with a 4.5 h session over two sittings.
-4. Whether to keep 20k steps if SmolVLA drops to batch 32.
+**Owner decisions still open (before the first demo):** items 1, 3 and 4 below were decided
+on 2026-11-09 (see "PR 2: owner follow-up"); item 2's horizon too (the label rule stands).
+1. ~~15 Hz instead of LeRobot's 30 fps (Stage A).~~ Kept: 15 Hz control, 30 fps cameras.
+2. ~~The 450-step horizon~~ (kept, shared by both policies) and the label rule (blinded verdict
+   AND no recorded fault).
+3. ~~The SmolVLA command rate~~: synchronous inference, `max_chunk_age_ms` 800, ~6.3 writes/s,
+   two sittings.
+4. ~~Whether to keep 20k steps if SmolVLA drops to batch 32~~: kept (half the samples, recorded).
+
+### PR 2: owner follow-up (capture gap, bowl check, baseline cadence)
+
+2026-11-09, $0, CPU / MPS, fakes, the mock rig and offline kinematics only (no arm, camera,
+serial port, Hub push, RunPod or workflow action). Main is NOT merged in here and the #33
+conflicts are not resolved here (a later step, after #33 lands).
+
+**1. Capture / resume gap (owner item 2).** A kill after a trial's scored record was flushed and
+before its episode was saved left three scored trials and two recordings.
+- Mechanism: the record hook now runs `EvalCapture.stage` BEFORE the record is logged. It waits
+  for LeRobot's PNG writer, writes the episode's state, action and timing (`frames.npz`),
+  hard-links the frame PNGs (a copy if a link fails) and the end-state stills into
+  `<capture>/staged/<trial id>/`, and writes `staged.json` last (renamed into place, so a journal
+  is whole or absent). A saved episode deletes its journal. Measured cost: 0.26 s per 450-frame
+  trial (mock rig, both cameras).
+- Resume (`reconcile_captures`, before any new trial), for each scored trial with no episode:
+  (1) its trial id is in the capture provenance (saved, then killed before its `capture` row):
+  attached; (2) else a whole journal exists: rebuilt and saved under the next free episode index
+  (`recovered`); (3) else flagged `recording_missing` with the reason. The slot is never re-run
+  and keeps its score; indices follow save order and the provenance maps each to its trial id.
+- Limits: nothing that was never staged can be recovered. That covers a trial the process died
+  in before its record (`session_lost`; staged at the session end only if the process lived to
+  run its `finally`), a kill while staging, a capture error, or a deleted or damaged journal.
+- Export: vishwaroop's declaration has no "incomplete" field (`docs/SO101_EXPORT.md` section 2;
+  `parse_declaration` / `check_export` read the copy at `<scratchpad>/vishwaroop-copy`), so a
+  scored trial without its recording REFUSES the evaluation bundle. A staged one says "resume
+  first". `--allow-missing-recordings` builds it declared `protocol_version`
+  `real-0.1-incomplete` (the same in-spec mechanism as `-dev`), with `status: INCOMPLETE` and the
+  missing trials in `bundle.json` and `trials.json`.
+- Regression test (`tests/test_capture_resume_gap.py`): a real SIGKILL of a child mock session
+  (`tests/capture_kill_child.py`) at the 3rd trial (a) after the scored record and before the save
+  (the owner's case), (b) inside LeRobot's save (data and video written, nothing finalized), and
+  (c) after the save, before its `capture` row; then a resume. Each case gives 3 scored trials, no
+  slot re-run, episodes {0, 1, 2} each mapped to its own trial, and a COMPLETE export. With the
+  journal deleted: `recording_missing`, the export refused, `--allow-missing-recordings` gives
+  INCOMPLETE with 2 episodes, and a second resume changes nothing. Hard timeout: SIGALRM raising
+  a BaseException, re-armed every second once it fires; the child has its own 240 s timeout.
+
+**2. Bowl check (owner item 3), offline through the REAL safety filter.**
+`scripts/wo07_bowl_check.py` runs the sim PickPlace oracle kinematically: hover, descend, close,
+lift, carry, lower, release, retreat, at all 25 used slots (5 seen + 20 ring) x the 7 schedule
+yaws. Every command passes through `src/robot/safety.py` built from `configs/real.yaml` with the
+sim FK. Two oracle variants: IK bounded by the safety joint limits (what a controller respecting
+the real limits commands), and the sim oracle unchanged (URDF range). Run
+`20261109T091250Z-wo07-bowl-check-real-0125` (scratch, not committed).
+- The limit: `workspace_box_m` y <= 0.20 m (TCP, base frame). The bowl centre at y 0.205 is
+  beyond it, and the oracle's TCP sits up to 9.3 mm from the bowl centre at lower / release /
+  retreat (grasp clearance + retreat offset).
+- Frozen bowl (0.195, 0.205): carry, lower, release and retreat are REJECTED at all 25 slots and
+  every yaw, with the TCP up to 1.05 cm outside the box. The pick phases pass. With the IK
+  bounded by the safety limits, they pass with only the gripper's intended -5 deg floor clip.
+  The unchanged sim oracle also clips wrist_flex (up to 5 deg) at the pick at 16 slots; that is a
+  sim-oracle artefact (its IK uses the URDF range) and does not depend on the bowl.
+- Constrained re-derivation: `derive_bowl`'s rule (>= 11.5 cm from all 36 slots, keep-out,
+  reach - 5 mm) PLUS the box, shrunk by the 5 mm tolerance and the 9.3 mm TCP offset, on the
+  same 5 mm lattice. **No position satisfies all constraints.** The grid spans y +-8.75 cm, so 11.5
+  cm of separation needs |y| >= 0.2025 beside it, x <= 0.0275 behind it (outside the box's x >=
+  0.10) or x >= 0.3825 in front of it (beyond reach).
+- Closest options (each verified through the filter with safety-bounded IK, 175 placements):
+
+| Option | xy (m) | Violates | Separation | Base dist. | Box margin* | Filter verdict at the bowl | Central slot |
+|---|---|---|---|---|---|---|---|
+| frozen | (0.195, 0.205) | box | 11.75 cm | 28.3 cm | -1.93 cm | REJECT (carry..retreat) | C4 |
+| A: rule kept | (0.115, +-0.200) | box | 11.58 cm | 23.1 cm | -1.30 cm | REJECT (carry..retreat) | C4 |
+| B: box kept, max separation | (0.115, +-0.185) | separation (-1.37 cm vs 11.5) | 10.13 cm | 21.8 cm | +0.16 cm | pass (gripper floor clip only), cube over the floor 175/175 | C4 |
+| B': box kept, beside the grid | (0.205, +-0.185) | separation (-1.67 cm) | 9.83 cm | 27.6 cm | +0.12 cm | pass (gripper floor clip only), 175/175 | C4 |
+| C: in front | (0.385, 0.0) | reach (-10 cm vs 28.5) | 11.88 cm | 38.5 cm | (TCP 2.1 cm short of the centre: IK at full reach) | pass, 175/175 | C3 |
+
+  *Bowl centre to the nearest box face, after the 5 mm tolerance and the measured TCP offset.
+  Separation is a sim placement constraint (`MIN_SEP` 11 cm), not a safety limit. At 10 cm the
+  bowl's outer rim (~6.4 cm radius) still clears a 3 cm cube's corner (2.1 cm) by ~1.5 cm. The
+  safety filter was not loosened. `protocol_real.py` is unchanged (the bowl, the hash and the
+  schedules stay as frozen). The central-slot rule still picks C4 for A, B and B'. Only C changes
+  it (to C3). The bowl stays PENDING: the owner chooses.
+
+**3. Baseline cadence (owner item 4).** Kept and now stated in `configs/real.yaml` and the eval
+docstring: 15 Hz nominal control, 30 fps cameras, ONE 450-command cap for SmolVLA and ACT,
+synchronous inference (no overlap), `max_chunk_age_ms` 800.
+Measured: single run, MOCK RIG (fake arm, two fake 640x480 cameras with 30 noise frames each;
+real loop, safety filter, sim FK and model), capture on, 450-command trials, Apple M3 Pro. These
+are untrained ACT and the pretrained `smolvla_base`, whose actions mean nothing for this arm.
+
+| Policy | writes/s per trial (p50) | Chunk p50 / p95 ms | Boundary gap p50 / p95 ms | In-chunk gap p50 ms | Actions / chunk | Policy s / trial | Stage s | Save + checkpoint s | Run |
+|---|---|---|---|---|---|---|---|---|---|
+| SmolVLA (bf16, MPS) | 6.27 | 438.6 / 476.6 | 513.7 / 547.5 | 76.5 | 5.14 | 68.5 (71.7 at 450 writes) | 0.26 | 7.87 | `20261109T091606Z-...-0977` |
+| ACT (fp32, MPS) | 12.86 | 41.1 / 48.3 | 115.1 / 122.9 | 75.5 | 10.84 | 34.9 | 0.26 | 7.50 | `20261109T091924Z-...-c2ba` |
+
+- Inside a chunk the loop writes every ~76 ms (about 13.1 Hz), not the nominal 66.7 ms, with the
+  capture on.
+- One SmolVLA chunk in 176 exceeded the 700 ms in-process deadline (`server_timeout`, 20 writes
+  into the 2nd trial, just after the 1st trial's 7.9 s save). On the arm that is a fault failure
+  for that trial. It is a single run: watch for it in the rehearsal. No setting was changed.
+
+Budget per 150-trial session (POLICY = the policy commanding; BENCH = everything else):
+
+| | Policy per trial | Bench per trial | Policy h | Bench h | Total h |
+|---|---|---|---|---|---|
+| SmolVLA | 71.7 s (450 / 6.27) | 36.1 s | 2.99 | 1.51 | 4.49 |
+| ACT | 35.0 s (450 / 12.86) | 35.8 s | 1.46 | 1.49 | 2.95 |
+
+Bench per trial = staging 0.26 s + save and checkpoint 7.5-7.9 s (both measured) + settle 3 s
+(protocol) + home ~5 s + placement / reset ~15 s + score ~5 s (the last three ESTIMATES; the mock
+cannot time them). The SmolVLA session needs two sittings through `--resume`.
+
+**4. Batch 32.** If the 24 GB probe needs batch 32, SmolVLA keeps 20,000 steps = 640k samples,
+HALF of batch 64's 1.28M. `configs/wo07_train.yaml` says so. `wo07_train.py` writes
+`results.batch_deviation` (reference batch, samples, fraction) whenever the batch is not the
+configured one, and the probe's projection carries it. Cost line unchanged: estimated RTX 4090 x
+3.35-5.35 h = $2.98-$4.76 at batch 32.
+
+**5. real-judge-3 rename: prepared, NOT applied** (the owner sequences it after #33 lands and the
+bowl is approved). It will touch:
+- `src/eval/protocol_real.py`: `JUDGING_RULE_VERSION` -> `real-judge-3`; `JUDGING_GENERAL`'s
+  start definition (the first policy goal write to the bus BEGAN; a definitively blocked first
+  goal is not started; a write that began and failed counts); `RUBRIC.rules` R2 / R4 to match;
+  recommended `RUBRIC_VERSION` "1" -> "2", which moves `TASK_VERSION` (the vishwaroop
+  `task_version`).
+- Hash inputs that move: `hash_components()["judging"]` (version and text) and `["rubric"]`. The
+  real-0.1 composite hash `edee44aa...f279d749` changes. The schedules (eval `dd1345de...`, dev
+  `21fe5598...`), slots, bowl, objects and convention hash do not.
+- `scripts/wo07_real_eval.py`: 6 references (docstring, the pooling and resume refusal text,
+  `JUDGING_RULE_VERSION` re-export). `src/robot/client.py`: 4 docstring references plus #33's
+  start semantics. `configs/real.yaml`: the `eval.settle_s` comment.
+- Tests: `tests/test_protocol_real.py` (`FROZEN` hash and the `real-judge-2` literal),
+  `tests/test_real_eval.py` (2 literals).
+- Docs: `docs/STATUS.md`, `docs/PLAN.md`, ADR-0003, `docs/bringup/WO-06-checklist.md`,
+  `docs/work-orders/WO-07-real-demos-baseline.md`.
+- The placement-grid PDF prints the hash's first 12 characters: regenerate it.
+- Effect on data: none (nothing has been recorded). A real-0.1 session started under real-judge-2
+  would be refused on `--resume` (the hash differs), as intended.
+
+**Gates.** Full pytest 570 passed + 1 skipped. `ruff check src tests scripts`, `black --check .` and
+`mypy --strict src` are clean. No shell file changed. `pyproject.toml`, `uv.lock`,
+`src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/eval/protocol_real.py` and
+`src/env/success.py` are unchanged; so is the real-0.1 hash `edee44aa...`.
+
 
 ## Blockers and decisions pending the owner
 
+- 2026-11-09 PR 2: the bowl is PENDING. The frozen (0.195, 0.205) is rejected by the safety box
+  from the carry on, and no position satisfies `derive_bowl`'s rule and the box together. The
+  options are in "PR 2: owner follow-up" (B (0.115, +-0.185) or B' (0.205, +-0.185) pass the
+  filter at ~10 cm separation). Seen slots B2 B5 E2 E5 + C4, the cubes and the seeded schedules
+  are approved.
 - Resolved 2026-11-09 by the pivot (ADR-0003): the OFT track is stopped, so the WO-04 item below
   is closed. Open for the owner: the seen slots, bowl position and schedule freeze (PR 2), the
   servo P gain to use (LeRobot writes 16 at connect, firmware default 32; WO-06 checklist), and
@@ -1529,6 +1672,11 @@ are unchanged.
 
 ## Owner decisions in effect
 
+- 2026-11-09 PR 2 baseline cadence: 15 Hz nominal control, 30 fps cameras, one 450-command cap
+  for SmolVLA and ACT, synchronous inference, `max_chunk_age_ms` 800; SmolVLA keeps 20,000 steps
+  at batch 32 (half the samples, recorded). Placement: seen slots B2 B5 E2 E5 + C4, the cubes and
+  the seeded schedules approved; the bowl pending. Judging: real-judge-3 for #33's start rule,
+  applied after #33 lands and the bowl is approved.
 - 2026-11-09 Pivot to SmolVLA + ACT on the real SO-101 (ADR-0003); decisions D1-D6
   (`docs/reviews/2026-11-09-pivot-decisions.md`): five seen slots x 10 demos, bowl fixed, cells of
   50 binary trials, freeze before recording, development trials on a disjoint schedule, mock

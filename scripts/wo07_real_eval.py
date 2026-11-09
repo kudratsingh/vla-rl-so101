@@ -98,15 +98,15 @@ episode = trial; ``capture.episode_index`` in the trial record, the trial id in 
 ``meta/vla_rl_so101.json``); a not-started attempt is never an episode. The summary reports seen,
 shifted, unseen per object and unseen pooled (the headline). ``--report RUN RUN`` prints two
 sessions side by side and refuses unless they ran the same protocol hash and schedule.
-Bench budget (review F4; single-run mock-rig figures, synthetic frames, M3 Pro): a trial has no
-success latch and runs to ``TRIAL_MAX_STEPS`` = 450 policy writes, so its policy time is 450 /
-the achieved write rate, which differs per family at the current ``max_chunk_age_ms``: SmolVLA on
-MPS ~6.2 writes/s -> ~73 s, ACT ~12.8 writes/s -> ~35 s (the 450-step horizon is a fixed number of
-commands, not a fixed wall-clock time). Plus home ~5 s, place ~15 s, settle 3 s, score ~5 s and
-the episode save + checkpoint (~7.3 s for 450 frames of both cameras): SmolVLA ~108 s per trial
-= ~4.5 h for 150, ACT ~70 s = ~2.9 h. Plan the SmolVLA session over two bench sittings through
-``--resume`` (the capture is durable per episode), or decide the command-rate issue first
-(overlap inference with execution, or another chunk age: docs/STATUS.md, PR 2 owner decisions).
+Baseline cadence (owner 2026-11-09): 15 Hz nominal control, 30 fps cameras, the SAME 450-command
+cap for SmolVLA and ACT, synchronous inference (no overlap) and ``max_chunk_age_ms`` 800. Budget
+per 150-trial session (single-run MOCK-RIG rates with the capture on, 450-command trials, M3 Pro;
+docs/STATUS.md "PR 2: owner follow-up"): POLICY time (the policy commanding) = 450 / the achieved
+write rate: SmolVLA 6.27 writes/s -> ~72 s per trial, ~3.0 h per session; ACT 12.86 writes/s ->
+~35 s, ~1.5 h. BENCH time (everything else) ~36 s per trial, ~1.5 h per session: measured staging
+0.26 s and episode save + checkpoint ~7.5-7.9 s, the 3 s settle, and ESTIMATES (not measurable
+on the mock) of home ~5 s, placement / reset ~15 s, score ~5 s. Totals ~4.5 h (SmolVLA) and
+~3.0 h (ACT); the SmolVLA session takes two bench sittings through ``--resume``.
 
 Audit against final2 item 5 (where each requirement lives):
 * randomized trial order, seeded and recorded, the same for both policies: real-0.1 =

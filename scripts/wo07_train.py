@@ -511,6 +511,26 @@ def reload_check(
     return out
 
 
+def batch_deviation(block: dict[str, Any], steps: int, batch: int) -> dict[str, Any] | None:
+    """When the run's batch differs from the configured one (``policies.<p>.batch_size``: SmolVLA
+    64, the guide's and the paper's): the steps stay as configured (owner 2026-11-09: a 24 GB
+    probe that needs batch 32 keeps 20,000 steps), so the run sees ``batch / reference`` of the
+    reference's samples. None when the batch is the configured one."""
+    ref = int(block["batch_size"])
+    if int(batch) == ref:
+        return None
+    return {
+        "reference_batch_size": ref,
+        "batch_size": int(batch),
+        "steps": int(steps),
+        "samples": int(steps) * int(batch),
+        "reference_samples": int(steps) * ref,
+        "fraction_of_reference_samples": round(int(batch) / ref, 4),
+        "note": f"steps kept at {steps} (owner 2026-11-09): batch {batch} sees "
+        f"{int(batch) / ref:.0%} of the samples of batch {ref}",
+    }
+
+
 def projection(cfg: Config, block: dict[str, Any], s_per_step: float, batch: int) -> dict[str, Any]:
     """Hours and $ of the full run at the measured s/step (this batch), + setup and storage."""
     cost = cfg.get("cost") or {}
@@ -526,6 +546,8 @@ def projection(cfg: Config, block: dict[str, Any], s_per_step: float, batch: int
         "usd_per_hour": price,
         "steps": steps,
         "batch_size": batch,
+        "samples": steps * batch,
+        "batch_deviation": batch_deviation(block, steps, batch),
         "s_per_step": round(s_per_step, 4),
         "train_h": round(train_h, 3),
         "setup_h": setup_h,
@@ -649,6 +671,7 @@ def _run(
         run.results.update(
             steps=steps,
             batch_size=batch,
+            samples=steps * batch,
             train_wall_s=round(train_s, 1),
             step_s_median=round(step_s, 4),
             loss_first=trained.losses[0] if trained.losses else None,
@@ -657,6 +680,10 @@ def _run(
         )
         est = projection(cfg, block, step_s, batch)
         run.results["projection_full_run"] = est
+        dev = batch_deviation(block, int(block["steps"]) if args.probe else steps, batch)
+        if dev is not None:  # e.g. SmolVLA at batch 32: half the samples of batch 64
+            run.results["batch_deviation"] = dev
+            print(f"[batch] {dev['note']}")
         check: dict[str, Any] = {"ok": True}
         if args.probe:
             (run.dir / "probe.json").write_text(json.dumps(run.results, indent=2) + "\n")

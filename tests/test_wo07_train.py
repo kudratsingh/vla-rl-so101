@@ -149,6 +149,14 @@ def test_policy_config_follows_the_convention() -> None:
     pcfg = wo07.make_policy_config("act", act, "cpu")
     assert (pcfg.chunk_size, pcfg.n_action_steps, pcfg.push_to_hub) == (50, 50, False)
 
+    # owner 2026-11-09: batch 32 keeps 20,000 steps = half the samples of batch 64, recorded
+    assert wo07.batch_deviation(sm, 20000, 64) is None
+    dev = wo07.batch_deviation(sm, 20000, 32)
+    assert dev is not None and dev["fraction_of_reference_samples"] == 0.5
+    assert (dev["samples"], dev["reference_samples"], dev["steps"]) == (640_000, 1_280_000, 20000)
+    est = wo07.projection(cfg, sm, 0.6, 32)
+    assert est["steps"] == 20000 and est["batch_deviation"] == dev
+
     bad = json.loads(json.dumps(cfg))
     bad["policies"]["act"]["overrides"]["chunk_size"] = 100
     with pytest.raises(wo07.TrainSetupError, match="convention"):

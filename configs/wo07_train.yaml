@@ -38,6 +38,11 @@ policies:
     base: lerobot/smolvla_base       # LeRobot guide: --policy.path=lerobot/smolvla_base
     steps: 20000                     # guide + paper §4.3
     batch_size: 64                   # guide + paper; the probe drops it on a 24 GB OOM (64 -> 32 -> 16)
+                                     # Owner 2026-11-09: if the probe needs 32, steps STAY 20000:
+                                     # 640k samples = HALF of batch 64's 1.28M. wo07_train.py writes
+                                     # results.batch_deviation into the run record whenever the
+                                     # batch is not this one; estimated: RTX 4090 x 3.35-5.35 h =
+                                     # $2.98-$4.76 at batch 32 (docs/STATUS.md)
     precision: bf16                  # LeRobot's own: VLM loaded bf16 (smolvlm_with_expert.py:80),
                                      # action expert fp32, no AMP (= lerobot-train defaults)
     overrides:                       # set on the smolvla_base config, then checked
