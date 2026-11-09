@@ -1817,6 +1817,80 @@ the 800 ms chunk limit; the freshness re-check after the sync covers a slow disk
   `mypy --strict src`: clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/success.py`
   and the pins unchanged.
 
+### PR 2: sync review (fixer, 2026-11-09, $0)
+
+Review of head `9041423`: S32-R1 / D1 (same defect), D2, D3, D4 confirmed; all applied, none skipped.
+The placement freeze stays ON HOLD (B' fit check): `BOWL_XY_M`, `RUBRIC_VERSION`, the rubric
+rules, the placement-grid PDF and the protocol hash are untouched; `bowl_box_problem` and
+`freeze_problem` still refuse.
+
+- **S32-R1 / D1 (power-loss rebuild of a resumed run dropped the earlier runs' trials).** A resumed
+  run writes the earlier runs' trials only to its record.json. `results_from_metrics` now takes
+  them from the run its synced `session` row says it resumed from (`load_prior` of that run,
+  recursively, so a lost parent record is rebuilt too), and `load_prior` merges this run's rows on
+  top with the usual (cell, trial_idx, start_utc, attempt) dedupe. A parent run that is gone, or a
+  cycle, refuses the resume (it would re-run scored slots). Tests: two-run chain with run 2's
+  record.json missing / cut (slots 0, 1 stand; the resume runs slot 2 only; run 1's record of
+  slot 0 is the session's), and the refusal. Both fail on `9041423`.
+- **S32-D2 (capture episode named by a synced record but not itself synced).** `EvalCapture.finish`
+  now syncs the files the save wrote (`src.runs.sync_tree`, mtime since the save, PNG folder
+  skipped) and every dataset directory BEFORE it drops the staged journal; the block carries
+  `sync_s` / `synced_files`, a failed sync keeps the journal (`sync_error`); the stills are synced
+  too; `recording.write_json` (provenance, journals) is atomic and synced (`write_durable`). And
+  `reconcile_captures` first clears a record's `episode_index` that the recovered dataset no
+  longer holds (or that the provenance maps to another trial): the trial is then attached,
+  recovered or flagged `recording_missing` (`lost_episode` keeps the old claim, `reconciled.lost`
+  lists it), never left claiming an index the next save reuses. Tests: episode 1 deleted from the
+  dataset while record.json claims it (trial 2 `recording_missing`, trial 3's journal recovered as
+  episode 1, export refuses COMPLETE and builds INCOMPLETE naming trial 2; fails on `9041423`:
+  trial 2 keeps claiming index 1), and the sync-before-drop order with a failing sync.
+- **S32-D3 (latency on the capture path).** Re-measured on real-0.1 with the capture on (below).
+- **S32-D4 (tests).** A cut back to the last synced metrics.jsonl offset (every later decision /
+  trial / capture row gone) with record.json as of its last write before it, over one run and a
+  two-run chain: `load_prior` scores the in-flight trial `session_lost`, `--resume` never re-runs a
+  started slot.
+
+Synced on stable storage now: the `trial_started` / `trial_start_retracted` / `session` rows,
+every record.json write, every saved capture episode (and its provenance / stills), staged
+journal index files. Still plain writes: decision / trial / capture rows (each trial / capture
+row is followed by a synced record.json holding it), staged frame files (a lost journal is
+flagged `recording_missing`, never attached).
+
+**Latency, real-0.1 with capture** (mock `wo07_real_eval`, REAL clock, 42 trials (14 per cell),
+max 5 steps, gRPC mock policy, fake checkpoint, Mac M3 Pro local SSD; single run each, MOCK RIG;
+`s32r2-measure-tools/measure_sync_real01.py` in the scratchpad):
+
+| `policy_start_mark_ms` | p50 | p95 | max |
+|---|---|---|---|
+| with the start-row sync (F_FULLFSYNC) | 4.73 | 6.00 | 6.95 |
+| without (append only; capture syncs on) | 1.52 | 1.94 | 2.59 |
+| added | +3.2 | +4.1 | +4.4 |
+
+- Protocol 0.2 (no capture, earlier run): 4.32 / 5.86 / 6.69 with, 1.01 / 1.80 / 1.93 without.
+- The reviewer's own real-0.1 run before the capture sync (about 120 first decisions) saw a max of
+  13.48 ms. This run, with the episode synced between trials, saw 6.95 ms. Both are single runs;
+  the bench Mac's disk is unmeasured. Both are far inside the 800 ms chunk limit, and the
+  freshness re-check after the sync covers a slow disk.
+- Capture episode sync (new, between trials, never during motion): p50 23.3 ms, p95 26.6 ms, max
+  31.7 ms; 7 to 8 files per episode. Frame return to a trial's first write: p50 80.1 ms with the
+  start-row sync, 75.0 ms without.
+
+**Reruns on the combined code (`d26e275`; the docs commit after it changes no code).**
+- PR #33's stop / resume list (all of `tests/test_deploy_prewrite_stop.py` plus the 10 named ids):
+  76 passed (71 + the 5 new power-loss tests).
+- Capture / recovery (`test_capture_resume_gap.py`, `test_pr2_review_fixes.py`): 22 passed (20 + 2
+  new), including the score-before-save interruption (`after_record`, `mid_save`, `after_save`).
+- Export / protocol (`test_export_bundle.py`, `test_pr2_pipeline.py`, `test_protocol_real.py`): 58
+  passed + 1 skipped. `test_runs.py`: 4 passed.
+- vishwaroop importer mock (scratch copy's real tools, `make_pr2r1_bundles.py` +
+  `run_importer_s32c.sh`): 4 seals, 4 verifies, 4 imports exit 0,
+  `declared_group_and_lineage_checks_passed` x4; 11 episodes, both cameras; eval rubric
+  real-judge-3 / `dca199e6da62`; records `F_FULLFSYNC`; every eval episode synced (9 to 12 files,
+  20 to 25 ms, no `sync_error`).
+- Full pytest 651 passed + 1 skipped. `ruff check src tests scripts`, `black --check .`,
+  `mypy --strict src`: clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/success.py`,
+  `protocol_real.py` and the pins unchanged in this round.
+
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
 Owner 2026-11-09: the stop check #30 added to teleop and the park now also guards the pilot and
