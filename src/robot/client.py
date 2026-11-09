@@ -6,6 +6,12 @@
     home = loop.go_home()                                 # MOVES THE ARM (through safety)
     result = loop.run_trial(protocol.instruction("PickPlace", RED_CUBE))
 
+In-process policy (SmolVLA / ACT on the Mac, ``src/robot/local_policy.py``): a
+``LocalPolicyClient`` in place of ``PolicyClient`` and a ``CameraRig`` (front + wrist) in place of
+the front camera, with ``local_pipe``. Everything below applies unchanged; ``ServerFault`` then
+describes the in-process call (stop reasons ``server_timeout`` / ``server_error`` /
+``server_bad_reply``), and ``request_timeout_ms`` is ``local_policy.request_timeout_ms``.
+
 Every write goes through ``So101Driver.step`` (deadman frame check -> ``SafetyFilter`` -> bus);
 the only other writes are the driver's own hold-at-measured-pose responses.
 
@@ -121,7 +127,7 @@ import numpy.typing as npt
 
 from src.config import Config
 from src.eval import protocol
-from src.robot.camera import CameraFault, Frame
+from src.robot.camera import CameraFault, Frame, RigFrame
 from src.robot.driver import (
     SERVO_FAULT_PROMPT,
     TORQUE_OFF_UNCONFIRMED,
@@ -371,7 +377,26 @@ def check_server(info: Mapping[str, Any], dcfg: DeployConfig) -> None:
 # Control loop
 # ------------------------------------------------------------------------------------------------
 class FrameSource(Protocol):
-    def read(self) -> Frame: ...
+    """One camera (``OpenCVFrameSource``: the gRPC path's front view) or a ``CameraRig`` (every
+    convention camera: the in-process path, ``src/robot/local_policy.py``)."""
+
+    def read(self) -> Frame | RigFrame: ...
+
+
+class PolicyBackend(Protocol):
+    """``PolicyClient`` (gRPC) or ``local_policy.LocalPolicyClient`` (in process): one chunk of
+    absolute joint targets (rad) per query, or ``ServerFault``."""
+
+    chunk_len: int
+    action_dim: int
+
+    def act(self, image: Any, state: npt.ArrayLike, instruction: str) -> ActReply: ...
+
+
+def policy_images(frame: Frame | RigFrame) -> Any:
+    """What ``DeployLoop.pipe`` is given: the one camera's image (``Frame``) or every camera's
+    by name (``RigFrame``)."""
+    return frame.images if isinstance(frame, RigFrame) else frame.image
 
 
 @dataclass
@@ -442,8 +467,8 @@ class DeployLoop:
         self,
         arm: So101Driver,
         cam: FrameSource,
-        pipe: Callable[[np.ndarray], np.ndarray],
-        client: PolicyClient,
+        pipe: Callable[[Any], Any],
+        client: PolicyBackend,
         dcfg: DeployConfig,
         *,
         clock: Callable[[], float] = time.perf_counter,
@@ -485,7 +510,7 @@ class DeployLoop:
         if stop is not None:
             raise stop
 
-    def _read_frame(self) -> Frame | None:
+    def _read_frame(self) -> Frame | RigFrame | None:
         try:
             return self.cam.read()
         except CameraFault as e:
@@ -578,7 +603,7 @@ class DeployLoop:
             assert frame is not None  # check_frame raised otherwise
             t_capture = frame.capture_time
             state = self.arm.read_state()
-            image = self.pipe(frame.image)
+            image = self.pipe(policy_images(frame))
             t_pre = self.clock()
             try:
                 reply = self.client.act(image, state.astype(np.float32), instruction)
