@@ -147,8 +147,10 @@ eval:                                # scripts/wo07_real_eval.py
   trials_per_cell: 50                # = protocol REAL_TRIALS_PER_CELL
   cells: [seen, shifted, unseen_objects]
   grid: docs/assets/placement-grid-a3.pdf   # scripts/make_placement_grid.py (print at 100%)
-  slot_seed: 0                       # placement plan (src/eval/real_grid.py). The SFT and SFT+RL
-                                     # sessions MUST use the same slot sequence (owner 2026-11-08):
-                                     # --hardware refuses any other --slot-seed
+  slot_seed: 0                       # protocol 0.2 only: placement plan (src/eval/real_grid.py).
+                                     # The SFT and SFT+RL sessions MUST use the same slot sequence
+                                     # (owner 2026-11-08): --hardware refuses any other --slot-seed.
+                                     # Protocol real-0.1 (the default, src/eval/protocol_real.py)
+                                     # ignores it: its schedule, slots and bowl are frozen and hashed
   settle_s: 3.0                      # s the arm holds still after a trial before it is scored
                                      # (judging rule real-judge-2; recorded per trial)

@@ -18,6 +18,18 @@ Needs: a leader arm in ``teleop.leader`` (otherwise exits with a message), both 
     .venv/bin/python scripts/wo06_teleop_record.py --preset real --task Push --rehearsal  # 1 episode
     .venv/bin/python scripts/wo06_teleop_record.py --preset real                  # 5 x 3 tasks
     .venv/bin/python scripts/wo06_teleop_record.py --preset real --push           # also upload
+    .venv/bin/python scripts/wo06_teleop_record.py --preset real --task PickPlace --demo-schedule
+
+WO-07 demos (``--demo-schedule``; owner 2026-11-09, final2 item 6 / amendments D1, D2, D4): the 50
+PickPlace demos of protocol real-0.1 (``src/eval/protocol_real.py`` ``demo_schedule()``): 10 at each
+of the five frozen seen slots B2 B5 E2 E5 C4, the red cube, the bowl FIXED on its mark at
+(x 0.195, y +0.205) m for every demo (``docs/assets/placement-grid-a3.pdf`` marks the slots and the
+bowl). Never the other 11 inner slots, the 20-slot ring or the unseen objects (purple / green cube),
+and none of them in a camera-match frame either. Each episode's prompt names its slot and yaw (a
+PLANNED pose); a redo keeps the same placement; ``meta/vla_rl_so101.json`` maps every saved episode
+to its placement and cites the protocol hash, the session id, the time, the follower id and the
+calibration copied to ``meta/calibration_follower.json`` (what ``scripts/wo07_export_bundle.py
+demo`` needs; it refuses a dataset recorded without ``--demo-schedule``).
 
 (``.venv/bin/python``, not ``uv run``: under ``uv run`` a Ctrl-Z also stops ``uv`` and the session
 ends; ``src/robot/prompts.py``.)
@@ -88,6 +100,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.config import add_config_args, load_config
 from src.data.recorder import datasets_write_compat
+from src.eval import protocol_real as PR
 from src.eval.protocol import (
     PROTOCOL_VERSION,
     RED_CUBE,
@@ -96,6 +109,7 @@ from src.eval.protocol import (
     protocol_hash,
 )
 from src.robot import convention as conv
+from src.robot import recording
 from src.robot.camera import (
     CameraFault,
     CameraRig,
@@ -130,6 +144,7 @@ from src.robot.prompts import (
 )
 from src.robot.safety import DeadmanResponse, load_sim_fk
 from src.robot.units import JOINT_NAMES, UnitMap
+from src.runs import new_run_id
 
 log = logging.getLogger(__name__)
 
@@ -160,22 +175,15 @@ def features() -> dict[str, dict[str, Any]]:
 
 
 def create_dataset(repo_id: str, root: Path) -> Any:
-    """The recording LeRobotDataset (v3.0) in the frozen convention. ``root`` must not exist."""
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    """The recording LeRobotDataset (v3.0) in the frozen convention (``src/robot/recording.py``,
+    shared with the evaluation capture). ``root`` must not exist."""
+    return recording.create_dataset(repo_id, root)
 
-    with datasets_write_compat():
-        return LeRobotDataset.create(
-            repo_id=repo_id,
-            fps=conv.FPS,
-            features=features(),
-            root=root,
-            robot_type=conv.ROBOT_TYPE,
-            use_videos=True,
-            # LeRobot's record default: 4 PNG writer threads per camera, off the control tick
-            image_writer_threads=4 * len(conv.CAMERAS),
-            video_backend=conv.VIDEO_BACKEND,
-            vcodec=conv.VIDEO_CODEC,
-        )
+
+def _utc_now() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def protocol_instructions(tasks: Sequence[str]) -> dict[str, str]:
@@ -234,6 +242,8 @@ class Session:
         self.period = 1.0 / arm.safety.config.control_hz
         self.target: np.ndarray | None = None  # last leader pose, canonical rad
         self.stop = False  # Ctrl-C under ctrl_c_as_flag; the loops check it between ticks
+        # saved episode index -> its demo-schedule placement (``--demo-schedule``)
+        self.placements: dict[str, dict[str, Any]] = {}
 
     @property
     def torque_released(self) -> bool:
@@ -513,15 +523,18 @@ def record_session(
     instructions: dict[str, str],
     n_eps: int,
     ep_time: float,
+    placements: Sequence[dict[str, Any]] | None = None,
 ) -> int:
-    """The interactive episode loop; returns the number of saved episodes. Ends through
+    """The interactive episode loop; returns the number of saved episodes. ``placements``
+    (``--demo-schedule``): episode k of the task is placed as ``placements[k]`` (prompted; a redo
+    keeps it) and recorded in ``sess.placements`` under its dataset episode index. Ends through
     ``end_session`` unless an exception (serial fault, torque-off deadman) ends it first. Any
     other exception (a dataset or convention error, a bug) holds the follower and goes
     through ``end_session``'s support prompt before it propagates (``_unexpected_error``): the
     driver's ``with`` block would otherwise drop the arm at once."""
     with ctrl_c_as_flag(sess):
         try:
-            return _episodes(sess, dataset, tasks, instructions, n_eps, ep_time)
+            return _episodes(sess, dataset, tasks, instructions, n_eps, ep_time, placements)
         except (DeadmanTripped, SerialFault):
             raise  # torque already off (or not confirmed): nothing to hold or support
         except Exception as e:
@@ -557,13 +570,17 @@ def _episodes(
     instructions: dict[str, str],
     n_eps: int,
     ep_time: float,
+    placements: Sequence[dict[str, Any]] | None = None,
 ) -> int:
     arm = sess.arm
     saved = 0
     for task in tasks:
         k = 0
         while k < n_eps:
-            msg = f"[{task} {k + 1}/{n_eps}] arrange the scene, hold the leader, ENTER (q = end): "
+            scene = (
+                "arrange the scene" if placements is None else PR.placement_prompt(placements[k])
+            )
+            msg = f"[{task} {k + 1}/{n_eps}] {scene}, hold the leader, ENTER (q = end): "
             if torque_on_ask(sess, msg) == QUIT:  # servo health before and after the wait
                 end_session(arm, sess)
                 return saved
@@ -614,6 +631,8 @@ def _episodes(
                 return saved
             if n_frames > 0 and keep in ("", "y", "yes"):
                 print("saving episode (encoding video, a few seconds; Ctrl-C is ignored) ...")
+                # the dataset index this episode gets (only the demo schedule records it)
+                index = int(dataset.num_episodes) if placements is not None else -1
                 try:
                     with datasets_write_compat():
                         dataset.save_episode()
@@ -622,11 +641,46 @@ def _episodes(
                     discard_episode(dataset)
                     continue
                 saved += 1
+                if placements is not None:
+                    sess.placements[str(index)] = dict(placements[k])
                 k += 1
             else:
                 discard_episode(dataset)
     end_session(arm, sess)
     return saved
+
+
+def recording_provenance(
+    cfg: dict[str, Any],
+    units: UnitMap,
+    instructions: dict[str, str],
+    config_instructions: dict[str, str | None],
+    *,
+    rehearsal: bool,
+    demo_schedule: bool,
+) -> dict[str, Any]:
+    """``meta/vla_rl_so101.json`` at the start of a session (``main`` adds the calibration copy,
+    the session end and the episode placements)."""
+    return {
+        "source": "scripts/wo06_teleop_record.py",
+        "convention": conv.citation(),
+        "units": dict(conv.DECLARED_UNITS),
+        "unit_map": dataclasses.asdict(units),
+        "cameras": {n: dict(cfg["cameras"][n]) for n in conv.CAMERA_NAMES},
+        "protocol_version": PROTOCOL_VERSION,
+        "protocol_hash": protocol_hash(),
+        "instructions": instructions,
+        "config_instructions": config_instructions,
+        "rehearsal": rehearsal,
+        # export inputs (scripts/wo07_export_bundle.py demo): nothing there is guessed
+        "purpose": "demonstration",
+        "session_id": new_run_id("WO-06", "teleop"),
+        "recorded_at": _utc_now(),
+        "robot_id": str(cfg["robot"]["id"]),
+        "demo_schedule": demo_schedule,
+        "protocol": PR.citation() if demo_schedule else None,
+        "episodes": {},
+    }
 
 
 def main() -> None:
@@ -638,6 +692,12 @@ def main() -> None:
     parser.add_argument("--push", action="store_true", help="upload to the Hub (private)")
     parser.add_argument(
         "--verbose", action="store_true", help="also log the safety filter's per-tick INFO clips"
+    )
+    parser.add_argument(
+        "--demo-schedule",
+        action="store_true",
+        help="WO-07 demos: protocol real-0.1's frozen demo schedule (PickPlace, 5 seen slots x 10, "
+        "fixed bowl); --episodes N records its first N",
     )
     parser.add_argument(
         "--rehearsal",
@@ -674,6 +734,14 @@ def main() -> None:
                 f"(teleop.instructions says {config_instructions.get(t)!r})"
             )
     n_eps = 1 if args.rehearsal else int(args.episodes or tcfg["episodes_per_task"])
+    placements: list[dict[str, Any]] | None = None
+    if args.demo_schedule:
+        if tasks != [PR.TASK]:
+            sys.exit(f"--demo-schedule records {PR.TASK} only: pass --task {PR.TASK}")
+        placements = PR.demo_schedule()
+        n_eps = 1 if args.rehearsal else int(args.episodes or len(placements))
+        if not 1 <= n_eps <= len(placements):
+            sys.exit(f"--episodes must be in [1, {len(placements)}] with --demo-schedule")
     ep_time = float(tcfg["episode_time_s"])
     problems = conv.check_config(cfg)
     if problems:
@@ -701,18 +769,14 @@ def main() -> None:
     dataset = create_dataset(repo_id, root)
     cite = conv.citation()
     print(f"recording in {cite['id']} {cite['version']} ({cite['module']}, sha256 {cite['hash']})")
-    provenance: dict[str, Any] = {
-        "source": "scripts/wo06_teleop_record.py",
-        "convention": cite,
-        "units": dict(conv.DECLARED_UNITS),
-        "unit_map": dataclasses.asdict(units),
-        "cameras": {n: dict(cfg["cameras"][n]) for n in conv.CAMERA_NAMES},
-        "protocol_version": PROTOCOL_VERSION,
-        "protocol_hash": protocol_hash(),
-        "instructions": instructions,
-        "config_instructions": {t: config_instructions.get(t) for t in tasks},
-        "rehearsal": bool(args.rehearsal),
-    }
+    provenance = recording_provenance(
+        cfg,
+        units,
+        instructions,
+        {t: config_instructions.get(t) for t in tasks},
+        rehearsal=bool(args.rehearsal),
+        demo_schedule=placements is not None,
+    )
     (root / "meta").mkdir(parents=True, exist_ok=True)
     (root / "meta" / "vla_rl_so101.json").write_text(json.dumps(provenance, indent=2) + "\n")
     leader.connect(calibrate=False)  # leader configure() leaves its torque off
@@ -720,6 +784,8 @@ def main() -> None:
         if not leader.is_calibrated:
             sys.exit("leader motors do not match its calibration file; recalibrate the leader")
         arm = So101Driver.from_config(cfg, fk)
+        # the follower's calibration as loaded (lerobot read <calibration_dir>/<id>.json)
+        provenance["calibration"] = recording.copy_calibration(arm.follower, root)
         sess: Session | None = None
         # Ctrl-Z ignored, foreground watched: from before torque on until the session's record
         # is written, the TORQUE OFF UNCONFIRMED instruction included (review F3)
@@ -737,10 +803,12 @@ def main() -> None:
                         park=park_from_config(cfg),  # None unless robot.park.enabled
                         torque_wait=TorqueWait.from_config(cfg, "teleop", allow_none=True),
                     )
-                    record_session(sess, dataset, tasks, instructions, n_eps, ep_time)
+                    record_session(sess, dataset, tasks, instructions, n_eps, ep_time, placements)
             finally:
                 _torque_off_unconfirmed(arm)  # also after the driver's own torque-off on exit
                 provenance.update(session_record(arm, sess))
+                if sess is not None:
+                    provenance["episodes"] = dict(sess.placements)
                 (root / "meta" / "vla_rl_so101.json").write_text(
                     json.dumps(provenance, indent=2) + "\n"
                 )

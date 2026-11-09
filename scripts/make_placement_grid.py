@@ -12,7 +12,13 @@ Content, all derived from code (``src/eval/real_grid.py``, which reads ``src/eva
 * the robot base outline (convex hull of the base_link visual meshes projected on the table) and
   the base_link origin, so the sheet can be aligned to the arm; +x / +y axis arrows;
 * a 10 cm scale bar with 1 cm ticks: measure it after printing; if it is not 100 mm the print
-  was scaled (print at 100% / "Actual size", never "Fit to page").
+  was scaled (print at 100% / "Actual size", never "Fit to page");
+* protocol real-0.1 (``src/eval/protocol_real.py``): the five frozen SEEN slots (heavy outline,
+  "SEEN"), the 11 other inner slots marked "not used" (never a demo, a camera-match frame or a
+  trial in real-0.1), and the FIXED bowl. The bowl centre (x 0.195, y +0.205 m) lies 56.5 mm beyond
+  the A3 sheet's left edge (the sheet cannot hold the whole 1:1 layout), so the sheet prints a
+  "bowl line" at x = 0.195 m ending in a reference tick at y = +0.105 m: the bowl centre is exactly
+  100 mm further left along that line. Mark it on the table once and keep the bowl on it.
 
     uv run scripts/make_placement_grid.py --preset real          # writes the PDF
     uv run scripts/make_placement_grid.py --preset real --check  # exit 1 if it is stale
@@ -40,6 +46,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.config import add_config_args
 from src.eval import protocol as P
+from src.eval import protocol_real as PR
 from src.eval import real_grid as G
 
 OUT = REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf"
@@ -217,6 +224,7 @@ def draw() -> str:
     slots = G.all_slots()
     dx, dy = G.cell_size_m()
 
+    seen_ids = set(PR.SEEN_SLOTS)
     # slot rectangles: shifted shaded, seen white; centre crosses and ids
     for s in slots:
         x0, y0 = page(s.x - s.half_x, s.y + s.half_y)  # page bottom-left: min x, max y
@@ -231,6 +239,12 @@ def draw() -> str:
         c.line(px - 3, py, px + 3, py)
         c.line(px, py - 3, px, py + 3)
         c.text(px + 1.2, py + 1.6, s.id, 8.0, bold=True)
+        if s.id in seen_ids:  # real-0.1 seen cell: heavy outline
+            c.width(1.2)
+            c.rect(x0 + 1.0, y0 + 1.0, dy * 1000.0 - 2.0, dx * 1000.0 - 2.0)
+            c.text(px - 8.0, py - 6.0, "SEEN", 7.0, bold=True)
+        elif s.cell == "seen":  # the other 11 inner slots: never used in real-0.1
+            c.text(px - 8.0, py - 6.0, "not used", 6.0)
 
     # region borders: seen solid thick, shifted dashed
     for region, dashed in ((P.SEEN_REGION, False), (P.SHIFTED_REGION, True)):
@@ -280,6 +294,39 @@ def draw() -> str:
     c.arrow(ox - 6, oy, ox - 75, oy)
     c.text(ox - 78.0, oy + 2.0, "+y (robot's left)", 8.0, bold=True)
 
+    # real-0.1 fixed bowl: a line at its x, a reference tick at y = +0.105 m (the grid's +y edge);
+    # the bowl centre is (bowl y - 0.105) m further along the line, beyond the sheet's left edge
+    bx, by = PR.BOWL_XY_M
+    ref_y = P.SHIFTED_REGION.center[1] + P.SHIFTED_REGION.half_extent[1]
+    lx, ly = page(bx, ref_y)
+    c.gray(0.0)
+    c.width(0.5)
+    c.dash(3.0, 1.5)
+    c.line(lx, ly, 0.0, ly)
+    c.dash()
+    c.width(0.8)
+    c.line(lx, ly - 4.0, lx, ly + 4.0)
+    off_mm = (by - ref_y) * 1000.0
+    edge_mm = -page(bx, by)[0]
+    c.text(2.0, ly + 2.0, "BOWL LINE", 6.0, bold=True)
+    for i, line in enumerate(
+        (
+            (
+                f"BOWL, FIXED for every demo and trial ({PR.PROTOCOL_VERSION}): centre x = "
+                f"{bx:.3f} m, y = {by:+.3f} m."
+            ),
+            (
+                f"Along the dashed BOWL LINE (left, x = {bx:.3f} m) the centre is {off_mm:.1f} mm "
+                f"left of the line's end tick (y = {ref_y:+.3f} m),"
+            ),
+            (
+                f"{edge_mm:.1f} mm beyond this sheet's left edge. Mark it on the table once; the "
+                "bowl stays on the mark."
+            ),
+        )
+    ):
+        c.text(14.0, 345.0 - 4.2 * i, line, 7.5, bold=i == 0)
+
     # 10 cm scale bar
     sx, sy = 14.0, 360.0
     c.width(0.6)
@@ -319,6 +366,14 @@ def draw() -> str:
         385.0,
         f"Slots: {dx * 100:.1f} cm (x) by {dy * 100:.1f} cm (y) rectangles of the shifted region; "
         "row letter = x (A nearest the base), column = y (1 = robot's left).",
+        7.5,
+    )
+    c.text(
+        14.0,
+        380.5,
+        f"Protocol {PR.PROTOCOL_VERSION} {PR.protocol_hash()[:12]}: SEEN = {' '.join(PR.SEEN_SLOTS)} "
+        "(demos + seen + unseen-object trials); shifted = the shaded ring; 'not used' = never "
+        "in real-0.1; bowl FIXED (bowl line).",
         7.5,
     )
     return "\n".join(c.ops) + "\n"

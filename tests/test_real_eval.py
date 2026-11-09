@@ -94,7 +94,10 @@ class QuitAfter(ScriptedOperator):
 
 
 def _args(tmp: Path, *extra: str) -> list[str]:
+    """Protocol 0.2 sessions (the real-0.1 path: tests/test_protocol_real.py)."""
     return ["--preset", "real", "--mock", "--fake-clock", "--max-steps", "16"] + [
+        "--protocol",
+        "0.2",
         "--runs-dir",
         str(tmp),
         *extra,
@@ -262,6 +265,7 @@ def test_hardware_refuses_a_slot_seed_other_than_the_config(
     monkeypatch.setattr(ev, "require_terminal", lambda _what: None)  # as if in Terminal
     monkeypatch.setattr("builtins.input", lambda _msg="": "go")
     argv = ["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"]
+    argv += ["--protocol", "0.2"]
     with pytest.raises(SystemExit, match="must use the same placements"):
         ev.main([*argv, "--slot-seed", "7"])  # exits before any client, camera or port
 

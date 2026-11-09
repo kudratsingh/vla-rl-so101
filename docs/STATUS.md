@@ -984,6 +984,128 @@ process group?), Ctrl-Z in the Mac Terminal during motion and at a prompt (and N
 delivery to the Python child under `uv run` when the Terminal window closes, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
 grid's scale and alignment with the real base.
 
+### PR 2: eval
+
+Branch `feat/smolvla-real-eval` (sub-branch of `feat/smolvla-real`, no PR), 2026-11-09, $0, CPU
+only, fakes and the mock rig only (no arm, camera, serial port, Hub push or RunPod action).
+Handoff final2 items 5-7 and the owner's amendments D1-D6. **Unverified on hardware.**
+
+**Protocol `real-0.1`** (`src/eval/protocol_real.py`, new; 0.1-draft and 0.2 untouched, sim keeps
+its objects). Composite hash `a39c1be29ec5f49d1bd2243842077eba2a1abf6690d12987d08fcf74a763d395`,
+pinned in `tests/test_protocol_real.py`; it covers the slot ids and the rules that chose them, the
+bowl and the constraint values it was derived from, the objects, the eval / demo / dev schedules
+in full, the grid geometry, the judging rule and rubric, the horizon and settle, and the
+convention hash (`b8701c57...`). Values, not file bytes.
+
+| Item | Frozen value | Why |
+|---|---|---|
+| Seen slots | `B2 B5 E2 E5` (corners of the inner 4x4) + `C4` | D1: one near each corner, one central. The block has no centre slot; `C4` is the central slot whose bowl distance (22.3 cm) is nearest the corners' mean (20.9 cm), so the middle training position is also mid-range in carry distance |
+| Bowl | (0.195, +0.205) m, fixed for every demo and trial | D2: derived (`derive_bowl`) on a 5 mm lattice: every one of the 36 slot centres >= MIN_SEP 11 cm + 5 mm away, >= keep-out 15 cm + 5 mm and <= PUSH_REACH 29 cm - 5 mm from the base; nearest the grid centre; tie to +y (front camera side). 11.75 cm from the nearest slot (C1), 28.3 cm from the base. Sim IK reaches it at release / carry / retreat heights (< 0.1 mm, tilt <= 20 deg). No position ahead of the grid fits (it would be >= 37 cm out) |
+| Objects | seen red cube; unseen purple cube + green cube (3 cm, the red cube's material; only colour differs) | D3: replaces the green cylinder on the real arm only |
+| Eval schedule | 150 trials, one seeded order across all cells; seen 10 x 5 slots; shifted 50 over the 20 ring slots (3 at every other slot around the ring, 2 at the rest); unseen 5 per slot per object | D3/D4; interleaving keeps drift off any one cell; `schedule_sha256` `dd1345de...` |
+| Demo schedule | 50 = 10 per seen slot (all seven 15 deg yaws + 3), red cube, fixed bowl | D1 |
+| Dev schedule | 30 trials (10 per cell), never reported; yaws on the half-step grid so no placement equals an eval placement | D5 |
+| Horizon / settle | 450 steps (30 s at 15 Hz = the teleop demo cap) / 3 s | the 0.2 horizon (150 = 10 s) fits OFT sim parity, not a teleop-paced real task |
+| Scoring | binary (real-judge-2 + rubric R1-R4); partial credit only as a secondary column from the blinded review | CLAUDE.md rule 4 |
+
+Placement sheet regenerated (`docs/assets/placement-grid-a3.pdf`): the five SEEN slots outlined,
+the 11 other inner slots "not used", the protocol hash, and a "bowl line" at x = 0.195 m: the bowl
+centre is 56.5 mm beyond the A3 sheet's left edge, so the sheet prints a reference tick at
+y = +0.105 m and the centre is 100.0 mm further along the line.
+
+**Real eval audit** (final2 item 5; `scripts/wo07_real_eval.py`):
+
+| Requirement | Before this branch | Now |
+|---|---|---|
+| Randomized trial order, seeded, recorded, same for both policies | partly: per-cell seeded slot permutation (`real_grid.sample_plan`), cells in fixed order, `placement_plan_sha256` per record, `--hardware` refuses another `--slot-seed` | real-0.1: one frozen order across cells, `schedule_pos` + `schedule_sha256` per record |
+| Initial object pose per trial from the grid | yes: `placement` per record (`client.run_trials`) | `planned_*` keys + `pose_source` |
+| Named labeler and success rubric in the record | judging rule text and hash only | `labeler` (`--labeler`, required on the arm) and `rubric` per record |
+| Fault after start = failure with reason | yes (`client._score`, `trial_fault`) | unchanged |
+| Resume skips started, retries never-started | yes (`done_indices`, `load_prior`) | unchanged; also re-hashes the checkpoint |
+| Two policies | one `--label` | `--family {smolvla,act}` (stable `family_id`), `--training-run-id`, `--checkpoint-dir` (content hash in the fingerprint); `--report A B` refuses unless same protocol hash and schedule and different checkpoints |
+
+Protocol 0.2 stays available as `--protocol 0.2` (the existing tests run it). On the arm, real-0.1
+refuses `--trials/--cells/--slot-seed`, a missing labeler or policy identity, a settle other than
+3 s and any convention departure (both cameras), before anything opens.
+
+**Evaluation capture** (6b; `src/robot/recording.py`, new): one LeRobotDataset v3.0 per session at
+`runs/<session>/capture/dataset`, episode = trial, written through the same
+`convention.recording_frame` and `create_dataset` as the demos (the recorder now imports them).
+`DeployLoop.on_write` (`src/robot/client.py`, a 10-line hook) hands each policy write's frame and
+step result to the capture; the loop reads both cameras through `RigFrameSource` (a fault on either
+is a lost frame). A not-started attempt is never an episode; a capture failure never reaches the
+arm or the score (recorded in `capture.error`). After the score one frame of each camera is saved as
+end-state stills for the blinded review. Resume appends (LeRobot's own resume path); a dataset left
+unfinalized by a SIGKILL cannot be reopened and the resume says so. Measured on the M3 Pro:
+0.40 ms per control tick, 4.5 s / 7.3 s to save a 10 s / 30 s episode of both cameras. Bench
+budget: 150 trials at up to ~65 s = 2.3-2.7 h per policy.
+
+**Label provenance** (6c): `scripts/wo07_blind_review.py` (new) pools the captured episodes of one
+or more sessions, shuffles them (seed recorded), and shows packets named by random ids (contact
+sheet of both cameras decoded with torchcodec + end-state stills), never the policy. Its
+`review.json` is the only input that makes an export declare `blinded_review`; live operator scores
+and automatic fault outcomes stay in the trial records with their own `outcome_source`. Label
+rule (decision, see open issues): `success` = every blinded reviewer said yes (R1) AND no fault
+after the start (R2, from the recorded fault).
+
+**Export** (7; `src/eval/export_bundle.py` + `scripts/wo07_export_bundle.py`, new): `demo` (dataset
+from `wo06_teleop_record.py --demo-schedule`) or `eval --session <run>` writes `declaration.json`
+(every section-2 field), `calibration.json` (the follower calibration copied into the dataset at
+record time, sha-checked), `rubric.json`, `placements.json` (demos) or `trials.json` (eval: every
+trial and attempt), `labels.json` only with `--review`, and for trained policies every checkpoint
+file + `checkpoint_files.json` (`checkpoint_id = sha256:` over all files, matched against the hash
+the session recorded). `object_pose` is null: only planned poses exist and vishwaroop reads
+`object_pose` as a per-frame stream. Family ids `so101-real-smolvla` / `so101-real-act`; session id
+= the recording session's id (demo: the recorder's run id; eval: the session's first run id).
+Refuses a missing or unknown value, a mock session without `--allow-mock`, a dev session without
+`--include-dev`, an incomplete session without `--allow-incomplete`, other weights, a protocol or
+convention hash other than this code's. Sealing stays in vishwaroop.
+
+**Mock export against the real importer (D6), 2026-11-09.** vishwaroop `ba0eef6`, copied (read
+only; the original was never written) and run in the copy:
+
+```bash
+S=<scratchpad>; V="$HOME/Machine Learning Projects/vishwaroop"; C=$S/vishwaroop-copy
+rsync -a --exclude .git --exclude .venv --exclude '/data/' --exclude __pycache__ \
+  --exclude .pytest_cache --exclude .mypy_cache --exclude .ruff_cache "$V/" "$C/"
+cd "$C" && uv venv --python 3.13 .venv && VIRTUAL_ENV=$C/.venv uv pip install -r requirements-dev.txt
+# bundles: 2 demos via the real recorder path on fakes (--demo-schedule placements), a mock
+# real-0.1 session (1 trial per cell, capture on), its bundle, a blinded review and a 2nd bundle
+PYTHONPATH=src .venv/bin/python -m vishwaroop.data.so101_import seal --dataset <dataset> \
+  --declaration <bundle>/declaration.json --extra <bundle>/<each file in bundle.json extras> \
+  --export-id mock-demo-2026-11-09a --out $S/vw-exports        # and mock-eval-2026-11-09a / b
+PYTHONPATH=src .venv/bin/python -m vishwaroop.data.so101_import verify --export $S/vw-exports/<id>
+PYTHONPATH=src .venv/bin/python -m vishwaroop.data.so101_import import --export $S/vw-exports/<id> \
+  --split config/splits/so101-mock-v1.json --repo-root "$C"
+```
+
+Split (in the copy): demo session `train`, eval session `dev`, distinct scene groups. Results:
+all three seals `{"sealed": ...}` exit 0; verify exit 0 (demo: 2 episodes, cameras front + wrist,
+teleop; eval: 3 episodes, trained); import exit 0 for all three (`audit.status:
+declared_group_and_lineage_checks_passed`, contract v1 validator passed). Derived episodes:
+demo `teleop`, `assessment_method: unknown`, `success: null`; eval (labels null) the same with
+`family_id: so101-real-smolvla`; the labelled eval export `assessment_method: blinded_review`,
+`success` true/true/false, `reviewer_ids: [mock-reviewer]`; streams `state`, `rgb_front`,
+`rgb_wrist`. The real seal also refused, as the mirrored validator does, a unit `degrees`, a
+missing `robot_id`, a teleop policy with a `family_id`, and a labels method `operator`.
+
+**Gates:** full pytest 520 passed (+48 new: `tests/test_protocol_real.py` 13,
+`tests/test_export_bundle.py` 35); ruff, black, mypy --strict src clean; no shell files changed.
+`pyproject.toml`, `uv.lock`, `src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/env/success.py`
+and every reported number untouched.
+
+**Open issues for the owner:**
+- Horizon 450 steps (30 s) and the label rule (blinded R1 AND no recorded fault) are frozen in
+  real-0.1: confirm or overrule before the first demo (a change is a new protocol version).
+- The deploy loop still feeds the policy the front camera at the 224 crop (`PolicyImagePipeline`);
+  the two-camera SmolVLA / ACT input is the inference branch's (`RigFrameSource` already carries
+  both images). Its checkpoint identity should hash the same files as `checkpoint_identity`.
+- Bowl at 28.3 cm is 7 mm inside PUSH_REACH: reachable in the sim IK; check the real arm's reach
+  over it during the camera match before recording.
+- A capture refusal on resume (unfinalized dataset) happens after the arm is connected; the trial
+  records stay intact, but the session's capture cannot continue.
+- vishwaroop's ET-M5-1 wording is the owner's to amend there (final2).
+
 ## Blockers and decisions pending the owner
 
 - WO-04: GRPO has not produced a clear gain (PickPlace seen +3.7 to +5.7 points across four
