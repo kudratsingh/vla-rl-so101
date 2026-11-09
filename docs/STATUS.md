@@ -984,6 +984,58 @@ process group?), Ctrl-Z in the Mac Terminal during motion and at a prompt (and N
 delivery to the Python child under `uv run` when the Terminal window closes, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
 grid's scale and alignment with the real base.
 
+### PR 2: infer
+
+Branch `feat/smolvla-real-infer` (sub-branch of `feat/smolvla-real`, no PR), 2026-11-09, $0, mock
+rig only, **unverified on hardware**. Handoff PR 2 item 4: the Mac inference path.
+
+- `src/robot/local_policy.py`: `LocalPolicyClient`, an in-process SmolVLA / ACT client for the
+  existing `DeployLoop` with `PolicyClient`'s contract (`ActReply` or `ServerFault`). Deadman,
+  safety clip, servo-health torque-off, prompts and trial records are the loop's own, unchanged.
+  Observations go through `convention.policy_observation` and actions through
+  `convention.action_targets`. In between are the checkpoint's own LeRobot processors; for
+  SmolVLA that includes `SMOLVLA_RENAME_MAP` when the checkpoint saved no map.
+- Checkpoint identity: `checkpoint_sha256` over config, weights, both processor JSONs and the
+  processor state files (normalization stats), plus `checkpoint_revision` (Hub snapshot commit).
+  `local_policy.checkpoint_sha256` refuses a mismatch before the weights load and again in
+  `check_local`, before the arm is opened.
+- Deadline: inference runs on a worker thread with a deadline, `local_policy.request_timeout_ms`
+  (700 ms, below `deploy.max_chunk_age_ms` 800). A late or hung call is `server_timeout`, which
+  holds the arm. A hung call refuses every later query.
+- `DeployLoop` now takes a `CameraRig` (`pipe` gets every camera's frame). `configs/real.yaml`
+  gains a `local_policy` block, with `base: null` until a fine-tune exists.
+
+Latency on the mock rig, measured with `scripts/wo07_local_latency.py --preset real`. **Single
+run, mock rig** (fake arm, two fake 640x480 cameras; real deploy loop, safety filter, sim FK and
+model). **Excludes camera capture.** Mac: Apple M3 Pro (Mac15,7, 36 GB), macOS 26.5.2, torch from
+`uv.lock`, commit `32f057d`. 300 bus writes per run, 15 Hz (66.7 ms period). Each run warms up
+twice before the first trial.
+
+| Policy | Device | Chunk (in-process query) p50 / p95 / max ms | Model only p50 / p95 / max ms | Gap between bus writes p50 / p95 / max ms | Actions per chunk | Write Hz | Run |
+|---|---|---|---|---|---|---|---|
+| SmolVLA `lerobot/smolvla_base` (bf16) | MPS | 448.4 / 463.5 / 471.8 | 441.8 / 453.3 / 468.3 | 76.5 / 526.8 / 547.9 | 5.0 | 6.2 | `20261109T055550Z-wo07-local-latency-real-e73b` |
+| ACT, fresh untrained init, LeRobot defaults, chunk 50 (fp32) | MPS | 52.5 / 60.8 / 66.6 | 44.6 / 51.5 / 52.8 | 74.9 / 124.1 / 136.0 | 10.7 | 12.8 | `20261109T055653Z-wo07-local-latency-real-c3a2` |
+| SmolVLA `lerobot/smolvla_base` (fp32) | CPU fallback | warm-up 914 / 869 ms; first query timed out (`server_timeout`, hold), 0 writes | | | | | `20261109T055723Z-wo07-local-latency-real-aa28` |
+
+- No trained checkpoint exists yet. The ACT row is a freshly initialised ACT: random ResNet18,
+  placeholder stats centred on `home_qpos`. The SmolVLA row is the pretrained base. Neither
+  model's actions mean anything for this arm. All actions went through the safety filter
+  (SmolVLA: 193 clipped, 106 rejected). To time full chunks, the script sets
+  `deploy.stop_on_reject: false` for itself only. A rejected tick still writes the filter's
+  hold command on schedule.
+- **SmolVLA on MPS takes about 450 ms per chunk.** With `max_chunk_age_ms: 800` it executes only
+  5 of its 50 actions before re-querying. Writes then arrive at about 6 Hz: about 520 ms at each
+  chunk boundary, about 77 ms inside a chunk. CPU fallback (about 0.87 s per chunk) misses the
+  700 ms deadline, so it is not usable at these settings.
+- **Write gap inside a chunk is about 75 ms, not 66.7 ms.** On this Mac `time.sleep` overshoots
+  by about 8.8 ms p50 (60 x 60 ms sleeps, standalone). This affects the existing loop pacing on
+  both the gRPC and in-process paths.
+- Records show `dirty: true` for the second and third runs. The cause is the previous run's
+  untracked record directory; the code is commit `32f057d`.
+- Owner decisions before real SmolVLA trials: (a) overlap inference with execution (async
+  chunking; the loop's documented WO-08 item); (b) raise `max_chunk_age_ms`, a safety parameter
+  that is the owner's call; or (c) accept about 6 Hz. No change has been made.
+
 ## Blockers and decisions pending the owner
 
 - WO-04: GRPO has not produced a clear gain (PickPlace seen +3.7 to +5.7 points across four
