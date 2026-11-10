@@ -1417,15 +1417,15 @@ class _MacSyncs:
 
     def fail(self, how: str) -> None:
         self.log.append(("fail", how))
-        if how == "missing":
-            delattr(self._fcntl, "F_FULLFSYNC")
+        if how == "missing":  # through monkeypatch: its undo stays consistent (Linux: none)
+            self._mp.delattr(self._fcntl, "F_FULLFSYNC", raising=False)
         else:
             self.errno = getattr(errno, how)
 
     def heal(self) -> None:
         self.log.append(("heal",))
         self.errno = None
-        self._fcntl.F_FULLFSYNC = 51  # type: ignore[attr-defined]
+        self._mp.setattr(self._fcntl, "F_FULLFSYNC", 51, raising=False)
 
     def file_fsyncs_after_fail(self) -> list[tuple[str, ...]]:
         i = next(k for k, e in enumerate(self.log) if e[0] == "fail")
