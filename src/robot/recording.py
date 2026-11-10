@@ -74,7 +74,8 @@ Evaluation capture (``EvalCapture``), one dataset per evaluation session, one ep
   never be attached to a later attempt of the same slot.
 * Power loss (S32-D2): a saved episode is synced to stable storage (``src.runs.sync_tree``:
   every dataset file the save wrote except the frame PNG folder, then every directory;
-  F_FULLFSYNC on macOS) BEFORE its staged journal is deleted and before ``finish`` returns, so
+  F_FULLFSYNC on macOS, required on a real-arm session there: ``EvalCapture.sync_policy``, the
+  session Run's) BEFORE its staged journal is deleted and before ``finish`` returns, so
   the scored record's ``capture`` block (and the synced record.json that holds it) never names
   an episode the page cache still held. Between trials, never during motion; ``sync_s`` in the
   block says what it cost. A failed sync keeps the journal and says so (``sync_error``).
@@ -101,7 +102,7 @@ import numpy as np
 
 from src.robot import convention as conv
 from src.robot.camera import CameraFault, CameraRig, Frame, ImageU8, RigFrame
-from src.runs import sync_path, sync_tree, write_durable
+from src.runs import SyncPolicy, sync_path, sync_tree, write_durable
 
 log = logging.getLogger(__name__)
 
@@ -375,11 +376,11 @@ def prune_provenance(prov: dict[str, Any], num_episodes: int) -> list[str]:
     return gone
 
 
-def write_json(path: Path, value: Any) -> None:
+def write_json(path: Path, value: Any, policy: SyncPolicy = SyncPolicy.BEST_EFFORT) -> None:
     """Atomic, synced JSON write (``src.runs.write_durable``: temp file + sync + rename +
-    directory sync): neither a kill nor a power loss leaves half a file."""
+    directory sync, under ``policy``): neither a kill nor a power loss leaves half a file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_durable(path, json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
+    write_durable(path, json.dumps(value, indent=2, sort_keys=True, default=str) + "\n", policy)
 
 
 def sha256_file(path: Path) -> str:
@@ -465,8 +466,10 @@ class EvalCapture:
         *,
         end_state: Callable[[], Mapping[str, ImageU8] | None] | None = None,
         clock: Callable[[], float] = time.perf_counter,
+        sync_policy: SyncPolicy = SyncPolicy.BEST_EFFORT,
     ):
         self.dataset = dataset
+        self.sync_policy = sync_policy  # the session Run's (src/runs.py): its file syncs
         self.root = Path(root)  # the capture dir: dataset/, end_state/
         self.provenance = provenance
         self.provenance.setdefault("episodes", {})
@@ -491,10 +494,11 @@ class EvalCapture:
         follower: Any,
         end_state: Callable[[], Mapping[str, ImageU8] | None] | None = None,
         clock: Callable[[], float] = time.perf_counter,
+        sync_policy: SyncPolicy = SyncPolicy.BEST_EFFORT,
     ) -> EvalCapture:
         ds_root = Path(root) / "dataset"
         if resume and ds_root.exists():
-            prov, recovery = recover_capture(root, provenance.get("session_id"))
+            prov, recovery = recover_capture(root, provenance.get("session_id"), sync_policy)
             if recovery["episodes"] == 0:  # killed during its first save: start the dataset over
                 stash = Path(root) / f"dataset.empty-{_utc_stamp()}"
                 shutil.move(str(ds_root), str(stash))
@@ -512,19 +516,28 @@ class EvalCapture:
             prov.setdefault("runs", []).extend(provenance.get("runs", []))
             if recovery["moved"] or recovery.get("pruned"):
                 prov.setdefault("recoveries", []).append(recovery)
-            cap = cls(ds, Path(root), prov, end_state=end_state, clock=clock)
+            cap = cls(
+                ds, Path(root), prov, end_state=end_state, clock=clock, sync_policy=sync_policy
+            )
         else:
             if ds_root.exists():
                 raise FileExistsError(f"{ds_root} exists: a new session never reuses a dataset")
             ds_root.parent.mkdir(parents=True, exist_ok=True)
             ds = DurableDataset(create_dataset(repo_id, ds_root), repo_id)
             provenance["calibration"] = copy_calibration(follower, ds_root)
-            cap = cls(ds, Path(root), provenance, end_state=end_state, clock=clock)
+            cap = cls(
+                ds,
+                Path(root),
+                provenance,
+                end_state=end_state,
+                clock=clock,
+                sync_policy=sync_policy,
+            )
         cap._write_provenance()
         return cap
 
     def _write_provenance(self) -> None:
-        write_json(self.dataset_root / PROVENANCE, self.provenance)
+        write_json(self.dataset_root / PROVENANCE, self.provenance, self.sync_policy)
 
     @property
     def open_episode(self) -> tuple[str, int] | None:
@@ -715,6 +728,7 @@ class EvalCapture:
                     "record": {k: rec.get(k) for k in JOURNAL_KEYS},
                     "staged_utc": _utc_stamp(),
                 },
+                self.sync_policy,
             )
             if final.exists():
                 shutil.rmtree(final)
@@ -881,7 +895,10 @@ class EvalCapture:
         durable: dict[str, Any] = {}
         try:  # on stable storage before the journal goes and the record names it (module doc)
             durable["synced_files"] = sync_tree(
-                self.dataset_root, skip=frozenset({"images"}), since=t_save
+                self.dataset_root,
+                skip=frozenset({"images"}),
+                since=t_save,
+                policy=self.sync_policy,
             )
             self.drop_staged(cur["trial_id"])  # saved, synced, in the provenance: done
         except OSError as e:
@@ -894,7 +911,7 @@ class EvalCapture:
             self._write_provenance()
             if isinstance(stills, dict):
                 for rel in stills.values():
-                    sync_path(self.root / rel)
+                    sync_path(self.root / rel, self.sync_policy)
                 sync_path(self.root / END_STATE_DIR)
         except OSError as e:
             log.error("eval capture: provenance / stills not written: %s", e)
@@ -920,7 +937,9 @@ class EvalCapture:
             self._write_provenance()
 
 
-def recover_capture(root: Path, session_id: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+def recover_capture(
+    root: Path, session_id: Any, policy: SyncPolicy = SyncPolicy.BEST_EFFORT
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """(provenance, recovery report) of a session's capture dir: ``recover_dataset`` on its
     dataset (quarantine under ``<capture>/recovered-<utc>``), provenance entries of dropped
     episodes pruned. Refuses a capture of another session."""
@@ -931,7 +950,7 @@ def recover_capture(root: Path, session_id: Any) -> tuple[dict[str, Any], dict[s
     report = recover_dataset(ds_root, Path(root) / f"recovered-{_utc_stamp()}")
     report["pruned"] = prune_provenance(prov, int(report["episodes"]))
     if report["moved"] or report["pruned"]:
-        write_json(ds_root / PROVENANCE, prov)
+        write_json(ds_root / PROVENANCE, prov, policy)
     return prov, report
 
 

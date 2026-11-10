@@ -761,7 +761,8 @@ class DeployLoop:
         1. the pre-write stop check: a stop recorded before it blocks the goal, no marker;
         2. the policy start (``_policy_started``): the stamp and the durable ``trial_started``
            row, written AND synced to stable storage before ``on_policy_start`` returns
-           (``DURABLE_ROW_KINDS``; the real eval's ``Run.log_durable``: F_FULLFSYNC on macOS).
+           (``DURABLE_ROW_KINDS``; the real eval's ``Run.log_durable``: F_FULLFSYNC on macOS, and
+           required on the real arm there: no fsync fallback, src/runs.py ``SyncPolicy``).
            If saving or syncing it fails (any exception: I/O error, disk full), the goal is blocked
            with ``START_MARKER_FAILED`` (a ``SessionStop``: hold, the session ends), since a
            started slot without its durable marker could be re-rolled by a resume;

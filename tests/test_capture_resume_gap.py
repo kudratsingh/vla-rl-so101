@@ -680,11 +680,13 @@ def test_a_saved_episode_is_synced_before_its_journal_is_dropped(
     real_tree, real_drop = recording.sync_tree, recording.EvalCapture.drop_staged
     fail = {"on": False}
 
-    def sync_tree(root: Path, skip: frozenset[str] = frozenset(), since: Any = None) -> int:
+    def sync_tree(
+        root: Path, skip: frozenset[str] = frozenset(), since: Any = None, policy: Any = None
+    ) -> int:
         if fail["on"]:
             raise OSError(5, "Input/output error")
         order.append(f"sync:{Path(root).name}")
-        return int(real_tree(root, skip, since))
+        return int(real_tree(root, skip, since, *([] if policy is None else [policy])))
 
     def drop(self: Any, trial_id: str) -> None:
         order.append("drop")

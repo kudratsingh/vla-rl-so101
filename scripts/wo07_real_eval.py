@@ -92,7 +92,13 @@ written when the session is bound and after every trial, so a run killed without
 Power loss (owner 2026-11-09): the ``DURABLE_ROWS`` (``session``, ``trial_started``,
 ``trial_start_retracted``) are synced to stable storage before the call that wrote them returns
 (``Run.log_durable``: ``F_FULLFSYNC`` on macOS, ``fsync`` elsewhere), and every record.json write
-is atomic and synced (``src/runs.py``); other metrics rows (decisions, trial and capture rows)
+is atomic and synced (``src/runs.py``). A ``--hardware`` session on macOS REQUIRES F_FULLFSYNC on
+every journal file sync (``journal_policy``, owner 2026-11-10): unsupported or failed, it raises
+and is never replaced by ``fsync``, so a start marker that cannot be F_FULLFSYNCed blocks the
+first goal (``start_marker_failed``, the safe shutdown); ``preflight_journal`` refuses the
+session before anything is opened when the runs directory's filesystem cannot do it. Mock
+sessions and Linux keep the best-effort sync, the method recorded (record.json ``sync``); other
+metrics rows (decisions, trial and capture rows)
 are plain appends, each trial / capture row followed by a synced record.json holding it. The
 start marker's sync is part of the marker: a failed sync blocks the first goal like a failed
 write, and the freshness and final stop checks run after it. ``load_prior`` rebuilds the session
@@ -259,13 +265,29 @@ from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
 from src.robot.units import UnitMap
-from src.runs import RUNS_DIR, Run, new_run_id
+from src.runs import (
+    RUNS_DIR,
+    Run,
+    SyncPolicy,
+    journal_sync_policy,
+    new_run_id,
+    probe_full_fsync,
+)
 
 PROTOCOLS = (PR.PROTOCOL_VERSION, P2.PROTOCOL_VERSION)
 
 JUDGING_RULE_VERSION = PR.JUDGING_RULE_VERSION  # "real-judge-3"
 # metrics rows synced to stable storage before log_row returns (module doc, Run.log_durable)
 DURABLE_ROWS: tuple[str, ...] = (*DURABLE_ROW_KINDS, "session")
+
+
+def journal_policy(mode: str) -> SyncPolicy:
+    """The session journal's sync policy (src/runs.py, owner 2026-11-10): a hardware session on
+    macOS requires F_FULLFSYNC on every journal file sync (no fsync fallback); mock sessions and
+    Linux keep the best-effort sync, the method recorded."""
+    return journal_sync_policy(real_arm=mode == "hardware")
+
+
 DEFAULT_SETTLE_S = 3.0  # eval.settle_s
 # the rule's text lives in src/eval/protocol_real.py (hashed by real-0.1), with #33's start
 # wording (real-judge-3); protocol 0.2 sessions record the same version and text hash
@@ -881,6 +903,7 @@ def session(
     prior_runs: Sequence[str] = (),
     torque_wait: TorqueWait | None = None,
     camera_check: dict[str, Any] | None = None,
+    journal_preflight: dict[str, Any] | None = None,
 ) -> Path:
     task = str(settings["task"])
     settle_s = float(settings["settle_s"])
@@ -903,6 +926,7 @@ def session(
         device=str(_local_runtime(info).get("runtime", {}).get("device") or "cpu"),
         runs_dir=runs_dir,
         run_id=new_run_id("WO-07", f"realeval-{mode}"),
+        sync_policy=journal_policy(mode),  # fixed for the session (src/runs.py)
     ) as run:
         if not settings.get("session_id"):
             settings["session_id"] = extra["session_id"] = run.id
@@ -935,6 +959,8 @@ def session(
             "synced_rows": list(DURABLE_ROWS),
             "record_json": "atomic: tmp + sync + rename + directory sync, every write",
             "sync": run.sync_method,
+            "sync_policy": str(run.sync_policy),
+            "preflight": journal_preflight,
         }
 
         print(f"{judging_rule(settle_s)['general']}\n  {task} success = {JUDGING_RULE[task]}.")
@@ -1480,6 +1506,7 @@ def open_capture(
         follower=loop.arm.follower,
         end_state=lambda: rig.read().images,
         clock=loop.clock,
+        sync_policy=run.sync_policy,  # the session journal's (src/runs.py)
     )
 
 
@@ -1952,6 +1979,7 @@ def run_hardware(
         problems = real_hardware_problems(cfg, settings)
         if problems:
             sys.exit("refusing a real-0.1 session; nothing was opened:\n  " + "\n  ".join(problems))
+    journal_preflight = preflight_journal(args.runs_dir)  # before anything is opened
     cfg_seed = int((cfg.get("eval") or {}).get("slot_seed", 0))
     if not real and int(settings["slot_seed"]) != cfg_seed:
         sys.exit(
@@ -2015,7 +2043,23 @@ def run_hardware(
                     prior_runs=prior_runs,
                     torque_wait=torque_wait,
                     camera_check=camera_check,
+                    journal_preflight=journal_preflight,
                 )
+
+
+def preflight_journal(runs_dir: Path) -> dict[str, Any]:
+    """A hardware session's journal preflight (owner 2026-11-10): once, before the policy,
+    camera or arm is opened (so before torque on), a temp file in the runs directory (the run,
+    session and capture directories are created under it) is synced under the hardware
+    ``journal_policy``. On macOS a filesystem that cannot F_FULLFSYNC refuses the session here
+    rather than at the first trial's start marker (which still requires it, every write)."""
+    try:
+        return probe_full_fsync(Path(runs_dir), journal_policy("hardware"))
+    except OSError as e:
+        sys.exit(
+            f"refusing the hardware session; nothing was opened: the journal in {runs_dir} "
+            f"cannot be synced as required ({type(e).__name__}: {e})"
+        )
 
 
 def _show_file(path: Path) -> None:

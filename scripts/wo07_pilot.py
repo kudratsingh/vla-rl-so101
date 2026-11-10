@@ -76,7 +76,7 @@ from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
 from src.robot.units import UnitMap
-from src.runs import RUNS_DIR, Run, new_run_id
+from src.runs import RUNS_DIR, Run, journal_sync_policy, new_run_id, probe_full_fsync
 
 MOCK_LABEL = "MOCK: fake arm, fake camera, mock policy; exercises the client only, NOT a result"
 HARDWARE_LABEL = "pilot, single run, real arm; fewer than 50 trials per cell, not a protocol table"
@@ -132,6 +132,7 @@ def session(
     runs_dir: Path,
     on_trial_start: Callable[[int], None] | None = None,
     torque_wait: TorqueWait | None = None,
+    journal_preflight: dict[str, Any] | None = None,
 ) -> Path:
     trials: list[dict[str, Any]] = []
     end = "error"
@@ -142,8 +143,12 @@ def session(
         device="cpu",
         runs_dir=runs_dir,
         run_id=new_run_id("WO-07", f"pilot-{mode}"),
+        # record.json writes: F_FULLFSYNC required on the real arm on macOS (src/runs.py); the
+        # pilot never resumes, so its metrics rows stay plain appends
+        sync_policy=journal_sync_policy(real_arm=mode == "hardware"),
     ) as run:
         run.results.update(
+            journal_preflight=journal_preflight,
             mode=mode,
             label=MOCK_LABEL if mode == "mock" else HARDWARE_LABEL,
             server_info=info,
@@ -295,6 +300,15 @@ def run_hardware(cfg: Config, args: argparse.Namespace) -> Path:
             "cameras.front.intrinsics is null: the policy would see an uncalibrated crop. Run "
             "scripts/wo06_camera_intrinsics.py first (or pass --allow-uncalibrated-camera)"
         )
+    try:  # the journal's sync, before anything is opened (src/runs.py, owner 2026-11-10)
+        journal_preflight = probe_full_fsync(
+            Path(args.runs_dir), journal_sync_policy(real_arm=True)
+        )
+    except OSError as e:
+        sys.exit(
+            f"refusing the hardware session; nothing was opened: the journal in "
+            f"{args.runs_dir} cannot be synced as required ({type(e).__name__}: {e})"
+        )
     from src.robot.camera import OpenCVFrameSource
 
     dcfg = DeployConfig.from_config(cfg)
@@ -331,6 +345,7 @@ def run_hardware(cfg: Config, args: argparse.Namespace) -> Path:
                 camera_calibrated=pipe.calibrated,
                 runs_dir=args.runs_dir,
                 torque_wait=torque_wait,
+                journal_preflight=journal_preflight,
             )
 
 
