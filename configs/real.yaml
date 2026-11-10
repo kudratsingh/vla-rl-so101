@@ -62,10 +62,19 @@ robot:
     max_temperature_c: 55            # C, PROVISIONAL; STS3215 factory Max_Temperature_Limit (EEPROM 13) is 70 C
                                      # (Feetech STS memory table; logged at connect): trip 15 C below
     max_current_ma: 1500             # mA, PROVISIONAL, sustained (below); lerobot caps the gripper's firmware
-                                     # Protection_Current at 250 x 6.5 mA = 1625 mA (so_follower.py:169)
+                                     # Protection_Current at 250 x 6.5 mA = 1625 mA (so_follower.py:169).
+                                     # The follower is the 12 V STS3215 (retailer listings: stall
+                                     # ~2.7 A at 12 V, 4-14 V; Feetech datasheet not re-checked):
+                                     # 1500 mA sustained stays below stall, so a stall trips
     current_trip_s: 1.0              # s, PROVISIONAL, above max_current_ma before the trip
     current_ma_per_count: 6.5        # mA per Present_Current count (Feetech STS memory table)
     bus_budget_ms: 10                # ms per monitor read before a warning (15% of the 66.7 ms period)
+
+power:                               # docs/bringup/kit.md; checked over the bus by
+                                     # `wo06_calibrate.py voltage` (Present_Voltage, read only)
+  follower: {servo: STS3215 12 V (Seeed SO-ARM101 Pro), supply_v: 12.0}
+  leader: {servo: STS3215 7.4 V (Seeed SO-ARM101 Pro), supply_v: 5.0}
+  tolerance_frac: 0.15               # |reading - supply_v| / supply_v allowed at rest, unloaded
 
 teleop:
   leader: null                       # only with a leader arm, e.g.
@@ -87,8 +96,16 @@ teleop:
     Push: push the cube to the target
     Stack: stack the red cube on the blue cube
 
+# Cameras (owner kit list 2026-11-10, docs/bringup/kit.md). Scene: all-white table, ONE LED clamp
+# desk lamp (2700-6500 K) set ONCE to 5000 K and never changed. Exposure and white balance are
+# LOCKED on both cameras at that light before the camera match (WO-06 checklist steps 6-7), never
+# auto (protocol real-0.1 scene, src/eval/protocol_real.py). macOS: OpenCV's AVFoundation backend
+# (LeRobot's OpenCVCamera) cannot set these UVC controls, so they are set with a UVC controls tool
+# and the locked values are written here by hand (`controls`); nothing in the code changes them.
 cameras:
-  front:
+  front:                             # Logitech C920x on the NEEWER UA057 22-inch magic arm + desk
+                                     # clamp, at the sim pose front_left_45: eye [0.555, 0.350, 0.495] m,
+                                     # target [0.205, 0, 0] m (src/env/cameras.py, configs/sim.yaml)
     index: 0
     width: 640                       # px, streamed resolution
     height: 480                      # px
@@ -98,13 +115,34 @@ cameras:
     pose: front_left_45               # must equal sim camera pose
     crop_to: 224                     # px, policy image side (OpenVLA-OFT input); = sim env.image_size
     fov_deg: 40                      # deg, VERTICAL (SAPIEN fovy); must equal configs/sim.yaml env.camera.fov_deg
-  wrist:                             # SO-101 kit 32 mm module on the gripper. Recorded in every
-                                     # demo and eval frame with the front camera (owner 2026-11-09;
-                                     # src/robot/convention.py: both 640x480 at 30 fps, uncropped)
+    controls:                        # LOCKED at the camera match under the 5000 K lamp; never auto
+      auto_exposure: false
+      exposure: null                 # the locked value as the tool shows it (UVC units); null =
+                                     # not locked yet (WO-06 step 7 reports it)
+      auto_white_balance: false
+      white_balance_k: 5000          # K; the C920 exposes a manual UVC white-balance temperature
+                                     # (2000-6500 K per its UVC control list; unverified on this unit)
+      gain: null                     # locked gain if the tool exposes it; null = not recorded
+      autofocus: false               # the C920x autofocuses: lock focus at the table distance too
+      set_with: null                 # the tool (and version) used to set them on the Mac
+  wrist:                             # SO-ARM101 Pro kit 32 mm USB module on the gripper mount
+                                     # (3D-printed from the LeRobot SO-101 files if the kit has
+                                     # none). Recorded in every demo and eval frame with the front
+                                     # camera (owner 2026-11-09; src/robot/convention.py: both
+                                     # 640x480 at 30 fps, uncropped)
     index: 1
     width: 640                       # px
     height: 480                      # px
     fps: 30
+    intrinsics: null                 # filled in WO-06 (wo06_camera_intrinsics.py --camera wrist)
+    controls:                        # LOCKED with the front camera's, same lamp; never auto
+      auto_exposure: false
+      exposure: null                 # locked value (UVC units); null = not locked yet
+      auto_white_balance: false
+      white_balance_k: 5000          # K, IF the module exposes a UVC white-balance temperature;
+                                     # if it does not, set null and record what it does lock
+      gain: null
+      set_with: null
 
 server:
   # The server binds 127.0.0.1 on the GPU box (src/robot/serve.py); the Mac reaches it through
@@ -180,7 +218,9 @@ eval:                                # scripts/wo07_real_eval.py
   # (SmolVLA, ~6.3 writes/s) and ~35 s (ACT, ~12.9 writes/s); docs/STATUS.md has the budget.
   trials_per_cell: 50                # = protocol REAL_TRIALS_PER_CELL
   cells: [seen, shifted, unseen_objects]
-  grid: docs/assets/placement-grid-a3.pdf   # scripts/make_placement_grid.py (print at 100%)
+  grid: docs/assets/placement-grid-a3.pdf   # scripts/make_placement_grid.py (print at 100%); or
+                                     # placement-grid-tabloid2.pdf (--layout tabloid2): two
+                                     # 11 x 17 in sheets taped (owner kit list 2026-11-10)
   slot_seed: 0                       # protocol 0.2 only: placement plan (src/eval/real_grid.py).
                                      # The SFT and SFT+RL sessions MUST use the same slot sequence
                                      # (owner 2026-11-08): --hardware refuses any other --slot-seed.

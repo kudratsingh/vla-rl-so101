@@ -81,10 +81,12 @@ def test_release_window_and_the_pending_bowl_preflights(
     cfg = load_config("real")
     box = BF.workspace_box(cfg)
     r = bc.RELEASE_RADIUS_M
+    # sim floor radius 45 mm (the cup's floor is PENDING) less the nominal 1-inch cube's 12.7 mm
+    assert r == pytest.approx(0.045 - 0.0127) and r == BF.release_radius_m()
     assert BF.release_window((0.25, 0.0), box, r) == {
-        "radius_m": 0.03,
+        "radius_m": 0.0323,
         "inside_fraction": 1.0,
-        "inscribed_radius_m": 0.03,
+        "inscribed_radius_m": 0.0323,
     }
     b = BF.release_window((0.115, 0.185), box, r)  # two faces 15 mm away, 10 mm after the 5 mm
     assert b["inscribed_radius_m"] == 0.01 and 0.4 < b["inside_fraction"] < 0.6
@@ -115,3 +117,36 @@ def test_release_window_and_the_pending_bowl_preflights(
         teleop.main()
     monkeypatch.setattr(ev, "bowl_box_problem", lambda *_a, **_k: None)
     assert PR.freeze_problem() in ev.real_hardware_problems(cfg, s)
+
+
+def test_prop_geometry_reads_the_one_measurement_place() -> None:
+    """Owner kit list 2026-11-10: the cube and cup geometry of every bowl check comes from
+    protocol_real.MEASURED; pending values fall back to the sim bowl, labelled, and the nominal
+    1-inch cube; filling MEASURED is the one edit that moves the release window and clearances."""
+    g = BF.geometry()
+    assert g.cube_half_m == pytest.approx(0.0127) and not g.measured
+    assert "NOMINAL" in g.sources["cube_half_m"]
+    for k in ("floor_radius_m", "rim_radius_m", "rim_height_m"):
+        assert g.sources[k].startswith("PENDING")
+    assert g.rim_height_m == pytest.approx(0.036)  # sim wall 30 + floor 6 mm stands in
+    assert bc.GEOMETRY == g and bc.CUBE_HALF_M == g.cube_half_m
+    # the oracle's carry: TCP 72 mm, cube centre 3 mm below it, half-edge 12.7 mm, sim rim 36 mm
+    assert BF.carry_rim_clearance_m(g) == pytest.approx(0.072 - 0.003 - 0.0127 - 0.036)
+    m = PR.PropMeasurements(
+        red_cube_edge_mm=25.0,
+        bowl_outer_rim_diameter_mm=110.0,
+        bowl_inside_floor_diameter_mm=70.0,
+        bowl_table_to_rim_height_mm=60.0,
+    )
+    gm = BF.geometry(m)
+    assert gm.measured and gm.to_dict()["all_measured"]
+    assert (gm.cube_half_m, gm.floor_radius_m, gm.rim_radius_m, gm.rim_height_m) == (
+        pytest.approx(0.0125),
+        pytest.approx(0.035),
+        pytest.approx(0.055),
+        pytest.approx(0.060),
+    )
+    assert BF.release_radius_m(gm) == pytest.approx(0.0225)
+    assert BF.carry_rim_clearance_m(gm) < 0  # a 60 mm cup: the oracle's carry hits the rim
+    d = 0.0983  # B' to its nearest slot
+    assert BF.cube_rim_clearance_m(d, gm) == pytest.approx(d - 0.055 - 0.0125 * 2**0.5 - 0.005)

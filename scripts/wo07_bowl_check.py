@@ -6,7 +6,9 @@ policy of the sim demos: hover, descend, close, lift, carry, lower, release, ret
 waypoint heights, tilts and 0.065 rad/step joint cap) runs KINEMATICALLY: every joint command it
 issues is assumed tracked exactly, the TCP is the shared FK (``src/env/kinematics.py``), the cube
 rides in the gripper from the lift to the release with the offset it had at the grasp, and the
-gripper reads at least 0.15 rad while it holds the 3 cm cube. Every command is passed through
+gripper reads at least 0.15 rad while it holds the cube (the hand2mind 1-inch cube, 25.4 mm nominal;
+cube and cup geometry from ``src/eval/bowl_fit.py`` ``geometry()``, i.e. ``protocol_real.MEASURED``,
+with the sim bowl standing in, labelled, while a cup measurement is pending). Every command is passed through
 ``src/robot/safety.py`` ``SafetyFilter`` built from ``configs/real.yaml`` (``make_safety``: the
 URDF joint limits less ``urdf_limit_margin_deg``, the 4 deg/step and 60 deg/s caps, the
 ``workspace_box_m`` TCP box) with the sim FK, measured = the previous command (the reference is
@@ -83,19 +85,19 @@ from src.runs import RUNS_DIR, Run, new_run_id
 
 PHASES = ("hover", "descend", "close", "lift", "carry", "lower", "release", "retreat")
 BOWL_PHASES = ("lower", "release", "retreat")
-CUBE_HALF_M = 0.015  # the 3 cm cubes of real-0.1
-GRIP_HOLD_RAD = 0.15  # the gripper reads at least this while it holds the cube
+# Cube and cup geometry from ONE place (src/eval/bowl_fit.py geometry(), which reads
+# protocol_real.MEASURED; sim-bowl fallbacks while a cup measurement is pending, labelled in the
+# record): the hand2mind 1-inch cube, nominal 25.4 mm until measured, and the LE TAUCI cup.
+GEOMETRY = BF.geometry()
+CUBE_HALF_M = GEOMETRY.cube_half_m
+GRIP_HOLD_RAD = 0.15  # the gripper reads at least this while it holds the cube (sim 3 cm value;
+# a 25.4 mm cube closes the jaws further: unverified, it only marks the hold in this kinematic run)
 MAX_STEPS = 700
 BOX_MARGIN_M = PR.BOWL_MARGIN_M  # the operator's placement tolerance (5 mm), as derive_bowl
 STATUS_ORDER = {"pass": 0, "clip(gripper floor)": 1, "clip": 2, "reject": 3, "not reached": 4}
 CARRY_AND_BOWL = ("carry", *BOWL_PHASES)
-RELEASE_RADIUS_M = S.BOWL_FLOOR_RADIUS - CUBE_HALF_M  # TCP over the floor, the cube inside it
-# the sim bowl's outer rim radius (floor + tilted wall + wall thickness) and a 3 cm cube's corner
-RIM_RADIUS_M = (
-    S.BOWL_FLOOR_RADIUS
-    + S.BOWL_WALL_HEIGHT * math.tan(math.radians(S.BOWL_WALL_TILT_DEG))
-    + S.BOWL_WALL_THICKNESS
-)
+RELEASE_RADIUS_M = BF.release_radius_m(GEOMETRY)  # TCP over the floor, the cube inside it
+RIM_RADIUS_M = GEOMETRY.rim_radius_m  # the cup's outer rim (sim bowl fallback while pending)
 CUBE_CORNER_M = CUBE_HALF_M * math.sqrt(2.0)
 
 
@@ -324,7 +326,7 @@ def verify(
         if cells[(s, nm)] != "clip(gripper floor)"
     }
     bowl_ok = all(STATUS_ORDER[worst[nm]] <= 1 for nm in ("carry", *BOWL_PHASES))
-    in_bowl = (scene.obj[:, :2] - torch.tensor(bowl)).norm(dim=-1) < S.BOWL_FLOOR_RADIUS
+    in_bowl = (scene.obj[:, :2] - torch.tensor(bowl)).norm(dim=-1) < GEOMETRY.floor_radius_m
     placed = sorted({rows[i][0] for i in range(len(rows)) if bool(scene.released[i] & in_bowl[i])})
     return {
         "bowl_xy_m": [round(bowl[0], 4), round(bowl[1], 4)],
@@ -374,7 +376,7 @@ def analytic(bowl: Sequence[float]) -> dict[str, float]:
         "reach_margin_m": round(k["reach_m"] - m - r, 4),
         # CUBE ONLY (no gripper, no collision model): the rim to the nearest cube's corner at any
         # yaw, the bowl placed 5 mm closer. The open jaws reach further: not checked here.
-        "cube_rim_clearance_m": round(d - RIM_RADIUS_M - CUBE_CORNER_M - m, 4),
+        "cube_rim_clearance_m": round(BF.cube_rim_clearance_m(d, GEOMETRY), 4),
     }
 
 
@@ -623,7 +625,17 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     yaws = [0.0] if tiny else [float(y) for y in PR.YAWS_DEG]
     bowls = [tuple(b) for b in args.bowl] if args.bowl else [PR.BOWL_XY_M]
     fk = load_sim_fk()
-    out: dict[str, Any] = {"frozen_bowl_xy_m": list(PR.BOWL_XY_M), "results": []}
+    out: dict[str, Any] = {
+        "frozen_bowl_xy_m": list(PR.BOWL_XY_M),
+        "geometry": GEOMETRY.to_dict(),
+        "carry_rim_clearance_m": round(BF.carry_rim_clearance_m(GEOMETRY), 4),
+        "results": [],
+    }
+    print(
+        f"prop geometry {out['geometry']}; cube bottom over the rim at the oracle's carry "
+        f"{out['carry_rim_clearance_m']} m"
+        + ("" if GEOMETRY.measured else " (PENDING measurements: not the real cup's numbers)")
+    )
     with Run(
         work_order="WO-07",
         script=__file__,

@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-11-09
+Updated: 2026-11-10
 
 ## Pivot to SmolVLA (owner decision 2026-11-09, ADR-0003)
 
@@ -44,7 +44,7 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 01 | done, merged | #7 (merged) | See benchmarks. Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). |
 | 02 | closed by owner decision, **below the original target band**; PR open | `wo-02-sft` | OpenVLA-OFT LoRA SFT, 4 attempts, all below the 20-60% band on seen positions (ADR-0001). Owner (2026-10-27): keep OFT, amend rule 3, close with the full protocol table of attempt 4 `step_004000` (25 demos/task): seen PickPlace 17.0%, Push 10.0%, Stack 2.7% (`docs/results.md`). |
 | 03 | done, merged after owner review | #4 (merged) | **Out of order** (started before WO-01/02). CPU only, toy env. |
-| 06 | **current WO** (bring-up, new table); part 1 merged, kit arrived, physical bring-up pending | #5, #24 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
+| 06 | **current WO** (bring-up, new table); part 1 merged, kit arrived, physical bring-up pending | #5, #24 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. Hardware: the owner's bill of materials, [`docs/bringup/kit.md`](bringup/kit.md) (2026-11-10; "PR 2: owner kit list" below). |
 | 04 | **benchmark not met; track stopped 2026-11-09 (ADR-0003)**, partial result recorded, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
 | 07 | now "real demos + SmolVLA/ACT baseline"; code only, **out of order** (started before WO-06 bring-up is verified): pilot client/server and real-eval harness on fakes, **unverified on hardware** | #23, #29 (merged); SmolVLA/ACT code is PR 2 (`feat/smolvla-real`) | Mock pilot, gRPC server, `scripts/wo07_real_eval.py` (protocol 0.2), placement grid. No real trials. |
 | SmolVLA pivot, PR 2 | PR #32 open, code only, $0 (PR 1 #31 merged) | `feat/smolvla-real` | Convention, SmolVLA / ACT trainer, Mac in-process inference, protocol real-0.1, eval capture, vishwaroop export. **Unverified on hardware and GPU.** See "PR 2: SmolVLA and ACT on the real arm" below. |
@@ -1891,6 +1891,105 @@ max 5 steps, gRPC mock policy, fake checkpoint, Mac M3 Pro local SSD; single run
   `mypy --strict src`: clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/success.py`,
   `protocol_real.py` and the pins unchanged in this round.
 
+### PR 2: owner kit list (branch `feat/smolvla-real-kit`, 2026-11-10, $0)
+
+The owner's list of the items actually used for training, runs and evaluation, with "multimeter
+not needed, table will be all white". Bill of materials: [`docs/bringup/kit.md`](bringup/kit.md),
+linked from the WO-06 checklist, the WO-06 / WO-07 work orders, `docs/PLAN.md` (hardware line)
+and here. Code and docs only, no device opened. **The placement freeze stays PENDING**
+(`FREEZE_STATUS` "pending: bowl fit check"; `BOWL_XY_M`, `RUBRIC_VERSION` and the committed A3
+PDF unchanged; no regenerated PDF committed).
+
+- **Real-0.1 objects** (`src/eval/protocol_real.py`, real only; protocols 0.1-draft / 0.2 and
+  `src/env/**` untouched). One set, hand2mind 1-inch wood cubes: RED seen (PickPlace), PURPLE and
+  GREEN unseen, BLUE recorded as the seen Stack base (`STACK_BASE_OBJECT`, deferred, unused in
+  real-0.1). Edge 25.4 mm NOMINAL until measured; "wood, same set: same edge, mass and finish;
+  only the colour differs"; colours as supplied in the set (the sim RGBA is no longer a hash
+  input). Every real-arm "3 cm cube" statement replaced (protocol, bowl check, checklist step 10,
+  ENVIRONMENT hardware, START_HERE). Bowl = LE TAUCI 8 oz bouillon cup, white (`bowl_spec()`).
+- **Pending measurements in ONE place:** `protocol_real.MEASURED` (`PropMeasurements`, mm, None =
+  PENDING): `red_cube_edge_mm`, `bowl_outer_rim_diameter_mm`, `bowl_inside_floor_diameter_mm`,
+  `bowl_table_to_rim_height_mm`. `freeze_problem()` refuses while any is None (also with
+  `FREEZE_STATUS` frozen); they are hash inputs (`props`, `bowl`); `src/eval/bowl_fit.py`
+  `geometry()` reads them for the release radius, the cube-to-rim clearance and the new
+  carry-over-rim clearance, used by `scripts/wo07_bowl_check.py` (its record now carries
+  `geometry` with per-value sources and `carry_rim_clearance_m`). While pending, the cube is the
+  25.4 mm nominal and the cup values are the sim bowl's, labelled `PENDING measurement: sim bowl
+  fallback`. After the owner's numbers: one edit of `MEASURED`, rerun the bowl check, then the
+  freeze. The bowl check's numbers now use the 25.4 mm cube (release radius 32.3 mm instead of
+  30 mm; in the tests the frozen bowl is still REJECT and B' still passes at C4); the B' / D tables above were
+  computed with the 3 cm cube and are superseded by that rerun. Interim rerun of B' (0.205, 0.185)
+  with the nominal 25.4 mm cube and the sim-bowl fallback (`wo07_bowl_check.py --preset real
+  --bowl 0.205 0.185`, CPU, single run, NOT the real cup's numbers): safety-bounded IK passes
+  every phase at all 25 slots x 7 yaws (only the intended gripper-floor clip), 175/175 cubes over
+  the floor, box margin +0.14 cm (own TCP offset 8.6 mm), release window 70% / 10 mm (was 71% /
+  10 mm), cube-to-rim clearance +1.13 cm, carry over the rim +2.03 cm; the unchanged-oracle (urdf)
+  variant clips wrist_flex in carry (3.3 deg, 6 slots) and retreat (5.0 deg, 25 slots), as with
+  the 3 cm cube.
+- **Scene facts as hash inputs** (`SCENE` via `scene_spec()`): table all white; one 17-inch LED
+  clamp lamp set ONCE to 5000 K, position recorded at the camera match; exposure / white balance
+  locked on both cameras; C920x on the NEEWER UA057 magic arm at `front_left_45` (eye and target
+  read from `src/env/cameras.py`); 32 mm wrist module on the gripper mount. **New real-0.1 hash
+  `1d5674420b6d3a55636a98b63c72ccd9bafcce40a2515caf2d7abcbdf74cf19c`** (was `dca199e6da62`;
+  allowed, the freeze is pending; pin updated in `tests/test_protocol_real.py`). Slots,
+  schedules (eval / dev sha256 unchanged), seeds and the bowl position unchanged.
+- **White table + white cup (RISK).** Low contrast of the cup rim on the white table for both
+  cameras. Recorded in the protocol (`WHITE_ON_WHITE_RISK`), the WO-06 checklist step 7 (item 5:
+  the rim must be visible in both cameras under the 5000 K lamp with exposure locked; adjust the
+  lamp or the locked exposure once, never the table or the cup) and `docs/bringup/kit.md`. The sim
+  stays wood-coloured (0.2 frozen); the WO-08 plan says the two-camera sim protocol should use a
+  white table, a white cup of the measured size and 25.4 mm cubes.
+- **Cameras and light** (`configs/real.yaml`, checklist steps 6-7): the C920x on the magic arm at
+  the sim pose (numbers in the config comment and the checklist), the wrist module on the gripper
+  mount (3D-printed from the LeRobot SO-101 files if the kit has none), the lamp set once to
+  5000 K, then `cameras.front.controls` / `cameras.wrist.controls` (auto exposure / auto WB off,
+  `white_balance_k: 5000`, exposure / gain / tool recorded; C920x autofocus off). On macOS
+  OpenCV / AVFoundation cannot set UVC controls, so they are set with a UVC tool and recorded by
+  hand; no code sets or checks them (unverified: whether the 32 mm module exposes a WB
+  temperature). Both at 640 x 480 @ 30 fps as frozen.
+- **Checkerboard** (`scripts/wo06_camera_intrinsics.py`): 10 x 7 squares (9 x 6 inner corners) on
+  letter paper glued to cardboard; `--square-mm` is now REQUIRED (no 25 mm default) and recorded
+  in `cameras.<camera>.intrinsics.board`; `--camera front|wrist` (the wrist skips the front's
+  crop check); `cameras.wrist.intrinsics: null` added. Test: synthetic board, wrist written, front
+  dry run, missing `--square-mm` refused.
+- **Placement grid on two tabloid sheets** (`scripts/make_placement_grid.py --layout tabloid2`):
+  two portrait 11 x 17 in pages; sheet 1 = grid + base with a dashed CUT line, sheet 2 = the
+  robot's-left side with the BOWL CENTRE cross on the sheet (the cup's rim circle once its
+  diameter is measured), the title block and a ruler check (bowl cross to slot C1's cross,
+  117.5 mm, across the join); 10 mm overlap, registration ticks R1-R3 at the same heights on both
+  sheets, a 100 mm scale bar and a label on each sheet; deterministic bytes; A3 unchanged and
+  still the default. Not committed (generated with the freeze). Rendered locally (macOS `sips`)
+  to check the layout.
+- **No multimeter** (checklist step 0 rewritten): read the servo and supply labels (follower
+  12 V STS3215 on the 12 V supply, leader 7.4 V servos on the 5 V supply), never cross them; new
+  step 2b `wo06_calibrate.py --preset real voltage [--device leader]` reads each servo's
+  `Present_Voltage` and EEPROM `Min/Max_Voltage_Limit` (read only: port open, three
+  `sync_read(normalize=False)`, `disconnect(disable_torque=False)`; `read_voltages` /
+  `voltage_report` in `src/robot/servo_health.py`, 0.1 V per count per the Feetech STS table,
+  unverified on this arm) against `configs/real.yaml` `power` (follower 12.0 V, leader 5.0 V,
+  15% tolerance), flags a crossed supply and a reading outside the servo's own limits; tested
+  with a fake bus. Reporting table updated. No multimeter mention left in the repo.
+- **Servo facts.** Follower = 12 V STS3215 (Seeed Pro). Retailer listings for the 12 V STS3215
+  (C018 / C047) give about 2.7 A stall at 12 V and a 4-14 V range (robotshop, openelab, the
+  servodatabase page; the Feetech datasheet itself was not re-checked: unverified). The owner's
+  provisional thresholds stay (55 C, 1500 mA for 1 s): 1500 mA is about 55% of that stall
+  current, so a stalled 12 V servo trips and normal motion should not; 55 C stays 15 C under the
+  firmware's 70 C limit. Nothing in the config assumed a voltage before; the new `power` block
+  is the only one. Spare gripper servo (12 V STS3215, still to buy) in the checklist hardware
+  floor and step 9.
+- **Deferred items recorded:** the 2-inch (50.8 mm) matte black disc is the Push target (Push
+  deferred; the sim's disc is 5 cm); the green cylinder is replaced by the green cube; Push and
+  Stack props beyond the disc wait for the PickPlace baseline.
+- **Not done / flagged:** the cup may have handles (bouillon cups often do): their orientation is
+  recorded at the fit check. An 8 oz cup may be taller than the sim bowl's 36 mm: if the measured
+  height makes `carry_rim_clearance_m` negative, the sim oracle's carry (the bowl check's proxy)
+  passes through the rim and the check must be read with that in mind. The sim gripper's grasp
+  centre and the bowl check's 0.15 rad hold reading are 3 cm values; a 25.4 mm cube closes the
+  jaws further (rough estimate +0.1 rad at contact, unverified), still above the -5 deg floor.
+- **Gates:** full pytest 657 passed + 1 skipped (651 + 6 new); `ruff check src tests scripts`,
+  `black --check .`, `mypy --strict src` clean. `src/eval/protocol.py`, `protocol_v02.py` and
+  `src/env/**` unchanged; the committed A3 PDF still matches the drawing except the hash prefix.
+
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
 Owner 2026-11-09: the stop check #30 added to teleop and the park now also guards the pilot and
@@ -2011,6 +2110,13 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
 
 ## Blockers and decisions pending the owner
 
+- 2026-11-10 kit list: the four prop measurements (red cube edge; cup outer rim diameter, inside
+  floor diameter, table-to-rim height) are PENDING in `src/eval/protocol_real.py` `MEASURED`;
+  `freeze_problem()` refuses until they are in. Then: fill `MEASURED`, rerun
+  `scripts/wo07_bowl_check.py --preset real --search` with the real cup, and freeze together with
+  the B' fit check. Risk to watch at the camera match: the white cup rim on the white table
+  (checklist step 7 item 5). Still to buy: the spare 12 V gripper servo and, if the kit has none,
+  the 3D-printed wrist camera mount (`docs/bringup/kit.md`).
 - 2026-11-09 PR 2: the bowl is PENDING. The frozen (0.195, 0.205) is rejected by the safety box
   from the carry on, and no position satisfies `derive_bowl`'s rule and the box together. The
   options are in "PR 2: owner follow-up" and its round 2 (B (0.115, +-0.185), B' (0.205,

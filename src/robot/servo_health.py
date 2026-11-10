@@ -237,3 +237,68 @@ def monitor_from_config(cfg: Config) -> ServoMonitor | None:
     """A ServoMonitor for ``robot.servo_monitor``, or None when the block is absent."""
     mcfg = ServoHealthConfig.from_config(cfg)
     return None if mcfg is None else ServoMonitor(mcfg)
+
+
+# ------------------------------------------------------------------------------------------------
+# Supply voltage over the bus (WO-06 checklist step 2b; owner kit list 2026-11-10)
+# ------------------------------------------------------------------------------------------------
+# lerobot 0.4.4 ``STS_SMS_SERIES_CONTROL_TABLE``: Present_Voltage address 62, 1 byte, read-only;
+# Max_Voltage_Limit 14 and Min_Voltage_Limit 15 (EEPROM), 1 byte each. Unit 0.1 V per count
+# (Feetech STS memory table; unverified on this arm).
+VOLTAGE = "Present_Voltage"
+VOLTAGE_LIMITS: tuple[str, str] = ("Min_Voltage_Limit", "Max_Voltage_Limit")
+VOLTS_PER_COUNT = 0.1
+
+
+def read_voltages(bus: Any) -> dict[str, dict[str, int]]:
+    """Raw ``Present_Voltage`` and the EEPROM voltage limits of every motor: three read-only
+    ``sync_read(..., normalize=False)`` calls. Writes nothing; torque is left as it is."""
+    out: dict[str, dict[str, int]] = {}
+    for reg in (VOLTAGE, *VOLTAGE_LIMITS):
+        raw = bus.sync_read(reg, None, normalize=False)
+        out[reg] = {str(m): int(v) for m, v in raw.items()}
+    return out
+
+
+def voltage_report(
+    raw: Mapping[str, Mapping[str, int]],
+    supply_v: float,
+    tolerance_frac: float,
+    other_supply_v: float | None = None,
+) -> dict[str, Any]:
+    """Per motor: the reading and the servo's own limits in volts, and the problems: a reading
+    more than ``tolerance_frac`` off the supply label (and, when it sits nearer the OTHER arm's
+    supply, a crossed-supply warning), or outside the servo's own limits (it would alarm)."""
+    motors: dict[str, dict[str, float]] = {}
+    problems: list[str] = []
+    lo_reg, hi_reg = VOLTAGE_LIMITS
+    for m, c in raw[VOLTAGE].items():
+        v = round(c * VOLTS_PER_COUNT, 2)
+        lo = raw.get(lo_reg, {}).get(m)
+        hi = raw.get(hi_reg, {}).get(m)
+        row: dict[str, float] = {"present_v": v}
+        if lo is not None:
+            row["min_limit_v"] = round(lo * VOLTS_PER_COUNT, 2)
+        if hi is not None:
+            row["max_limit_v"] = round(hi * VOLTS_PER_COUNT, 2)
+        motors[m] = row
+        if abs(v - supply_v) > tolerance_frac * supply_v:
+            msg = f"{m}: reads {v:.1f} V, the supply label says {supply_v:g} V"
+            if other_supply_v is not None and abs(v - other_supply_v) < abs(v - supply_v):
+                msg += (
+                    f" (nearer the other arm's {other_supply_v:g} V supply: CROSSED SUPPLIES? "
+                    "switch off now)"
+                )
+            problems.append(msg)
+        if lo is not None and hi is not None and not row["min_limit_v"] <= v <= row["max_limit_v"]:
+            problems.append(
+                f"{m}: {v:.1f} V is outside the servo's own limits "
+                f"[{row['min_limit_v']:g}, {row['max_limit_v']:g}] V (voltage alarm)"
+            )
+    return {
+        "supply_v": supply_v,
+        "tolerance_frac": tolerance_frac,
+        "motors": motors,
+        "problems": problems,
+        "ok": not problems,
+    }

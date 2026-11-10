@@ -24,8 +24,10 @@ from src.robot.client import ScriptedOperator
 
 # Pinned: frozen before the first demo (owner D4). A change fails here on purpose: add a new real
 # protocol version instead (CLAUDE.md rule 4). PENDING (PR.FREEZE_STATUS): the current computed
-# value after real-judge-3 (2026-11-09); the bowl fit check, the rubric bump and the PDF follow.
-FROZEN = {"real-0.1": "dca199e6da6275bddc047812e1ea83379a70f21778f564315c5483811c0954f2"}
+# value after the owner's kit list (2026-11-10: hand2mind 1-inch cubes, LE TAUCI cup with its
+# measurements pending, white table, 5000 K lamp, cameras); before it dca199e6da62 (real-judge-3).
+# The measurements, the bowl fit check, the rubric bump and the PDF follow.
+FROZEN = {"real-0.1": "1d5674420b6d3a55636a98b63c72ccd9bafcce40a2515caf2d7abcbdf74cf19c"}
 # the hash prefix the committed placement-grid PDF prints: real-0.1 before real-judge-3. The PDF
 # is regenerated with the freeze, not before (owner 2026-11-09)
 PDF_HASH12_PENDING = "edee44aa957d"
@@ -158,6 +160,43 @@ def test_placement_sheet_marks_the_seen_slots_and_the_bowl() -> None:
     assert PR.protocol_hash()[:12] in ops
 
 
+def test_two_tabloid_placement_sheets(tmp_path: Path) -> None:
+    """Owner kit list 2026-11-10: the grid on two taped tabloid (11 x 17 in) sheets. Two pages,
+    deterministic bytes, a 100 mm scale bar and a label on each, registration ticks at the same
+    heights on both sides of the join, the bowl cross ON sheet 2, the A3 file untouched."""
+    grid_pdf = _load("make_placement_grid")
+    pages = grid_pdf.draw_tabloid()
+    assert len(pages) == 2 and pages == grid_pdf.draw_tabloid()
+    data = grid_pdf.layout_bytes("tabloid2")
+    assert data == grid_pdf.layout_bytes("tabloid2")  # deterministic
+    assert data.count(b"/Type /Page ") == 2 and b"/MediaBox [0 0 792.00 1224.00]" in data
+    s1, s2 = pages
+    assert "(SHEET 1 of 2: grid + robot base" in s1 and "(SHEET 2 of 2: bowl side" in s2
+    for sheet in pages:
+        assert sheet.count("10 cm scale bar: must measure 100 mm on THIS sheet") == 1
+        assert PR.protocol_hash()[:12] in sheet
+        for i in (1, 2, 3):
+            assert f"(R{i}) Tj" in sheet
+    assert "CUT sheet 1 along this dashed line" in s1 and "JOIN line" in s2
+    # the fixed bowl's centre lies on sheet 2, left of the join, with the cross-join ruler check
+    bx, _ = grid_pdf.page(*PR.BOWL_XY_M)
+    assert grid_pdf.SHEET2_X0_MM + 10.0 < bx < grid_pdf.JOIN_X_MM - 10.0
+    assert "(BOWL CENTRE)" in s2 and "mm from slot C1's centre cross" in s2
+    assert "PENDING the measured outer rim diameter" in s2
+    # every slot cross is on sheet 1, right of its cut line
+    for s in G.all_slots():
+        assert grid_pdf.page(s.x, s.y)[0] - 3 > grid_pdf.JOIN_X_MM
+    out = tmp_path / "tab.pdf"
+    assert grid_pdf.main(["--preset", "real", "--layout", "tabloid2", "--out", str(out)]) == 0
+    assert out.read_bytes() == data
+    assert (
+        grid_pdf.main(["--preset", "real", "--layout", "tabloid2", "--out", str(out), "--check"])
+        == 0
+    )
+    assert grid_pdf.layout_bytes("a3") == grid_pdf.pdf_bytes(grid_pdf.draw())
+    assert grid_pdf.OUTS["a3"] == grid_pdf.OUT  # the A3 default path is unchanged
+
+
 def test_the_freeze_is_pending_and_every_real_session_and_demo_refuses() -> None:
     """Owner 2026-11-09: the bowl fit check of B' is pending. The protocol says so
     (``FREEZE_STATUS``), the bowl and the rubric version are unchanged, the hardware session and
@@ -179,6 +218,63 @@ def test_the_freeze_is_pending_and_every_real_session_and_demo_refuses() -> None
     ops = grid_pdf.draw()
     assert PR.protocol_hash()[:12] in ops and PDF_HASH12_PENDING not in ops
     assert grid_pdf.pdf_bytes(ops.replace(PR.protocol_hash()[:12], PDF_HASH12_PENDING)) == committed
+
+
+def test_kit_objects_bowl_and_scene_are_the_owners_items() -> None:
+    """Owner kit list 2026-11-10: hand2mind 1-inch wood cubes (red seen, purple + green unseen,
+    blue the deferred Stack base), the LE TAUCI cup with its measurements PENDING in one place,
+    and the scene facts (white table, 5000 K lamp, locked controls, both cameras) in the hash."""
+    comp = PR.hash_components()
+    seen, unseen = comp["objects"]["seen"], comp["objects"]["unseen"]
+    assert seen["label"] == "red cube" and [o["label"] for o in unseen] == [
+        "purple cube",
+        "green cube",
+    ]
+    for o in (seen, *unseen, comp["objects"]["stack_base"]):
+        assert o["edge_mm"] == 25.4 and "NOMINAL" in o["edge_source"]
+        assert "hand2mind" in o["set"] and o["material"].startswith("wood")
+        assert "as supplied in the set" in o["colour"]
+    assert comp["objects"]["stack_base"]["label"] == "blue cube"
+    assert "unused in real-0.1" in comp["objects"]["stack_base"]["use"]
+    for o in (PR.SEEN_OBJECT, *PR.UNSEEN_OBJECTS, PR.STACK_BASE_OBJECT):
+        assert o.size == pytest.approx(0.0254)  # never the sim's 3 cm on the real arm
+    bowl = comp["bowl"]
+    assert "LE TAUCI 8 oz bouillon cup, white" in bowl["product"] and bowl["colour"] == "white"
+    for k in ("outer_rim_diameter_mm", "inside_floor_diameter_mm", "table_to_rim_height_mm"):
+        assert k in bowl and bowl[k] is None  # PENDING
+    assert (
+        comp["props"]["pending"] == PR.pending_measurements()
+        and len(PR.pending_measurements()) == 4
+    )
+    scene = comp["scene"]
+    assert scene["table_surface"] == "all white" and "5000 K" in scene["lighting"]
+    assert "locked" in scene["camera_controls"] and "low contrast" in scene["risk"]
+    from src.config import load_config
+
+    sim_cam = load_config("sim")["env"]["camera"]
+    assert scene["front_camera"]["eye_m"] == sim_cam["eye"]
+    assert scene["front_camera"]["target_m"] == sim_cam["target"]
+    assert scene["front_camera"]["device"] == "Logitech C920x"
+    assert "32 mm" in scene["wrist_camera"]["device"]
+
+
+def test_pending_measurements_refuse_the_freeze_and_move_the_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(PR, "FREEZE_STATUS", PR.FROZEN)
+    problem = PR.freeze_problem()  # frozen status alone is not enough
+    assert problem is not None and "prop measurements PENDING" in problem
+    assert "not frozen" not in problem and "bowl_table_to_rim_height_mm" in problem
+    before = PR.protocol_hash()
+    m = PR.PropMeasurements(25.2, 110.0, 70.0, 58.0)
+    monkeypatch.setattr(PR, "MEASURED", m)
+    assert PR.pending_measurements() == [] and PR.freeze_problem() is None
+    assert PR.cube_edge_mm() == (25.2, "measured (red cube)")
+    assert PR.hash_components()["bowl"]["table_to_rim_height_mm"] == 58.0
+    assert PR.protocol_hash() != before  # the measurements are hash inputs
+    from src.eval import bowl_fit as BF
+
+    assert BF.geometry().measured and BF.geometry().rim_height_m == pytest.approx(0.058)
 
 
 # ------------------------------------------------------------------------------------------------

@@ -316,6 +316,42 @@ def cmd_verify(
         bus.disconnect(disable_torque=True)
 
 
+def cmd_voltage(args: argparse.Namespace, cfg: dict[str, Any], bus: Any = None) -> dict[str, Any]:
+    """Each servo's Present_Voltage and its EEPROM voltage limits, read over the bus: port only
+    (no configure(), no torque change, no write), like camera_match's read_arm_joints. Compared
+    with the supply label in ``power.<device>.supply_v`` (owner kit list 2026-11-10):
+
+        uv run scripts/wo06_calibrate.py --preset real voltage [--device leader]
+    """
+    from src.robot.servo_health import read_voltages, voltage_report
+
+    power = cfg.get("power") or {}
+    if args.device not in power:
+        sys.exit(f"power.{args.device} missing in the config (supply_v: the supply label)")
+    other = "leader" if args.device == "follower" else "follower"
+    supply = float(power[args.device]["supply_v"])
+    other_v = float(power[other]["supply_v"]) if other in power else None
+    if bus is None:
+        bus = _make_device(args, cfg).bus
+    bus.connect()  # port only: no configure(), no torque change
+    try:
+        raw = read_voltages(bus)
+    finally:
+        bus.disconnect(disable_torque=False)
+    rep = voltage_report(raw, supply, float(power.get("tolerance_frac", 0.15)), other_v)
+    print(f"{args.device}: {power[args.device].get('servo', '?')} on the {supply:g} V supply")
+    print(f"{'motor':<14}{'present V':>10}{'min V':>8}{'max V':>8}")
+    for m, r in rep["motors"].items():
+        print(
+            f"{m:<14}{r['present_v']:>10.1f}{r.get('min_limit_v', float('nan')):>8.1f}"
+            f"{r.get('max_limit_v', float('nan')):>8.1f}"
+        )
+    for p in rep["problems"]:
+        print("PROBLEM", p)
+    print("voltage check: OK" if rep["ok"] else "voltage check: FAIL - switch the supply off")
+    return rep
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     add_config_args(parser)
@@ -336,10 +372,15 @@ def main() -> None:
     p.add_argument("--write-limits", action="store_true")
     p = sub.add_parser("verify", help="stream canonical joint angles + TCP with torque off")
     p.add_argument("--device", choices=["follower", "leader"], default="follower")
+    p = sub.add_parser("voltage", help="read each servo's supply voltage (read only, no motion)")
+    p.add_argument("--device", choices=["follower", "leader"], default="follower")
     args = parser.parse_args()
     if args.preset != "real":
         parser.error("WO-06 hardware scripts run with --preset real")
     cfg = load_config(args.preset, args.config)
+    if args.cmd == "voltage":
+        cmd_voltage(args, cfg)
+        return
     {"find-port": cmd_find_port, "calibrate": cmd_calibrate, "check": cmd_check}.get(
         args.cmd, cmd_verify
     )(args, cfg)

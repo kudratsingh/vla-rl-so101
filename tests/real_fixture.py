@@ -31,6 +31,7 @@ BRINGUP_PLACEHOLDERS: dict[tuple[str, ...], Any] = {
     ("cameras", "front", "index"): 0,
     ("cameras", "front", "intrinsics"): None,
     ("cameras", "wrist", "index"): 1,
+    ("cameras", "wrist", "intrinsics"): None,
     ("teleop", "leader"): None,
 }
 

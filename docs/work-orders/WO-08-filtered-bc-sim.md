@@ -33,7 +33,13 @@ tested on the arm only after the sim gain is in.
    `src/eval/sim_eval.py` (`FILES` in `src/eval/protocol_v02.py`). Editing any of them, even a
    comment, changes 0.2's hash. So pin 0.2's current hash in a test first, then put the wrist
    camera, the two-camera observation function and the new protocol in new files that import
-   the frozen ones.
+   the frozen ones. Scene match (owner kit list 2026-11-10, `docs/bringup/kit.md`): the real
+   scene has an all-white table, a white cup (LE TAUCI 8 oz; its measured rim / floor / height
+   from `src/eval/protocol_real.py` `MEASURED`) and 25.4 mm cubes (hand2mind 1 inch, measured
+   edge), lit by one 5000 K lamp. The two-camera sim protocol should use a white table, a white cup
+   of those dimensions and 25.4 mm cubes so it matches the real scene; protocol 0.2's wood table,
+   sim bowl and 3 cm cubes stay frozen. The grasp centre (`tcp_link`) and the oracle's heights are
+   set for a 3 cm cube and are re-derived for 25.4 mm in the new files.
 4. **SFT base.** SmolVLA (`policy.base` from config) fine-tuned on the rebuilt 25 demos per task,
    both camera streams, with the same script as WO-07. Entry rule (CLAUDE.md rule 3, owner
    amendment 2026-10-27): filtered BC may start only from a checkpoint with ≥10% success on seen

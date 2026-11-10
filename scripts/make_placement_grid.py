@@ -22,6 +22,18 @@ Content, all derived from code (``src/eval/real_grid.py``, which reads ``src/eva
 
     uv run scripts/make_placement_grid.py --preset real          # writes the PDF
     uv run scripts/make_placement_grid.py --preset real --check  # exit 1 if it is stale
+    uv run scripts/make_placement_grid.py --preset real --layout tabloid2   # two tabloid sheets
+
+``--layout tabloid2`` (owner kit list 2026-11-10: print on A3, or on two tabloid 11 x 17 in sheets
+taped together) writes ``docs/assets/placement-grid-tabloid2.pdf``: the same 1:1 drawing (same
+coordinates, the A3 page frame used as the world frame) split over two portrait tabloid pages.
+SHEET 1 holds the grid and the robot base outline; SHEET 2 the robot's-left side with the FIXED
+bowl's centre cross ON the sheet (and the cup's outer-rim circle once its diameter is measured,
+``protocol_real.MEASURED``), the title block and a ruler check from the bowl cross to the nearest
+slot cross across the join. Each sheet has its own 100 mm scale bar and label. Joining: cut sheet 1
+along its dashed CUT line (10 mm overlap), lay the cut edge on sheet 2's JOIN line so the three
+registration ticks R1 R2 R3 run on continuously, tape. Deterministic bytes, like the A3 file.
+Neither PDF is regenerated before the real-0.1 freeze (generating them is part of it).
 
 ``--config`` / ``--preset`` are accepted for the project convention and only ``real`` is allowed;
 the grid reads no config: it is derived only from ``protocol.py`` and ``real_grid.py``, so
@@ -50,6 +62,7 @@ from src.eval import protocol_real as PR
 from src.eval import real_grid as G
 
 OUT = REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf"
+OUTS = {"a3": OUT, "tabloid2": REPO_ROOT / "docs" / "assets" / "placement-grid-tabloid2.pdf"}
 URDF = REPO_ROOT / "src" / "env" / "assets" / "so101" / "so101_new_calib.urdf"
 PAGE_MM = (297.0, 420.0)
 PT_PER_MM = 72.0 / 25.4
@@ -219,8 +232,9 @@ def pdf_bytes(content: str) -> bytes:
 # ------------------------------------------------------------------------------------------------
 # The sheet
 # ------------------------------------------------------------------------------------------------
-def draw() -> str:
-    c = Canvas()
+def _draw_grid(c: Canvas) -> None:
+    """The slot lattice, region borders, row / column labels, robot base outline and axes, in
+    page mm of the A3 layout (the tabloid layout uses the same coordinates as its world frame)."""
     slots = G.all_slots()
     dx, dy = G.cell_size_m()
 
@@ -293,6 +307,12 @@ def draw() -> str:
     c.text(ox + 2.0, oy + 76.0, "+x (forward)", 8.0, bold=True)
     c.arrow(ox - 6, oy, ox - 75, oy)
     c.text(ox - 78.0, oy + 2.0, "+y (robot's left)", 8.0, bold=True)
+
+
+def draw() -> str:
+    c = Canvas()
+    dx, dy = G.cell_size_m()
+    _draw_grid(c)
 
     # real-0.1 fixed bowl: a line at its x, a reference tick at y = +0.105 m (the grid's +y edge);
     # the bowl centre is (bowl y - 0.105) m further along the line, beyond the sheet's left edge
@@ -379,15 +399,212 @@ def draw() -> str:
     return "\n".join(c.ops) + "\n"
 
 
+# ------------------------------------------------------------------------------------------------
+# Two-tabloid tiled variant (owner kit list 2026-11-10: "A3, or two tabloid sheets taped")
+# ------------------------------------------------------------------------------------------------
+TABLOID_MM = (279.4, 431.8)  # 11 x 17 in, portrait
+JOIN_X_MM = 14.0  # the join line, in the A3 layout's page mm (the tiled layout's world frame)
+SHEET1_X0_MM = 5.0  # sheet 1 (grid + base) covers world x 5 .. 284.4
+SHEET2_X0_MM = JOIN_X_MM + 10.0 - TABLOID_MM[0]  # sheet 2 (bowl side) covers -255.4 .. 24
+REG_MARKS_Y_MM = (60.0, 195.0, 400.0)  # registration ticks across the join (clear of labels)
+
+
+def _scale_bar(c: Canvas, x: float, y: float) -> None:
+    c.gray(0.0, 0.0)
+    c.width(0.6)
+    c.line(x, y, x + 100.0, y)
+    for i in range(11):
+        c.line(x + 10.0 * i, y, x + 10.0 * i, y + (3.0 if i in (0, 5, 10) else 1.8))
+    c.text(x, y + 4.5, "10 cm scale bar: must measure 100 mm on THIS sheet", 8.0, bold=True)
+    c.text(x, y - 5.0, "If not, reprint at 100% / Actual size (never Fit to page)", 7.0)
+
+
+def _sheet1(c: Canvas) -> None:
+    """Grid + base sheet: the CUT line on its left, the registration ticks, label, scale bar."""
+    c.gray(0.0, 0.0)
+    c.width(0.3)
+    c.dash(2.0, 1.5)
+    c.line(JOIN_X_MM, 0.0, JOIN_X_MM, TABLOID_MM[1])
+    c.dash()
+    c.width(0.4)
+    for i, y in enumerate(REG_MARKS_Y_MM, start=1):
+        c.line(JOIN_X_MM, y, JOIN_X_MM + 8.0, y)
+        c.line(JOIN_X_MM + 4.0, y - 2.0, JOIN_X_MM + 4.0, y + 2.0)
+        c.text(JOIN_X_MM + 1.0, y + 1.2, f"R{i}", 5.0, bold=True)
+    c.text(JOIN_X_MM + 1.5, 12.0, "<- CUT sheet 1 along this dashed line; lay the cut edge on", 7.0)
+    c.text(JOIN_X_MM + 1.5, 8.5, "sheet 2's JOIN line with R1 R2 R3 continuous; tape.", 7.0)
+    hash12 = PR.protocol_hash()[:12]
+    c.text(
+        30.0, 414.0, "SHEET 1 of 2: grid + robot base  (tabloid 11 x 17 in, 1:1)", 12.0, bold=True
+    )
+    c.text(
+        30.0,
+        408.0,
+        f"Protocol {PR.PROTOCOL_VERSION} {hash12}; SEEN = {' '.join(PR.SEEN_SLOTS)}; the FIXED "
+        "bowl is marked on sheet 2. Title block and bowl notes: sheet 2.",
+        7.5,
+    )
+    _scale_bar(c, 30.0, 360.0)
+
+
+def _sheet2(c: Canvas) -> None:
+    """Bowl sheet: the JOIN line, the matching registration ticks, the bowl mark, the title."""
+    left = SHEET2_X0_MM + 10.0
+    c.gray(0.0, 0.0)
+    c.width(0.4)
+    c.line(JOIN_X_MM, 10.0, JOIN_X_MM, TABLOID_MM[1] - 10.0)
+    for i, y in enumerate(REG_MARKS_Y_MM, start=1):
+        c.line(JOIN_X_MM - 8.0, y, JOIN_X_MM, y)
+        c.line(JOIN_X_MM - 4.0, y - 2.0, JOIN_X_MM - 4.0, y + 2.0)
+        c.text(JOIN_X_MM - 7.5, y + 1.2, f"R{i}", 5.0, bold=True)
+    c.text(JOIN_X_MM - 66.0, 20.0, "JOIN line: sheet 1's cut edge goes here ->", 7.0, bold=True)
+    c.text(JOIN_X_MM - 66.0, 16.5, "(sheet 1 overlaps this sheet's right 10 mm)", 7.0)
+
+    # the bowl: centre cross; its rim circle once the outer rim is measured
+    bx, by = PR.BOWL_XY_M
+    px, py = page(bx, by)
+    c.width(0.6)
+    c.line(px - 10.0, py, px + 10.0, py)
+    c.line(px, py - 10.0, px, py + 10.0)
+    rim = PR.MEASURED.bowl_outer_rim_diameter_mm
+    if rim is not None:
+        r = float(rim) / 2.0
+        c.width(0.4)
+        pts = [
+            (px + r * math.cos(2 * math.pi * k / 72), py + r * math.sin(2 * math.pi * k / 72))
+            for k in range(72)
+        ]
+        c.poly(pts)
+    rep = PR.bowl_report()
+    near = rep["nearest_slot"]
+    d_mm = 1000.0 * float(rep["min_slot_distance_m"])
+    c.text(px + 2.0, py + 2.0, "BOWL CENTRE", 7.0, bold=True)
+    for i, line in enumerate(
+        (
+            (
+                f"BOWL, FIXED for every demo and trial ({PR.PROTOCOL_VERSION}): centre x = {bx:.3f} m, "
+                f"y = {by:+.3f} m (the cross)."
+            ),
+            (
+                f"Ruler check across the join: the cross is {d_mm:.1f} mm from slot {near}'s centre "
+                "cross on sheet 1."
+            ),
+            (
+                f"Cup outer rim {float(rim):.1f} mm: centre the cup on the circle."
+                if rim is not None
+                else "Cup outline: PENDING the measured outer rim diameter; centre the cup on "
+                "the cross."
+            ),
+            "Mark the centre on the table once; the cup stays on the mark.",
+        )
+    ):
+        c.text(left, 345.0 - 4.2 * i, line, 7.5, bold=i == 0)
+
+    _scale_bar(c, left, 360.0)
+    dx, dy = G.cell_size_m()
+    hash12 = PR.protocol_hash()[:12]
+    lines = (
+        "Place each object's CENTRE on its slot cross. Slot ids = scripts/wo07_real_eval.py prompts.",
+        (
+            f"White = seen / unseen_objects slots (SEEN_REGION centre {P.SEEN_REGION.center} m); "
+            f"shaded = shifted (x{P.SHIFT_SCALE}, outside seen)."
+        ),
+        (
+            f"Generated by scripts/make_placement_grid.py --layout tabloid2; src/eval/protocol.py "
+            f"{P.PROTOCOL_VERSION} {P.protocol_hash()[:12]}."
+        ),
+        (
+            f"Slots: {dx * 100:.1f} cm (x) by {dy * 100:.1f} cm (y); row letter = x (A nearest the "
+            "base), column = y (1 = robot's left)."
+        ),
+        (
+            f"Protocol {PR.PROTOCOL_VERSION} {hash12}: SEEN = {' '.join(PR.SEEN_SLOTS)}; shifted = the "
+            "shaded ring; 'not used' = never in real-0.1."
+        ),
+    )
+    c.text(left, 414.0, "SHEET 2 of 2: bowl side  (tabloid 11 x 17 in, 1:1)", 12.0, bold=True)
+    c.text(left, 407.0, "vla-rl-so101 WO-07 real-eval placement grid, two tabloid sheets", 9.0)
+    for i, line in enumerate(lines):
+        c.text(left, 400.0 - 4.5 * i, line, 7.0)
+
+
+def draw_tabloid() -> list[str]:
+    """The two sheets' content streams: the A3 grid drawn in world mm, clipped to each sheet's
+    side of the join and shifted onto the sheet, plus each sheet's own marks."""
+    pages = []
+    sheets = (
+        (SHEET1_X0_MM, JOIN_X_MM - 1.0, SHEET1_X0_MM + TABLOID_MM[0], _sheet1),
+        (SHEET2_X0_MM, SHEET2_X0_MM, JOIN_X_MM + 0.5, _sheet2),
+    )
+    for x0, lo, hi, own in sheets:
+        c = Canvas()
+        _draw_grid(c)
+        own(c)
+        clip = f"{_f(lo - x0)} 0 {_f(hi - lo)} {_f(TABLOID_MM[1])} re W n"
+        head = ["q", clip, f"1 0 0 1 {_f(-x0)} 0 cm"]
+        pages.append("\n".join([*head, *c.ops, "Q"]) + "\n")
+    return pages
+
+
+def pages_pdf_bytes(contents: Sequence[str], page_mm: tuple[float, float]) -> bytes:
+    """A multi-page PDF (same minimal writer as ``pdf_bytes``), deterministic bytes."""
+    w, h = (f"{v * PT_PER_MM:.2f}" for v in page_mm)
+    n = len(contents)
+    kids = " ".join(f"{5 + 2 * i} 0 R" for i in range(n))
+    objs: list[bytes] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        f"<< /Type /Pages /Kids [{kids}] /Count {n} >>".encode(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+    ]
+    for i, content in enumerate(contents):
+        stream = content.encode("latin-1")
+        objs.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] /Resources << /Font << "
+                f"/F1 3 0 R /F2 4 0 R >> >> /Contents {6 + 2 * i} 0 R >>"
+            ).encode()
+        )
+        objs.append(
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"
+        )
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+def layout_bytes(layout: str) -> bytes:
+    if layout == "a3":
+        return pdf_bytes(draw())
+    if layout == "tabloid2":
+        return pages_pdf_bytes(draw_tabloid(), TABLOID_MM)
+    raise ValueError(f"unknown layout {layout!r}; expected one of {sorted(OUTS)}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
     add_config_args(parser)
-    parser.add_argument("--out", type=Path, default=OUT)
+    parser.add_argument(
+        "--layout",
+        choices=sorted(OUTS),
+        default="a3",
+        help="a3: one A3 sheet (default); tabloid2: two 11 x 17 in sheets, cut and taped",
+    )
+    parser.add_argument("--out", type=Path, default=None, help="default: docs/assets/<layout> PDF")
     parser.add_argument("--check", action="store_true", help="exit 1 if the file is stale")
     args = parser.parse_args(argv)
     if args.preset != "real":
         parser.error("the placement grid is a real-arm artefact: --preset real")
-    data = pdf_bytes(draw())
+    args.out = args.out or OUTS[args.layout]
+    data = layout_bytes(args.layout)
     if args.check:
         if not args.out.is_file() or args.out.read_bytes() != data:
             print(f"{args.out} is stale: run scripts/make_placement_grid.py --preset real")

@@ -133,3 +133,69 @@ def test_verify_asks_to_support_the_arm_before_torque_off(
     cal.cmd_verify(argparse.Namespace(device="follower"), real_cfg(), ask=ask)
     assert "support the arm" in dev.bus.calls[0]
     assert dev.bus.calls[1:] == ["connect", "disable_torque", "disconnect(disable_torque=True)"]
+
+
+class VoltBus:
+    """A bus that answers the three voltage registers; any write or torque change fails."""
+
+    def __init__(self, present: dict[str, int], lo: int = 40, hi: int = 140) -> None:
+        self.regs = {
+            "Present_Voltage": present,
+            "Min_Voltage_Limit": {m: lo for m in present},
+            "Max_Voltage_Limit": {m: hi for m in present},
+        }
+        self.calls: list[str] = []
+
+    def connect(self) -> None:
+        self.calls.append("connect")
+
+    def sync_read(self, reg: str, motors: Any = None, normalize: bool = True) -> dict[str, int]:
+        assert normalize is False and motors is None
+        self.calls.append(f"read {reg}")
+        return dict(self.regs[reg])
+
+    def disable_torque(self, *a: Any, **k: Any) -> None:
+        raise AssertionError("the voltage read never changes torque")
+
+    enable_torque = disable_torque
+
+    def disconnect(self, disable_torque: bool = True) -> None:
+        assert disable_torque is False
+        self.calls.append("disconnect")
+
+
+def test_voltage_reads_present_voltage_read_only(capsys: pytest.CaptureFixture[str]) -> None:
+    """Owner kit list 2026-11-10: the follower's 12 V STS3215 on the 12 V supply, the leader's
+    7.4 V servos on the 5 V supply; step 2b reads Present_Voltage over the bus."""
+    from src.config import load_config
+
+    cfg = load_config("real")
+    assert (
+        cfg["power"]["follower"]["supply_v"] == 12.0 and cfg["power"]["leader"]["supply_v"] == 5.0
+    )
+    names = ["shoulder_pan", "gripper"]
+    args = argparse.Namespace(device="follower")
+    bus = VoltBus({n: 121 for n in names})
+    rep = cal.cmd_voltage(args, cfg, bus=bus)
+    assert rep["ok"] and rep["motors"]["gripper"] == {
+        "present_v": 12.1,
+        "min_limit_v": 4.0,
+        "max_limit_v": 14.0,
+    }
+    assert bus.calls == [
+        "connect",
+        "read Present_Voltage",
+        "read Min_Voltage_Limit",
+        "read Max_Voltage_Limit",
+        "disconnect",
+    ]
+    assert "voltage check: OK" in capsys.readouterr().out
+    # the leader supply on the follower: crossed
+    crossed = cal.cmd_voltage(args, cfg, bus=VoltBus({n: 50 for n in names}))
+    assert not crossed["ok"] and "CROSSED SUPPLIES" in crossed["problems"][0]
+    # a 12 V supply on the leader's 7.4 V servos (limits 4.0-8.0 V): off-label and over the limit
+    lead = cal.cmd_voltage(
+        argparse.Namespace(device="leader"), cfg, bus=VoltBus({n: 120 for n in names}, hi=80)
+    )
+    assert not lead["ok"] and any("outside the servo's own limits" in p for p in lead["problems"])
+    assert "voltage check: FAIL" in capsys.readouterr().out
