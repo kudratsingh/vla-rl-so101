@@ -3,10 +3,11 @@
 Every number: run id, config hash, protocol hash, seeds, date, GPU, dollars. Single-run numbers
 are labelled single-run. Sim and real are never mixed in one table.
 
-**The OpenVLA-OFT sim rows below (WO-02 SFT, WO-04 RL) are a partial result, track stopped
-2026-11-09** (ADR-0003). No number in them has changed.
+**The OpenVLA-OFT sim rows below (WO-02 SFT, WO-04 RL) remain recorded partial results.**
+Further OpenVLA-OFT / GRPO experiments are deferred until after full evaluation of the real arm
+and the SmolVLA/ACT baseline (owner, 2026-11-10; ADR-0003 amendment). No number has changed.
 
-## Sim — success rate (%), 100 episodes/cell, 3 seeds, 95% Wilson interval (OpenVLA-OFT: partial result, track stopped 2026-11-09)
+## Sim — success rate (%), 100 episodes/cell, 3 seeds, 95% Wilson interval (OpenVLA-OFT: partial result)
 
 SFT-only = OpenVLA-OFT LoRA, WO-02 attempt 4 `step_004000` (25 demos/task, 8000 steps; Hub
 `KudratSingh22/vla-rl-so101-sft/wo02/u87r9sjnwig58d/runs/20261027T073615Z-wo02-sim-4b4b/checkpoints/step_004000`).
@@ -28,11 +29,12 @@ One SFT training run (single-run); GPU sim (physx_cuda), RTX 4090, 2026-10-27, e
 | Stack | shifted | 0.0 [0.0, 1.3] (0, 0, 0) | | | `20261027T190836Z-wo02eval-sim-cdd3` | 0.1-draft `e9ce5bb47a88` |
 | Stack | unseen objects | 2.0 [0.9, 4.3] (1, 3, 2) | | | `20261027T190836Z-wo02eval-sim-cdd3` | 0.1-draft `e9ce5bb47a88` |
 
-The SFT+RL column stays empty: it needs 3 training seeds, and only one two-task seed finished. It
-will not be filled: the track stopped on 2026-11-09 (ADR-0003).
+The SFT+RL column stays empty: it needs 3 training seeds, and only one two-task seed finished.
+The intended three-training-seed comparison is incomplete; further experiments are deferred
+under the ADR-0003 amendment.
 The two RL runs that completed are in the next table.
 
-## Sim — WO-04 RL runs, each a single training seed (single-run; partial result, track stopped 2026-11-09)
+## Sim — WO-04 RL runs, each a single training seed (single-run; partial result)
 
 Success %, pooled over 3 sim seeds x 100 episodes, [95% Wilson]. Protocol 0.1-draft
 `e9ce5bb47a88`, horizon 150, GPU sim, A100-80GB, final checkpoint (step 150). Both start from the
@@ -74,7 +76,7 @@ No peak: each mid-run checkpoint is within 2 points of its run's final checkpoin
 27.0%. Against SFT-only (unpaired): two-task step 50 p = 0.18, PickPlace-only step 100 p = 0.08,
 before allowing for having looked at four checkpoints.
 
-## Ablations (WO-05; not run, track stopped 2026-11-09)
+## Ablations (WO-05; not run, follow-up deferred)
 
 | Factor | Levels | Result | Run ids |
 |---|---|---|---|
