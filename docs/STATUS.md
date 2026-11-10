@@ -1,11 +1,24 @@
 # Status
 
-Updated: 2026-11-09
+Updated: 2026-11-10
+
+## Current direction and retained OpenVLA work (owner, 2026-11-10)
+
+The active direction is real SO-101 bring-up and matched SmolVLA/ACT evaluation. Further
+OpenVLA-OFT / GRPO work is **deferred until after full evaluation of the real arm and that
+baseline**. Its implementation, artifacts and measured partial results remain available for
+follow-up. This supersedes permanent-stop wording in the historical notes below; numerical
+results, unmet benchmarks and cancelled spend approvals are unchanged (ADR-0003 amendment).
+
+PR #32 is open at `5b9d5d6`, with passing CI for the integrated SmolVLA/ACT code. Physical
+cube/cup measurements and unpowered placement checks still gate the protocol freeze. Real-arm
+policy success has not been measured. Spend, credentials and powered steps 9–10 remain on hold.
 
 ## Pivot to SmolVLA (owner decision 2026-11-09, ADR-0003)
 
-The OpenVLA-OFT / SimpleVLA-RL reproduction is stopped. The project is now SmolVLA on the real
-SO-101 with ACT as the baseline: leader-arm teleop demos, two cameras (wrist + front), fine-tune
+The OpenVLA-OFT / SimpleVLA-RL reproduction is deferred under the amendment above. The project is
+now SmolVLA on the real SO-101 with ACT as the baseline: leader-arm teleop demos, two cameras
+(wrist + front), fine-tune
 on a 24 GB card, inference on the Mac (MPS). Few-shot stays a sim experiment; the real arm is
 data-first (CLAUDE.md rule 3). Spec: `docs/reviews/2026-11-09-smolvla-pivot-handoff.md`, refined
 by the owner's decisions D1-D6 in `docs/reviews/2026-11-09-pivot-decisions.md`.
