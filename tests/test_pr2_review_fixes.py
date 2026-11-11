@@ -165,7 +165,7 @@ def test_a_killed_capture_is_recovered_before_the_resume_connects_the_arm(
     settings, _ = ev.load_prior(rec.parent)
     ds_root = runs / settings["session_id"] / "capture" / "dataset"
     _simulate_kill_mid_save(ds_root, 3)
-    report = ev.precheck_capture(runs, settings)
+    report = ev.precheck_capture(runs, settings, ev.recorded_mode(rec.parent))
     assert report is not None and report["episodes"] == 3 and report["moved"]
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(ev, "ScriptedOperator", ScriptedOperator)

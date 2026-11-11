@@ -1436,10 +1436,19 @@ def _as_hardware_on_darwin(monkeypatch: pytest.MonkeyPatch, mod: Any = ev) -> No
     """Review F2: a mock-rig session of ``mod`` (wo07_real_eval or wo07_pilot) driven as the
     HARDWARE session on a simulated macOS: ``session`` gets ``mode="hardware"`` (what
     ``run_hardware`` passes) and the platform is darwin; the script's own ``journal_policy(mode)``
-    then picks the policy, so a mutation of that choice (or of the mode string) fails."""
+    then picks the policy, so a mutation of that choice (or of the mode string) fails. A
+    ``--mock --resume`` is checked as the hardware resume (``check_resume_mode``) too."""
     darwin = functools.partial(runs_mod.journal_sync_policy, platform="darwin")
     monkeypatch.setattr(mod, "journal_sync_policy", darwin)
     real_session = mod.session
+    if hasattr(mod, "check_resume_mode"):
+        real_check = mod.check_resume_mode
+
+        def check_resume_mode(run_dir: Path, mode: str) -> str:
+            assert mode == "mock"
+            return str(real_check(run_dir, "hardware"))
+
+        monkeypatch.setattr(mod, "check_resume_mode", check_resume_mode)
 
     def session(*a: Any, **k: Any) -> Path:
         assert k.get("mode") == "mock"  # the mock rig's entry, now as the hardware one
@@ -1752,26 +1761,18 @@ def test_darwin_hardware_resume_preflights_before_the_capture_recovery_changes_a
     fsync. With F_FULLFSYNC, the recovery's writes (provenance pruned, info.json, stats.json)
     are F_FULLFSYNCed, never fsynced, before the session goes on to its next check
     (``--i-am-present`` missing: refused, nothing opened)."""
-    from test_pr2_review_fixes import _simulate_kill_mid_save
-    from test_protocol_real import real_args
-
     runs = tmp_path / "runs"
-    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
-    rec = ev.main(real_args(runs, "--task", "PickPlace", "--trials", "1"))
-    settings, _ = ev.load_prior(rec.parent)
+    run_dir = _killed_real_session(runs, monkeypatch, "hardware")  # PR #32 hold: a hardware one
+    settings, _ = ev.load_prior(run_dir)
     capture = runs / str(settings["session_id"]) / "capture"
     ds_root = capture / "dataset"
     prov_path = ds_root / "meta" / "vla_rl_so101.json"
-    prov = json.loads(prov_path.read_text())
-    prov["episodes"]["3"] = {"trial_id": "lost-in-the-kill"}  # an entry the recovery prunes
-    prov_path.write_text(json.dumps(prov))
-    _simulate_kill_mid_save(ds_root, 3)
     before = {p: p.read_bytes() for p in (prov_path, ds_root / "meta" / "info.json")}
 
     syncs = _MacSyncs(monkeypatch)
     monkeypatch.setattr(ev, "journal_sync_policy", functools.partial(
         runs_mod.journal_sync_policy, platform="darwin"))  # fmt: skip
-    argv = ["--preset", "real", "--hardware", "--resume", rec.parent.name, "--runs-dir", str(runs)]
+    argv = ["--preset", "real", "--hardware", "--resume", run_dir.name, "--runs-dir", str(runs)]
     syncs.fail("missing")
     with pytest.raises(SystemExit, match="refusing the hardware session; nothing was opened"):
         ev.main(argv)
@@ -1804,6 +1805,124 @@ def test_darwin_hardware_resume_preflights_before_the_capture_recovery_changes_a
     heal = len(syncs.log) - syncs.log[::-1].index(("heal",))  # after the last heal
     full = {e[2] for e in syncs.log[heal:] if e[:2] == ("F_FULLFSYNC", "file")}
     assert {"vla_rl_so101.json.tmp", "info.json", "stats.json"} <= full
+    assert [e for e in syncs.log if e[:2] == ("fsync", "file")] == []
+
+
+def _tree_digest(root: Path) -> dict[str, str]:
+    """{relative path: sha256 of its bytes, or "dir"} of every entry under ``root``."""
+    import hashlib
+
+    return {
+        str(p.relative_to(root)): (
+            "dir" if p.is_dir() else hashlib.sha256(p.read_bytes()).hexdigest()
+        )
+        for p in sorted(root.rglob("*"))
+    }
+
+
+def _killed_real_session(runs: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> Path:
+    """A finished real-0.1 session recorded as ``mode`` (hardware: the mock rig driven as the
+    hardware session on a simulated macOS, ``_as_hardware_on_darwin``), then a kill mid-save of
+    its capture and a provenance entry the recovery would prune: a resume's recovery would
+    quarantine, prune and rewrite. Returns the run dir."""
+    from test_pr2_review_fixes import _simulate_kill_mid_save
+    from test_protocol_real import real_args
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ev, "ScriptedOperator", ScriptedOperator)
+        if mode == "hardware":
+            _MacSyncs(mp)
+            _as_hardware_on_darwin(mp)
+        rec = ev.main(real_args(runs, "--task", "PickPlace", "--trials", "1"))
+    assert json.loads(rec.read_text())["results"]["mode"] == mode
+    settings, _ = ev.load_prior(rec.parent)
+    ds_root = runs / str(settings["session_id"]) / "capture" / "dataset"
+    prov_path = ds_root / "meta" / "vla_rl_so101.json"
+    prov = json.loads(prov_path.read_text())
+    prov["episodes"]["3"] = {"trial_id": "lost-in-the-kill"}
+    prov_path.write_text(json.dumps(prov))
+    _simulate_kill_mid_save(ds_root, 3)
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    return rec.parent
+
+
+@pytest.mark.parametrize(
+    ("recorded", "flag"), [("hardware", "--mock"), ("mock", "--hardware")]
+)  # fmt: skip
+def test_a_resume_in_the_other_mode_is_refused_before_any_file_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorded: str, flag: str
+) -> None:
+    """Owner, PR #32 hold (P1): ``--mock --resume`` of a HARDWARE session reached the capture
+    recovery under the best-effort sync. A resume reads the recorded session mode read only and
+    refuses a mismatch (either way) before the journal preflight, ``load_prior`` or the
+    capture recovery: the whole runs tree (capture, metrics.jsonl, record.json) is unchanged."""
+    runs = tmp_path / "runs"
+    run_dir = _killed_real_session(runs, monkeypatch, recorded)
+    before = _tree_digest(runs)
+    argv = ["--preset", "real", flag, "--resume", run_dir.name, "--runs-dir", str(runs)]
+    if flag == "--mock":  # the session's own step cap: nothing else would refuse it
+        argv += ["--fake-clock", "--max-steps", "6"]
+    refused: str | None = None
+    try:
+        ev.main(argv)
+    except SystemExit as e:
+        refused = str(e.code)
+    assert _tree_digest(runs) == before, f"the resume changed the session's files ({refused})"
+    assert refused is not None and f"recorded as a {recorded} session" in refused, refused
+    assert refused.startswith("--resume refused: ")
+
+
+def test_a_resume_without_a_recorded_mode_is_refused_before_any_file_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session whose record.json is lost and whose synced ``session`` row carries no mode (or
+    whose record has none) is refused, not guessed; nothing changes. With the row's mode (rows
+    written from this fix on) the rebuilt session's mode is the recorded one."""
+    runs = tmp_path / "runs"
+    run_dir = _killed_real_session(runs, monkeypatch, "hardware")
+    assert ev.recorded_mode(run_dir) == "hardware"
+    (run_dir / "record.json").unlink()
+    assert ev.recorded_mode(run_dir) == "hardware"  # from the synced session row
+    metrics = run_dir / "metrics.jsonl"
+    rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+    for row in rows:
+        row.pop("mode", None)
+    metrics.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    before = _tree_digest(runs)
+    argv = ["--preset", "real", "--mock", "--fake-clock", "--max-steps", "6", "--resume",
+            run_dir.name, "--runs-dir", str(runs)]  # fmt: skip
+    refused: str | None = None
+    try:
+        ev.main(argv)
+    except SystemExit as e:
+        refused = str(e.code)
+    assert _tree_digest(runs) == before, f"the resume changed the session's files ({refused})"
+    assert refused is not None and "records no session mode" in refused, refused
+
+
+def test_precheck_capture_derives_the_sync_policy_from_the_recorded_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hardware session's capture recovery runs under the hardware journal policy (macOS:
+    F_FULLFSYNC required), never under the best-effort one: ``precheck_capture`` takes the
+    recorded mode, not a policy, and the recovery's writes are F_FULLFSYNCed, never fsynced."""
+    runs = tmp_path / "runs"
+    run_dir = _killed_real_session(runs, monkeypatch, "hardware")
+    settings, _ = ev.load_prior(run_dir)
+    syncs = _MacSyncs(monkeypatch)
+    monkeypatch.setattr(ev, "journal_sync_policy", functools.partial(
+        runs_mod.journal_sync_policy, platform="darwin"))  # fmt: skip
+    seen: list[Any] = []
+    real_check = ev.check_capture_resumable
+
+    def check(*a: Any) -> Any:
+        seen.append(a[-1])
+        return real_check(*a)
+
+    monkeypatch.setattr(ev, "check_capture_resumable", check)
+    report = ev.precheck_capture(runs, settings, ev.recorded_mode(run_dir))
+    assert report is not None and report["moved"]
+    assert seen == [runs_mod.SyncPolicy.FULL_FSYNC_REQUIRED]
     assert [e for e in syncs.log if e[:2] == ("fsync", "file")] == []
 
 

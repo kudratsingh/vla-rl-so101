@@ -96,8 +96,11 @@ is atomic and synced (``src/runs.py``). A ``--hardware`` session on macOS REQUIR
 every journal file sync (``journal_policy``, owner 2026-11-10): unsupported or failed, it raises
 and is never replaced by ``fsync``, so a start marker that cannot be F_FULLFSYNCed blocks the
 first goal (``start_marker_failed``, the safe shutdown); ``preflight_journal`` refuses the
-session before anything is opened or changed (it runs first in ``run``, before a resume's capture
-recovery, which syncs under the same policy) when the runs directory's filesystem cannot do it. Mock
+session before anything is opened or changed (it runs in ``run`` before a resume's capture
+recovery, which syncs under the same policy) when the runs directory's filesystem cannot do it.
+Before it, a resume reads the session's recorded mode read only and refuses the other mode
+(``check_resume_mode``, owner PR #32 hold): a mock resume never recovers a hardware session's
+capture under the best-effort sync, and nothing is written before that check. Mock
 sessions and Linux keep the best-effort sync, the method recorded (record.json ``sync``); other
 metrics rows (decisions, trial and capture rows)
 are plain appends, each trial / capture row followed by a synced record.json holding it. The
@@ -751,6 +754,42 @@ def results_from_metrics(run_dir: Path, why: str, _below: tuple[str, ...] = ()) 
     }
 
 
+MODES = ("mock", "hardware")
+
+
+def recorded_mode(run_dir: Path) -> str:
+    """The mode ("mock" | "hardware") the run to resume recorded, read only (owner, PR #32
+    hold): ``results.mode`` of its record.json, else (record.json missing or unreadable, as in
+    ``load_prior``) the ``mode`` of its last synced ``session`` row. Exits when neither records
+    one: the mode decides the capture recovery's sync policy, so it is never guessed."""
+    try:
+        results = json.loads((run_dir / "record.json").read_text()).get("results") or {}
+        mode = results.get("mode")
+    except (OSError, ValueError, AttributeError):
+        row = _last_session_row(run_dir)
+        mode = None if row is None else row.get("mode")
+    if mode not in MODES:
+        sys.exit(
+            f"--resume refused: {run_dir} records no session mode ({mode!r}; record.json "
+            "results.mode, else the synced session row's): nothing was opened or changed"
+        )
+    return str(mode)
+
+
+def check_resume_mode(run_dir: Path, mode: str) -> str:
+    """Before anything is written (the journal preflight, the capture recovery): refuse to
+    resume a session recorded in the other mode. A mock resume of a hardware session would
+    recover its capture under the best-effort sync (owner, PR #32 hold); a hardware resume of a
+    mock session would pool mock trials into a hardware session. Returns the recorded mode."""
+    recorded = recorded_mode(run_dir)
+    if recorded != mode:
+        sys.exit(
+            f"--resume refused: {run_dir.name} is recorded as a {recorded} session; resume it "
+            f"with --{recorded}, never --{mode}: nothing was opened or changed"
+        )
+    return recorded
+
+
 def _row_key(row: Mapping[str, Any]) -> tuple[Any, Any, Any, Any]:
     """A trial / attempt's key in the session's rows (``load_prior``)."""
     return (row["cell"], row["trial_idx"], row["start_utc"], row.get("attempt"))
@@ -980,7 +1019,9 @@ def session(
 
         # the session in metrics.jsonl too, synced: load_prior rebuilds from it without
         # record.json (power loss), and record.json carries which sync ran
-        log_row(kind="session", session=settings, resumed_from=resumed_from, run_id=run.id)
+        log_row(
+            kind="session", session=settings, resumed_from=resumed_from, run_id=run.id, mode=mode
+        )
         run.results["durability"] = {
             "synced_rows": list(DURABLE_ROWS),
             "record_json": "atomic: tmp + sync + rename + directory sync, every write",
@@ -1540,12 +1581,15 @@ def capture_repo_id(session_id: str) -> str:
     return f"local/so101-real-eval-{session_id}"
 
 
-def precheck_capture(
-    runs_dir: Path, settings: dict[str, Any], policy: SyncPolicy = SyncPolicy.BEST_EFFORT
-) -> dict[str, Any] | None:
+def precheck_capture(runs_dir: Path, settings: dict[str, Any], mode: str) -> dict[str, Any] | None:
     """A resumed real-0.1 session, BEFORE the arm is connected (review F1): recover its capture
-    dataset (a kill mid-save; its writes synced under ``policy``, the session journal's) and make
-    sure it reopens; refuses with a clear message if not."""
+    dataset (a kill mid-save) and make sure it reopens; refuses with a clear message if not. Its
+    writes are synced under the session journal's policy, ``journal_policy`` of the session's
+    RECORDED ``mode`` (``check_resume_mode``): a hardware session's capture is never recovered
+    under the best-effort sync (owner, PR #32 hold)."""
+    if mode not in MODES:
+        raise ValueError(f"mode {mode!r} not in {MODES}")
+    policy = journal_policy(mode)
     sid = settings.get("session_id")
     if not sid or not settings.get("capture"):
         return None
@@ -1905,19 +1949,22 @@ def run(
     fk: FkFn | None = None,
     operator: Operator | None = None,
 ) -> Path:
-    # a hardware session's journal preflight comes first: before anything is opened AND before a
+    mode = "hardware" if args.hardware else "mock"
+    prior_dir: Path | None = None
+    if args.resume:  # the recorded mode, read only, before anything is written (PR #32 hold)
+        prior_dir = Path(args.resume) if Path(args.resume).is_dir() else args.runs_dir / args.resume
+        recorded = check_resume_mode(prior_dir, mode)
+    # a hardware session's journal preflight comes next: before anything is opened AND before a
     # resume's capture recovery changes the capture (it syncs under the same policy)
     journal_preflight = preflight_journal(args.runs_dir) if args.hardware else None
-    policy = journal_policy("hardware" if args.hardware else "mock")
-    if args.resume:
-        prior_dir = Path(args.resume) if Path(args.resume).is_dir() else args.runs_dir / args.resume
+    if prior_dir is not None:
         settings, prior = load_prior(prior_dir)
         prior_runs = check_newest(prior_dir, settings)
         resumed_from: str | None = prior_dir.name
         check_identity(settings, args)
         settings.setdefault("backend", "grpc")  # sessions recorded before --backend
         if settings.get("protocol_id") == PR.PROTOCOL_VERSION:  # before anything is opened
-            precheck_capture(args.runs_dir, settings, policy)
+            precheck_capture(args.runs_dir, settings, recorded)  # == mode (checked above)
         if args.backend not in (None, settings["backend"]):
             sys.exit(f"--resume refused: the session ran --backend {settings['backend']}")
     else:
