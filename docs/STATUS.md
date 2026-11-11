@@ -2108,7 +2108,17 @@ PDF unchanged; no regenerated PDF committed).
   the floor, box margin +0.14 cm (own TCP offset 8.6 mm), release window 70% / 10 mm (was 71% /
   10 mm), cube-to-rim clearance +1.13 cm, carry over the rim +2.03 cm; the unchanged-oracle (urdf)
   variant clips wrist_flex in carry (3.3 deg, 6 slots) and retreat (5.0 deg, 25 slots), as with
-  the 3 cm cube.
+  the 3 cm cube. Correction (owner hold on PR #32): the release radius kept only the cube's
+  half-edge clear of the floor edge; the whole cube at any yaw needs its half-diagonal, so with
+  the 25.4 mm cube and the 90 mm sim-bowl floor it is 27.0 mm, not 32.3 mm. B' window now 73% /
+  10 mm: the share rose because the disc shrank (in-box release area ~2281 -> ~1679 mm2). No
+  verdict changed (B' passes at C4, frozen bowl REJECT, 175/175). Still sim-fallback numbers.
+- **PR #32 owner hold fixes** (2026-11-10, CPU/mock only): `--resume` refuses a session recorded
+  in the other mode before anything is written (`check_resume_mode`); an episode whose save sync
+  failed stays PENDING (no `episode_index`, `summary.recordings_pending`, not protocol-complete,
+  every export refused) until a resume verifies and syncs it (`EvalCapture.confirm_saved`);
+  `--report` gives `protocol_complete` only for two hardware sessions and labels mock reports
+  MOCK; the bowl release radius uses the half-diagonal (above).
 - **Scene facts as hash inputs** (`scene_spec()`): table all white; one 17-inch LED
   clamp lamp set ONCE to 5000 K, position recorded at the camera match; exposure / white balance
   locked on both cameras; C920x on the NEEWER UA057 magic arm at `front_left_45` (eye and target
