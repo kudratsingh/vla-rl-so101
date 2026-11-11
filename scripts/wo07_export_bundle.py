@@ -57,7 +57,11 @@ def eval_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     settings, trials = ev.load_prior(run_dir)  # record.json + metrics + started-without-record
     ev.check_newest(run_dir, settings)  # refuses an older run of a continued session
     results = json.loads((run_dir / "record.json").read_text()).get("results") or {}
-    mode = str(results.get("mode"))
+    mode = ev.session_mode(results)  # None: missing / unknown / trials disagree: not hardware
+    if mode is None:
+        sys.exit(
+            "refused: the session has no recorded mode (hardware | mock): not a hardware record"
+        )
     if mode == "mock" and not args.allow_mock:
         sys.exit(
             "refused: a mock session (fake arm and policy) needs --allow-mock: format test only"
@@ -126,6 +130,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     except X.ExportRefused as err:
         sys.exit(f"REFUSED: {err}")
     print(json.dumps(index, indent=2, default=str))
+    if index.get("mode") == "mock":
+        print(f"\n{index['mock_label']}")
     if index.get("status") == "INCOMPLETE":
         print(
             f"\nINCOMPLETE EXPORT: {len(index['recording_missing'])} scored trial(s) have no "

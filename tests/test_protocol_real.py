@@ -456,6 +456,46 @@ def test_report_pairs_two_policies_on_one_schedule(
         ev.report([a.parent, b.parent])
 
 
+def test_report_on_two_full_mock_sessions_is_labelled_mock_never_protocol_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Owner, PR #32 hold: two complete 150-trial mock sessions reported protocol_complete=True.
+    Only hardware sessions make a protocol table; mock is labelled; mixed or unknown refuses."""
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    runs = tmp_path / "runs"
+    full = ("--task", "PickPlace", "--trials", str(P1.REAL_TRIALS_PER_CELL), "--no-capture")
+    full = (*full, "--max-steps", "1")
+    a = ev.main(real_args(runs, *full, family="smolvla", payload=b"a"))
+    b = ev.main(real_args(runs, *full, family="act", payload=b"b"))
+    assert all(_results(r)["summary"]["complete"] for r in (a, b))  # 150 scored trials each
+    capsys.readouterr()
+    out = ev.report([a.parent, b.parent])
+    printed = capsys.readouterr().out
+    assert not out["protocol_complete"], "a mock report must never be protocol_complete"
+    assert out["mode"] == "mock" and out["mock_complete"] and out["label"] == ev.MOCK_REPORT_LABEL
+    assert printed.count(ev.MOCK_REPORT_LABEL) == 2  # the first and the last line
+
+    def set_mode(rec: Path, mode: str | None) -> None:
+        data = json.loads(rec.read_text())
+        for blob in (data["results"], *data["results"]["trials"]):
+            blob.pop("mode", None)
+            if mode is not None:
+                blob["mode"] = mode
+        rec.write_text(json.dumps(data))
+
+    for rec in (a, b):  # the same two records as if run on the arm
+        set_mode(rec, "hardware")
+    out = ev.report([a.parent, b.parent])
+    assert out["protocol_complete"] and out["mode"] == "hardware"
+    assert "MOCK" not in capsys.readouterr().out
+    set_mode(b, "mock")
+    with pytest.raises(SystemExit, match="mixes a hardware and a mock session"):
+        ev.report([a.parent, b.parent])
+    set_mode(b, None)  # no recorded mode: not hardware, refused
+    with pytest.raises(SystemExit, match="no recorded session mode"):
+        ev.report([a.parent, b.parent])
+
+
 def test_resume_refuses_a_changed_policy_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

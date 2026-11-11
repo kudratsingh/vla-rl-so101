@@ -1223,7 +1223,7 @@ y = +0.105 m and the centre is 100.0 mm further along the line.
 | Named labeler and success rubric in the record | judging rule text and hash only | `labeler` (`--labeler`, required on the arm) and `rubric` per record |
 | Fault after start = failure with reason | yes (`client._score`, `trial_fault`) | unchanged |
 | Resume skips started, retries never-started | yes (`done_indices`, `load_prior`) | unchanged; also re-hashes the checkpoint |
-| Two policies | one `--label` | `--family {smolvla,act}` (stable `family_id`), `--training-run-id`, `--checkpoint-dir` (content hash in the fingerprint); `--report A B` refuses unless same protocol hash and schedule and different checkpoints |
+| Two policies | one `--label` | `--family {smolvla,act}` (stable `family_id`), `--training-run-id`, `--checkpoint-dir` (content hash in the fingerprint); `--report A B` refuses unless same protocol hash and schedule, different checkpoints and the same recorded mode; `protocol_complete` only for two hardware sessions, two mock sessions give a report labelled MOCK (`mode: mock`, `mock_complete`) |
 
 Protocol 0.2 stays available as `--protocol 0.2` (the existing tests run it). On the arm, real-0.1
 refuses `--trials/--cells/--slot-seed`, a missing labeler or policy identity, a settle other than
@@ -1259,7 +1259,8 @@ file + `checkpoint_files.json` (`checkpoint_id = sha256:` over all files, matche
 the session recorded). `object_pose` is null: only planned poses exist and vishwaroop reads
 `object_pose` as a per-frame stream. Family ids `so101-real-smolvla` / `so101-real-act`; session id
 = the recording session's id (demo: the recorder's run id; eval: the session's first run id).
-Refuses a missing or unknown value, a mock session without `--allow-mock`, a dev session without
+Refuses a missing or unknown value, a session without a recorded `mode` (not hardware), a mock
+session without `--allow-mock` (with it, `bundle.json` / `trials.json` carry `mock_label`), a dev session without
 `--include-dev`, an incomplete session without `--allow-incomplete`, other weights, a protocol or
 convention hash other than this code's. Sealing stays in vishwaroop.
 

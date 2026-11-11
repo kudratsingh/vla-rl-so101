@@ -468,6 +468,7 @@ def _protocol(prov: Mapping[str, Any]) -> None:
 
 
 DEV_SUFFIX = "-dev"  # a development session's protocol_version (never reported; review F9)
+MOCK_EXPORT_LABEL = "MOCK EXPORT: fake arm and mock policy; a format test, NOT a real-arm result"
 INCOMPLETE_SUFFIX = "-incomplete"  # an export missing a scored trial's recording (module doc)
 
 
@@ -600,6 +601,8 @@ def build_eval_bundle(
     """Bundle one finished evaluation session (``scripts/wo07_real_eval.py``, protocol real-0.1).
     A scored trial without its episode refuses the export unless ``allow_missing_recordings``
     (then declared ``-incomplete``; module doc)."""
+    if mode not in ("hardware", "mock"):
+        raise ExportRefused(f"session mode {mode!r} is neither hardware nor mock")
     prov = _provenance(capture_dataset)
     _protocol(prov)
     sid = str(_need(settings, "session_id", "the session"))
@@ -687,6 +690,7 @@ def build_eval_bundle(
         {
             "session_id": sid,
             "mode": mode,
+            "mock_label": MOCK_EXPORT_LABEL if mode == "mock" else None,
             "protocol": PR.citation(),
             "schedule": settings.get("schedule"),
             "labeler": settings.get("labeler"),
@@ -751,6 +755,7 @@ def build_eval_bundle(
         "purpose": "evaluation",
         "protocol_version": decl["protocol_version"],
         "mode": mode,
+        "mock_label": MOCK_EXPORT_LABEL if mode == "mock" else None,
         "timing": {
             "note": "LeRobot timestamps are nominal (frame_index / fps); the real write and camera "
             f"times are the {conv.TIMING_KEY} feature",

@@ -133,7 +133,9 @@ at the control rate into one LeRobotDataset v3.0 per session (``<runs>/<session>
 episode = trial; ``capture.episode_index`` in the trial record, the trial id in the dataset's
 ``meta/vla_rl_so101.json``); a not-started attempt is never an episode. The summary reports seen,
 shifted, unseen per object and unseen pooled (the headline). ``--report RUN RUN`` prints two
-sessions side by side and refuses unless they ran the same protocol hash and schedule.
+sessions side by side and refuses unless they ran the same protocol hash and schedule in the same
+recorded mode; ``protocol_complete`` needs two hardware sessions, and two mock sessions print a
+report labelled MOCK (``mode: mock``, ``mock_complete``, ``protocol_complete: false``).
 Baseline cadence (owner 2026-11-09): 15 Hz nominal control, 30 fps cameras, the SAME 450-command
 cap for SmolVLA and ACT, synchronous inference (no overlap) and ``max_chunk_age_ms`` 800. Budget
 per 150-trial session (single-run MOCK-RIG rates with the capture on, 450-command trials, M3 Pro;
@@ -297,6 +299,7 @@ JUDGING_RULE: dict[str, str] = PR.JUDGING_RULE
 
 MOCK_LABEL = "MOCK: fake arm, fake camera, mock policy; exercises the eval loop only, NOT a result"
 HARDWARE_LABEL = "real arm, operator-scored, single session per checkpoint"
+MOCK_REPORT_LABEL = "MOCK - not a real-arm result: fake arm, fake camera, mock policy"
 
 HARDWARE_REFUSAL = """--hardware drives the real SO-101 and refuses to run without --i-am-present.
 
@@ -2238,16 +2241,36 @@ def _run_dir(runs_dir: Path, r: str) -> Path:
     return Path(r) if Path(r).is_dir() else runs_dir / r
 
 
+def session_mode(results: dict[str, Any]) -> str | None:
+    """The record's session mode ("hardware" | "mock"), or None when it is missing, unknown, or
+    not the same on the session and on every trial record (a mock resume of an arm session)."""
+    modes = {results.get("mode")} | {t.get("mode") for t in results.get("trials") or []}
+    mode = modes.pop() if len(modes) == 1 else None
+    return mode if mode in ("hardware", "mock") else None
+
+
 def report(run_dirs: Sequence[Path]) -> dict[str, Any]:
     """Two real-0.1 sessions (e.g. SmolVLA and ACT) side by side. Refuses unless both ran the
-    same protocol hash and the same evaluation schedule, under different policies."""
-    rows = []
+    same protocol hash and the same evaluation schedule, under different policies, in the same
+    mode. Only two hardware sessions can make a protocol table (``protocol_complete``); two mock
+    sessions give a report labelled MOCK (``mode: mock``, ``mock_complete``), never a result."""
+    rows, modes = [], []
     for d in run_dirs:
         results = json.loads((d / "record.json").read_text()).get("results") or {}
         st, summ = results.get("session") or {}, results.get("summary") or {}
         if st.get("protocol_id") != PR.PROTOCOL_VERSION:
             sys.exit(f"--report: {d.name} is not a {PR.PROTOCOL_VERSION} session")
+        mode = session_mode(results)
+        if mode is None:
+            sys.exit(
+                f"--report refused: {d.name} has no recorded session mode (or its trials disagree "
+                "with it): not a hardware record"
+            )
         rows.append((d.name, st, summ))
+        modes.append(mode)
+    if len(set(modes)) != 1:
+        sys.exit("--report refused: it mixes a hardware and a mock session")
+    mock = modes[0] == "mock"
     (_, a, sa), (_, b, sb) = rows
     pa, pb = a["protocol"], b["protocol"]
     if pa["protocol_hash"] != pb["protocol_hash"] or pa["real_eval"].get("schedule_sha256") != pb[
@@ -2260,10 +2283,14 @@ def report(run_dirs: Sequence[Path]) -> dict[str, Any]:
     if ida and idb and ida.get("checkpoint_sha256") == idb.get("checkpoint_sha256"):
         sys.exit("--report refused: both sessions ran the same checkpoint")
     out = {
+        "mode": modes[0],
+        "label": MOCK_REPORT_LABEL if mock else HARDWARE_LABEL,
         "protocol_version": PR.PROTOCOL_VERSION,
         "protocol_hash": pa["protocol_hash"],
         "rows": {},
     }
+    if mock:
+        print(MOCK_REPORT_LABEL)
     names = [
         f"{(st.get('policy_identity') or {}).get('family') or st.get('label')}" for _, st, _ in rows
     ]
@@ -2281,9 +2308,12 @@ def report(run_dirs: Sequence[Path]) -> dict[str, Any]:
         out["rows"][row] = cells
         print(f"| {row} | {cells[0]} | {cells[1]} |")
     complete = [bool(summ.get("protocol_complete")) for summ in (sa, sb)]
-    if not all(complete):
+    if mock:  # a mock session is never a protocol result, however many trials it ran
+        out["mock_complete"] = all(complete)
+        print(MOCK_REPORT_LABEL)
+    elif not all(complete):
         print("  NOT a protocol table: a session is incomplete")
-    out["protocol_complete"] = all(complete)
+    out["protocol_complete"] = all(complete) and not mock
     return out
 
 
