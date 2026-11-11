@@ -74,7 +74,10 @@ carries its cost line. Each paid run still requires its own estimate and explici
 under [CLAUDE.md](../CLAUDE.md#hard-rules).
 
 Hardware is budgeted separately (SO-101 follower + leader, wrist camera module, Logitech C920x,
-spare gripper servo).
+spare gripper servo). The exact items used for training, runs and evaluation (owner, 2026-11-10)
+are the bill of materials in [`docs/bringup/kit.md`](bringup/kit.md): Seeed SO-ARM101 Pro (12 V
+follower, 5 V leader), C920x on a magic arm, one LED lamp at 5000 K, hand2mind 1-inch wood cubes,
+LE TAUCI 8 oz white cups as the bowl, an all-white table.
 
 ## Follow-ons (not in scope now)
 

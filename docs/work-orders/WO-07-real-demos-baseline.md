@@ -4,7 +4,8 @@ Branch: `feat/smolvla-real` (code, PR 2 of the pivot handoff), then the owner's 
 evaluation sessions. Tier: dev GPU (24 GB) for fine-tuning; Mac (MPS) for inference and the arm.
 Rewritten 2026-11-09 for the SmolVLA pivot (ADR-0003; handoff
 `docs/reviews/2026-11-09-smolvla-pivot-handoff.md`, owner decisions D1-D6 in
-`docs/reviews/2026-11-09-pivot-decisions.md`, which win where they differ).
+`docs/reviews/2026-11-09-pivot-decisions.md`, which win where they differ). Props, cameras and
+light: the owner's bill of materials, [`docs/bringup/kit.md`](../bringup/kit.md) (2026-11-10).
 
 ## Done when
 
@@ -28,8 +29,21 @@ demos; 50 binary trials per cell (seen, shifted, unseen) for each; immutable exp
   no point inside the 6 x 6 grid is 11 cm from all 20 ring slot centres (the best is about
   6.5 cm), so the fixed bowl sits beside the printed grid, not on it. PR 2 picks the position,
   checks every constraint in code, checks that the front camera sees it, and freezes it.
-- **Unseen objects:** the purple cube and the green cube, never in a demo or a camera-match frame.
-  They replace the green cylinder for the real arm.
+- **Objects (owner kit list 2026-11-10):** hand2mind 1-inch wood cubes from one set (25.4 mm edge
+  NOMINAL until the owner's measurement; same wood, mass and finish, only the colour differs).
+  Seen: the red cube. The blue cube is recorded as the seen Stack base (Stack deferred, unused in
+  real-0.1).
+- **Unseen objects:** the set's purple cube and green cube, never in a demo or a camera-match
+  frame. They replace the green cylinder for the real arm.
+- **Bowl:** a LE TAUCI 8 oz bouillon cup, white. Its outer rim diameter, inside floor diameter,
+  table-to-rim height and table-to-inside-floor height are PENDING measurements in one place
+  (`src/eval/protocol_real.py` `MEASURED`, mm): the freeze refuses until they are in and in range,
+  and the bowl checks read them (a carry through the rim or a lower into the floor fails the
+  check).
+- **Scene:** all-white table; one LED clamp lamp set once to 5000 K; exposure and white balance
+  locked on both cameras; C920x front camera at the sim pose; 32 mm wrist module. These are
+  real-0.1 hash inputs. Risk: the white cup on the white table is low contrast; the camera match
+  must show its rim in both cameras.
 
 ## Eval cells, 50 binary trials each (D3)
 

@@ -367,6 +367,39 @@ def check_config(cfg: Config) -> list[str]:
     return out
 
 
+def camera_controls_problems(cfg: Config) -> list[str]:
+    """Where ``cameras.<name>.controls`` is not locked (empty = both cameras locked).
+
+    real-0.1's scene (``protocol_real.scene_spec``, a hash input) states exposure and white
+    balance locked on both cameras, never auto (owner kit list 2026-11-10; WO-06 step 7 item 4).
+    The values are set with a UVC tool and recorded by hand (OpenCV on macOS cannot set them), so
+    this checks the record: auto exposure / auto white balance false, the locked exposure and the
+    tool recorded, and on the front C920x autofocus false with the locked focus recorded (focus
+    changes the intrinsics, WO-06 step 6). A demo recording or a real-0.1 session refuses while
+    any is listed."""
+    out: list[str] = []
+    cams = cfg.get("cameras") or {}
+    for name in CAMERA_NAMES:
+        c = (cams.get(name) or {}).get("controls")
+        if not isinstance(c, Mapping):
+            out.append(f"cameras.{name}.controls is missing: lock exposure and white balance")
+            continue
+        for key in ("auto_exposure", "auto_white_balance"):
+            if c.get(key) is not False:
+                out.append(f"cameras.{name}.controls.{key} is {c.get(key)!r}, must be false")
+        for key in ("exposure", "set_with"):
+            if c.get(key) is None:
+                out.append(f"cameras.{name}.controls.{key} is null: not locked / not recorded yet")
+        if name == "front":
+            if c.get("autofocus") is not False:
+                out.append(
+                    f"cameras.front.controls.autofocus is {c.get('autofocus')!r}, must be false"
+                )
+            if c.get("focus") is None:
+                out.append("cameras.front.controls.focus is null: lock focus at the table distance")
+    return out
+
+
 # ------------------------------------------------------------------------------------------------
 # Frames: recording and the one preprocessing function
 # ------------------------------------------------------------------------------------------------

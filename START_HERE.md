@@ -2,7 +2,7 @@
 
 1. Create the GitHub repo (private until WO-05), push this kit, protect `main` (PR required).
 2. Order hardware this week: SO-101 follower (pair if you want teleop/HIL-SERL later), 2 USB
-   webcams, table clamps, 3 cm cubes + bowl. Lead time 2–4 weeks.
+   webcams, table clamps, cubes + bowl (the kit in use: `docs/bringup/kit.md`). Lead time 2–4 weeks.
 3. Point the coding agent at `CLAUDE.md` with: "Start WO-01."
 4. You launch every paid run. The agent gives you config hash + cost; you run it on RunPod
    (dev = RTX 4090, rl = A100-80GB) and paste the run id back.

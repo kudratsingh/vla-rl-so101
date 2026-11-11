@@ -35,10 +35,32 @@ then reaches the bowl from the side away from the camera, so the camera sees the
 oracle IK reaches it at release, carry and retreat heights (probed 2026-11-09, < 0.1 mm residual,
 tilt <= 20 deg). Nothing else fits in front of the grid: a bowl ahead of it would sit beyond 37 cm.
 
-Objects (D3). Seen: the red cube (``protocol.RED_CUBE``). Unseen, replacing protocol 0.1's green
-cylinder on the real arm only: the purple cube (``protocol.PURPLE_CUBE``) and a green cube
-(``GREEN_CUBE``, the cylinder's green): 3 cm cubes of the red cube's material, mass and finish, so
-only the colour differs.
+Objects (D3; owner kit list 2026-11-10, ``docs/bringup/kit.md``). Every object is a cube from ONE
+set, hand2mind 1-inch wood cubes (set of 100, six colours): edge 25.4 mm NOMINAL (1 inch) until the
+owner's measurement lands in ``MEASURED``, wood, same mass and finish, the colours as supplied in
+the set (never painted to the sim RGBA). Seen (PickPlace): the set's RED cube. Unseen, replacing
+protocol 0.1's green cylinder on the real arm only: the set's PURPLE and GREEN cubes, so only the
+colour differs. The set's BLUE cube is recorded as the seen Stack base (``STACK_BASE_OBJECT``): Stack
+is deferred, so it is unused in real-0.1. The sim keeps its 3 cm cubes (protocol 0.2 frozen).
+
+Bowl. The LE TAUCI 8 oz bouillon cup, white (set of 6: one is the bowl, the others spares). Its
+outer rim diameter, inside floor diameter, table-to-rim height and table-to-inside-floor height are
+PENDING measurements (``MEASURED``); ``src/eval/bowl_fit.py`` reads them for the release window,
+the cube-to-rim, carry-over-rim and lower-over-floor clearances and the release height, and falls
+back to the sim bowl's geometry, labelled as a fallback, while they are pending.
+``measurement_problems()`` range-checks them (mm, plausible for a 1-inch cube and an 8 oz cup). Filling ``MEASURED`` is the one edit before the geometry rerun
+(``scripts/wo07_bowl_check.py``).
+
+Scene (owner kit list 2026-11-10; hash inputs, ``scene_spec()``): table surface all white; one 17-inch LED
+clamp desk lamp set ONCE to 5000 K and never changed (its position recorded at the camera match,
+WO-06 step 7); exposure and white balance locked on both cameras at that light
+(``configs/real.yaml`` ``cameras.<name>.controls``); the front camera a Logitech C920x on a NEEWER
+UA057 22-inch magic arm with desk clamp at the sim front pose (``src/env/cameras.py``
+``front_left_45``); the wrist camera the kit's 32 mm USB module on the gripper mount. RISK, white on
+white: the white cup rim on the white table is low contrast for both cameras. The camera-match step
+must show the rim visible in BOTH cameras under the 5000 K lamp with exposure locked; the table is
+not changed for it. The sim scene stays wood-coloured (protocol 0.2 frozen); the WO-08 two-camera
+sim protocol should use a white table, a white cup and 25.4 mm cubes to match this scene.
 
 Schedules (D3, D4, D5), all seeded and frozen, materialized in the hash:
 
@@ -67,8 +89,9 @@ as a secondary column (``RUBRIC["secondary"]``), never as the headline. Unseen i
 object and pooled; the pooled 50 is the headline.
 
 Hash (``protocol_hash()``): SHA-256 of the canonical JSON of ``hash_components()``: the version,
-slot ids and the rules that chose them, the bowl and the constraint values it was derived from, the
-objects, the three schedules in full, the grid geometry (every slot's id, cell and centre), the
+slot ids and the rules that chose them, the bowl (its product, measurements and position) and the
+constraint values it was derived from, the objects (the set, nominal and measured edge), the scene
+facts, the three schedules in full, the grid geometry (every slot's id, cell and centre), the
 judging rule and rubric, the horizon and settle interval, and the observation/action convention
 hash (``src/robot/convention.py``). Values, not file bytes, so a comment edit never moves it.
 Pinned in ``tests/test_protocol_real.py``: freeze before the first demo (D4).
@@ -78,8 +101,11 @@ on the bench (unpowered fit check); until he confirms, ``BOWL_XY_M``, ``RUBRIC_V
 placement-grid PDF stay as they are, the hash pinned in the test is the current computed value
 (it moved with real-judge-3), and ``freeze_problem()`` makes every hardware session and the demo
 schedule refuse (scripts/wo07_real_eval.py ``real_hardware_problems``, scripts/wo06_teleop_record.py
-``--demo-schedule``), next to ``bowl_fit.bowl_box_problem``. The freeze sets ``FREEZE_STATUS`` to
-``FROZEN``, moves the bowl, bumps the rubric and regenerates the PDF and the hash together.
+``--demo-schedule``), next to ``bowl_fit.bowl_box_problem``. ``freeze_problem()`` also refuses
+while any prop measurement in ``MEASURED`` is None or out of range (``measurement_problems``),
+even with ``FREEZE_STATUS`` set to ``FROZEN``.
+The freeze fills ``MEASURED``, sets ``FREEZE_STATUS`` to ``FROZEN``, moves the bowl, bumps the
+rubric and regenerates the PDF and the hash together.
 """
 
 from __future__ import annotations
@@ -87,6 +113,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
+from dataclasses import asdict, dataclass, fields
 from typing import Any
 
 import numpy as np
@@ -122,30 +149,164 @@ BOWL_RULE = (
     "BASE_KEEPOUT + 0.065 + 5 mm and <= PUSH_REACH - 5 mm from the base; nearest the grid centre; "
     "tie +y (the front camera's side)"
 )
-BOWL_SPEC: dict[str, Any] = {
-    "label": "bowl",
-    "planned_xy_m": list(BOWL_XY_M),
-    "yaw": "not applicable (round bowl)",
-    "inner_floor_diameter_mm": "90 +- 5 (sim: 2 x BOWL_FLOOR_RADIUS 45 mm, src/env/success.py)",
-    "rim_height_mm": "<= 36 (sim wall 30 mm + floor 6 mm; the oracle carries the cube 16 mm above)",
-    "colour": "off-white (sim BOWL_RGBA 0.93 0.93 0.90)",
-    "fixed": "the same bowl at the same marked position for every demo and every trial",
-}
+# -- props: the owner's bench measurements (owner kit list 2026-11-10, docs/bringup/kit.md) -----
+CUBE_SET = "hand2mind 1-inch wood cubes (set of 100, six colours)"
+CUBE_EDGE_NOMINAL_MM = 25.4  # 1 inch: NOMINAL, the set's stated size, until MEASURED has it
+BOWL_PRODUCT = "LE TAUCI 8 oz bouillon cup, white (set of 6; one is the bowl, the rest spares)"
+
+
+@dataclass(frozen=True)
+class PropMeasurements:
+    """The owner's measured prop dimensions, mm. None = PENDING (not measured yet).
+
+    THE one place for them: ``freeze_problem`` refuses while any is None, the hash covers them,
+    and ``src/eval/bowl_fit.py`` (release window, cube-to-rim and carry-over-rim clearances, read by
+    ``scripts/wo07_bowl_check.py``) reads them, so the geometry rerun after the measurements is the
+    one edit of ``MEASURED`` below."""
+
+    red_cube_edge_mm: float | None = None  # calipers across two faces of the red cube
+    bowl_outer_rim_diameter_mm: float | None = None  # across the outside of the rim
+    bowl_inside_floor_diameter_mm: float | None = None  # the flat inside floor
+    bowl_table_to_rim_height_mm: float | None = None  # table top to the rim's top edge
+    # table top to the top of the inside floor (a footed cup's floor sits above the table): the
+    # height the cube is released onto (bowl_fit.geometry floor_height_m)
+    bowl_table_to_inside_floor_height_mm: float | None = None
+
+
+MEASURED = PropMeasurements()  # PENDING: the owner sends the five numbers (2026-11-10)
+
+
+def pending_measurements() -> list[str]:
+    """The names of the prop measurements still None (empty once all are measured)."""
+    return [f.name for f in fields(MEASURED) if getattr(MEASURED, f.name) is None]
+
+
+def measurement_problems(m: PropMeasurements | None = None) -> list[str]:
+    """Out-of-range or inconsistent measured values (mm; a value in inches or cm, or a cup the
+    1-inch cube cannot sit in). Pending (None) values are not checked here."""
+    m = MEASURED if m is None else m
+    out: list[str] = []
+    edge = m.red_cube_edge_mm
+    rim, floor = m.bowl_outer_rim_diameter_mm, m.bowl_inside_floor_diameter_mm
+    h_rim, h_floor = m.bowl_table_to_rim_height_mm, m.bowl_table_to_inside_floor_height_mm
+    if edge is not None and not 20.0 <= edge <= 30.0:
+        out.append(f"red_cube_edge_mm {edge} not in [20, 30] mm (a 1-inch cube is ~25.4 mm)")
+    diag = (CUBE_EDGE_NOMINAL_MM if edge is None else edge) * 2.0**0.5
+    if floor is not None and not diag < floor <= 200.0:
+        out.append(
+            f"bowl_inside_floor_diameter_mm {floor} not in ({diag:.1f}, 200] mm (more than the "
+            "cube's diagonal, or the cube cannot lie flat on it at every yaw)"
+        )
+    if rim is not None and not 30.0 <= rim <= 250.0:
+        out.append(f"bowl_outer_rim_diameter_mm {rim} not in [30, 250] mm")
+    if rim is not None and floor is not None and rim <= floor:
+        out.append(f"bowl_outer_rim_diameter_mm {rim} <= the inside floor diameter {floor} mm")
+    if h_rim is not None and not 20.0 <= h_rim <= 120.0:
+        out.append(f"bowl_table_to_rim_height_mm {h_rim} not in [20, 120] mm")
+    if h_floor is not None and not 0.0 <= h_floor <= 40.0:
+        out.append(f"bowl_table_to_inside_floor_height_mm {h_floor} not in [0, 40] mm")
+    if h_rim is not None and h_floor is not None and h_floor >= h_rim:
+        out.append(f"bowl_table_to_inside_floor_height_mm {h_floor} >= the rim height {h_rim} mm")
+    return out
+
+
+def cube_edge_mm() -> tuple[float, str]:
+    """(edge, source): the measured red-cube edge, else the set's nominal 25.4 mm."""
+    if MEASURED.red_cube_edge_mm is not None:
+        return float(MEASURED.red_cube_edge_mm), "measured (red cube)"
+    return CUBE_EDGE_NOMINAL_MM, "NOMINAL 1 inch, pending the owner's measurement"
+
+
+def props_spec() -> dict[str, Any]:
+    edge, src = cube_edge_mm()
+    return {
+        "measured_mm": asdict(MEASURED),
+        "pending": pending_measurements(),
+        "cube_set": CUBE_SET,
+        "cube_edge_nominal_mm": CUBE_EDGE_NOMINAL_MM,
+        "cube_edge_mm": edge,
+        "cube_edge_source": src,
+        "bowl_product": BOWL_PRODUCT,
+    }
+
+
+def bowl_spec() -> dict[str, Any]:
+    return {
+        "label": "bowl",
+        "product": BOWL_PRODUCT,
+        "planned_xy_m": list(BOWL_XY_M),
+        "yaw": "not applicable for a round cup (any handle orientation is recorded at the fit "
+        "check)",
+        "outer_rim_diameter_mm": MEASURED.bowl_outer_rim_diameter_mm,  # None = PENDING
+        "inside_floor_diameter_mm": MEASURED.bowl_inside_floor_diameter_mm,  # None = PENDING
+        "table_to_rim_height_mm": MEASURED.bowl_table_to_rim_height_mm,  # None = PENDING
+        "table_to_inside_floor_height_mm": MEASURED.bowl_table_to_inside_floor_height_mm,
+        "colour": "white",
+        "fixed": "the same cup at the same marked position for every demo and every trial",
+    }
+
 
 # -- objects (D3) -----------------------------------------------------------------------------
-GREEN_CUBE = P.ObjectSpec("green cube", "cube", (0.10, 0.65, 0.20, 1.0))  # the cylinder's green
-SEEN_OBJECT = P.RED_CUBE
-UNSEEN_OBJECTS: tuple[P.ObjectSpec, ...] = (P.PURPLE_CUBE, GREEN_CUBE)
-OBJECT_MATERIAL = "same material, mass and finish as the red demo cube; only the colour differs"
+# The set's colours; the RGBA is the sim's reference value only (not a hash input: the real cube
+# is the set's colour as supplied). Size = the nominal edge; object_spec reports cube_edge_mm().
+_EDGE_M = CUBE_EDGE_NOMINAL_MM / 1000.0
+SEEN_OBJECT = P.ObjectSpec(P.RED_CUBE.label, "cube", P.RED_CUBE.rgba, _EDGE_M)
+PURPLE_CUBE = P.ObjectSpec(P.PURPLE_CUBE.label, "cube", P.PURPLE_CUBE.rgba, _EDGE_M)
+GREEN_CUBE = P.ObjectSpec("green cube", "cube", (0.10, 0.65, 0.20, 1.0), _EDGE_M)
+UNSEEN_OBJECTS: tuple[P.ObjectSpec, ...] = (PURPLE_CUBE, GREEN_CUBE)
+STACK_BASE_OBJECT = P.ObjectSpec(P.BLUE_CUBE.label, "cube", P.BLUE_CUBE.rgba, _EDGE_M)
+STACK_BASE_NOTE = "seen Stack base; Stack is deferred, so unused in real-0.1"
+OBJECT_MATERIAL = (
+    "wood, from the same set as the red demo cube: same edge, mass and finish; only the colour "
+    "differs"
+)
 
 
 def object_spec(o: P.ObjectSpec) -> dict[str, Any]:
+    edge, src = cube_edge_mm()
     return {
         "label": o.label,
         "shape": o.shape,
-        "edge_mm": round(o.size * 1000.0, 3),
-        "nominal_rgba": list(o.rgba),
+        "set": CUBE_SET,
+        "colour": f"{o.label.split()[0]}, as supplied in the set",
+        "edge_mm": edge,
+        "edge_source": src,
         "material": OBJECT_MATERIAL,
+    }
+
+
+# -- scene (owner kit list 2026-11-10) ----------------------------------------------------------
+WHITE_ON_WHITE_RISK = (
+    "low contrast: the white cup rim on the all-white table, for both cameras. The camera match "
+    "(WO-06 step 7) must show the rim visible in BOTH cameras under the 5000 K lamp with "
+    "exposure and white balance locked; the table is not changed"
+)
+
+
+def scene_spec() -> dict[str, Any]:
+    from src.env.cameras import DEFAULT_FOV_DEG, named_pose  # read only
+
+    eye, target = named_pose("front_left_45")
+    return {
+        "table_surface": "all white",
+        "lighting": "one 17-inch LED clamp desk lamp (2700-6500 K) set ONCE to 5000 K and never "
+        "changed; its position recorded at the camera match",
+        "camera_controls": "exposure and white balance locked on both cameras at that light "
+        "(configs/real.yaml cameras.<name>.controls), never auto",
+        "front_camera": {
+            "device": "Logitech C920x",
+            "mount": "NEEWER UA057 22-inch magic arm with desk clamp",
+            "pose": "front_left_45 (the sim front pose, src/env/cameras.py)",
+            "eye_m": list(eye),
+            "target_m": list(target),
+            "sim_vertical_fov_deg": DEFAULT_FOV_DEG,
+        },
+        "wrist_camera": {
+            "device": "the SO-ARM101 Pro kit's 32 mm USB camera module",
+            "mount": "the SO-101 gripper mount (3D-printed from the LeRobot SO-101 files if the "
+            "kit has none)",
+        },
+        "risk": WHITE_ON_WHITE_RISK,
     }
 
 
@@ -199,13 +360,17 @@ JUDGING_GENERAL = (
     "input, no answer in deploy.prompt_torque_timeout_s) scores it n. An attempt whose policy "
     "never started is not scored and is redone with the same placement."
 )
-JUDGING_RULE: dict[str, str] = {  # mirrors src/env/success.py, read only
+# The success conditions of src/env/success.py (read only), with the REAL props' sizes (owner kit
+# list 2026-11-10). Only PickPlace is judged in real-0.1; Push and Stack are deferred.
+JUDGING_RULE: dict[str, str] = {
     "PickPlace": "the object rests inside the bowl (over the bowl floor, below the rim), the bowl "
     "is upright, and the object touches neither gripper jaw",
-    "Push": "the object's centre is inside the 5 cm target disc, the object is on the table, it "
-    "was never lifted off the table during the trial, and the gripper is not holding it",
-    "Stack": "the object rests on top of the blue cube (centred within ~1.5 cm, flat), the blue "
-    "cube is still on the table, and the object touches neither gripper jaw",
+    "Push": "(deferred: not judged in real-0.1) the object's centre is inside the 2-inch (50.8 mm) "
+    "matte black target disc, the object is on the table, it was never lifted off the table "
+    "during the trial, and the gripper is not holding it",
+    "Stack": "(deferred: not judged in real-0.1) the object rests on top of the blue cube (centred "
+    f"within half the cube edge, ~{cube_edge_mm()[0] / 2:.1f} mm, flat), the blue cube is still on "
+    "the table, and the object touches neither gripper jaw",
 }
 RUBRIC_ID = "so101-real-pickplace-rubric"
 RUBRIC_VERSION = "1"
@@ -213,14 +378,30 @@ TASK_VERSION = f"{RUBRIC_ID}-{RUBRIC_VERSION}"  # vishwaroop task_version = rubr
 
 
 def freeze_problem() -> str | None:
-    """Why no demo or hardware session may use this protocol yet (None once it is frozen)."""
-    if FREEZE_STATUS == FROZEN:
+    """Why no demo or hardware session may use this protocol yet (None once it is frozen and
+    every prop measurement is in)."""
+    pending = pending_measurements()
+    bad = measurement_problems()
+    if FREEZE_STATUS == FROZEN and not pending and not bad:
         return None
-    return (
-        f"protocol {PROTOCOL_VERSION} is not frozen ({FREEZE_STATUS}): the bowl position, the "
-        "rubric version, the placement-grid PDF and the hash wait for the owner's confirmation "
-        "(src/eval/protocol_real.py FREEZE_STATUS)"
-    )
+    parts = []
+    if FREEZE_STATUS != FROZEN:
+        parts.append(
+            f"protocol {PROTOCOL_VERSION} is not frozen ({FREEZE_STATUS}): the bowl position, the "
+            "rubric version, the placement-grid PDF and the hash wait for the owner's "
+            "confirmation (src/eval/protocol_real.py FREEZE_STATUS)"
+        )
+    if pending:
+        parts.append(
+            f"protocol {PROTOCOL_VERSION} prop measurements PENDING: {', '.join(pending)} "
+            "(src/eval/protocol_real.py MEASURED; the owner's bench measurements)"
+        )
+    if bad:
+        parts.append(
+            f"protocol {PROTOCOL_VERSION} prop measurements out of range: {'; '.join(bad)} "
+            "(src/eval/protocol_real.py MEASURED, in mm)"
+        )
+    return "; ".join(parts)
 
 
 def judging_text(settle_s: float = SETTLE_S) -> str:
@@ -516,11 +697,14 @@ def hash_components() -> dict[str, Any]:
         "task": {"name": TASK, "id": TASK_ID, "version": TASK_VERSION},
         "seen": {"slots": list(SEEN_SLOTS), "rule": SEEN_RULE, "corners": list(CORNER_SLOTS)},
         "shifted": {"slots": ring_order(), "counts": shifted_counts()},
-        "bowl": {**BOWL_SPEC, "rule": BOWL_RULE, "constraints": bowl_constraints()},
+        "bowl": {**bowl_spec(), "rule": BOWL_RULE, "constraints": bowl_constraints()},
         "objects": {
             "seen": object_spec(SEEN_OBJECT),
             "unseen": [object_spec(o) for o in UNSEEN_OBJECTS],
+            "stack_base": {**object_spec(STACK_BASE_OBJECT), "use": STACK_BASE_NOTE},
         },
+        "props": props_spec(),
+        "scene": scene_spec(),
         "schedules": {
             "eval": eval_schedule(),
             "demo": demo_schedule(),

@@ -93,12 +93,16 @@ syncs `dev` + `gpu`.
 
 ## Hardware
 
-- SO-101 follower (leader optional). Feetech STS3215 servos, Waveshare bus board, 5 V 4 A supply
-  (for the 7.4 V STS3215 variant; an arm built with 12 V STS3215 servos needs its 12 V supply:
-  read the servo label).
-- 2 USB webcams at 640×480 @ 30 fps: one fixed overhead/front (matches the sim camera pose),
-  one optional wrist cam. Record intrinsics in `configs/real.yaml`.
-- Table clamps; printed placement grid (A3) for randomized object positions; cubes 3 cm, bowl.
+The kit in use is listed in [`docs/bringup/kit.md`](bringup/kit.md) (owner, 2026-11-10).
+
+- Seeed SO-ARM101 Pro: SO-101 follower with 12 V STS3215 servos on its 12 V supply; leader with
+  7.4 V servos on its 5 V supply; two Waveshare bus boards. Never cross the supplies (read the
+  labels; `wo06_calibrate.py voltage` reads each servo's voltage over the bus).
+- 2 cameras at 640×480 @ 30 fps: Logitech C920x front camera at the sim pose (on a NEEWER UA057
+  magic arm), the kit's 32 mm module on the wrist. Intrinsics of both in `configs/real.yaml`.
+- One LED clamp lamp fixed at 5000 K; exposure and white balance locked on both cameras.
+- Table clamps; all-white table; printed placement grid (A3, or two tabloid sheets taped);
+  hand2mind 1-inch (25.4 mm nominal) wood cubes; LE TAUCI 8 oz white bouillon cup as the bowl.
 
 ## Data locations
 

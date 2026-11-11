@@ -31,6 +31,13 @@ BRINGUP_PLACEHOLDERS: dict[tuple[str, ...], Any] = {
     ("cameras", "front", "index"): 0,
     ("cameras", "front", "intrinsics"): None,
     ("cameras", "wrist", "index"): 1,
+    ("cameras", "wrist", "intrinsics"): None,
+    # WO-06 step 7 item 4: the locked camera controls the owner records by hand
+    ("cameras", "front", "controls", "exposure"): None,
+    ("cameras", "front", "controls", "focus"): None,
+    ("cameras", "front", "controls", "set_with"): None,
+    ("cameras", "wrist", "controls", "exposure"): None,
+    ("cameras", "wrist", "controls", "set_with"): None,
     ("teleop", "leader"): None,
 }
 

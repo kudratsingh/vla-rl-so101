@@ -6,7 +6,9 @@ policy of the sim demos: hover, descend, close, lift, carry, lower, release, ret
 waypoint heights, tilts and 0.065 rad/step joint cap) runs KINEMATICALLY: every joint command it
 issues is assumed tracked exactly, the TCP is the shared FK (``src/env/kinematics.py``), the cube
 rides in the gripper from the lift to the release with the offset it had at the grasp, and the
-gripper reads at least 0.15 rad while it holds the 3 cm cube. Every command is passed through
+gripper reads at least 0.15 rad while it holds the cube (the hand2mind 1-inch cube, 25.4 mm nominal;
+cube and cup geometry from ``src/eval/bowl_fit.py`` ``geometry()``, i.e. ``protocol_real.MEASURED``,
+with the sim bowl standing in, labelled, while a cup measurement is pending). Every command is passed through
 ``src/robot/safety.py`` ``SafetyFilter`` built from ``configs/real.yaml`` (``make_safety``: the
 URDF joint limits less ``urdf_limit_margin_deg``, the 4 deg/step and 60 deg/s caps, the
 ``workspace_box_m`` TCP box) with the sim FK, measured = the previous command (the reference is
@@ -43,7 +45,11 @@ window, and verifies each option through the filter with both IK variants (joint
 bowl-phase clips as reported constraints). Nothing here loosens the safety filter.
 
 Not modelled: collisions. The separation figures are centre distances; the jaw-to-rim clearance
-of a grasp at the nearest slot (open jaws, any yaw, the 5 mm tolerance) is NOT checked here.
+of a grasp at the nearest slot (open jaws, any yaw, the 5 mm tolerance) is NOT checked here. The
+cup's rim and floor are checked analytically instead (``bowl_fit.geometry_problems``: the carry
+over the rim, the lower over the inside floor, the nearest cube to the rim, the measurements'
+ranges): any of them makes the verdict FAIL (``passes_carry_and_bowl_phases`` false, ``PROBLEM``
+lines), whatever the kinematic phases say.
 
     uv run scripts/wo07_bowl_check.py --preset real                    # the frozen bowl
     uv run scripts/wo07_bowl_check.py --preset real --search           # + constrained search
@@ -72,7 +78,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.config import CONFIG_DIR, Config, add_config_args, load_config
 from src.data import oracle as O
-from src.env import success as S
 from src.env.kinematics import ArmKinematics
 from src.eval import bowl_fit as BF
 from src.eval import protocol_real as PR
@@ -83,19 +88,19 @@ from src.runs import RUNS_DIR, Run, new_run_id
 
 PHASES = ("hover", "descend", "close", "lift", "carry", "lower", "release", "retreat")
 BOWL_PHASES = ("lower", "release", "retreat")
-CUBE_HALF_M = 0.015  # the 3 cm cubes of real-0.1
-GRIP_HOLD_RAD = 0.15  # the gripper reads at least this while it holds the cube
+# Cube and cup geometry from ONE place (src/eval/bowl_fit.py geometry(), which reads
+# protocol_real.MEASURED; sim-bowl fallbacks while a cup measurement is pending, labelled in the
+# record): the hand2mind 1-inch cube, nominal 25.4 mm until measured, and the LE TAUCI cup.
+GEOMETRY = BF.geometry()
+CUBE_HALF_M = GEOMETRY.cube_half_m
+GRIP_HOLD_RAD = 0.15  # the gripper reads at least this while it holds the cube (sim 3 cm value;
+# a 25.4 mm cube closes the jaws further: unverified, it only marks the hold in this kinematic run)
 MAX_STEPS = 700
 BOX_MARGIN_M = PR.BOWL_MARGIN_M  # the operator's placement tolerance (5 mm), as derive_bowl
 STATUS_ORDER = {"pass": 0, "clip(gripper floor)": 1, "clip": 2, "reject": 3, "not reached": 4}
 CARRY_AND_BOWL = ("carry", *BOWL_PHASES)
-RELEASE_RADIUS_M = S.BOWL_FLOOR_RADIUS - CUBE_HALF_M  # TCP over the floor, the cube inside it
-# the sim bowl's outer rim radius (floor + tilted wall + wall thickness) and a 3 cm cube's corner
-RIM_RADIUS_M = (
-    S.BOWL_FLOOR_RADIUS
-    + S.BOWL_WALL_HEIGHT * math.tan(math.radians(S.BOWL_WALL_TILT_DEG))
-    + S.BOWL_WALL_THICKNESS
-)
+RELEASE_RADIUS_M = BF.release_radius_m(GEOMETRY)  # TCP over the floor, the cube inside it
+RIM_RADIUS_M = GEOMETRY.rim_radius_m  # the cup's outer rim (sim bowl fallback while pending)
 CUBE_CORNER_M = CUBE_HALF_M * math.sqrt(2.0)
 
 
@@ -188,7 +193,8 @@ class KinematicScene:
             if bool(self.attached[i]) and not holding:
                 self.attached[i] = False
                 self.released[i] = True
-                self.obj[i, 2] = self.goal[i, 2] + S.BOWL_FLOOR_THICKNESS + CUBE_HALF_M
+                # onto the cup's inside floor (measured, else the sim floor; bowl_fit.geometry)
+                self.obj[i, 2] = self.goal[i, 2] + GEOMETRY.floor_height_m + CUBE_HALF_M
             if holding:
                 q[i, 5] = max(float(q[i, 5]), GRIP_HOLD_RAD)
         self.q = q
@@ -323,8 +329,11 @@ def verify(
         for (s, nm), v in detail.items()
         if cells[(s, nm)] != "clip(gripper floor)"
     }
-    bowl_ok = all(STATUS_ORDER[worst[nm]] <= 1 for nm in ("carry", *BOWL_PHASES))
-    in_bowl = (scene.obj[:, :2] - torch.tensor(bowl)).norm(dim=-1) < S.BOWL_FLOOR_RADIUS
+    kinematic_ok = all(STATUS_ORDER[worst[nm]] <= 1 for nm in ("carry", *BOWL_PHASES))
+    # the kinematic scene models neither the rim nor the floor: the prop geometry fails it alone
+    geometry_problems = BF.geometry_problems(GEOMETRY)
+    bowl_ok = kinematic_ok and not geometry_problems
+    in_bowl = (scene.obj[:, :2] - torch.tensor(bowl)).norm(dim=-1) < GEOMETRY.floor_radius_m
     placed = sorted({rows[i][0] for i in range(len(rows)) if bool(scene.released[i] & in_bowl[i])})
     return {
         "bowl_xy_m": [round(bowl[0], 4), round(bowl[1], 4)],
@@ -349,6 +358,8 @@ def verify(
             j: round(v, 2) for j, v in joint_margin.items() if v < 1e8
         },
         "reject_max_outside_box_m": {k: round(v, 4) for k, v in outside_m.items()},
+        "kinematic_phases_ok": kinematic_ok,
+        "geometry_problems": geometry_problems,
         "passes_carry_and_bowl_phases": bowl_ok,
         "tcp_to_bowl_max_m": round(tcp_bowl_off, 4),
         "tcp_box_margin_m": {k: round(v, 4) for k, v in box_margin.items()},
@@ -374,7 +385,7 @@ def analytic(bowl: Sequence[float]) -> dict[str, float]:
         "reach_margin_m": round(k["reach_m"] - m - r, 4),
         # CUBE ONLY (no gripper, no collision model): the rim to the nearest cube's corner at any
         # yaw, the bowl placed 5 mm closer. The open jaws reach further: not checked here.
-        "cube_rim_clearance_m": round(d - RIM_RADIUS_M - CUBE_CORNER_M - m, 4),
+        "cube_rim_clearance_m": round(BF.cube_rim_clearance_m(d, GEOMETRY), 4),
     }
 
 
@@ -439,6 +450,8 @@ def search(cfg: Config, tcp_off: float) -> dict[str, Any]:
 
     passing = sorted((r for r in rows if ok(r)), key=lambda r: (r["grid_centre_m"], -r["xy"][1]))
     out: dict[str, Any] = {"tcp_offset_m": tcp_off, "box_pad_m": BOX_MARGIN_M + tcp_off}
+    # position-independent: every candidate fails the bowl check while any is listed
+    out["geometry_problems"] = BF.geometry_problems(GEOMETRY)
     out["passing"] = passing[:5]
     if passing:
         return out
@@ -491,6 +504,13 @@ def check_bowl(
     v["box_margin_search_offset_m"] = box_margin(bxy, cfg, search_off)
     v["box_face_margins_m"] = BF.face_margins(bxy, BF.workspace_box(cfg), search_off)
     v["release_window"] = release_window(bxy, cfg)
+    rim = v["analytic"]["cube_rim_clearance_m"]
+    if rim < 0:  # the nearest slot's cube overlaps the cup's rim (5 mm tolerance)
+        v["geometry_problems"] = [
+            *v["geometry_problems"],
+            f"cube to rim: the nearest slot's cube corner is {100 * rim:+.2f} cm from the outer rim",
+        ]
+        v["passes_carry_and_bowl_phases"] = False
     return v
 
 
@@ -553,8 +573,12 @@ def verify_options(
 
 
 def _verdict(v: dict[str, Any]) -> str:
-    """Worst carry / bowl-phase status, the gripper floor clip counted as a pass."""
+    """Worst carry / bowl-phase status, the gripper floor clip counted as a pass; any prop
+    geometry problem (rim, floor, measurements) is a FAIL whatever the phases say."""
     worst = max((v["worst_by_phase"][p] for p in CARRY_AND_BOWL), key=STATUS_ORDER.__getitem__)
+    geo = v.get("geometry_problems") or []
+    if geo:
+        return "FAIL (" + "; ".join(p.split(":")[0] for p in geo) + ")"
     return "pass" if STATUS_ORDER[worst] <= 1 else worst
 
 
@@ -623,7 +647,22 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     yaws = [0.0] if tiny else [float(y) for y in PR.YAWS_DEG]
     bowls = [tuple(b) for b in args.bowl] if args.bowl else [PR.BOWL_XY_M]
     fk = load_sim_fk()
-    out: dict[str, Any] = {"frozen_bowl_xy_m": list(PR.BOWL_XY_M), "results": []}
+    out: dict[str, Any] = {
+        "frozen_bowl_xy_m": list(PR.BOWL_XY_M),
+        "geometry": GEOMETRY.to_dict(),
+        "carry_rim_clearance_m": round(BF.carry_rim_clearance_m(GEOMETRY), 4),
+        "lower_floor_clearance_m": round(BF.lower_floor_clearance_m(GEOMETRY), 4),
+        "geometry_problems": BF.geometry_problems(GEOMETRY),
+        "results": [],
+    }
+    print(
+        f"prop geometry {out['geometry']}; cube bottom over the rim at the oracle's carry "
+        f"{out['carry_rim_clearance_m']} m, over the inside floor after the lower "
+        f"{out['lower_floor_clearance_m']} m"
+        + ("" if GEOMETRY.measured else " (PENDING measurements: not the real cup's numbers)")
+    )
+    for p in out["geometry_problems"]:
+        print(f"PROBLEM {p}: the bowl check FAILS at every position")
     with Run(
         work_order="WO-07",
         script=__file__,
@@ -641,6 +680,10 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             )
             print(_fmt_table(v))
             print(f"worst by phase {v['worst_by_phase']}; central slot {v['central_slot']}")
+            print(
+                f"verdict {_verdict(v)}"
+                + "".join(f"\n  PROBLEM {p}" for p in v["geometry_problems"])
+            )
             print(
                 f"TCP-to-bowl max {v['tcp_to_bowl_max_m']} m; box margins at the bowl "
                 f"{v['tcp_box_margin_bowl_phases_m']}"

@@ -36,7 +36,9 @@ The bowl is PENDING (owner 2026-11-09): the frozen bowl lies outside the safety 
 workspace box once the placement tolerance and the oracle's TCP offset are counted, so every carry
 would be rejected; ``--demo-schedule`` refuses before anything opens while that holds
 (``src/eval/bowl_fit.py`` ``bowl_box_problem``, ``scripts/wo07_bowl_check.py``), and while the
-protocol is not frozen (``src/eval/protocol_real.py`` ``FREEZE_STATUS``, ``freeze_problem``).
+protocol is not frozen (``src/eval/protocol_real.py`` ``FREEZE_STATUS``, ``freeze_problem``), and
+while either camera's exposure / white balance (and the front's focus) is not recorded as locked
+(``src/robot/convention.py`` ``camera_controls_problems``, WO-06 step 7).
 
 Durable and resumable (review F1 / F5). Every kept episode is saved, its placement written to
 ``meta/vla_rl_so101.json``, then the dataset is finalized and reopened (``src/robot/recording.py``
@@ -862,6 +864,12 @@ def main() -> None:
         frozen = PR.freeze_problem()  # PR.FREEZE_STATUS: demos only on the frozen protocol
         if frozen is not None:
             sys.exit(f"refusing the real-0.1 demo schedule; nothing was opened: {frozen}")
+        locked = conv.camera_controls_problems(cfg)  # the scene's locked cameras (WO-06 step 7)
+        if locked:
+            sys.exit(
+                "refusing the real-0.1 demo schedule; nothing was opened: camera controls not "
+                "locked: " + "; ".join(locked)
+            )
         n_eps = 1 if args.rehearsal else int(args.episodes or len(placements))
         if not 1 <= n_eps <= len(placements):
             sys.exit(f"--episodes must be in [1, {len(placements)}] with --demo-schedule")

@@ -332,6 +332,30 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# the printed placement grid per eval.grid_layout (= scripts/make_placement_grid.py OUTS)
+GRID_PDFS: dict[str, str] = {
+    "a3": "docs/assets/placement-grid-a3.pdf",
+    "tabloid2": "docs/assets/placement-grid-tabloid2.pdf",
+}
+
+
+def grid_layout_from_config(cfg: Config) -> str:
+    v = str((cfg.get("eval") or {}).get("grid_layout", "a3"))
+    if v not in GRID_PDFS:
+        raise ValueError(f"eval.grid_layout must be one of {sorted(GRID_PDFS)}, got {v!r}")
+    return v
+
+
+def grid_pdf_fields(layout: str = "a3") -> dict[str, Any]:
+    """The printed grid's layout, file and sha256 (None while that PDF is not generated)."""
+    path = REPO_ROOT / GRID_PDFS[layout]
+    return {
+        "grid_layout": layout,
+        "grid_pdf": GRID_PDFS[layout],
+        "grid_pdf_sha256": _sha256(path) if path.is_file() else None,
+    }
+
+
 def settle_s_from_config(cfg: Config) -> float:
     v = float((cfg.get("eval") or {}).get("settle_s", DEFAULT_SETTLE_S))
     if not (math.isfinite(v) and 0.0 <= v <= 30.0):
@@ -353,8 +377,9 @@ def protocol_fields(
     settle_s: float = DEFAULT_SETTLE_S,
     protocol: str = P2.PROTOCOL_VERSION,
     schedule: str | None = None,
+    grid_layout: str = "a3",
 ) -> dict[str, Any]:
-    """Per-trial protocol citation. 0.2: its composite hash, 0.1-draft as a reference, real-eval
+    """Per-trial protocol citation (``grid_layout``: the printed grid used, eval.grid_layout). 0.2: its composite hash, 0.1-draft as a reference, real-eval
     files. real-0.1: its composite hash (slots, bowl, objects, schedules, grid, rubric, convention),
     the schedule run and its hash, the same reference and files."""
     rule_text = json.dumps(judging_rule(settle_s), sort_keys=True)
@@ -363,7 +388,7 @@ def protocol_fields(
         "judging_rule_sha256": hashlib.sha256(rule_text.encode()).hexdigest(),
         "settle_s": float(settle_s),
         "grid_sha256": _sha256(REPO_ROOT / "src" / "eval" / "real_grid.py"),
-        "grid_pdf_sha256": _sha256(REPO_ROOT / "docs" / "assets" / "placement-grid-a3.pdf"),
+        **grid_pdf_fields(grid_layout),
     }
     if protocol == PR.PROTOCOL_VERSION:
         sched = schedule or "eval"
@@ -457,7 +482,7 @@ def fingerprint_values(
     }  # control_hz, chunk_len, exec_steps, timeouts, chunk age, trial steps, home, park
     return _canon(
         {
-            "protocol": protocol_fields(settle_s, protocol, schedule),
+            "protocol": protocol_fields(settle_s, protocol, schedule, grid_layout_from_config(cfg)),
             "policy": {
                 "policy_id": info.get("policy_id"),
                 "policy_checkpoint": dcfg.policy_checkpoint,
@@ -1633,7 +1658,10 @@ def new_settings(args: argparse.Namespace, cfg: Config) -> dict[str, Any]:
         "backend": resolve_backend(args, real),
         "policy_id": None,  # from the server's Info
         "settle_s": settle_s_from_config(cfg),
-        "protocol": protocol_fields(settle_s_from_config(cfg), protocol, schedule),
+        "grid_layout": grid_layout_from_config(cfg),
+        "protocol": protocol_fields(
+            settle_s_from_config(cfg), protocol, schedule, grid_layout_from_config(cfg)
+        ),
         "fingerprint": None,  # bind_session, once the rig and the server are known
     }
 
@@ -1647,6 +1675,7 @@ def check_resume(
         float(settings.get("settle_s", DEFAULT_SETTLE_S)),
         str(settings.get("protocol_id") or P2.PROTOCOL_VERSION),
         settings.get("schedule"),
+        str(settings.get("grid_layout") or "a3"),
     )
     bad = [
         f"{k}: session {settings['protocol'][k]!r} != now {now[k]!r}"
@@ -1937,6 +1966,14 @@ def run(
 def real_hardware_problems(cfg: Config, settings: dict[str, Any]) -> list[str]:
     """Why a real-0.1 hardware session may not start (empty = it may)."""
     out = [f"convention: {p}" for p in conv.check_config(cfg)]  # both cameras, 15 Hz, gripper
+    # the scene's locked exposure / white balance / focus (protocol_real.scene_spec, WO-06 step 7)
+    out += [f"camera controls: {p}" for p in conv.camera_controls_problems(cfg)]
+    grid = grid_pdf_fields(grid_layout_from_config(cfg))
+    if grid["grid_pdf_sha256"] is None:
+        out.append(
+            f"eval.grid_layout {grid['grid_layout']}: {grid['grid_pdf']} is not generated "
+            f"(scripts/make_placement_grid.py --preset real --layout {grid['grid_layout']})"
+        )
     if settings.get("backend") != "local":
         out.append("--backend local: a real-0.1 session runs SmolVLA / ACT in process on the Mac")
     if settle_s_from_config(cfg) != PR.SETTLE_S:
