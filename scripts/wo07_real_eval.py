@@ -100,7 +100,9 @@ session before anything is opened or changed (it runs in ``run`` before a resume
 recovery, which syncs under the same policy) when the runs directory's filesystem cannot do it.
 Before it, a resume reads the session's recorded mode read only and refuses the other mode
 (``check_resume_mode``, owner PR #32 hold): a mock resume never recovers a hardware session's
-capture under the best-effort sync, and nothing is written before that check. Mock
+capture under the best-effort sync, and nothing is written before that check. The recorded mode
+is the session's AND every trial record's, on every run of the session (a chain mixed by the
+pre-fix code, a hardware run then a mock resume of it, is refused). Mock
 sessions and Linux keep the best-effort sync, the method recorded (record.json ``sync``); other
 metrics rows (decisions, trial and capture rows)
 are plain appends, each trial / capture row followed by a synced record.json holding it. The
@@ -112,8 +114,11 @@ line is skipped, and record.json's trials stand without metrics.jsonl. A real-0.
 episode is synced before its staged journal goes and before its ``capture`` row / record.json
 names it, and a resume treats a named episode the dataset no longer holds as missing
 (``reconcile_captures``, S32-D2). An episode whose save's sync failed is PENDING (owner hold on
-PR #32): no record claims its index, the summary lists it (``recordings_pending``, the session is
-not protocol-complete) and the export refuses, until a resume confirms it (verified, synced). Closing the Terminal (SIGHUP / SIGTERM) is not a kill: the session takes the closed-stdin path (grace period, torque off, released_unconfirmed,
+PR #32), and so is one whose checkpoint failed after the save or a record that claims its index
+beside the save's error or with its journal still staged (``recording.capture_unconfirmed``, the
+export's rule): the summary lists it (``recordings_pending``, the session is not
+protocol-complete), the session prints the ``--resume`` hint and the export refuses, until a
+resume confirms it (verified, synced). Closing the Terminal (SIGHUP / SIGTERM) is not a kill: the session takes the closed-stdin path (grace period, torque off, released_unconfirmed,
 cause hangup) and writes its record. Ctrl-Z never suspends a hardware session (ignored with a
 message); the session must run in the terminal's foreground, and losing it takes the same path
 (cause lost_foreground).
@@ -267,6 +272,7 @@ from src.robot.recording import (
     EvalCapture,
     RigFrameSource,
     capture_pending,
+    capture_unconfirmed,
     check_capture_resumable,
     has_staged,
     recording_required,
@@ -764,21 +770,31 @@ def results_from_metrics(run_dir: Path, why: str, _below: tuple[str, ...] = ()) 
 MODES = ("mock", "hardware")
 
 
-def recorded_mode(run_dir: Path) -> str:
-    """The mode ("mock" | "hardware") the run to resume recorded, read only (owner, PR #32
-    hold): ``results.mode`` of its record.json, else (record.json missing or unreadable, as in
-    ``load_prior``) the ``mode`` of its last synced ``session`` row. Exits when neither records
-    one: the mode decides the capture recovery's sync policy, so it is never guessed."""
+def _run_modes(run_dir: Path) -> tuple[Any, set[Any]]:
+    """(session id, every mode a run records), read only: record.json ``results.mode`` and each
+    trial record's, else (record.json missing or unreadable, as in ``load_prior``) the ``mode``
+    of its last synced ``session`` row (its trials are an earlier run's: checked there)."""
     try:
         results = json.loads((run_dir / "record.json").read_text()).get("results") or {}
-        mode = results.get("mode")
+        modes = {results.get("mode")} | {t.get("mode") for t in results.get("trials") or []}
     except (OSError, ValueError, AttributeError):
-        row = _last_session_row(run_dir)
-        mode = None if row is None else row.get("mode")
+        results = _last_session_row(run_dir) or {}
+        modes = {results.get("mode")}
+    return (results.get("session") or {}).get("session_id"), modes
+
+
+def recorded_mode(run_dir: Path) -> str:
+    """The mode ("mock" | "hardware") the run to resume recorded, read only (owner, PR #32
+    hold; ``_run_modes``: the session's and every trial record's must agree, as in
+    ``session_mode``). Exits when none, or more than one, is recorded: the mode decides the
+    capture recovery's sync policy, so it is never guessed."""
+    _, modes = _run_modes(run_dir)
+    mode = next(iter(modes)) if len(modes) == 1 else None
     if mode not in MODES:
         sys.exit(
-            f"--resume refused: {run_dir} records no session mode ({mode!r}; record.json "
-            "results.mode, else the synced session row's): nothing was opened or changed"
+            f"--resume refused: {run_dir} records no session mode "
+            f"({sorted(map(str, modes))}; record.json results.mode and every trial's, else the "
+            "synced session row's): nothing was opened or changed"
         )
     return str(mode)
 
@@ -794,6 +810,16 @@ def check_resume_mode(run_dir: Path, mode: str) -> str:
             f"--resume refused: {run_dir.name} is recorded as a {recorded} session; resume it "
             f"with --{recorded}, never --{mode}: nothing was opened or changed"
         )
+    sid, _ = _run_modes(run_dir)
+    if sid is not None:  # every run of the session (a chain mixed before this check existed)
+        for rid in session_runs(run_dir.parent, str(sid)):
+            _, modes = _run_modes(run_dir.parent / rid)
+            if modes != {recorded}:
+                sys.exit(
+                    f"--resume refused: session {sid} mixes modes: run {rid} records "
+                    f"{sorted(map(str, modes))}, {run_dir.name} {recorded!r}: nothing was "
+                    "opened or changed"
+                )
     return recorded
 
 
@@ -858,11 +884,17 @@ def done_indices(trials: Sequence[dict[str, Any]], cell: str) -> set[int]:
 
 
 def table(
-    trials: Sequence[dict[str, Any]], settings: dict[str, Any], cfg_deploy: DeployConfig
+    trials: Sequence[dict[str, Any]],
+    settings: dict[str, Any],
+    cfg_deploy: DeployConfig,
+    capture_root: Path | None = None,
 ) -> dict[str, Any]:
     """client.summarize over the first started record per (cell, trial_idx) (a started slot is
     never re-run, so there is one) plus every not-started attempt, and completeness. Raises
-    PoolingRefused when a trial's session fingerprint differs from the session's."""
+    PoolingRefused when a trial's session fingerprint differs from the session's. A real-0.1
+    trial whose episode is not confirmed durable (``capture_unconfirmed``; with the session's
+    ``capture_root``, a claimed index whose journal is still staged too) is listed under
+    ``recordings_pending``: then the session is not protocol-complete."""
     if settings.get("fingerprint"):
         check_poolable(trials, settings["fingerprint"])
     first: dict[tuple[str, int], dict[str, Any]] = {}
@@ -896,7 +928,9 @@ def table(
         # session with an episode saved and not yet durable is not a protocol table: a resume
         # confirms it first (owner hold on PR #32; the export refuses until then)
         s["recordings_pending"] = [
-            t.get("trial_id") for t in scored if capture_pending(t.get("capture") or {})
+            t.get("trial_id")
+            for t in scored
+            if capture_unconfirmed(t.get("capture") or {}, capture_root, t.get("trial_id"))
         ]
         s["protocol_complete"] = bool(
             s["protocol_complete"] and s["reportable"] and not s["recordings_pending"]
@@ -1116,7 +1150,7 @@ def session(
                 torque_off_unconfirmed=loop.arm.torque_off_unconfirmed,
                 trials=trials,
             )
-            summary = table(trials, settings, loop.dcfg)
+            summary = table(trials, settings, loop.dcfg, None if capture is None else capture.root)
             run.results.update(summary=summary)
         print_table(run.id, summary, end, shutdown.record())
         if not summary["complete"]:
@@ -1419,6 +1453,7 @@ def reconcile_captures(
         "recording_missing": [],
         "discarded": [],
         "pending_sync": [],
+        "confirmed": [],
         "lost": lost,
     }
 
@@ -1446,11 +1481,20 @@ def reconcile_captures(
             continue
         if cap.get("episode_index") is not None:
             tid = str(t.get("trial_id"))
-            if t.get("trial_id") is None or not has_staged(capture.root, tid):
+            if t.get("trial_id") is None or not capture_unconfirmed(cap, capture.root, tid):
                 continue
-            idx = int(cap["episode_index"])  # saved, its journal kept: never confirmed durable
+            idx = int(cap["episode_index"])  # claimed, never confirmed durable (module doc)
             got = capture.confirm_saved(tid, idx)
-            block = {**cap, **got} if "error" not in got else pending(tid, idx, cap, got["error"])
+            if "error" in got:
+                block = pending(tid, idx, cap, got["error"])
+            else:  # the save's error is history now: kept as what was confirmed
+                was = {k: cap[k] for k in ("error", "sync_error") if cap.get(k)}
+                block = {
+                    **{k: v for k, v in cap.items() if k not in was},
+                    **got,
+                    "confirmed_after": was or "its staged journal was kept",
+                }
+                out["confirmed"].append(tid)
         elif cap.get("recording_missing"):
             out["recording_missing"].append(t.get("trial_id"))
             continue
@@ -1564,14 +1608,19 @@ def stage_unsaved(capture: EvalCapture, trials: Sequence[dict[str, Any]]) -> Non
 def capture_gaps(root: Path, trials: Sequence[dict[str, Any]]) -> dict[str, list[Any]]:
     """Scored trials that need a recording (``recording.recording_required``) without an
     episode: ``recording_missing`` (flagged: no journal or a damaged one; or nothing staged) and
-    ``recoverable_on_resume`` (a whole staged journal, never flagged). The same classification
-    as ``export_bundle.missing_recordings``."""
+    ``recoverable_on_resume`` (a whole staged journal, never flagged; or an episode saved but not
+    confirmed durable, ``capture_unconfirmed``: a resume confirms it). The same classification
+    as ``export_bundle.missing_recordings`` / ``pending_episodes``."""
     out: dict[str, list[Any]] = {"recoverable_on_resume": [], "recording_missing": []}
     for t in trials:
         cap = t.get("capture") or {}
-        if not recording_required(t) or cap.get("episode_index") is not None:
+        if not recording_required(t):
             continue
         tid = t.get("trial_id")
+        if cap.get("episode_index") is not None:
+            if capture_unconfirmed(cap, root, tid):
+                out["recoverable_on_resume"].append(tid)
+            continue
         if capture_pending(cap) or (
             not cap.get("recording_missing") and tid is not None and has_staged(root, str(tid))
         ):

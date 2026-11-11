@@ -83,7 +83,11 @@ Evaluation capture (``EvalCapture``), one dataset per evaluation session, one ep
   ``pending_episode_index`` (``episode_index`` None, so nothing counts it as present), its
   provenance entry carries ``sync_pending``, and the export refuses while any episode is pending
   (``export_bundle.pending_episodes``: a pending block, a ``sync_pending`` entry, or a saved
-  episode whose journal is still staged). A resume's reconcile confirms it
+  episode whose journal is still staged). A checkpoint that fails after the save (the provenance
+  write, the finalize / reopen: ``CheckpointFailed``) leaves it PENDING the same way. A record
+  that claims its index with the save's error beside it (5126daa records) or with its journal
+  still staged is unconfirmed too (``capture_unconfirmed``: the session summary, the resume and
+  the export use that one rule). A resume's reconcile confirms it
   (``EvalCapture.confirm_saved``: the episode verified readable with its frame count, the
   dataset, its stills and the provenance synced under the session's policy, then the journal
   dropped) before attaching the index; a confirmation that fails leaves it pending.
@@ -145,6 +149,26 @@ SYNC_PENDING = (
 def capture_pending(cap: Mapping[str, Any]) -> bool:
     """A capture block whose episode was saved but is not confirmed durable (module doc)."""
     return cap.get("episode_index") is None and cap.get("pending_episode_index") is not None
+
+
+def capture_unconfirmed(
+    cap: Mapping[str, Any], capture_root: Path | None = None, trial_id: Any = None
+) -> bool:
+    """A saved episode not confirmed durable (module doc): a pending block, or a block that
+    claims its ``episode_index`` beside the save's ``sync_error`` / ``error`` (a checkpoint
+    failure; records written before the pending block), or, ``capture_root`` given, one that
+    claims it while the trial's journal is still staged (a confirmed save drops it)."""
+    if capture_pending(cap):
+        return True
+    if cap.get("episode_index") is None:
+        return False
+    if cap.get("sync_error") or cap.get("error"):
+        return True
+    return (
+        capture_root is not None
+        and trial_id is not None
+        and has_staged(capture_root, str(trial_id))
+    )
 
 
 def episode_problem(ds_root: Path, index: int, frames: Any = None) -> str:
@@ -955,10 +979,22 @@ class EvalCapture:
         t_save = time.time()
         try:
             index = self.dataset.save_episode(before_checkpoint=provenance_entry)
-        except CheckpointFailed as e:  # saved, but the dataset could not be made durable
+        except CheckpointFailed as e:  # saved, not made durable: PENDING (journal kept)
             log.exception("eval capture: checkpoint failed")
             self.broken = str(e)
-            return {**base, **timing, "episode_index": e.index, "error": str(e)}
+            entry["sync_pending"] = str(e)
+            try:
+                self._write_provenance()
+            except Exception:  # the block below says pending regardless
+                log.exception("eval capture: provenance not written after the checkpoint")
+            return {
+                **base,
+                **timing,
+                "episode_index": None,
+                "pending_episode_index": e.index,
+                "reason": SYNC_PENDING,
+                "error": str(e),
+            }
         except Exception as e:
             log.exception("eval capture: episode not saved")
             self._open = cur

@@ -169,6 +169,8 @@ def test_eval_bundle_is_complete_and_valid(eval_session: _Session, tmp_path: Pat
     assert index["episodes"] == 3 and index["sessions"] == [sid] and index["mode"] == "mock"
     assert index["mock_label"] == X.MOCK_EXPORT_LABEL  # labelled mock: a format test only
     decl = json.loads((out / X.DECLARATION_FILE).read_text())
+    # the sealed declaration (what vishwaroop imports) says mock too, never plain real-0.1
+    assert decl["protocol_version"] == "real-0.1-mock" == index["protocol_version"]
     pol = decl["policy"]
     ident = X.checkpoint_identity(eval_session.ckpt)
     assert pol == {

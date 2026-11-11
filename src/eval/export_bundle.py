@@ -22,7 +22,10 @@ seal``); this repo only produces the inputs, per recording session, next to the 
 * demonstration sessions: ``placements.json`` (each episode's planned placement from the frozen
   demo schedule); a rehearsal recording is refused.
 * development sessions (``--include-dev``; never reported) are declared with protocol_version
-  ``real-0.1-dev``, so the sealed declaration itself says they are not the evaluation.
+  ``real-0.1-dev``, so the sealed declaration itself says they are not the evaluation; a mock
+  session (``--allow-mock``: fake arm, mock policy, a format test) gets ``-mock`` right after the
+  version (``real-0.1-mock``, ``real-0.1-mock-dev``, ``real-0.1-mock-incomplete``), so the sealed declaration says mock too, not only
+  ``bundle.json`` / ``trials.json`` (``mock_label``; review F2 of the PR #32 hold round).
 * timing: LeRobot's ``timestamp`` (what the importer reads) is nominal; every frame's real write
   and camera times are the ``timing_s`` feature (convention 1.1), each trial's achieved write rate
   is in ``trials.json`` and ``bundle.json`` warns when it is more than 10% off the nominal fps.
@@ -470,6 +473,7 @@ def _protocol(prov: Mapping[str, Any]) -> None:
 
 
 DEV_SUFFIX = "-dev"  # a development session's protocol_version (never reported; review F9)
+MOCK_SUFFIX = "-mock"  # a mock session's (fake arm, mock policy): the declaration says so too
 MOCK_EXPORT_LABEL = "MOCK EXPORT: fake arm and mock policy; a format test, NOT a real-arm result"
 INCOMPLETE_SUFFIX = "-incomplete"  # an export missing a scored trial's recording (module doc)
 
@@ -721,6 +725,7 @@ def build_eval_bundle(
         "evaluation",
         {i: sid for i in eps},
         protocol_version=PR.PROTOCOL_VERSION
+        + (MOCK_SUFFIX if mode == "mock" else "")
         + (DEV_SUFFIX if dev else "")
         + (INCOMPLETE_SUFFIX if missing else ""),
     )
@@ -794,11 +799,12 @@ def pending_episodes(
     episodes: Sequence[int],
     capture_root: Path,
 ) -> list[dict[str, Any]]:
-    """Episodes saved but not confirmed durable (``recording.capture_pending``; owner hold on PR
-    #32): a trial's pending block, a provenance entry marked ``sync_pending``, or a saved episode
-    (in the dataset, or claimed by a record) whose trial still has a whole staged journal (its
-    sync failed or never ran). A resume confirms them (``EvalCapture.confirm_saved``)."""
-    from src.robot.recording import capture_pending, has_staged
+    """Episodes saved but not confirmed durable (``recording.capture_unconfirmed``, the rule the
+    session summary uses; owner hold on PR #32): a trial's pending block, a record that claims
+    its index beside the save's error, a provenance entry marked ``sync_pending``, or a saved
+    episode (in the dataset, or claimed by a record) whose trial still has a whole staged journal
+    (its sync failed or never ran). A resume confirms them (``EvalCapture.confirm_saved``)."""
+    from src.robot.recording import capture_pending, capture_unconfirmed, has_staged
 
     found: dict[str, dict[str, Any]] = {}
 
@@ -810,12 +816,9 @@ def pending_episodes(
         tid = t.get("trial_id")
         if capture_pending(cap):
             add(tid, cap["pending_episode_index"], str(cap.get("sync_error") or cap.get("reason")))
-        elif (
-            cap.get("episode_index") is not None
-            and tid is not None
-            and has_staged(capture_root, str(tid))
-        ):
-            add(tid, cap["episode_index"], "saved, its staged journal kept")
+        elif capture_unconfirmed(cap, capture_root, tid):
+            why = cap.get("sync_error") or cap.get("error") or "saved, its staged journal kept"
+            add(tid, cap["episode_index"], str(why))
     entries = prov.get("episodes") or {}
     for i in episodes:
         entry = entries.get(str(i)) or {}

@@ -300,7 +300,7 @@ def test_dev_sessions_and_rehearsals_are_never_exported_as_results(
         xb.main([*argv, str(runs), "--out", str(out), "--allow-mock"])
     index = xb.main([*argv, str(runs), "--out", str(out), "--allow-mock", "--include-dev"])
     decl = json.loads((out / X.DECLARATION_FILE).read_text())
-    assert decl["protocol_version"] == "real-0.1-dev" == index["protocol_version"]
+    assert decl["protocol_version"] == "real-0.1-mock-dev" == index["protocol_version"]
     # a rehearsal demo recording
     demo = tmp_path / "demo" / "dataset"
     (demo / "meta").mkdir(parents=True)

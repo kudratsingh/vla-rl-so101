@@ -755,18 +755,27 @@ def test_an_episode_whose_save_sync_failed_stays_pending_until_a_resume_syncs_it
         assert "Input/output error" in cap["sync_error"]
         assert recording.has_staged(capture_root, t["trial_id"])
     assert r["summary"]["recordings_pending"] == tids
+    prov_path = capture_root / "dataset" / recording.PROVENANCE
+    prov = json.loads(prov_path.read_text())
+    assert all("Input/output error" in prov["episodes"][str(i)]["sync_pending"] for i in range(3))
 
+    # a resume: episode 0's provenance says one frame more than it holds (the verification
+    # refuses it before any sync), the confirmation sync of the others fails: all stay pending
+    prov["episodes"]["0"]["frames"] += 1
+    prov_path.write_text(json.dumps(prov))
     fail.update(on=False, confirm=True)
     rec1 = _resume(runs, rec.parent)
+    prov = json.loads(prov_path.read_text())  # restored: its own count again
+    prov["episodes"]["0"]["frames"] -= 1
+    prov_path.write_text(json.dumps(prov))
     _check_no_rerun(rec1)
     assert rec1["results"]["capture"]["reconciled"]["pending_sync"] == tids
     assert rec1["results"]["capture"]["recoverable_on_resume"] == tids
     assert rec1["results"]["summary"]["recordings_pending"] == tids
     assert not rec1["results"]["summary"]["protocol_complete"]
-    for t in rec1["results"]["trials"]:
-        assert (
-            recording.capture_pending(t["capture"]) and "confirm" in t["capture"]["confirm_error"]
-        )
+    for i, t in enumerate(rec1["results"]["trials"]):
+        why = "frames" if i == 0 else "confirm"
+        assert recording.capture_pending(t["capture"]) and why in t["capture"]["confirm_error"]
         assert recording.has_staged(capture_root, t["trial_id"])
     with pytest.raises(SystemExit, match="PENDING"):
         _export(runs, rec1["path"].parent.name, tmp_path / "export1")
@@ -788,3 +797,70 @@ def test_an_episode_whose_save_sync_failed_stays_pending_until_a_resume_syncs_it
     assert recording.episode_problem(ds_root, 0, frames) == ""
     assert "frames" in recording.episode_problem(ds_root, 0, frames + 1)
     assert "0 metadata rows" in recording.episode_problem(ds_root, 3)
+
+
+def test_an_episode_whose_checkpoint_failed_after_the_save_stays_pending(
+    tmp_path: Path, hard_timeout: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review DR-1 / F1 (PR #32 hold round): episode 2 is saved, then its checkpoint fails
+    (EIO): its block is PENDING like a failed sync (no index claimed, the journal kept, the
+    provenance marked), the summary lists it, the session prints the resume hint and the export
+    refuses. A record that still claims the index with its journal staged (written before the
+    pending block existed) is unconfirmed by the same rule (the summary with the capture root,
+    the export), and a healthy resume confirms it (verified, synced), then the export is
+    COMPLETE."""
+    real_checkpoint = recording.DurableDataset.checkpoint
+    calls = {"n": 0}
+
+    def checkpoint(self: Any) -> None:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise OSError(5, "Input/output error (checkpoint)")
+        real_checkpoint(self)
+
+    monkeypatch.setattr(recording.DurableDataset, "checkpoint", checkpoint)
+    runs = tmp_path / "runs"
+    rec = _new_session(runs, _ckpt(tmp_path))
+    data = json.loads(rec.read_text())
+    r = data["results"]
+    capture_root = runs / r["session"]["session_id"] / "capture"
+    tids = [t["trial_id"] for t in r["trials"]]
+    cap = r["trials"][2]["capture"]
+    assert cap["episode_index"] is None and cap["pending_episode_index"] == 2, cap
+    assert "checkpoint failed" in cap["error"] and recording.capture_pending(cap)
+    assert recording.has_staged(capture_root, tids[2])
+    assert r["summary"]["recordings_pending"] == [tids[2]]
+    assert r["capture"]["recoverable_on_resume"] == [tids[2]]  # the --resume hint
+    prov_path = capture_root / "dataset" / recording.PROVENANCE
+    prov = json.loads(prov_path.read_text())
+    assert "checkpoint failed" in prov["episodes"]["2"]["sync_pending"]
+    with pytest.raises(SystemExit, match="PENDING") as refused:
+        _export(runs, rec.parent.name, tmp_path / "export0")
+    assert tids[2] in str(refused.value)
+
+    # the same episode as a record that claims it (no error beside it), the journal staged
+    r["trials"][2]["capture"] = {
+        k: v for k, v in cap.items() if k not in ("pending_episode_index", "reason", "error")
+    } | {"episode_index": 2}
+    rec.write_text(json.dumps(data))
+    del prov["episodes"]["2"]["sync_pending"]
+    prov_path.write_text(json.dumps(prov))
+    settings, trials = ev.load_prior(rec.parent)
+    assert ev.table(trials, settings, xb._dcfg_stub())["recordings_pending"] == []
+    assert ev.table(trials, settings, xb._dcfg_stub(), capture_root)["recordings_pending"] == [
+        tids[2]
+    ]
+    assert ev.capture_gaps(capture_root, trials)["recoverable_on_resume"] == [tids[2]]
+    with pytest.raises(SystemExit, match="PENDING") as refused:
+        _export(runs, rec.parent.name, tmp_path / "export1")
+    assert tids[2] in str(refused.value)
+
+    monkeypatch.setattr(recording.DurableDataset, "checkpoint", real_checkpoint)
+    rec1 = _resume(runs, rec.parent)
+    scored = _check_no_rerun(rec1)
+    assert rec1["results"]["capture"]["reconciled"]["confirmed"] == [tids[2]]
+    assert sorted(t["capture"]["episode_index"] for t in scored) == [0, 1, 2]
+    assert rec1["results"]["summary"]["recordings_pending"] == []
+    assert not list((capture_root / recording.STAGED_DIR).glob("*"))
+    index = _export(runs, rec1["path"].parent.name, tmp_path / "export2")
+    assert index["status"] == "COMPLETE" and index["episodes"] == 3

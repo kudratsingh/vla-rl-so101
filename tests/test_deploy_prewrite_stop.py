@@ -25,6 +25,7 @@ import errno
 import functools
 import json
 import os
+import shutil
 import signal
 import sys
 from collections.abc import Iterator
@@ -1898,6 +1899,47 @@ def test_a_resume_without_a_recorded_mode_is_refused_before_any_file_changes(
         refused = str(e.code)
     assert _tree_digest(runs) == before, f"the resume changed the session's files ({refused})"
     assert refused is not None and "records no session mode" in refused, refused
+
+
+def test_a_mock_resume_of_a_chain_mixed_before_the_mode_check_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review DR-2 (PR #32 hold round): a hardware run H, then a mock run M that resumed it
+    (5126daa allowed it: M records mode mock, its trials H's hardware). ``--mock --resume M``
+    is refused before anything changes: M's trials disagree with its mode; M relabelled whole
+    mock, H in its chain is hardware; M's record.json lost, the same from its session row."""
+    runs = tmp_path / "runs"
+    hw = _killed_real_session(runs, monkeypatch, "hardware")
+    m = runs / f"{hw.name}-mockresume"
+    shutil.copytree(hw, m)
+    data = json.loads((m / "record.json").read_text())
+    data["results"].update(mode="mock", resumed_from=hw.name)
+    (m / "record.json").write_text(json.dumps(data))
+    rows = [json.loads(line) for line in (m / "metrics.jsonl").read_text().splitlines()]
+    for row in rows:
+        if row.get("kind") == "session":
+            row.update(mode="mock", resumed_from=hw.name)
+    (m / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    argv = ["--preset", "real", "--mock", "--fake-clock", "--max-steps", "6", "--resume",
+            m.name, "--runs-dir", str(runs)]  # fmt: skip
+
+    def refused() -> str:
+        before = _tree_digest(runs)
+        try:
+            ev.main(argv)
+        except SystemExit as e:
+            assert _tree_digest(runs) == before, f"the resume changed files ({e.code})"
+            return str(e.code)
+        raise AssertionError("the mock resume of a mixed chain was not refused")
+
+    assert "records no session mode" in refused()  # M: mode mock, its trials hardware
+    for t in data["results"]["trials"]:
+        t["mode"] = "mock"
+    (m / "record.json").write_text(json.dumps(data))
+    assert f"run {hw.name} records ['hardware']" in refused()  # H, in M's chain
+    (m / "record.json").unlink()
+    assert ev.recorded_mode(m) == "mock"  # the session row's
+    assert f"run {hw.name} records ['hardware']" in refused()
 
 
 def test_precheck_capture_derives_the_sync_policy_from_the_recorded_mode(

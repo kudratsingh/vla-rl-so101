@@ -488,6 +488,24 @@ def test_report_on_two_full_mock_sessions_is_labelled_mock_never_protocol_comple
     out = ev.report([a.parent, b.parent])
     assert out["protocol_complete"] and out["mode"] == "hardware"
     assert "MOCK" not in capsys.readouterr().out
+
+    class Dcfg:
+        latency_target_ms, capture_offset_ms = 150.0, None
+
+    # review DR-3: a full 150-trial session with ONE episode not confirmed durable is not a
+    # protocol table (a pending block, or a 5126daa record: its index beside the sync error)
+    res = _results(a)
+    trials, settings = res["trials"], res["session"]
+    assert ev.table(trials, settings, Dcfg())["protocol_complete"]
+    t0 = next(t for t in trials if t.get("policy_started") and t["outcome"] in ev.SCORED)
+    for cap in (
+        {"episode_index": None, "pending_episode_index": 0},
+        {"episode_index": 0, "sync_error": "OSError: [Errno 5] (the staged journal is kept)"},
+    ):
+        t0["capture"] = cap
+        summ = ev.table(trials, settings, Dcfg())
+        assert summ["complete"] and summ["recordings_pending"] == [t0["trial_id"]]
+        assert not summ["protocol_complete"]
     set_mode(b, "mock")
     with pytest.raises(SystemExit, match="mixes a hardware and a mock session"):
         ev.report([a.parent, b.parent])
