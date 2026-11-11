@@ -179,3 +179,14 @@ def test_intrinsics_script_needs_the_measured_square_and_does_both_cameras(
     front = intr_mod.main([*argv, "--camera", "front", "--square-mm", "23.5", "--dry-run"])
     assert front["board"]["square_mm"] == 23.5
     assert yaml.safe_load(cfg_path.read_text())["cameras"]["front"]["intrinsics"] is None
+    # focus changes the intrinsics: the front camera refuses to write until focus is locked
+    with pytest.raises(SystemExit, match="focus"):
+        intr_mod.main([*argv, "--camera", "front", "--square-mm", "23.5"])
+    assert yaml.safe_load(cfg_path.read_text())["cameras"]["front"]["intrinsics"] is None
+    from src.robot.yamlio import update_yaml_file
+
+    update_yaml_file(cfg_path, ["cameras", "front", "controls", "focus"], 30)
+    front = intr_mod.main([*argv, "--camera", "front", "--square-mm", "23.5"])
+    controls = front["board"]["controls_at_capture"]
+    assert controls["focus"] == 30 and controls["autofocus"] is False
+    assert yaml.safe_load(cfg_path.read_text())["cameras"]["front"]["intrinsics"] == front

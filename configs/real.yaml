@@ -124,6 +124,9 @@ cameras:
                                      # (2000-6500 K per its UVC control list; unverified on this unit)
       gain: null                     # locked gain if the tool exposes it; null = not recorded
       autofocus: false               # the C920x autofocuses: lock focus at the table distance too
+      focus: null                    # the locked focus value (UVC units). Lock it BEFORE the
+                                     # intrinsics (WO-06 step 6): focus changes fx / fy and the
+                                     # distortion; redo the intrinsics if it ever changes
       set_with: null                 # the tool (and version) used to set them on the Mac
   wrist:                             # SO-ARM101 Pro kit 32 mm USB module on the gripper mount
                                      # (3D-printed from the LeRobot SO-101 files if the kit has
@@ -218,9 +221,11 @@ eval:                                # scripts/wo07_real_eval.py
   # (SmolVLA, ~6.3 writes/s) and ~35 s (ACT, ~12.9 writes/s); docs/STATUS.md has the budget.
   trials_per_cell: 50                # = protocol REAL_TRIALS_PER_CELL
   cells: [seen, shifted, unseen_objects]
-  grid: docs/assets/placement-grid-a3.pdf   # scripts/make_placement_grid.py (print at 100%); or
-                                     # placement-grid-tabloid2.pdf (--layout tabloid2): two
-                                     # 11 x 17 in sheets taped (owner kit list 2026-11-10)
+  grid_layout: a3                    # the printed placement grid (scripts/make_placement_grid.py,
+                                     # print at 100%): a3 = docs/assets/placement-grid-a3.pdf, or
+                                     # tabloid2 = placement-grid-tabloid2.pdf (--layout tabloid2,
+                                     # two 11 x 17 in sheets taped; owner kit list 2026-11-10).
+                                     # Every session records the layout and that PDF's sha256
   slot_seed: 0                       # protocol 0.2 only: placement plan (src/eval/real_grid.py).
                                      # The SFT and SFT+RL sessions MUST use the same slot sequence
                                      # (owner 2026-11-08): --hardware refuses any other --slot-seed.

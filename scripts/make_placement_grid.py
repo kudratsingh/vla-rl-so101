@@ -607,7 +607,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     data = layout_bytes(args.layout)
     if args.check:
         if not args.out.is_file() or args.out.read_bytes() != data:
-            print(f"{args.out} is stale: run scripts/make_placement_grid.py --preset real")
+            print(
+                f"{args.out} is stale: run scripts/make_placement_grid.py --preset real "
+                f"--layout {args.layout}"
+            )
             return 1
         print(f"{args.out} is up to date")
         return 0

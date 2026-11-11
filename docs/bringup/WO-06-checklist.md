@@ -58,7 +58,9 @@ not yet cover every item (the recorder is front-only today); the missing code is
   session; spare gripper servo on hand (STS3215 **12 V**, the follower's variant, about $20: still
   to buy, `docs/bringup/kit.md`).
 - One light: the LED clamp lamp set ONCE to 5000 K and never changed. Exposure and white balance
-  locked on both cameras at that light before camera match (step 7); never auto.
+  locked on both cameras at that light, and the C920x focus locked, before the intrinsics (step 6)
+  and the camera match (step 7); never auto. Recorded in `cameras.<name>.controls`; demos and
+  real-0.1 sessions refuse while they are not (`convention.camera_controls_problems`).
 - Shutdown and fault behaviour as merged in #29. Powered steps 9–10 only under supervision.
 
 Agent notes on these items:
@@ -346,8 +348,16 @@ The expected directions come from the sim's FK (`src/env/kinematics.py`) evaluat
 ## 6. Cameras: indices, then checkerboard intrinsics for BOTH 🟢 NO MOTION
 
 Both cameras: the Logitech C920x (FRONT) and the kit's 32 mm module (WRIST), each 640 × 480 at
-30 fps. Do this under the lamp at 5000 K with the controls already locked (step 7, item 3), since
-the intrinsics do not depend on them but the frames are easier to judge at the final light.
+30 fps.
+
+**Do step 7 items 1-4 FIRST** (mount both cameras, set the lamp to 5000 K, lock the controls),
+then come back here. Focus changes the focal length (fx, fy) and the distortion, so the C920x's
+autofocus must be OFF with focus fixed at the table distance before any intrinsics capture, and
+the locked value recorded in `configs/real.yaml` `cameras.front.controls.focus`. The script
+refuses to write the front intrinsics while `autofocus` is not `false` or `focus` is null, and
+records the controls in effect with the result (`intrinsics.board.controls_at_capture`). If the
+focus is ever changed, redo this step. Run the indices first (below), since locking the controls
+needs the right camera.
 
 ```bash
 uv run lerobot-find-cameras opencv          # lists cameras, saves test frames to outputs/captured_images (git-ignored)
@@ -371,7 +381,8 @@ uv run scripts/wo06_camera_intrinsics.py --preset real --camera wrist --images d
 ```
 
 - **Writes:** `cameras.front.index`, `cameras.wrist.index` and `cameras.<camera>.intrinsics`
-  (with `board`: inner corners, squares, the measured `square_mm`, images used) in
+  (with `board`: inner corners, squares, the measured `square_mm`, images used, the controls at
+  capture) in
   `configs/real.yaml`. Frames go to `data/camera_calib/<camera>-<stamp>/` (git-ignored).
 - **Expected:** `board found in N/20 images; reprojection rms <1 px`, then
   `cameras.<camera>: fx=... fy=... full fov H x V deg`, the `board {...}` line, and for the front
@@ -382,7 +393,8 @@ uv run scripts/wo06_camera_intrinsics.py --preset real --camera wrist --images d
   480 px height. A narrower webcam makes the policy pipeline raise, which blocks steps 7 and 9-10.
 - **Why 🟢:** the scripts import no driver and open no bus. They only open the camera through
   `OpenCVFrameSource` (`capture` in `scripts/wo06_camera_intrinsics.py`; `OpenCVFrameSource` in `src/robot/camera.py`).
-- **Report back:** the intrinsics output lines for both cameras, and the measured square size.
+- **Report back:** the intrinsics output lines for both cameras, the measured square size, and the
+  locked C920x focus value.
 
 ## 7. Camera placement and the sim/real match
 
@@ -408,18 +420,25 @@ uv run scripts/wo06_camera_intrinsics.py --preset real --camera wrist --images d
 4. **Lock exposure and white balance on BOTH cameras** at that light: manual exposure, manual
    white balance at 5000 K where the camera exposes it (the C920x does: a UVC white-balance
    temperature, 2000-6500 K per its UVC control list; unverified on this unit), autofocus off on
-   the C920x with focus set at the table distance, fixed gain. On the Mac, OpenCV's AVFoundation
+   the C920x with focus set at the table distance (record it as `cameras.front.controls.focus`;
+   step 6 needs it), fixed gain. On the Mac, OpenCV's AVFoundation
    backend (LeRobot's `OpenCVCamera`) cannot set these UVC controls, so set them with a UVC
    controls tool and write the locked values into `configs/real.yaml` `cameras.front.controls`
-   and `cameras.wrist.controls` (`exposure`, `white_balance_k`, `gain`, `set_with`; null means
-   not locked). If the wrist module has no white-balance temperature control, set its
+   and `cameras.wrist.controls` (`exposure`, `white_balance_k`, `gain`, `focus` (front),
+   `set_with`; null means not locked). A real-0.1 session and the demo schedule refuse while
+   either camera's auto exposure / auto white balance is not `false`, its `exposure` or
+   `set_with` is null, or the front's `autofocus` is not `false` / `focus` is null
+   (`src/robot/convention.py` `camera_controls_problems`). If the wrist module has no white-balance temperature control, set its
    `white_balance_k: null` and record what it does lock. Check after a replug or reboot that
    the controls stayed locked (some tools reset on reconnect); re-apply them every session if not.
 5. **White on white (risk).** The table is all white and the cup is white: the cup rim is low
    contrast for both cameras. With the cup on its mark (only after the freeze; until then a cup
    on a plain white sheet off the grid), check in BOTH cameras' frames, under the 5000 K lamp
    with the controls locked, that the cup rim is clearly visible all the way round (the front
-   camera at its pose; the wrist camera from the carry height above the cup). If it is not,
+   camera at its pose; the wrist camera from the carry height above the cup: hold the limp arm
+   there by hand, torque off). Save one frame per camera with
+   `uv run lerobot-find-cameras opencv` (it writes a test frame of every camera to
+   `outputs/captured_images`, git-ignored). If it is not,
    adjust the lamp position or the locked exposure once, re-record them, and report it; do not
    change the table or the cup.
 
@@ -470,10 +489,13 @@ uv run scripts/wo06_camera_match.py --preset real --with-arm --task PickPlace   
   unsupported arm): if any servo is torqued it refuses with `follower torque is ON ...`. Then
   run step 5's `verify` (it asks you to support the arm before torque goes off) or power-cycle the
   servo supply, and retry. You pose the limp arm by hand.
-- **Gate for `docs/STATUS.md`** (WO-06 deliverable 4): camera match passed for the front camera
-  (C920x on the magic arm) at `front_left_45` and for the wrist module on its gripper mount, with
-  the lamp at 5000 K, exposure and white balance locked on both cameras (Hardware floor), and the
-  white cup rim visible in both cameras (item 5). The OFT-era randomization retrain decision is
+- **Gate for `docs/STATUS.md`** (WO-06 deliverable 4): camera match (7a / 7b) passed for the
+  front camera (C920x on the magic arm) at `front_left_45`; the wrist module mounted on its
+  gripper mount, its intrinsics done (step 6), its controls locked and the cup rim visible in a
+  saved wrist frame (item 5; `scripts/wo06_camera_match.py` matches the front camera only, the sim
+  has no wrist camera until WO-08, so there is no wrist blend yet); the lamp at 5000 K, exposure
+  and white balance locked on both cameras (Hardware floor), and the white cup rim visible in
+  both cameras' saved frames (item 5). The OFT-era randomization retrain decision is
   dropped (WO-06 work order, Notes).
 - **Report back:** the PNG and JSON paths, `mean_abs_diff`, a screenshot of one blend, whether
   any object was on the table (and if so, that the freeze was committed first), the locked
@@ -808,9 +830,9 @@ trips before the prompt waits.
 | 2b | `voltage` table + verdict per arm (follower ~12 V, leader ~5 V) |
 | 3-4 | `check` table + effective limits |
 | 5 | verify lines (middle pose, resting pose) + any `robot.units` change; rest pose supported with torque off (y/n), park path clear (y/n), whether you set `robot.park.enabled: true` |
-| 6 | intrinsics lines for front AND wrist (fx, fy, rms, crop window for the front, any WARNING), the measured square size |
-| 7 | camera-match PNG/JSON paths, `mean_abs_diff`, objects on the table (none before the freeze), camera-match gate (C920x at `front_left_45`, wrist module mounted, lamp at 5000 K and its position of record, exposure / white balance locked on both, cup rim visible in both) |
+| 6 | intrinsics lines for front AND wrist (fx, fy, rms, crop window for the front, any WARNING), the measured square size, the locked C920x focus |
+| 7 | camera-match PNG/JSON paths, `mean_abs_diff`, objects on the table (none before the freeze), camera-match gate (C920x at `front_left_45` matched; wrist module mounted, intrinsics done, rim visible in a saved wrist frame; lamp at 5000 K and its position of record, exposure / white balance locked on both, one saved frame per camera showing the cup rim) |
 | 8 | leader vs follower verify lines for the same pose |
 | 9 | rehearsal log (incl. the `Max_Temperature_Limit` line, any `TORQUE ENABLE REFUSED` / `SERVO FAULT` / `TORQUE OFF UNCONFIRMED`), end-of-session servo temperatures, whether a cube slips at the -5 deg gripper floor, anything unexpected |
 | 10 | `saved N episodes`, per-task notes, Hub URL if pushed |
-| Hardware floor | wrist + front camera indices and settings (640 × 480, 30 fps), locked exposure / white balance values, P gain read back from the servos, drift-check lines for the session, spare 12 V gripper servo on hand (y/n) |
+| Hardware floor | wrist + front camera indices and settings (640 × 480, 30 fps), locked exposure / white balance / focus values, P gain read back from the servos, drift-check lines for the session, spare 12 V gripper servo on hand (y/n) |

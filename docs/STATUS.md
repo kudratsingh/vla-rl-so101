@@ -2011,7 +2011,7 @@ PDF unchanged; no regenerated PDF committed).
   10 mm), cube-to-rim clearance +1.13 cm, carry over the rim +2.03 cm; the unchanged-oracle (urdf)
   variant clips wrist_flex in carry (3.3 deg, 6 slots) and retreat (5.0 deg, 25 slots), as with
   the 3 cm cube.
-- **Scene facts as hash inputs** (`SCENE` via `scene_spec()`): table all white; one 17-inch LED
+- **Scene facts as hash inputs** (`scene_spec()`): table all white; one 17-inch LED
   clamp lamp set ONCE to 5000 K, position recorded at the camera match; exposure / white balance
   locked on both cameras; C920x on the NEEWER UA057 magic arm at `front_left_45` (eye and target
   read from `src/env/cameras.py`); 32 mm wrist module on the gripper mount. **New real-0.1 hash
@@ -2074,6 +2074,55 @@ PDF unchanged; no regenerated PDF committed).
 - **Gates:** full pytest 657 passed + 1 skipped (651 + 6 new); `ruff check src tests scripts`,
   `black --check .`, `mypy --strict src` clean. `src/eval/protocol.py`, `protocol_v02.py` and
   `src/env/**` unchanged; the committed A3 PDF still matches the drawing except the hash prefix.
+
+### PR 2: owner kit list, review fixes (branch `feat/smolvla-real-kit`, 2026-11-10, $0)
+
+The review's confirmed findings on the kit commit, all applied. The freeze stays PENDING
+(`FREEZE_STATUS`, `BOWL_XY_M`, `RUBRIC_VERSION`, the committed A3 PDF unchanged; no PDF
+regenerated). `feat/smolvla-real` (the F_FULLFSYNC commits, up to `0edfe69`) is merged in; the
+STATUS conflict is resolved by keeping both entries, F_FULLFSYNC first.
+
+- **Rim and floor fail the bowl check.** `bowl_fit.geometry_problems()`: a measurement out of
+  range, no release disc, the carry through the rim (`carry_rim_clearance_m` < 0) or the oracle's
+  lower into the cup's floor (new `lower_floor_clearance_m` < 0) fails the check at every
+  position; a nearest-slot cube that overlaps the rim (`cube_rim_clearance_m` < 0) fails that
+  position. `scripts/wo07_bowl_check.py` folds them into `passes_carry_and_bowl_phases` and
+  `_verdict` (`FAIL (...)`), keeps the kinematic result as `kinematic_phases_ok`, records
+  `geometry_problems` (top level, per bowl, in the search) and prints `PROBLEM` lines. Test: a
+  60 mm cup (carry through the rim) and a footed cup (floor 25 mm) both FAIL at B' while every
+  phase passes.
+- **Fifth measurement: the cup's inside-floor height** (`bowl_table_to_inside_floor_height_mm`,
+  table top to the top of the inside floor). It feeds `geometry().floor_height_m`, the release
+  height in the kinematic scene and the lower-over-floor clearance; pending, the sim floor (6 mm)
+  stands in, labelled. `kit.md`, WO-07 and the blocker line list five measurements now.
+- **Ranges.** `protocol_real.measurement_problems()`: cube edge 20-30 mm, floor wider than the
+  cube's diagonal, rim 30-250 mm and wider than the floor, rim height 20-120 mm, floor height
+  0-40 mm and below the rim. `freeze_problem()` refuses while any holds (a value in inches or cm
+  never freezes).
+- **Deferred judging text uses the real props.** `JUDGING_RULE["Push"]`: the 2-inch (50.8 mm)
+  matte black disc; `["Stack"]`: centred within half the cube edge (~12.7 mm nominal); both
+  marked deferred (not judged in real-0.1). Only PickPlace's text is a hash input, so the hash
+  moves through the new measurement field only; `judging_rule_sha256` moves with the text.
+- **Camera controls checked, focus before intrinsics.** `convention.camera_controls_problems()`:
+  a real-0.1 session (`real_hardware_problems`) and the demo schedule refuse while either camera's
+  auto exposure / auto white balance is not false, its `exposure` or `set_with` is null, or the
+  C920x's `autofocus` is not false / `focus` (new field) is null. Checklist step 6 now says to do
+  step 7 items 1-4 first (focus changes fx / fy and the distortion); the intrinsics script refuses
+  to write the front intrinsics while focus is not locked and records the controls in
+  `intrinsics.board.controls_at_capture`. The wrong "step 7, item 3" reference is gone.
+- **Wrist gate.** The step 7 gate no longer asks for a wrist camera match (the script and the sim
+  have only the front camera until WO-08): the wrist is mounted, calibrated, locked and shows the
+  rim in a saved frame (`lerobot-find-cameras opencv`).
+- **Printed grid recorded.** `configs/real.yaml` `eval.grid_layout: a3 | tabloid2` replaces the
+  comment-only `eval.grid`; every session records `grid_layout`, `grid_pdf` and that PDF's
+  sha256 (`wo07_real_eval.grid_pdf_fields`), and a hardware session refuses while the selected
+  PDF is not generated. `make_placement_grid.py --check` names the layout in its stale hint.
+- **`SCENE` citations** replaced by `scene_spec()` (protocol docstring, `kit.md`, here).
+- **New real-0.1 hash (pending): `da110112b5d06c9b4a1f17cea62547defc8cad7f63de3ec98d1f9caa9511d4ab`**
+  (was `1d5674420b6d`; the new measurement field). Pin updated; schedules, slots, seeds and the
+  bowl position unchanged. The interim B' numbers above are unchanged (the pending floor height
+  is the sim's, as before).
+- **Gates:** full pytest 677 passed + 1 skipped (674 after the merge + 3 new); `ruff check src tests scripts`, `black --check .`, `mypy --strict src` clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/**` unchanged; no PDF regenerated.
 
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
@@ -2195,9 +2244,12 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
 
 ## Blockers and decisions pending the owner
 
-- 2026-11-10 kit list: the four prop measurements (red cube edge; cup outer rim diameter, inside
-  floor diameter, table-to-rim height) are PENDING in `src/eval/protocol_real.py` `MEASURED`;
-  `freeze_problem()` refuses until they are in. Then: fill `MEASURED`, rerun
+- 2026-11-10 kit list: the five prop measurements (red cube edge; cup outer rim diameter, inside
+  floor diameter, table-to-rim height, table-to-inside-floor height) are PENDING in
+  `src/eval/protocol_real.py` `MEASURED` (mm); `freeze_problem()` refuses until they are in and
+  in range. The camera controls (exposure, white balance, C920x focus) are also still to be
+  locked and recorded (`configs/real.yaml` `cameras.<name>.controls`; demos and sessions refuse
+  until then). Then: fill `MEASURED`, rerun
   `scripts/wo07_bowl_check.py --preset real --search` with the real cup, and freeze together with
   the B' fit check. Risk to watch at the camera match: the white cup rim on the white table
   (checklist step 7 item 5). Still to buy: the spare 12 V gripper servo and, if the kit has none,

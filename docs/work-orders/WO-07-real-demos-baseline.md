@@ -35,9 +35,11 @@ demos; 50 binary trials per cell (seen, shifted, unseen) for each; immutable exp
   real-0.1).
 - **Unseen objects:** the set's purple cube and green cube, never in a demo or a camera-match
   frame. They replace the green cylinder for the real arm.
-- **Bowl:** a LE TAUCI 8 oz bouillon cup, white. Its outer rim diameter, inside floor diameter
-  and table-to-rim height are PENDING measurements in one place (`src/eval/protocol_real.py`
-  `MEASURED`): the freeze refuses until they are in, and the bowl checks read them.
+- **Bowl:** a LE TAUCI 8 oz bouillon cup, white. Its outer rim diameter, inside floor diameter,
+  table-to-rim height and table-to-inside-floor height are PENDING measurements in one place
+  (`src/eval/protocol_real.py` `MEASURED`, mm): the freeze refuses until they are in and in range,
+  and the bowl checks read them (a carry through the rim or a lower into the floor fails the
+  check).
 - **Scene:** all-white table; one LED clamp lamp set once to 5000 K; exposure and white balance
   locked on both cameras; C920x front camera at the sim pose; 32 mm wrist module. These are
   real-0.1 hash inputs. Risk: the white cup on the white table is low contrast; the camera match

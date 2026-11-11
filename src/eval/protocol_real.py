@@ -44,13 +44,14 @@ colour differs. The set's BLUE cube is recorded as the seen Stack base (``STACK_
 is deferred, so it is unused in real-0.1. The sim keeps its 3 cm cubes (protocol 0.2 frozen).
 
 Bowl. The LE TAUCI 8 oz bouillon cup, white (set of 6: one is the bowl, the others spares). Its
-outer rim diameter, inside floor diameter and table-to-rim height are PENDING measurements
-(``MEASURED``); ``src/eval/bowl_fit.py`` reads them for the release window, the cube-to-rim and
-carry-over-rim clearances, and falls back to the sim bowl's geometry, labelled as a fallback, while
-they are pending. Filling ``MEASURED`` is the one edit before the geometry rerun
+outer rim diameter, inside floor diameter, table-to-rim height and table-to-inside-floor height are
+PENDING measurements (``MEASURED``); ``src/eval/bowl_fit.py`` reads them for the release window,
+the cube-to-rim, carry-over-rim and lower-over-floor clearances and the release height, and falls
+back to the sim bowl's geometry, labelled as a fallback, while they are pending.
+``measurement_problems()`` range-checks them (mm, plausible for a 1-inch cube and an 8 oz cup). Filling ``MEASURED`` is the one edit before the geometry rerun
 (``scripts/wo07_bowl_check.py``).
 
-Scene (owner kit list 2026-11-10; hash inputs, ``SCENE``): table surface all white; one 17-inch LED
+Scene (owner kit list 2026-11-10; hash inputs, ``scene_spec()``): table surface all white; one 17-inch LED
 clamp desk lamp set ONCE to 5000 K and never changed (its position recorded at the camera match,
 WO-06 step 7); exposure and white balance locked on both cameras at that light
 (``configs/real.yaml`` ``cameras.<name>.controls``); the front camera a Logitech C920x on a NEEWER
@@ -101,7 +102,8 @@ placement-grid PDF stay as they are, the hash pinned in the test is the current 
 (it moved with real-judge-3), and ``freeze_problem()`` makes every hardware session and the demo
 schedule refuse (scripts/wo07_real_eval.py ``real_hardware_problems``, scripts/wo06_teleop_record.py
 ``--demo-schedule``), next to ``bowl_fit.bowl_box_problem``. ``freeze_problem()`` also refuses
-while any prop measurement in ``MEASURED`` is None, even with ``FREEZE_STATUS`` set to ``FROZEN``.
+while any prop measurement in ``MEASURED`` is None or out of range (``measurement_problems``),
+even with ``FREEZE_STATUS`` set to ``FROZEN``.
 The freeze fills ``MEASURED``, sets ``FREEZE_STATUS`` to ``FROZEN``, moves the bowl, bumps the
 rubric and regenerates the PDF and the hash together.
 """
@@ -166,14 +168,46 @@ class PropMeasurements:
     bowl_outer_rim_diameter_mm: float | None = None  # across the outside of the rim
     bowl_inside_floor_diameter_mm: float | None = None  # the flat inside floor
     bowl_table_to_rim_height_mm: float | None = None  # table top to the rim's top edge
+    # table top to the top of the inside floor (a footed cup's floor sits above the table): the
+    # height the cube is released onto (bowl_fit.geometry floor_height_m)
+    bowl_table_to_inside_floor_height_mm: float | None = None
 
 
-MEASURED = PropMeasurements()  # PENDING: the owner sends the four numbers (2026-11-10)
+MEASURED = PropMeasurements()  # PENDING: the owner sends the five numbers (2026-11-10)
 
 
 def pending_measurements() -> list[str]:
     """The names of the prop measurements still None (empty once all are measured)."""
     return [f.name for f in fields(MEASURED) if getattr(MEASURED, f.name) is None]
+
+
+def measurement_problems(m: PropMeasurements | None = None) -> list[str]:
+    """Out-of-range or inconsistent measured values (mm; a value in inches or cm, or a cup the
+    1-inch cube cannot sit in). Pending (None) values are not checked here."""
+    m = MEASURED if m is None else m
+    out: list[str] = []
+    edge = m.red_cube_edge_mm
+    rim, floor = m.bowl_outer_rim_diameter_mm, m.bowl_inside_floor_diameter_mm
+    h_rim, h_floor = m.bowl_table_to_rim_height_mm, m.bowl_table_to_inside_floor_height_mm
+    if edge is not None and not 20.0 <= edge <= 30.0:
+        out.append(f"red_cube_edge_mm {edge} not in [20, 30] mm (a 1-inch cube is ~25.4 mm)")
+    diag = (CUBE_EDGE_NOMINAL_MM if edge is None else edge) * 2.0**0.5
+    if floor is not None and not diag < floor <= 200.0:
+        out.append(
+            f"bowl_inside_floor_diameter_mm {floor} not in ({diag:.1f}, 200] mm (more than the "
+            "cube's diagonal, or the cube cannot lie flat on it at every yaw)"
+        )
+    if rim is not None and not 30.0 <= rim <= 250.0:
+        out.append(f"bowl_outer_rim_diameter_mm {rim} not in [30, 250] mm")
+    if rim is not None and floor is not None and rim <= floor:
+        out.append(f"bowl_outer_rim_diameter_mm {rim} <= the inside floor diameter {floor} mm")
+    if h_rim is not None and not 20.0 <= h_rim <= 120.0:
+        out.append(f"bowl_table_to_rim_height_mm {h_rim} not in [20, 120] mm")
+    if h_floor is not None and not 0.0 <= h_floor <= 40.0:
+        out.append(f"bowl_table_to_inside_floor_height_mm {h_floor} not in [0, 40] mm")
+    if h_rim is not None and h_floor is not None and h_floor >= h_rim:
+        out.append(f"bowl_table_to_inside_floor_height_mm {h_floor} >= the rim height {h_rim} mm")
+    return out
 
 
 def cube_edge_mm() -> tuple[float, str]:
@@ -206,6 +240,7 @@ def bowl_spec() -> dict[str, Any]:
         "outer_rim_diameter_mm": MEASURED.bowl_outer_rim_diameter_mm,  # None = PENDING
         "inside_floor_diameter_mm": MEASURED.bowl_inside_floor_diameter_mm,  # None = PENDING
         "table_to_rim_height_mm": MEASURED.bowl_table_to_rim_height_mm,  # None = PENDING
+        "table_to_inside_floor_height_mm": MEASURED.bowl_table_to_inside_floor_height_mm,
         "colour": "white",
         "fixed": "the same cup at the same marked position for every demo and every trial",
     }
@@ -325,13 +360,17 @@ JUDGING_GENERAL = (
     "input, no answer in deploy.prompt_torque_timeout_s) scores it n. An attempt whose policy "
     "never started is not scored and is redone with the same placement."
 )
-JUDGING_RULE: dict[str, str] = {  # mirrors src/env/success.py, read only
+# The success conditions of src/env/success.py (read only), with the REAL props' sizes (owner kit
+# list 2026-11-10). Only PickPlace is judged in real-0.1; Push and Stack are deferred.
+JUDGING_RULE: dict[str, str] = {
     "PickPlace": "the object rests inside the bowl (over the bowl floor, below the rim), the bowl "
     "is upright, and the object touches neither gripper jaw",
-    "Push": "the object's centre is inside the 5 cm target disc, the object is on the table, it "
-    "was never lifted off the table during the trial, and the gripper is not holding it",
-    "Stack": "the object rests on top of the blue cube (centred within ~1.5 cm, flat), the blue "
-    "cube is still on the table, and the object touches neither gripper jaw",
+    "Push": "(deferred: not judged in real-0.1) the object's centre is inside the 2-inch (50.8 mm) "
+    "matte black target disc, the object is on the table, it was never lifted off the table "
+    "during the trial, and the gripper is not holding it",
+    "Stack": "(deferred: not judged in real-0.1) the object rests on top of the blue cube (centred "
+    f"within half the cube edge, ~{cube_edge_mm()[0] / 2:.1f} mm, flat), the blue cube is still on "
+    "the table, and the object touches neither gripper jaw",
 }
 RUBRIC_ID = "so101-real-pickplace-rubric"
 RUBRIC_VERSION = "1"
@@ -342,7 +381,8 @@ def freeze_problem() -> str | None:
     """Why no demo or hardware session may use this protocol yet (None once it is frozen and
     every prop measurement is in)."""
     pending = pending_measurements()
-    if FREEZE_STATUS == FROZEN and not pending:
+    bad = measurement_problems()
+    if FREEZE_STATUS == FROZEN and not pending and not bad:
         return None
     parts = []
     if FREEZE_STATUS != FROZEN:
@@ -355,6 +395,11 @@ def freeze_problem() -> str | None:
         parts.append(
             f"protocol {PROTOCOL_VERSION} prop measurements PENDING: {', '.join(pending)} "
             "(src/eval/protocol_real.py MEASURED; the owner's bench measurements)"
+        )
+    if bad:
+        parts.append(
+            f"protocol {PROTOCOL_VERSION} prop measurements out of range: {'; '.join(bad)} "
+            "(src/eval/protocol_real.py MEASURED, in mm)"
         )
     return "; ".join(parts)
 

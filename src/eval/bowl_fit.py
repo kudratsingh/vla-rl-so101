@@ -19,8 +19,8 @@ box; it changes neither (nothing here is a protocol hash input, and the filter i
 Prop geometry (owner kit list 2026-11-10). ``geometry()`` is the cube and cup geometry every check
 here and in ``scripts/wo07_bowl_check.py`` uses, read from ONE place,
 ``protocol_real.MEASURED`` (the owner's measurements): the cube half-edge (measured, else the
-hand2mind set's nominal 25.4 mm), the cup's inside floor radius, outer rim radius and
-table-to-rim height. While a cup measurement is pending the sim bowl's value stands in
+hand2mind set's nominal 25.4 mm), the cup's inside floor radius, outer rim radius, table-to-rim
+height and table-to-inside-floor height. While a cup measurement is pending the sim bowl's value stands in
 (``src/env/success.py``, read only) and its ``sources`` entry says ``PENDING ... sim fallback``,
 so no number derived from it is the real cup's. From it:
 
@@ -30,7 +30,14 @@ so no number derived from it is the real cup's. From it:
   the 5 mm tolerance closer (cube only: the open jaws reach further, not modelled);
 * ``carry_rim_clearance_m``: how far the cube's bottom passes above the rim at the sim oracle's
   carry height (``src/data/oracle.py`` ``CARRY_Z``, the TCP ~3 mm above the cube centre after
-  the descend); < 0 means the oracle's carry would drag the cube through the rim.
+  the descend); < 0 means the oracle's carry would drag the cube through the rim;
+* ``lower_floor_clearance_m``: the cube's bottom above the cup's inside floor at the end of the
+  oracle's lower (its target: the cube bottom ``BOWL_FLOOR_THICKNESS + 12 mm`` above the table,
+  ``src/data/oracle.py`` "lower"); < 0 means the lower would drive the cube into the floor.
+
+``geometry_problems`` turns these (and ``protocol_real.measurement_problems``) into the bowl
+check's verdict: any entry fails the check (``scripts/wo07_bowl_check.py``), whatever the
+kinematic phases say, because the kinematic scene models neither the rim nor the floor.
 """
 
 from __future__ import annotations
@@ -51,6 +58,8 @@ TCP_TO_BOWL_OFFSET_M = 0.0093
 TOLERANCE_M = PR.BOWL_MARGIN_M  # the operator's placement tolerance (5 mm), as derive_bowl
 # the oracle's descend stops the TCP this far above the cube centre (src/data/oracle.py "descend")
 TCP_ABOVE_CUBE_CENTRE_M = 0.003
+# the oracle's lower stops the cube bottom this far above the sim floor (src/data/oracle.py "lower")
+LOWER_DROP_M = 0.012
 PENDING_FALLBACK = "PENDING measurement: sim bowl fallback (src/env/success.py)"
 
 
@@ -62,7 +71,9 @@ class PropGeometry:
     floor_radius_m: float
     rim_radius_m: float  # outer rim
     rim_height_m: float  # table top to the rim's top edge
+    floor_height_m: float  # table top to the top of the inside floor (where the cube lands)
     sources: dict[str, str]
+    problems: tuple[str, ...] = ()  # protocol_real.measurement_problems of the measurements used
 
     @property
     def measured(self) -> bool:
@@ -74,8 +85,10 @@ class PropGeometry:
             "floor_radius_m": round(self.floor_radius_m, 5),
             "rim_radius_m": round(self.rim_radius_m, 5),
             "rim_height_m": round(self.rim_height_m, 5),
+            "floor_height_m": round(self.floor_height_m, 5),
             "sources": dict(self.sources),
             "all_measured": self.measured,
+            "measurement_problems": list(self.problems),
         }
 
 
@@ -112,7 +125,14 @@ def geometry(m: PR.PropMeasurements | None = None) -> PropGeometry:
         ),
         rim_radius_m=pick("rim_radius_m", m.bowl_outer_rim_diameter_mm, sim_rim_r, 0.5),
         rim_height_m=pick("rim_height_m", m.bowl_table_to_rim_height_mm, sim_rim_h, 1.0),
+        floor_height_m=pick(
+            "floor_height_m",
+            m.bowl_table_to_inside_floor_height_mm,
+            S.BOWL_FLOOR_THICKNESS,
+            1.0,
+        ),
         sources=src,
+        problems=tuple(PR.measurement_problems(m)),
     )
 
 
@@ -134,6 +154,40 @@ def carry_rim_clearance_m(g: PropGeometry | None = None) -> float:
 
     g = geometry() if g is None else g
     return CARRY_Z - TCP_ABOVE_CUBE_CENTRE_M - g.cube_half_m - g.rim_height_m
+
+
+def lower_floor_clearance_m(g: PropGeometry | None = None) -> float:
+    """Cube bottom above the cup's inside floor at the end of the oracle's lower (< 0: into it)."""
+    from src.env import success as S  # read only
+
+    g = geometry() if g is None else g
+    return S.BOWL_FLOOR_THICKNESS + LOWER_DROP_M - g.floor_height_m
+
+
+def geometry_problems(g: PropGeometry | None = None) -> list[str]:
+    """Why the prop geometry fails the bowl check whatever the bowl position (empty = none):
+    out-of-range measurements, no release disc, the carry through the rim, the lower into the
+    floor. The position-dependent cube-to-rim clearance is checked per bowl."""
+    g = geometry() if g is None else g
+    out = [f"measurement: {p}" for p in g.problems]
+    if release_radius_m(g) <= 0:
+        out.append(
+            f"release radius {1000 * release_radius_m(g):+.1f} mm: the inside floor is narrower "
+            "than the cube"
+        )
+    c = carry_rim_clearance_m(g)
+    if c < 0:
+        out.append(
+            f"carry through the rim: the cube's bottom passes {100 * c:+.2f} cm over the rim at the "
+            "oracle's carry height (src/data/oracle.py CARRY_Z)"
+        )
+    f = lower_floor_clearance_m(g)
+    if f < 0:
+        out.append(
+            f"lower into the floor: the oracle's lower ends with the cube's bottom {100 * f:+.2f} "
+            "cm over the cup's inside floor"
+        )
+    return out
 
 
 def workspace_box(cfg: Mapping[str, Any]) -> dict[str, tuple[float, float]]:

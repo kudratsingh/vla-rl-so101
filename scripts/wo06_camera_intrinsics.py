@@ -12,7 +12,11 @@ it is recorded with the result (``intrinsics.board``). Run it once per camera, o
     uv run scripts/wo06_camera_intrinsics.py --preset real --camera front --square-mm <measured> --images DIR
 
 Captures must be at the streaming resolution (cameras.<camera> width x height), under the 5000 K
-lamp with the camera's exposure and white balance already locked (WO-06 checklist step 6). Vary the
+lamp with the camera's exposure, white balance and (C920x) focus already locked (WO-06 checklist
+step 7 items 1-4 come BEFORE step 6): focus changes fx / fy and the distortion, so the front camera
+refuses to write intrinsics while ``cameras.front.controls.autofocus`` is not false or ``focus`` is
+null, and the controls in effect are recorded (``intrinsics.board.controls_at_capture``). Redo the
+intrinsics if the focus ever changes. Vary the
 board pose between captures: near/far, tilted ~30 deg each way, and covering every image corner
 (the wrist module: hold the board in front of the gripper). Writes
 ``cameras.<camera>.intrinsics`` (fx, fy, cx, cy in px; OpenCV dist k1 k2 p1 p2 k3; rms_px; the board
@@ -108,6 +112,18 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         parser.error(f"--square-mm {args.square_mm}: measure the printed square, in mm")
     cfg = load_config(args.preset, args.config)
     cam_cfg = cfg["cameras"][args.camera]
+    controls = dict(cam_cfg.get("controls") or {})
+    if args.camera == "front" and (
+        controls.get("autofocus") is not False or controls.get("focus") is None
+    ):
+        msg = (
+            "cameras.front.controls: autofocus must be false and the locked focus recorded "
+            "(focus) BEFORE the intrinsics: focus changes fx / fy and the distortion (WO-06 step 7 "
+            "item 4 comes before step 6)"
+        )
+        if not args.dry_run:
+            sys.exit(f"refusing to write intrinsics: {msg}")
+        print(f"WARNING {msg}")
     cols, rows = (int(v) for v in args.pattern.lower().split("x"))
     pattern = (cols, rows)
 
@@ -148,6 +164,8 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         "square_mm": round(float(args.square_mm), 3),
         "square_source": "measured by the owner (--square-mm)",
         "images_used": int(sum(found)),
+        # the camera controls (focus, exposure, white balance) these intrinsics were taken under
+        "controls_at_capture": controls,
     }
     print(f"board {out['board']}")
     if args.dry_run:

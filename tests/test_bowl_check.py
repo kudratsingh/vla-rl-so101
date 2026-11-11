@@ -126,8 +126,9 @@ def test_prop_geometry_reads_the_one_measurement_place() -> None:
     g = BF.geometry()
     assert g.cube_half_m == pytest.approx(0.0127) and not g.measured
     assert "NOMINAL" in g.sources["cube_half_m"]
-    for k in ("floor_radius_m", "rim_radius_m", "rim_height_m"):
+    for k in ("floor_radius_m", "rim_radius_m", "rim_height_m", "floor_height_m"):
         assert g.sources[k].startswith("PENDING")
+    assert g.floor_height_m == pytest.approx(0.006)  # the sim floor stands in
     assert g.rim_height_m == pytest.approx(0.036)  # sim wall 30 + floor 6 mm stands in
     assert bc.GEOMETRY == g and bc.CUBE_HALF_M == g.cube_half_m
     # the oracle's carry: TCP 72 mm, cube centre 3 mm below it, half-edge 12.7 mm, sim rim 36 mm
@@ -137,6 +138,7 @@ def test_prop_geometry_reads_the_one_measurement_place() -> None:
         bowl_outer_rim_diameter_mm=110.0,
         bowl_inside_floor_diameter_mm=70.0,
         bowl_table_to_rim_height_mm=60.0,
+        bowl_table_to_inside_floor_height_mm=8.0,
     )
     gm = BF.geometry(m)
     assert gm.measured and gm.to_dict()["all_measured"]
@@ -150,3 +152,26 @@ def test_prop_geometry_reads_the_one_measurement_place() -> None:
     assert BF.carry_rim_clearance_m(gm) < 0  # a 60 mm cup: the oracle's carry hits the rim
     d = 0.0983  # B' to its nearest slot
     assert BF.cube_rim_clearance_m(d, gm) == pytest.approx(d - 0.055 - 0.0125 * 2**0.5 - 0.005)
+    assert any("carry through the rim" in p for p in BF.geometry_problems(gm))
+    assert BF.lower_floor_clearance_m(gm) == pytest.approx(0.006 + 0.012 - 0.008)
+
+
+def test_a_tall_or_footed_cup_fails_the_bowl_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review F1 / F4: the kinematic scene models neither the rim nor the floor, so a measured cup
+    whose rim the oracle's carry passes through, or whose inside floor sits above the oracle's
+    lower, FAILS the check at a bowl whose phases all pass."""
+    cfg = load_config("real")
+    fk = load_sim_fk()
+    assert BF.geometry_problems() == []  # the pending fallback (sim bowl, 25.4 mm cube) is clear
+    ok = bc.check_bowl(cfg, (0.205, 0.185), ["C4"], [0.0], fk, "safety")
+    assert ok["passes_carry_and_bowl_phases"] and bc._verdict(ok) == "pass"
+    tall = BF.geometry(PR.PropMeasurements(25.4, 110.0, 70.0, 60.0, 6.0))
+    footed = BF.geometry(PR.PropMeasurements(25.4, 110.0, 70.0, 45.0, 25.0))
+    for g, what in ((tall, "carry through the rim"), (footed, "lower into the floor")):
+        monkeypatch.setattr(bc, "GEOMETRY", g)
+        v = bc.check_bowl(cfg, (0.205, 0.185), ["C4"], [0.0], fk, "safety")
+        assert v["kinematic_phases_ok"] and not v["passes_carry_and_bowl_phases"]
+        assert any(what in p for p in v["geometry_problems"])
+        assert bc._verdict(v).startswith("FAIL (") and what in bc._verdict(v)
+    # the release lands on the measured floor, not the sim's
+    assert footed.floor_height_m == pytest.approx(0.025)

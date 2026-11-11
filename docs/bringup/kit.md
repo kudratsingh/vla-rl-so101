@@ -7,7 +7,8 @@ The items used for training, runs and evaluation on the real arm. This is the ow
 servo bus (checklist step 2b). The table surface is all white.
 
 Measured values still to come from the owner (until then they are PENDING in ONE place,
-`src/eval/protocol_real.py` `MEASURED`, and `freeze_problem()` refuses the freeze):
+`src/eval/protocol_real.py` `MEASURED`, in mm; `freeze_problem()` refuses the freeze while any is
+missing or out of range, `measurement_problems()`):
 
 | Measurement | Field | Today |
 |---|---|---|
@@ -15,11 +16,14 @@ Measured values still to come from the owner (until then they are PENDING in ONE
 | Cup outer rim diameter | `bowl_outer_rim_diameter_mm` | PENDING |
 | Cup inside floor diameter | `bowl_inside_floor_diameter_mm` | PENDING |
 | Table top to cup rim height | `bowl_table_to_rim_height_mm` | PENDING |
+| Table top to the cup's inside floor (rim height less the inside depth; a footed cup's floor sits above the table) | `bowl_table_to_inside_floor_height_mm` | PENDING |
 | Unpowered fit check of bowl B' (jaws and cube at the bowl and at C1, D1, B2, E2) | `FREEZE_STATUS` | PENDING |
 
 Filling `MEASURED` is the one edit before the geometry rerun (`scripts/wo07_bowl_check.py`):
-`src/eval/bowl_fit.py` `geometry()` reads it for the release window, the cube-to-rim clearance and
-the carry-over-rim clearance. Until then those checks use the 25.4 mm nominal cube and the sim
+`src/eval/bowl_fit.py` `geometry()` reads it for the release window, the cube-to-rim clearance,
+the carry-over-rim clearance, the lower-over-floor clearance and the release height. Any of those
+clearances below zero, or a measurement out of range, makes the bowl check FAIL
+(`bowl_fit.geometry_problems`). Until then those checks use the 25.4 mm nominal cube and the sim
 bowl's geometry, labelled as a fallback in their output.
 
 ## Kit (Seeed SO-ARM101 Pro, already have)
@@ -29,16 +33,16 @@ bowl's geometry, labelled as a fallback in their output.
 | SO-101 follower arm, 12 V STS3215 servos, with 12 V supply | The arm that runs every demo and trial. 12 V STS3215: retailer listings give about 2.7 A stall at 12 V and 4-14 V operating range (Feetech datasheet not re-checked) | `configs/real.yaml` `power.follower`, `robot.servo_monitor`; checklist steps 0, 2b |
 | SO-101 leader arm, 7.4 V servos, with 5 V supply | Teleop for demos (leader is read only, never driven) | `configs/real.yaml` `power.leader`, `teleop.leader`; checklist steps 0, 2b, 8 |
 | Two Waveshare bus servo boards and USB cables | One board per arm, each straight into the Mac (no shared hub) | checklist step 0 item 4, steps 1, 8 |
-| 32 mm USB camera module | The WRIST camera, on the gripper mount | `configs/real.yaml` `cameras.wrist`; protocol `SCENE`; checklist steps 6, 7 |
+| 32 mm USB camera module | The WRIST camera, on the gripper mount | `configs/real.yaml` `cameras.wrist`; protocol `scene_spec()`; checklist steps 6, 7 |
 | Table clamps | Clamp the follower base (and the leader) to the table | checklist step 0 item 3 |
 
 ## Ordered, arriving
 
 | Item | Used for | Cited in |
 |---|---|---|
-| Logitech C920x webcam | The FRONT camera at the sim pose `front_left_45` (eye [0.555, 0.350, 0.495] m, target [0.205, 0, 0] m) | `configs/real.yaml` `cameras.front`; protocol `SCENE`; checklist steps 6, 7 |
+| Logitech C920x webcam | The FRONT camera at the sim pose `front_left_45` (eye [0.555, 0.350, 0.495] m, target [0.205, 0, 0] m) | `configs/real.yaml` `cameras.front`; protocol `scene_spec()`; checklist steps 6, 7 |
 | NEEWER UA057 22 inch magic arm with desk clamp | Holds the C920x at the sim pose | checklist step 7 |
-| 17 inch LED clamp desk lamp, 2700 K to 6500 K | The only light: set ONCE to 5000 K and never changed; position recorded at the camera match | protocol `SCENE`; `configs/real.yaml` camera comments; checklist step 7 |
+| 17 inch LED clamp desk lamp, 2700 K to 6500 K | The only light: set ONCE to 5000 K and never changed; position recorded at the camera match | protocol `scene_spec()`; `configs/real.yaml` camera comments; checklist step 7 |
 | hand2mind 1 inch wood cubes, set of 100, six colours | All objects: RED = seen PickPlace object; BLUE = seen Stack base (Stack deferred, unused in real-0.1); PURPLE and GREEN = unseen objects. Edge 25.4 mm nominal until measured; same wood, mass and finish, only the colour differs | `src/eval/protocol_real.py` objects; WO-07 work order |
 | LE TAUCI 8 oz bouillon cups, white, set of 6 | The bowl: one cup at the fixed bowl mark; the others are spares. Rim, floor and height PENDING measurement | `src/eval/protocol_real.py` `bowl_spec()`, `MEASURED` |
 
@@ -80,7 +84,9 @@ bowl's geometry, labelled as a fallback in their output.
   cup and 25.4 mm cubes to match this scene.
 - **Cup height.** An 8 oz bouillon cup may be taller than the sim bowl (36 mm). If the measured
   table-to-rim height leaves the cube's bottom below the rim at the sim oracle's carry height,
-  `bowl_fit.carry_rim_clearance_m` goes negative and the bowl check says so. If the cup has handles,
+  `bowl_fit.carry_rim_clearance_m` goes negative and the bowl check FAILS (`PROBLEM carry through
+the rim`). A footed cup whose inside floor sits higher than the oracle's lower (18 mm over the
+table) fails the same way (`lower into the floor`). If the cup has handles,
   their orientation is recorded at the fit check and kept.
 - **Smaller cube.** 25.4 mm against the sim's 30 mm: the jaws close further before contact (rough
   estimate about +0.1 rad, from the sim's 0.15-0.2 rad on a 3 cm cube; unverified), still above
