@@ -2348,7 +2348,8 @@ and recovery `tests/test_capture_resume_gap.py` 16 passed and `tests/test_pr2_re
 F_FULLFSYNC (fakes). No real arm, camera or real-arm capture was run. The bowl numbers are the
 sim-bowl fallback, not the LE TAUCI cup.
 
-**Owner decisions / notes:** (1) a real-0.1 or 0.2 session written before this fix whose
+**Owner decisions / notes** (DECIDED by the owner on 2026-11-11, implemented in "PR 2: second
+owner hold at 4d9f66e" below): (1) a real-0.1 or 0.2 session written before this fix whose
 record.json is lost cannot be resumed: its session row has no mode. A session with an intact
 record.json is unaffected. (2) `--protocol` is still ignored on `--resume`; it cannot misdirect
 recovery. (3) A pending trial's outcome still counts in the per-cell rates (a started slot is
@@ -2361,6 +2362,114 @@ are refused by `--report`, the export and `--resume`. (5) Mock exports now decla
 **Next (owner):** collect the five measurements and do the unpowered fit check. Then rerun the
 bowl check with the measured props, freeze, and rerun CI and the vishwaroop import on the final
 commit.
+
+### PR 2: second owner hold at 4d9f66e (2026-11-11, $0)
+
+The owner kept PR #32 open at `4d9f66e` with the freeze PENDING. The four fixes of the previous
+hold checked out there (12 targeted tests passed). Two issues remained; both are fixed, each with
+a regression test, followed by one review round. CPU, fakes and the mock rig only: no arm, camera
+or serial port, no RunPod, nothing pushed to the Hub. The freeze stays PENDING (`FREEZE_STATUS`,
+`BOWL_XY_M`, `RUBRIC_VERSION`, `MEASURED`, slots, schedules, seeds unchanged; no PDF regenerated).
+Protocols 0.1-draft / 0.2, `src/env/**` and the pins are byte-identical. The real-0.1 hash
+`da110112...` is unchanged.
+
+- **Issue 1: a resume confirmed a pending episode whose MP4s were corrupt.** The owner corrupted
+  the clips of a pending mock capture; the resume accepted the episode and deleted its staged
+  journal. `confirm_saved` checked the metadata rows, the frame count and that the video files
+  existed, never that they decoded. Fix: `recording.verify_episode_video` decodes every camera
+  clip of the episode with torchcodec (never PyAV) across its full frame range (frame `i` at
+  `from_timestamp + (i + 0.5) / fps`, its pts within a quarter frame of `from_timestamp + i / fps`,
+  the feature's shape, the clip span `length / fps`; a convention camera that is not a declared
+  video feature fails). `EvalCapture.confirm_saved` (every resume path: pending blocks, claimed
+  indices, the kill-after-save fill) runs it before any sync or journal drop; a failure keeps the
+  journal, keeps the episode PENDING and records `confirm_error` (camera, `frames 0-N`, file,
+  exception) in the block and the provenance (`sync_pending`). `EvalCapture.finish` (a live save
+  and a recovery's save) runs it too, after the sync: a clip that does not decode leaves the
+  trial pending, never claimed; `verify_s` records the cost. The score is never touched. The
+  shared rule names the decode error as the pending reason. Tests
+  (`tests/test_capture_resume_gap.py`): a pending session with clips overwritten mid-file, cut
+  short at the tail, or damaged only inside the final frame's packet stays pending with its
+  journals byte-identical and the export refused, the healthy episode is confirmed, and with the
+  good MP4s restored a second resume attaches them and the export is COMPLETE; a save whose clip
+  does not decode stays pending; each guard of `verify_episode_video` on its own. On `4d9f66e`
+  the resume attached every corrupt episode (`pending_sync: []`).
+- **Issue 2: `--report` trusted a stale saved summary.** A legacy record with an `episode_index`
+  beside `sync_error` still produced `protocol_complete=True` because the report read the saved
+  summary. Fix: `export_bundle.recording_blockers` is the one pending-recording rule; the session
+  summary (`table()` via `recording_gate`), `--report` and the export all use it. `--report`
+  recomputes each session's rows and completeness from its trial blocks and its capture on disk
+  (`<runs>/<session id>/capture`), never from the saved summary, and prints a note when the saved
+  summary said complete and the recount does not. Test
+  (`tests/test_protocol_real.py`): two full 150-trial sessions relabelled hardware with capture
+  on, one record carrying `{episode_index, sync_error}` (or a claim with its journal staged) and
+  a saved summary still saying complete: the report is not complete and names the trial. On
+  `4d9f66e` it said complete.
+
+**Owner decisions, as now implemented** (the previous hold's open decisions are decided):
+
+- **Mode:** a resume is refused when the recorded mode is missing or inconsistent (record.json,
+  every trial record, and the last synced session row when it has a mode), before anything is
+  opened or written (`check_resume_mode` / `_run_modes`).
+- **Protocol:** `--protocol` defaults to None. A resume without it uses the recorded
+  `protocol_id` (a session recorded without one is 0.2). An explicit `--protocol` that differs is
+  refused by `check_resume_protocol` before the journal preflight, `load_prior` or the capture
+  precheck: the runs tree stays byte-identical. New sessions still default to real-0.1.
+- **Rates:** every scored trial stays in the running rates with its original score, including a
+  first-write fault that produced zero frames (that trial requires no recording:
+  `recording.recording_required`).
+- **Completeness:** a REQUIRED recording that is pending (`recordings_pending`), staged but not
+  saved (`recordings_unsaved`) or lost (`recording_missing`) blocks `protocol_complete` in the
+  session summary and in `--report`, and blocks a complete export (pending refuses every
+  export; missing refuses a complete one, `--allow-missing-recordings` builds only the labelled
+  `real-0.1-incomplete` bundle). Staged journals and data are never deleted by the summary, the
+  report or a failed confirmation.
+
+**Review round** (two reviewers: recovery, report / decisions). Four confirmed findings, all
+fixed in `05915c4`, none skipped:
+
+- **REC-1 (low):** five of seven mutants of `verify_episode_video` survived (skip the last
+  frame, no camera-presence, span, pts or shape check): no test damaged only the final frames.
+  Fix (tests only): a corruption of 16 bytes inside the last video packet only (located from the
+  MP4 `stsz` / `stco` / `stsc` tables) joins the parametrized resume test, and a direct test
+  drives each guard on a healthy mock episode (wrist feature undeclared, span 2 frames long, a
+  feature shape of half size, twice the fps and frames over the same span). All 5 mutants are
+  now caught.
+- **F1 (medium):** the shared rule treated a missing or unreadable capture dataset as no
+  blockers and never checked a claimed `episode_index` against the dataset or its provenance, so
+  `--report` could print complete where the export refused. Fix: `lost_claims` counts a required
+  recording lost when its claimed episode is not in the dataset (the dataset missing or
+  unreadable is named), or the provenance gives it to another trial. The export now refuses that
+  last case outright, incomplete bundles too (episodes are never re-mapped). The report test
+  fixture now writes a stand-in capture dataset (provenance + episode table) instead of
+  asserting completeness with none. Test: dataset deleted, a claim the dataset does not hold, a
+  claim against the provenance (report, summary), and a mock session whose swapped claims are
+  refused by the export.
+- **F2 (low):** `--report` called a saved, synced, decoded episode LOST when the run ended
+  before its capture row, while the export filled it from the provenance. Fix: the fill is one
+  function, `fill_from_provenance`, used by the export and by `recording_blockers` (on copies).
+  Tests: the killed-after-save session (`after_save`) has no blockers before its resume; the
+  placeholder block on a stand-in capture is complete.
+- **F3 (low):** no test proved a staged-unsaved required recording blocks `protocol_complete`.
+  Fix (test only): the staged case now has a whole journal on disk; it is listed under
+  `recordings_unsaved` only, blocks `table()` and `--report`, and the journal is still there.
+
+**Reruns on the final code (`05915c4`; the docs commit after it changes no code):** full pytest **705 passed, 1 skipped** (11 min 47 s, pytest exit code 0; `45bd1c5` gave 701 + 1). Targeted: capture / recovery
+`tests/test_capture_resume_gap.py` 22 passed; report / protocol `tests/test_protocol_real.py`
+23 passed; export `tests/test_export_bundle.py` 36 passed. Mutation checks: the 5 REC-1 mutants
+and 5 report-rule mutants (dropped unsaved bucket, no lost claims, no provenance fill, no owner
+check, no export refusal) all fail a test. `ruff check src tests scripts`, `black --check .`,
+`mypy --strict src`: clean. vishwaroop import (informational, scratch copy, not the final
+freeze commit): one mock demo export (2 episodes, `real-0.1`) and one mock eval export (3 episodes, COMPLETE, declared `real-0.1-mock`) built from `05915c4`: 2 seals, 2 verifies, 2 imports exit 0, `declared_group_and_lineage_checks_passed` x2. The official rerun is on the final freeze commit.
+
+**Unverified on hardware:** all of the above ran on the mock rig with fake cameras. The decode
+check's cost on a real 20-30 s two-camera 640x480 episode is not measured (mock: about 0.1-0.4 s
+per episode; `verify_s` records it). If torchcodec or FFmpeg cannot load, every episode stays
+pending (fails closed).
+
+**Next (owner):** send the five measurements and the unpowered fit results; the agent reruns the
+bowl check and brings back any change to B' or the 9.83 cm separation before freezing. Then the
+freeze, CI and the vishwaroop imports (including `real-0.1-mock`) on the final freeze commit, then
+merge review. Spend, RunPod credentials and powered steps 9-10 stay on hold.
 
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
