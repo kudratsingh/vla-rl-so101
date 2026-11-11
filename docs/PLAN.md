@@ -1,7 +1,9 @@
 # Plan
 
 Rewritten 2026-11-09 for the pivot to SmolVLA on the real SO-101 (ADR-0003). The OpenVLA-OFT /
-GRPO plan that came before it is in git history and in ADR-0001 / ADR-0002.
+GRPO plan that came before it is in git history and in ADR-0001 / ADR-0002. Owner clarification
+on 2026-11-10: further OpenVLA-OFT / GRPO work is deferred until after full evaluation of the
+real arm and the SmolVLA/ACT baseline. Its implementation and measured results are retained.
 
 ## What we are building
 
@@ -24,7 +26,7 @@ and citations: ADR-0003.
 
 | Phase | WOs | Output |
 |---|---|---|
-| Closed: OFT sim track | 01–05 | Sim env, oracle, demos, OFT SFT, GRPO loop and runs; recorded partial result |
+| Retained OFT sim foundation | 01–05 | Sim env, oracle, demos, OFT SFT, GRPO loop and runs; recorded partial result, follow-up deferred |
 | A. Bring-up | 06 | Calibrated arm, drift check, leader teleop, both cameras matched with locked exposure / white balance, Mac MPS latency on the mock rig |
 | B. Real baseline | 07 | 50 PickPlace demos, SmolVLA and ACT fine-tunes, 50 binary trials per cell for each, immutable export for `vishwaroop` |
 | C. Sim post-training | 08 | Filtered behaviour cloning on SmolVLA in a two-camera sim; transfer test on the arm only after a sim gain |
@@ -60,7 +62,8 @@ per cell, 3 seeds, 95% Wilson interval; every number cites its protocol hash.
 ## Non-goals
 
 - No learned reward models, no shaped rewards, no human-in-the-loop RL in this project.
-- No RL or GRPO in the new plan; WO-08 is filtered behaviour cloning.
+- WO-08 is filtered behaviour cloning. OpenVLA / GRPO follow-up is scoped separately after the
+  real-arm baseline evaluation.
 - No serving beyond the deploy loop; no web UI.
 - No new simulator; ManiSkill3 only. No Isaac Sim.
 - No dexterous, deformable or bimanual tasks.
@@ -81,5 +84,7 @@ LE TAUCI 8 oz white cups as the bowl, an all-white table.
 
 ## Follow-ons (not in scope now)
 
+- OpenVLA-OFT and GRPO after full real-arm and SmolVLA/ACT evaluation, using the retained
+  simulation, LoRA, rollout and evaluation infrastructure and the baseline's failure analysis.
 - Residual RL on a frozen VLA using object poses (Microsoft CoRL 2026 recipe, no code released).
 - The same brain-over-skills loop on the Microduck's command block.

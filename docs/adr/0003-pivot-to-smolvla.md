@@ -4,6 +4,17 @@ Status: accepted (owner, 2026-11-09)
 Date: 2026-11-09
 Work order: WO-06 onward (new table in `CLAUDE.md`)
 
+## Amendment on 2026-11-10
+
+The owner clarified the sequencing: **OpenVLA-OFT and GRPO are deferred until after full
+evaluation of the real arm and the SmolVLA/ACT baseline.** The simulation environments, LoRA
+training, GRPO implementation, checkpoint identities and measured results remain the foundation
+for that follow-up. Its scope will be informed by the real-arm baseline and failure analysis.
+
+The current implementation priority remains real-arm bring-up and matched SmolVLA/ACT evaluation.
+The original 2026-11-09 rationale below is retained; this amendment supersedes its permanent-stop
+wording. Recorded outcomes and the cancelled diagnostics approvals remain historical facts.
+
 Sources: `docs/reviews/2026-11-09-smolvla-pivot-handoff.md` (the spec) and
 `docs/reviews/2026-11-09-pivot-decisions.md` (owner decisions D1-D6, which refine it and win where
 they differ).

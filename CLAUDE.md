@@ -2,7 +2,8 @@
 
 SmolVLA (with ACT as the baseline) fine-tuned on leader-arm teleop demos for a real SO-101 arm,
 plus a filtered behaviour cloning experiment in ManiSkill3 simulation. The OpenVLA-OFT / GRPO track
-was stopped on 2026-11-09 (`docs/adr/0003-pivot-to-smolvla.md`). The owner is Kudrat
+is deferred until after full evaluation of the real arm and the SmolVLA/ACT baseline
+(owner, 2026-11-10; amendment to `docs/adr/0003-pivot-to-smolvla.md`). The owner is Kudrat
 Singh. You (the coding agent) write all the code. The owner launches every paid run.
 
 Read in this order before any work: this file → `docs/PLAN.md` → `docs/ENVIRONMENT.md` →
