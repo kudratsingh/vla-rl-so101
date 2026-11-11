@@ -527,9 +527,26 @@ def full_pair(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str, str]
     return runs, a.parent.name, b.parent.name
 
 
+def _write_capture(capture_root: Path, sid: str, owners: dict[int, str]) -> None:
+    """A stand-in capture dataset with what the recording rule reads (``recording_blockers``):
+    its provenance (episode -> trial id) and its episode index table. No frames or video."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    meta = capture_root / "dataset" / "meta"
+    (meta / "episodes" / "chunk-000").mkdir(parents=True, exist_ok=True)
+    episodes = {str(k): {"trial_id": tid} for k, tid in sorted(owners.items())}
+    (meta / "vla_rl_so101.json").write_text(json.dumps({"session_id": sid, "episodes": episodes}))
+    pq.write_table(
+        pa.table({"episode_index": sorted(owners)}),
+        meta / "episodes" / "chunk-000" / "file-000.parquet",
+    )
+
+
 def _captured_hardware_copy(full_pair: tuple[Path, str, str], tmp: Path) -> tuple[Path, Path]:
     """A copy of ``full_pair`` relabelled as two captured hardware sessions: mode hardware,
-    capture on, every scored trial claiming its own episode. Their SAVED summaries still say
+    capture on, every scored trial claiming its own episode, which the session's capture
+    dataset holds under that trial's id (``_write_capture``). Their SAVED summaries still say
     ``protocol_complete`` True. Returns the two record paths."""
     import shutil
 
@@ -542,16 +559,30 @@ def _captured_hardware_copy(full_pair: tuple[Path, str, str], tmp: Path) -> tupl
         res = data["results"]
         res["mode"] = "hardware"
         res["session"]["capture"] = True
-        k = 0
+        owners: dict[int, str] = {}
         for t in res["trials"]:
             t["mode"] = "hardware"
             if t.get("policy_started") and t["outcome"] in ev.SCORED:
-                t["capture"] = {"episode_index": k, "frames": 1}
-                k += 1
+                t["capture"] = {"episode_index": len(owners), "frames": 1}
+                owners[len(owners)] = t["trial_id"]
         assert res["summary"]["protocol_complete"]  # the saved summary, as 5126daa wrote it
         rec.write_text(json.dumps(data))
+        sid = str(res["session"]["session_id"])
+        _write_capture(tmp / "runs" / sid / "capture", sid, owners)
         recs.append(rec)
     return recs[0], recs[1]
+
+
+def _capture_owners(rec: Path) -> tuple[Path, str, dict[int, str]]:
+    """(capture root, session id, episode -> trial id) of a ``_captured_hardware_copy`` record."""
+    res = json.loads(rec.read_text())["results"]
+    sid = str(res["session"]["session_id"])
+    owners = {
+        int(t["capture"]["episode_index"]): t["trial_id"]
+        for t in res["trials"]
+        if (t.get("capture") or {}).get("episode_index") is not None
+    }
+    return rec.parent.parent / sid / "capture", sid, owners
 
 
 def _first_scored(rec: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -610,29 +641,94 @@ def test_required_recordings_gate_completeness_and_scores_stand(
     data, t0 = _first_scored(a)
     res = data["results"]
     trials, settings = res["trials"], res["session"]
-    root = a.parent.parent / str(settings["session_id"]) / "capture"
+    root, sid, owners = _capture_owners(a)
     base = ev.table(trials, settings, Dcfg(), root)
     assert base["protocol_complete"]
+    tid = t0["trial_id"]
+    # t0's episode 0 is not in the dataset from here on (never saved, or lost)
+    _write_capture(root, sid, {k: v for k, v in owners.items() if v != tid})
     t0["capture"] = {"episode_index": None, "frames": 0, "reason": recording.NO_POLICY_WRITE}
     summ = ev.table(trials, settings, Dcfg(), root)
     assert summ["protocol_complete"] and summ["real_rows"] == base["real_rows"]
     assert summ["cells"] == base["cells"]  # scored, in the rates, its score unchanged
-    for cap in (
-        {"episode_index": None, "recording_missing": True, "reason": "no journal"},
-        {"episode_index": None, "reason": "the session ended before the episode was saved"},
-        {"episode_index": None, "pending_episode_index": 0, "sync_error": "OSError"},
+    staged = recording.staged_path(root, tid)
+    for cap, key in (
+        ({"episode_index": None, "recording_missing": True, "reason": "no journal"}, "missing"),
+        ({"episode_index": None, "reason": "ended before the episode was saved"}, "unsaved"),
+        ({"episode_index": None, "pending_episode_index": 0, "sync_error": "OSError"}, "pending"),
     ):
         t0["capture"] = cap
+        if key == "unsaved":  # a whole staged journal: a resume would save it
+            staged.mkdir(parents=True)
+            (staged / recording.STAGED_INDEX).write_text("{}")
         summ = ev.table(trials, settings, Dcfg(), root)
         assert not summ["protocol_complete"], cap
+        gate = {
+            k: summ[k] for k in ("recordings_pending", "recordings_unsaved", "recording_missing")
+        }
+        assert {k: v for k, v in gate.items() if v} == {
+            {"missing": "recording_missing", "unsaved": "recordings_unsaved"}.get(
+                key, "recordings_pending"
+            ): [tid]
+        }, (cap, gate)
         assert summ["real_rows"] == base["real_rows"] and summ["cells"] == base["cells"]
         got = X.recording_blockers(trials, root)
-        assert [g["trial_id"] for g in got["pending"] + got["missing"]][:1] == [t0["trial_id"]]
+        assert [g["trial_id"] for g in got["pending"] + got["missing"]][:1] == [tid]
         a.write_text(json.dumps(data))  # the saved summary still says complete
         assert not ev.report([a.parent, b.parent])["protocol_complete"], cap
-    assert summ["recordings_pending"] == [t0["trial_id"]]
-    t0["capture"] = {"episode_index": None, "recording_missing": True}
-    assert ev.table(trials, settings, Dcfg(), root)["recording_missing"] == [t0["trial_id"]]
+        if key == "unsaved":  # the report never deletes staged data
+            assert (staged / recording.STAGED_INDEX).is_file()
+    assert summ["recordings_pending"] == [tid]
+
+
+def test_a_lost_capture_or_a_claim_it_does_not_hold_blocks_the_report(
+    full_pair: tuple[Path, str, str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review F1 (PR #32 hold): a REQUIRED recording lost on disk blocks a complete report and
+    summary as it refuses the export: the capture dataset missing or unreadable, a claimed
+    episode it does not hold, or one its provenance gives another trial (an older record of a
+    session a later resume re-mapped). The scores stand. Review F2: an episode saved before its
+    trial's capture row (the record keeps the placeholder block) is the trial's, as the export
+    fills it: no blocker."""
+    import shutil
+
+    a, b = _captured_hardware_copy(full_pair, tmp_path)
+    data, t0 = _first_scored(a)
+    res = data["results"]
+    trials, settings = res["trials"], res["session"]
+    root, sid, owners = _capture_owners(a)
+    tid = t0["trial_id"]
+    targets = ev.SavedTargets(150.0)
+    base = ev.table(trials, settings, targets, root)
+    assert base["protocol_complete"] and ev.report([a.parent, b.parent])["protocol_complete"]
+
+    t0["capture"] = {"episode_index": None, "reason": ev.CAPTURE_PENDING}  # F2: killed before row
+    assert ev.table(trials, settings, targets, root)["protocol_complete"]
+
+    other = next(v for v in owners.values() if v != tid)
+    for owners_now in (
+        {k: v for k, v in owners.items() if v != tid},  # episode 0 not in the dataset
+        {**owners, 0: other},  # episode 0 is another trial's in the provenance
+    ):
+        t0["capture"] = {"episode_index": 0, "frames": 1}
+        _write_capture(root, sid, owners_now)
+        summ = ev.table(trials, settings, targets, root)
+        assert summ["recording_missing"] == [tid] and not summ["protocol_complete"], owners_now
+        assert summ["real_rows"] == base["real_rows"] and summ["cells"] == base["cells"]
+        a.write_text(json.dumps(data))
+        capsys.readouterr()
+        assert not ev.report([a.parent, b.parent])["protocol_complete"]
+        assert "recordings LOST" in capsys.readouterr().out
+    _write_capture(root, sid, owners)
+    assert ev.table(trials, settings, targets, root)["protocol_complete"]
+
+    shutil.rmtree(root / "dataset")  # every required recording gone
+    summ = ev.table(trials, settings, targets, root)
+    assert len(summ["recording_missing"]) == len(owners) and not summ["protocol_complete"]
+    assert summ["real_rows"] == base["real_rows"]
+    lost = ev.recording_blockers(trials, root)["missing"]
+    assert "missing or unreadable" in lost[0]["reason"], lost[0]
+    assert not ev.report([a.parent, b.parent])["protocol_complete"]
 
 
 def test_resume_refuses_a_changed_policy_identity(

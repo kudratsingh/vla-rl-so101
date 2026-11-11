@@ -943,8 +943,11 @@ def recording_gate(
     (``export_bundle.recording_blockers``: the same helper; owner, PR #32 hold).
     ``recordings_pending``: saved, not confirmed durable. ``recordings_unsaved``: a required
     recording only staged (a resume recovers it). ``recording_missing``: a required recording
-    lost. Required: capture on and the scored trial's policy run produced a frame
-    (``recording.recording_required``). Their scores stand; nothing is deleted."""
+    lost (no episode, or a claimed one the capture dataset under ``capture_root`` does not hold,
+    is missing or unreadable, or gives another trial). An episode saved before its trial's
+    capture row is the trial's (the export's provenance fill). Required: capture on and the
+    scored trial's policy run produced a frame (``recording.recording_required``). Their scores
+    stand; nothing is deleted."""
     got = recording_blockers(trials, capture_root, required=bool(settings.get("capture")))
     pending = [p["trial_id"] for p in got["pending"]]
     return {

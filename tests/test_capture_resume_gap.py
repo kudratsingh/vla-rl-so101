@@ -207,6 +207,8 @@ def test_kill_between_score_and_episode_save_is_recovered(
     if mode != "after_save":
         assert recording.has_staged(capture_root, third["trial_id"])  # staged before the score
         assert third["capture"]["stage"]["staged"]
+    else:  # review F2: the summary / --report rule fills it from the provenance, as the export
+        assert not any(ev.recording_gate(before, settings, capture_root).values())
 
     rec2 = _resume(runs, run_dir)
     scored = _check_no_rerun(rec2)
@@ -878,11 +880,53 @@ def _clip(ds_root: Path, idx: int, key: str) -> Path:
     )
 
 
+def _last_sample(data: bytes) -> tuple[int, int]:
+    """(byte offset, size) of the last video packet of a one-track MP4 (its ``stsz`` / ``stco``
+    / ``stsc`` sample tables): the episode's final frame (review REC-1)."""
+    import struct
+
+    def box(path: tuple[str, ...], s: int = 0, e: int = len(data)) -> tuple[int, int]:
+        while s + 8 <= e:
+            size, typ = struct.unpack(">I4s", data[s : s + 8])
+            head = 8
+            if size == 1:
+                size, head = struct.unpack(">Q", data[s + 8 : s + 16])[0], 16
+            if typ.decode() == path[0]:
+                return (s + head, s + size) if len(path) == 1 else box(path[1:], s + head, s + size)
+            s += size
+        raise AssertionError(f"no {path[0]} box")
+
+    stbl = ("moov", "trak", "mdia", "minf", "stbl")
+    b, _ = box((*stbl, "stsz"))
+    fixed, count = struct.unpack(">4xII", data[b : b + 12])
+    sizes = (
+        [fixed] * count
+        if fixed
+        else list(struct.unpack(f">{count}I", data[b + 12 : b + 12 + 4 * count]))
+    )
+    b, _ = box((*stbl, "stco"))
+    (n,) = struct.unpack(">I", data[b + 4 : b + 8])
+    chunks = struct.unpack(f">{n}I", data[b + 8 : b + 8 + 4 * n])
+    b, _ = box((*stbl, "stsc"))
+    (m,) = struct.unpack(">I", data[b + 4 : b + 8])
+    runs = [struct.unpack(">III", data[b + 8 + 12 * k : b + 20 + 12 * k]) for k in range(m)]
+    per_chunk = [
+        next(spc for first, spc, _ in reversed(runs) if first <= c + 1) for c in range(len(chunks))
+    ]
+    first_of_last = sum(per_chunk[:-1])  # the last chunk holds the last sample
+    return chunks[-1] + sum(sizes[first_of_last:-1]), sizes[-1]
+
+
 def _corrupt(path: Path, how: str) -> None:
     data = path.read_bytes()
     if how == "middle":  # bytes overwritten inside the frame data
         mid = len(data) // 2
         path.write_bytes(data[:mid] + b"\x00" * 4096 + data[mid + 4096 :])
+    elif how == "last":  # bytes overwritten inside the final frame's packet only
+        off, size = _last_sample(data)
+        assert size >= 64 and off + size <= len(data), (off, size)
+        mid = off + size // 2
+        path.write_bytes(data[:mid] + b"\x00" * 16 + data[mid + 16 :])
     else:  # "tail": the file cut short (the index at its end gone)
         path.write_bytes(data[: len(data) - 4000])
 
@@ -898,8 +942,11 @@ def _tree_bytes(d: Path) -> dict[str, bytes]:
     [  # episode 0: one camera; episode 1: both cameras; episode 2 healthy (still confirmed)
         {0: {"front": "middle"}, 1: {"front": "tail", "wrist": "tail"}},
         {0: {"wrist": "tail"}, 1: {"front": "middle", "wrist": "middle"}},
+        # review REC-1: only the final frame's packet damaged (a decode that stops short of the
+        # last frame would confirm these)
+        {0: {"front": "last"}, 1: {"front": "last", "wrist": "last"}},
     ],
-    ids=["front-middle_both-tail", "wrist-tail_both-middle"],
+    ids=["front-middle_both-tail", "wrist-tail_both-middle", "front-last_both-last"],
 )
 def test_a_pending_episode_whose_video_does_not_decode_is_never_confirmed(
     tmp_path: Path,
@@ -996,6 +1043,109 @@ def test_a_pending_episode_whose_video_does_not_decode_is_never_confirmed(
     assert not [e for e in prov["episodes"].values() if "sync_pending" in e or "confirm_error" in e]
     index = _export(runs, rec2["path"].parent.name, tmp_path / "export2")
     assert index["status"] == "COMPLETE" and index["episodes"] == 3
+
+
+def _edit_episodes(ds_root: Path, index: int, **cols: Any) -> None:
+    """Overwrite columns of episode ``index``'s metadata row (in place)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    for f in sorted((ds_root / "meta" / "episodes").rglob("*.parquet")):
+        t = pq.read_table(f)
+        rows = t.to_pylist()
+        if not any(int(r["episode_index"]) == index for r in rows):
+            continue
+        for r in rows:
+            if int(r["episode_index"]) == index:
+                r.update(cols)
+        pq.write_table(pa.Table.from_pylist(rows, schema=t.schema), f)
+
+
+def test_the_video_check_refuses_every_mismatch_with_the_episode(
+    tmp_path: Path, hard_timeout: None
+) -> None:
+    """Review REC-1: each guard of ``verify_episode_video`` on its own, against a healthy mock
+    episode whose metadata no longer matches its clips: a camera of the convention not declared
+    as a video feature, a clip span that is not ``length / fps``, a decoded frame of another
+    shape, and frames whose pts are not the episode's own (twice the fps and twice the frames
+    over the same span: the span check passes, every other frame decodes its neighbour)."""
+    runs = tmp_path / "runs"
+    rec = _new_session(runs, _ckpt(tmp_path))
+    sid = json.loads(rec.read_text())["results"]["session"]["session_id"]
+    good = runs / sid / "capture" / "dataset"
+    assert recording.verify_episode_video(good, 2) == []
+    info = json.loads((good / "meta" / "info.json").read_text())
+    (ep,) = [r for r in X._read_parquet_dir(good / "meta" / "episodes")
+             if int(r["episode_index"]) == 2]  # fmt: skip
+    front, wrist = conv.IMAGE_KEYS["front"], conv.IMAGE_KEYS["wrist"]
+    n, fps = int(ep["length"]), float(info["fps"])
+
+    def no_wrist(ds: Path) -> str:
+        i = json.loads((ds / "meta" / "info.json").read_text())
+        del i["features"][wrist]
+        (ds / "meta" / "info.json").write_text(json.dumps(i))
+        return f"{wrist}: not a video feature"
+
+    def span(ds: Path) -> str:
+        _edit_episodes(
+            ds, 2, **{f"videos/{front}/to_timestamp": ep[f"videos/{front}/to_timestamp"] + 2 / fps}
+        )
+        return f"{front}: frames 0-{n - 1} of episode 2"
+
+    def shape(ds: Path) -> str:
+        i = json.loads((ds / "meta" / "info.json").read_text())
+        h, w, c = i["features"][front]["shape"]
+        i["features"][front]["shape"] = [h // 2, w // 2, c]
+        (ds / "meta" / "info.json").write_text(json.dumps(i))
+        return "frames, the feature is"
+
+    def pts(ds: Path) -> str:
+        i = json.loads((ds / "meta" / "info.json").read_text())
+        i["fps"] = 2 * fps
+        (ds / "meta" / "info.json").write_text(json.dumps(i))
+        _edit_episodes(ds, 2, length=2 * n)
+        return "frame 1 decodes the frame at"
+
+    for case in (no_wrist, span, shape, pts):
+        ds = tmp_path / case.__name__
+        shutil.copytree(good, ds)
+        want = case(ds)
+        problems = recording.verify_episode_video(ds, 2)
+        assert any(want in p for p in problems), (case.__name__, problems)
+
+
+def test_an_episode_claimed_against_its_provenance_is_refused_and_lost(
+    tmp_path: Path, hard_timeout: None
+) -> None:
+    """Review F1: a record whose claimed episode is another trial's in the capture provenance
+    (an older record of a session a later resume re-mapped) is never exported (episodes keep
+    the trial id their provenance gives them) and the summary / --report rule counts the
+    recording lost. Review F2: a record killed before its capture row (the placeholder block)
+    gets its episode back from the provenance in that rule, as the export fills it."""
+    runs = tmp_path / "runs"
+    rec = _new_session(runs, _ckpt(tmp_path))
+    data = json.loads(rec.read_text())
+    res = data["results"]
+    settings, trials = res["session"], res["trials"]
+    capture_root = runs / settings["session_id"] / "capture"
+    assert not any(ev.recording_gate(trials, settings, capture_root).values())
+    t0, t1 = trials[0], trials[1]
+    t0["capture"] = {"episode_index": None, "reason": ev.CAPTURE_PENDING}  # F2
+    assert not any(ev.recording_gate(trials, settings, capture_root).values())
+    t0["capture"], t1["capture"] = {"episode_index": 1, "frames": 5}, {
+        "episode_index": 0,
+        "frames": 5,
+    }
+    gate = ev.recording_gate(trials, settings, capture_root)
+    assert gate["recording_missing"] == [t0["trial_id"], t1["trial_id"]], gate
+    rec.write_text(json.dumps(data))
+    metrics = rec.parent / "metrics.jsonl"  # the record alone holds the claims
+    rows = [json.loads(x) for x in metrics.read_text().splitlines()]
+    metrics.write_text("".join(json.dumps(r) + "\n" for r in rows if r.get("kind") != "capture"))
+    with pytest.raises(SystemExit, match="belong to other trials"):
+        _export(runs, rec.parent.name, tmp_path / "export")
+    with pytest.raises(SystemExit, match="belong to other trials"):
+        _export(runs, rec.parent.name, tmp_path / "export_incomplete", "--allow-missing-recordings")
 
 
 def test_a_save_whose_video_does_not_decode_keeps_its_journal_and_stays_pending(
