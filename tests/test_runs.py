@@ -142,6 +142,7 @@ class _Syncs:
 
         self.log: list[tuple[str, str]] = []
         self.errno: int | None = None
+        self.dir_errno: int | None = None  # fcntl(F_FULLFSYNC) raises it on directories only
         self._mp = monkeypatch
         real_fcntl, real_fsync = fcntl.fcntl, os.fsync
 
@@ -154,6 +155,8 @@ class _Syncs:
             self.log.append(("F_FULLFSYNC", kind(fd)))
             if self.errno is not None:
                 raise OSError(self.errno, os.strerror(self.errno))
+            if self.dir_errno is not None and kind(fd) == "dir":
+                raise OSError(self.dir_errno, os.strerror(self.dir_errno))
             return 0
 
         def fsync(fd: int) -> None:
@@ -260,7 +263,11 @@ def test_run_records_its_sync_policy_and_a_required_run_never_uses_fsync_on_its_
     assert run.log_durable(kind="session") == "F_FULLFSYNC"
     run.flush()
     rec = json.loads(run.record_path.read_text())
-    assert rec["sync"] == {"policy": "full_fsync_required", "methods": ["F_FULLFSYNC"]}
+    assert rec["sync"] == {
+        "policy": "full_fsync_required",
+        "methods": ["F_FULLFSYNC"],
+        "dir_methods": ["F_FULLFSYNC"],
+    }
     assert ("fsync", "file") not in s.log
     s.missing()
     with pytest.raises(FullFsyncRequired, match="fcntl has no F_FULLFSYNC"):
@@ -276,6 +283,7 @@ def test_run_records_its_sync_policy_and_a_required_run_never_uses_fsync_on_its_
     assert json.loads(mock.record_path.read_text())["sync"] == {
         "policy": "best_effort",
         "methods": ["fsync"],
+        "dir_methods": ["fsync"],
     }
 
 
@@ -299,3 +307,63 @@ def test_probe_full_fsync_refuses_an_unsupported_filesystem(
         runs.probe_full_fsync(d, req)
     assert list(d.iterdir()) == []  # the probe file is gone either way
     assert runs.probe_full_fsync(d, SyncPolicy.BEST_EFFORT)["file"].startswith("fsync")
+
+
+def test_a_directory_that_rejects_f_fullfsync_is_recorded_and_noted_never_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review F4: a volume that takes F_FULLFSYNC on files but not on directories. The rename of
+    ``write_durable`` is made durable by the directory sync, so its fallback is recorded
+    (record.json ``sync.dir_methods``) and the preflight says so (``directory_note``); file syncs
+    stay F_FULLFSYNC and the session is not refused for it (directories: best effort)."""
+    from src import runs
+    from src.runs import SyncPolicy
+
+    req = SyncPolicy.FULL_FSYNC_REQUIRED
+    s = _Syncs(monkeypatch)
+    s.dir_errno = errno.ENOTSUP
+    probe = runs.probe_full_fsync(tmp_path / "runs", req)
+    assert probe["file"] == "F_FULLFSYNC" and probe["directory"].startswith("fsync")
+    assert "not F_FULLFSYNC" in probe["directory_note"]
+    assert "directory_note" not in runs.probe_full_fsync(tmp_path / "runs", SyncPolicy.BEST_EFFORT)
+    assert runs.replace_durable(tmp_path / "r.json", "{}", req) == (
+        "F_FULLFSYNC",
+        "fsync (F_FULLFSYNC unsupported here: ENOTSUP)",
+    )
+    run = Run(work_order="WO-07", script=__file__, cfg=load_config("tiny"), device="cpu",
+              runs_dir=tmp_path / "runs", sync_policy=req)  # fmt: skip
+    run.log_durable(kind="session")
+    run.flush()
+    sync = json.loads(run.record_path.read_text())["sync"]
+    assert sync["methods"] == ["F_FULLFSYNC"]
+    assert sync["dir_methods"] == ["fsync (F_FULLFSYNC unsupported here: ENOTSUP)"]
+    assert ("fsync", "file") not in s.log
+
+
+@pytest.mark.parametrize("fail", ["missing", "ENOTSUP"])
+def test_sync_tree_under_the_required_policy_raises_on_a_file_never_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    """Review F1/F2: ``sync_tree`` (a saved capture episode, a recovered dataset) passes the
+    policy to every file: F_FULLFSYNC on each, or ``FullFsyncRequired`` with no fsync fallback
+    (a mutation that drops ``policy`` from its file syncs fails here)."""
+    from src import runs
+    from src.runs import FullFsyncRequired, SyncPolicy
+
+    req = SyncPolicy.FULL_FSYNC_REQUIRED
+    (tmp_path / "meta").mkdir()
+    (tmp_path / "meta" / "info.json").write_text("{}")
+    (tmp_path / "data.parquet").write_bytes(b"x")
+    s = _Syncs(monkeypatch)
+    assert runs.sync_tree(tmp_path, policy=req) == 2
+    assert s.log.count(("F_FULLFSYNC", "file")) == 2 and ("fsync", "file") not in s.log
+    s.log.clear()
+    if fail == "missing":
+        s.missing()
+    else:
+        s.errno = errno.ENOTSUP
+    with pytest.raises(FullFsyncRequired):
+        runs.sync_tree(tmp_path, policy=req)
+    assert ("fsync", "file") not in s.log
+    assert runs.sync_tree(tmp_path) == 2  # best effort (mock): the fallback
+    assert ("fsync", "file") in s.log

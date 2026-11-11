@@ -36,10 +36,23 @@ in its record.json (``sync``: the policy and every method used):
 Directories keep the platform's best-effort sync under both policies (``sync_path`` on a
 directory fd): F_FULLFSYNC where the filesystem accepts it on a directory (it does on APFS:
 checked 2026-11-10 on macOS 26, ``fcntl(dirfd, F_FULLFSYNC)`` returns 0), else ``os.fsync``
-(Linux, or a filesystem that rejects it on directories); a directory sync never blocks motion
-by itself, as the file sync before it already flushed the drive. ``probe_full_fsync`` checks the
-policy once on a temp file in the runs directory before a real-arm session opens anything.
-Any other ``OSError`` of a sync propagates: the caller must treat the row as not durable.
+(Linux, or a filesystem that rejects it on directories). A directory sync never blocks motion by
+itself, but it is what makes a create or a rename durable: in ``write_durable`` the rename comes
+AFTER the file's F_FULLFSYNC, so on a volume that rejects F_FULLFSYNC on directories the rename
+is on stable storage only once the drive cache is next flushed. On the arm that is the next
+journal F_FULLFSYNC (F_FULLFSYNC flushes the whole drive cache), at the latest the next
+``trial_started`` row, before any motion. The record says which directory method ran (record.json
+``sync.dir_methods``) and ``probe_full_fsync`` says so up front (``directory_note``).
+``probe_full_fsync`` checks the policy once on a temp file in the runs directory before a
+real-arm session opens anything. Any other ``OSError`` of a sync propagates: the caller must
+treat the row as not durable.
+
+Journal writes under the session policy (the resume logic reads them): record.json (every
+write), the ``log_durable`` rows of metrics.jsonl (``session``, ``trial_started``,
+``trial_start_retracted``), and the evaluation capture (src/robot/recording.py): its provenance,
+staged episode journals, saved episode files and end-state stills, the dataset a new session or
+an empty restart creates (meta, calibration copy) and the files a capture recovery rewrites
+(``meta/info.json``, ``meta/stats.json``, the quarantine moves).
 """
 
 from __future__ import annotations
@@ -161,17 +174,32 @@ def probe_full_fsync(directory: Path, policy: SyncPolicy) -> dict[str, Any]:
     finally:
         os.close(fd)
         probe.unlink(missing_ok=True)
-    return {
+    out: dict[str, Any] = {
         "dir": str(directory),
         "policy": str(policy),
         "file": method,
         "directory": sync_path(directory, policy),
         "platform": sys.platform,
     }
+    if policy is SyncPolicy.FULL_FSYNC_REQUIRED and out["directory"] != "F_FULLFSYNC":
+        out["directory_note"] = (
+            f"directory sync is {out['directory']!r}, not F_FULLFSYNC: a rename is durable at "
+            "the next journal F_FULLFSYNC (before the next motion), not when it returns"
+        )
+    return out
 
 
 def write_durable(path: Path, text: str, policy: SyncPolicy = SyncPolicy.BEST_EFFORT) -> str:
-    """Atomic, synced replace of ``path``: tmp + sync + rename + sync of the directory."""
+    """Atomic, synced replace of ``path``: tmp + sync + rename + sync of the directory. Returns
+    the file's sync method. A failed file sync raises before the rename: ``path`` keeps its last
+    synced content."""
+    return replace_durable(path, text, policy)[0]
+
+
+def replace_durable(
+    path: Path, text: str, policy: SyncPolicy = SyncPolicy.BEST_EFFORT
+) -> tuple[str, str]:
+    """``write_durable``; (file sync method, directory sync method)."""
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
@@ -182,8 +210,7 @@ def write_durable(path: Path, text: str, policy: SyncPolicy = SyncPolicy.BEST_EF
     finally:
         os.close(fd)
     os.replace(tmp, path)
-    sync_path(path.parent)
-    return method
+    return method, sync_path(path.parent)
 
 
 def sync_tree(
@@ -323,6 +350,7 @@ class Run:
         self.sync_policy = SyncPolicy(sync_policy)  # fixed for the run's life (module doc)
         self.sync_method: str | None = None  # of the last sync (module doc)
         self._sync_methods: list[str] = []  # every distinct file-sync method used, in order
+        self._dir_methods: list[str] = []  # every distinct directory-sync method used (module doc)
         self._dir_entry_synced = False  # runs_dir holds this run's directory durably
         self._metrics_entry_synced = False  # the run directory holds metrics.jsonl durably
         dev = device_info(device)
@@ -348,7 +376,11 @@ class Run:
             "estimated_usd": float(estimated_usd),
             "actual_usd": None,
             "status": "running",
-            "sync": {"policy": str(self.sync_policy), "methods": self._sync_methods},
+            "sync": {
+                "policy": str(self.sync_policy),
+                "methods": self._sync_methods,
+                "dir_methods": self._dir_methods,
+            },
             "results": self.results,
         }
         self._write()
@@ -378,7 +410,7 @@ class Run:
         method = sync_path(self.metrics_path, self.sync_policy)  # no fallback when required
         self._synced(method)
         if not self._metrics_entry_synced:
-            sync_path(self.dir)
+            self._dir_synced(sync_path(self.dir))
             self._metrics_entry_synced = True
         return method
 
@@ -397,21 +429,25 @@ class Run:
 
     def _write(self) -> None:
         """record.json, atomic and synced (module doc)."""
-        self._synced(
-            write_durable(
-                self.record_path,
-                json.dumps(self.record, indent=2, default=str) + "\n",
-                self.sync_policy,
-            )
+        method, dir_method = replace_durable(
+            self.record_path,
+            json.dumps(self.record, indent=2, default=str) + "\n",
+            self.sync_policy,
         )
+        self._synced(method)
+        self._dir_synced(dir_method)
         if not self._dir_entry_synced:  # the run directory's own entry (mkdir) in runs_dir
-            sync_path(self.dir.parent)
+            self._dir_synced(sync_path(self.dir.parent))
             self._dir_entry_synced = True
 
     def _synced(self, method: str) -> None:
         self.sync_method = method
         if method not in self._sync_methods:  # record.json's "sync": in the next write
             self._sync_methods.append(method)
+
+    def _dir_synced(self, method: str) -> None:
+        if method not in self._dir_methods:  # record.json's "sync.dir_methods" (module doc)
+            self._dir_methods.append(method)
 
     def __enter__(self) -> Self:
         return self

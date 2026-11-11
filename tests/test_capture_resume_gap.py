@@ -683,6 +683,9 @@ def test_a_saved_episode_is_synced_before_its_journal_is_dropped(
     def sync_tree(
         root: Path, skip: frozenset[str] = frozenset(), since: Any = None, policy: Any = None
     ) -> int:
+        if since is None:  # the new dataset's sync at open (review F3), not an episode save
+            order.append(f"open:{Path(root).name}")
+            return int(real_tree(root, skip, since, *([] if policy is None else [policy])))
         if fail["on"]:
             raise OSError(5, "Input/output error")
         order.append(f"sync:{Path(root).name}")
@@ -698,6 +701,7 @@ def test_a_saved_episode_is_synced_before_its_journal_is_dropped(
     r = json.loads(rec.read_text())["results"]
     saves = [i for i, e in enumerate(order) if e == "sync:dataset"]
     assert len(saves) == 3 and all(order[i + 1] == "drop" for i in saves)
+    assert order[0] == "open:dataset"  # the new dataset is synced before the first trial
     assert all(t["capture"]["episode_index"] is not None for t in r["trials"])
 
     fail["on"] = True

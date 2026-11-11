@@ -76,7 +76,14 @@ from src.robot.safety import FkFn, load_sim_fk, make_safety
 from src.robot.serve import MockPolicy, PolicyServer, build_server
 from src.robot.servo_health import monitor_from_config
 from src.robot.units import UnitMap
-from src.runs import RUNS_DIR, Run, journal_sync_policy, new_run_id, probe_full_fsync
+from src.runs import (
+    RUNS_DIR,
+    Run,
+    SyncPolicy,
+    journal_sync_policy,
+    new_run_id,
+    probe_full_fsync,
+)
 
 MOCK_LABEL = "MOCK: fake arm, fake camera, mock policy; exercises the client only, NOT a result"
 HARDWARE_LABEL = "pilot, single run, real arm; fewer than 50 trials per cell, not a protocol table"
@@ -117,6 +124,13 @@ def mock_waypoints(home: Sequence[float]) -> list[np.ndarray]:
     return [hover, descend, close, lift, carry, release]
 
 
+def journal_policy(mode: str) -> SyncPolicy:
+    """The pilot journal's sync policy (src/runs.py, owner 2026-11-10): record.json writes of a
+    hardware session on macOS require F_FULLFSYNC (no fsync fallback); mock and Linux: best
+    effort, the method recorded."""
+    return journal_sync_policy(real_arm=mode == "hardware")
+
+
 def session(
     cfg: Config,
     loop: DeployLoop,
@@ -145,7 +159,7 @@ def session(
         run_id=new_run_id("WO-07", f"pilot-{mode}"),
         # record.json writes: F_FULLFSYNC required on the real arm on macOS (src/runs.py); the
         # pilot never resumes, so its metrics rows stay plain appends
-        sync_policy=journal_sync_policy(real_arm=mode == "hardware"),
+        sync_policy=journal_policy(mode),
     ) as run:
         run.results.update(
             journal_preflight=journal_preflight,
@@ -301,14 +315,14 @@ def run_hardware(cfg: Config, args: argparse.Namespace) -> Path:
             "scripts/wo06_camera_intrinsics.py first (or pass --allow-uncalibrated-camera)"
         )
     try:  # the journal's sync, before anything is opened (src/runs.py, owner 2026-11-10)
-        journal_preflight = probe_full_fsync(
-            Path(args.runs_dir), journal_sync_policy(real_arm=True)
-        )
+        journal_preflight = probe_full_fsync(Path(args.runs_dir), journal_policy("hardware"))
     except OSError as e:
         sys.exit(
             f"refusing the hardware session; nothing was opened: the journal in "
             f"{args.runs_dir} cannot be synced as required ({type(e).__name__}: {e})"
         )
+    if journal_preflight.get("directory_note"):
+        print(f"WARNING: {journal_preflight['directory_note']}")
     from src.robot.camera import OpenCVFrameSource
 
     dcfg = DeployConfig.from_config(cfg)

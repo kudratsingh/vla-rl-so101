@@ -96,7 +96,8 @@ is atomic and synced (``src/runs.py``). A ``--hardware`` session on macOS REQUIR
 every journal file sync (``journal_policy``, owner 2026-11-10): unsupported or failed, it raises
 and is never replaced by ``fsync``, so a start marker that cannot be F_FULLFSYNCed blocks the
 first goal (``start_marker_failed``, the safe shutdown); ``preflight_journal`` refuses the
-session before anything is opened when the runs directory's filesystem cannot do it. Mock
+session before anything is opened or changed (it runs first in ``run``, before a resume's capture
+recovery, which syncs under the same policy) when the runs directory's filesystem cannot do it. Mock
 sessions and Linux keep the best-effort sync, the method recorded (record.json ``sync``); other
 metrics rows (decisions, trial and capture rows)
 are plain appends, each trial / capture row followed by a synced record.json holding it. The
@@ -1514,15 +1515,18 @@ def capture_repo_id(session_id: str) -> str:
     return f"local/so101-real-eval-{session_id}"
 
 
-def precheck_capture(runs_dir: Path, settings: dict[str, Any]) -> dict[str, Any] | None:
+def precheck_capture(
+    runs_dir: Path, settings: dict[str, Any], policy: SyncPolicy = SyncPolicy.BEST_EFFORT
+) -> dict[str, Any] | None:
     """A resumed real-0.1 session, BEFORE the arm is connected (review F1): recover its capture
-    dataset (a kill mid-save) and make sure it reopens; refuses with a clear message if not."""
+    dataset (a kill mid-save; its writes synced under ``policy``, the session journal's) and make
+    sure it reopens; refuses with a clear message if not."""
     sid = settings.get("session_id")
     if not sid or not settings.get("capture"):
         return None
     root = Path(runs_dir) / str(sid) / "capture"
     try:
-        report = check_capture_resumable(root, capture_repo_id(str(sid)), sid)
+        report = check_capture_resumable(root, capture_repo_id(str(sid)), sid, policy)
     except Exception as e:  # noqa: BLE001 - nothing is open yet
         sys.exit(f"--resume refused: the session's capture {root} cannot be reopened ({e})")
     if report and (report["moved"] or report["pruned"]):
@@ -1872,6 +1876,10 @@ def run(
     fk: FkFn | None = None,
     operator: Operator | None = None,
 ) -> Path:
+    # a hardware session's journal preflight comes first: before anything is opened AND before a
+    # resume's capture recovery changes the capture (it syncs under the same policy)
+    journal_preflight = preflight_journal(args.runs_dir) if args.hardware else None
+    policy = journal_policy("hardware" if args.hardware else "mock")
     if args.resume:
         prior_dir = Path(args.resume) if Path(args.resume).is_dir() else args.runs_dir / args.resume
         settings, prior = load_prior(prior_dir)
@@ -1880,7 +1888,7 @@ def run(
         check_identity(settings, args)
         settings.setdefault("backend", "grpc")  # sessions recorded before --backend
         if settings.get("protocol_id") == PR.PROTOCOL_VERSION:  # before anything is opened
-            precheck_capture(args.runs_dir, settings)
+            precheck_capture(args.runs_dir, settings, policy)
         if args.backend not in (None, settings["backend"]):
             sys.exit(f"--resume refused: the session ran --backend {settings['backend']}")
     else:
@@ -1888,7 +1896,15 @@ def run(
             sys.exit("--task is required for a new session")
         settings, prior, resumed_from, prior_runs = new_settings(args, cfg), [], None, []
     if args.hardware:
-        return run_hardware(cfg, args, settings, prior, resumed_from, prior_runs)
+        return run_hardware(
+            cfg,
+            args,
+            settings,
+            prior,
+            resumed_from,
+            prior_runs,
+            journal_preflight=journal_preflight,
+        )
     torque_wait = TorqueWait.from_config(cfg, "deploy", allow_none=True)  # validated; mock: unused
     rig = (
         local_mock_rig(cfg, args, fk, settings)
@@ -1957,6 +1973,8 @@ def run_hardware(
     prior: list[dict[str, Any]],
     resumed_from: str | None,
     prior_runs: Sequence[str] = (),
+    *,
+    journal_preflight: dict[str, Any] | None = None,
 ) -> Path:
     if not args.i_am_present:
         print(HARDWARE_REFUSAL)
@@ -1979,7 +1997,8 @@ def run_hardware(
         problems = real_hardware_problems(cfg, settings)
         if problems:
             sys.exit("refusing a real-0.1 session; nothing was opened:\n  " + "\n  ".join(problems))
-    journal_preflight = preflight_journal(args.runs_dir)  # before anything is opened
+    if journal_preflight is None:  # run() ran it first; a direct call runs it here
+        journal_preflight = preflight_journal(args.runs_dir)  # before anything is opened
     cfg_seed = int((cfg.get("eval") or {}).get("slot_seed", 0))
     if not real and int(settings["slot_seed"]) != cfg_seed:
         sys.exit(
@@ -2054,12 +2073,15 @@ def preflight_journal(runs_dir: Path) -> dict[str, Any]:
     ``journal_policy``. On macOS a filesystem that cannot F_FULLFSYNC refuses the session here
     rather than at the first trial's start marker (which still requires it, every write)."""
     try:
-        return probe_full_fsync(Path(runs_dir), journal_policy("hardware"))
+        probe = probe_full_fsync(Path(runs_dir), journal_policy("hardware"))
     except OSError as e:
         sys.exit(
             f"refusing the hardware session; nothing was opened: the journal in {runs_dir} "
             f"cannot be synced as required ({type(e).__name__}: {e})"
         )
+    if probe.get("directory_note"):
+        print(f"WARNING: {probe['directory_note']}")
+    return probe
 
 
 def _show_file(path: Path) -> None:

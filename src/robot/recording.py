@@ -79,7 +79,11 @@ Evaluation capture (``EvalCapture``), one dataset per evaluation session, one ep
   the scored record's ``capture`` block (and the synced record.json that holds it) never names
   an episode the page cache still held. Between trials, never during motion; ``sync_s`` in the
   block says what it cost. A failed sync keeps the journal and says so (``sync_error``).
-  ``write_json`` (provenance, journals) is atomic and synced. Should an episode a record names
+  ``write_json`` (provenance, journals) is atomic and synced. A capture recovery
+  (``recover_dataset``: rewritten ``meta/info.json`` / ``meta/stats.json``, quarantine moves) and a
+  newly created dataset (a new session, or the empty restart: meta and the calibration copy) are
+  synced under the same policy before they return, so a resume never depends on a write the page
+  cache still held. Should an episode a record names
   still be gone after a power loss, the resume's reconcile treats the trial as having none
   (scripts/wo07_real_eval.py ``reconcile_captures``).
 """
@@ -275,12 +279,16 @@ def _utc_stamp() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def recover_dataset(root: Path, quarantine: Path | None = None) -> dict[str, Any]:
+def recover_dataset(
+    root: Path, quarantine: Path | None = None, policy: SyncPolicy = SyncPolicy.BEST_EFFORT
+) -> dict[str, Any]:
     """Make a recording dataset a kill left mid-save readable again (module doc): unreadable
     episode-metadata files, data / video files no finalized episode references, and the frame
     PNG folder are moved to ``quarantine``; ``meta/info.json`` totals and ``meta/stats.json`` are
-    rebuilt from the finalized episodes. Returns what it did (``moved`` empty = nothing to do).
-    Raises ``RuntimeError`` when a file a finalized episode needs is itself unreadable."""
+    rebuilt from the finalized episodes. ``meta/`` is synced under ``policy`` before it returns
+    and, when anything moved, every directory of the dataset and of the quarantine.
+    Returns what it did (``moved`` empty = nothing to do). Raises ``RuntimeError`` when a file a
+    finalized episode needs is itself unreadable, ``OSError`` when the sync fails."""
     import numpy as np
     import pyarrow.parquet as pq
     from lerobot.datasets.compute_stats import aggregate_stats
@@ -292,6 +300,8 @@ def recover_dataset(root: Path, quarantine: Path | None = None) -> dict[str, Any
     )
     info = json.loads((root / "meta" / "info.json").read_text())
     moved: list[str] = []
+    t_start = time.time()
+    rewritten = False
 
     def stash(path: Path) -> None:
         rel = path.relative_to(root)
@@ -345,6 +355,7 @@ def recover_dataset(root: Path, quarantine: Path | None = None) -> dict[str, Any
     if moved or info.get("total_episodes") != n or info.get("total_frames") != frames:
         info.update(total_episodes=n, total_frames=frames, splits={"train": f"0:{n}"})
         write_info(info, root)
+        rewritten = True
         stats_path = root / "meta" / "stats.json"
         if n:
             per_episode = []
@@ -358,6 +369,15 @@ def recover_dataset(root: Path, quarantine: Path | None = None) -> dict[str, Any
             write_stats(aggregate_stats(per_episode), root)
         elif stats_path.exists():
             stash(stats_path)
+    # durable before a resume relies on it (review F3, owner 2026-11-10). meta/ always: a
+    # recovery whose sync failed earlier left its rewrites in the page cache, and this one may
+    # find nothing left to change
+    sync_tree(root / "meta", policy=policy)
+    if moved or rewritten:  # the moves: every directory of the dataset and of the quarantine
+        sync_tree(root, since=t_start, policy=policy)
+        if quarantine.exists():
+            sync_tree(quarantine, since=t_start, policy=policy)
+            sync_path(quarantine.parent)
     return {
         "moved": moved,
         "quarantine": str(quarantine) if moved else None,
@@ -504,6 +524,7 @@ class EvalCapture:
                 shutil.move(str(ds_root), str(stash))
                 ds = DurableDataset(create_dataset(repo_id, ds_root), repo_id)
                 prov["calibration"] = copy_calibration(follower, ds_root)
+                _sync_new_dataset(ds_root, sync_policy)  # the stash rename too (module doc)
                 recovery["restarted_empty_dataset"] = str(stash)
             else:
                 try:
@@ -525,6 +546,7 @@ class EvalCapture:
             ds_root.parent.mkdir(parents=True, exist_ok=True)
             ds = DurableDataset(create_dataset(repo_id, ds_root), repo_id)
             provenance["calibration"] = copy_calibration(follower, ds_root)
+            _sync_new_dataset(ds_root, sync_policy)
             cap = cls(
                 ds,
                 Path(root),
@@ -937,6 +959,13 @@ class EvalCapture:
             self._write_provenance()
 
 
+def _sync_new_dataset(ds_root: Path, policy: SyncPolicy) -> None:
+    """A dataset just created (meta, the calibration copy): every file and directory synced
+    under ``policy``, then the capture directory that holds its entry (and a stash's)."""
+    sync_tree(ds_root, policy=policy)
+    sync_path(ds_root.parent)
+
+
 def recover_capture(
     root: Path, session_id: Any, policy: SyncPolicy = SyncPolicy.BEST_EFFORT
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -947,20 +976,23 @@ def recover_capture(
     prov = json.loads((ds_root / PROVENANCE).read_text())
     if prov.get("session_id") != session_id:
         raise RuntimeError(f"{ds_root} belongs to session {prov.get('session_id')!r}")
-    report = recover_dataset(ds_root, Path(root) / f"recovered-{_utc_stamp()}")
+    report = recover_dataset(ds_root, Path(root) / f"recovered-{_utc_stamp()}", policy)
     report["pruned"] = prune_provenance(prov, int(report["episodes"]))
     if report["moved"] or report["pruned"]:
         write_json(ds_root / PROVENANCE, prov, policy)
     return prov, report
 
 
-def check_capture_resumable(root: Path, repo_id: str, session_id: Any) -> dict[str, Any] | None:
-    """Before the arm is connected (a resumed hardware session): recover the capture and make
-    sure LeRobot reopens it. None when the session has no capture yet. Raises on failure."""
+def check_capture_resumable(
+    root: Path, repo_id: str, session_id: Any, policy: SyncPolicy = SyncPolicy.BEST_EFFORT
+) -> dict[str, Any] | None:
+    """Before the arm is connected (a resumed hardware session): recover the capture (its
+    writes synced under ``policy``, the session journal's) and make sure LeRobot reopens it.
+    None when the session has no capture yet. Raises on failure."""
     ds_root = Path(root) / "dataset"
     if not ds_root.exists():
         return None
-    _, report = recover_capture(root, session_id)
+    _, report = recover_capture(root, session_id, policy)
     if report["episodes"]:
         ds = open_dataset(repo_id, ds_root)
         ds.stop_image_writer()

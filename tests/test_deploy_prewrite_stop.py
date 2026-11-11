@@ -1432,17 +1432,33 @@ class _MacSyncs:
         return [e for e in self.log[i:] if e[:2] == ("fsync", "file")]
 
 
+def _as_hardware_on_darwin(monkeypatch: pytest.MonkeyPatch, mod: Any = ev) -> None:
+    """Review F2: a mock-rig session of ``mod`` (wo07_real_eval or wo07_pilot) driven as the
+    HARDWARE session on a simulated macOS: ``session`` gets ``mode="hardware"`` (what
+    ``run_hardware`` passes) and the platform is darwin; the script's own ``journal_policy(mode)``
+    then picks the policy, so a mutation of that choice (or of the mode string) fails."""
+    darwin = functools.partial(runs_mod.journal_sync_policy, platform="darwin")
+    monkeypatch.setattr(mod, "journal_sync_policy", darwin)
+    real_session = mod.session
+
+    def session(*a: Any, **k: Any) -> Path:
+        assert k.get("mode") == "mock"  # the mock rig's entry, now as the hardware one
+        return Path(real_session(*a, **{**k, "mode": "hardware"}))
+
+    monkeypatch.setattr(mod, "session", session)
+
+
 def _darwin_real_arm_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str, persistent: bool
 ) -> tuple[Path | None, Probe, _MacSyncs, BaseException | None]:
-    """``wo07_real_eval`` on the mock rig as a simulated macOS REAL-ARM session (its journal
-    policy: ``journal_sync_policy(real_arm=True, platform="darwin")``): F_FULLFSYNC fails (``how``)
-    from slot 0's ``trial_started`` row on, for that row's sync only or (``persistent``) for good.
+    """``wo07_real_eval`` on the mock rig as a simulated macOS REAL-ARM session
+    (``_as_hardware_on_darwin``: mode "hardware", the script's own policy choice): F_FULLFSYNC
+    fails (``how``) from slot 0's ``trial_started`` row on, for that row's sync only or
+    (``persistent``) for good.
     Returns (record.json or None if the session raised, the probe, the syncs, the exception)."""
     probes: list[Probe] = []
     syncs = _MacSyncs(monkeypatch)
-    real_arm_mac = functools.partial(runs_mod.journal_sync_policy, real_arm=True, platform="darwin")
-    monkeypatch.setattr(ev, "journal_policy", lambda _mode: real_arm_mac())
+    _as_hardware_on_darwin(monkeypatch)
 
     class SignalLoop(DeployLoop):
         def __init__(self, *a: Any, **k: Any) -> None:
@@ -1506,7 +1522,12 @@ def test_darwin_real_arm_unsupported_f_fullfsync_blocks_the_first_goal_no_fsync_
     assert not probe.loop.arm.follower.bus.torque_enabled  # type: ignore[attr-defined]
     rec_data = json.loads(rec.read_text())
     r1 = rec_data["results"]
-    assert rec_data["sync"] == {"policy": "full_fsync_required", "methods": ["F_FULLFSYNC"]}
+    assert r1["mode"] == "hardware"
+    assert rec_data["sync"] == {
+        "policy": "full_fsync_required",
+        "methods": ["F_FULLFSYNC"],
+        "dir_methods": ["F_FULLFSYNC"],
+    }
     assert r1["durability"]["sync_policy"] == "full_fsync_required"
     assert r1["session_end"].startswith("start_marker_failed: ")
     assert (r1["shutdown"], r1["support_confirmed"]) == ("supported", True)
@@ -1605,7 +1626,7 @@ def test_hardware_session_refuses_at_preflight_without_f_fullfsync_before_anythi
 
     syncs = _MacSyncs(monkeypatch)
     darwin = functools.partial(runs_mod.journal_sync_policy, platform="darwin")
-    monkeypatch.setattr(ev, "journal_policy", lambda mode: darwin(real_arm=mode == "hardware"))
+    monkeypatch.setattr(ev, "journal_sync_policy", darwin)  # the script's journal_policy runs
     monkeypatch.setattr(pilot, "journal_sync_policy", darwin)
     intr = {"fx": 500.0, "fy": 500.0, "cx": 320.0, "cy": 240.0, "dist": [0.0] * 5}
     _with_cfg(monkeypatch, lambda c: c["cameras"]["front"].update(intrinsics=intr))
@@ -1636,3 +1657,171 @@ def test_hardware_session_refuses_at_preflight_without_f_fullfsync_before_anythi
         pilot.main(pilot_argv)
     assert syncs.file_fsyncs_after_fail() == []
     assert list(runs.iterdir()) == []  # no probe file, no run
+
+
+def _file_syncs(syncs: _MacSyncs, method: str) -> set[str]:
+    return {e[2] for e in syncs.log if e[:2] == (method, "file")}
+
+
+def test_darwin_real_arm_capture_journal_is_f_fullfsynced_never_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review F1/F2 (round 2026-11-10): a real-0.1 session with the evaluation capture, as the
+    hardware session on a simulated macOS. Every capture journal file sync (provenance, the new
+    dataset's meta and calibration copy, the staged journal index, the saved episode's parquet /
+    meta files, the end-state stills) is an F_FULLFSYNC and none is an ``os.fsync``. A mutation
+    that drops the session policy anywhere on the capture's path (``open_capture``,
+    ``EvalCapture.open``, ``sync_tree``) or picks the mock policy for ``mode="hardware"`` fails."""
+    from test_protocol_real import real_args
+
+    syncs = _MacSyncs(monkeypatch)
+    _as_hardware_on_darwin(monkeypatch)
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    rec = ev.main(real_args(tmp_path / "runs", "--task", "PickPlace", "--trials", "1"))
+    data = json.loads(rec.read_text())
+    r = data["results"]
+    assert r["mode"] == "hardware" and r["session_end"] == "completed"
+    assert data["sync"]["policy"] == "full_fsync_required"
+    assert all(t["capture"]["episode_index"] is not None for t in r["trials"])
+    assert all("sync_error" not in t["capture"] for t in r["trials"])
+    assert [e for e in syncs.log if e[:2] == ("fsync", "file")] == []
+    full = _file_syncs(syncs, "F_FULLFSYNC")
+    for name in ("calibration_follower.json", "info.json", "vla_rl_so101.json"):
+        assert name in full, name
+    for name in ("vla_rl_so101.json.tmp", "staged.json.tmp"):  # write_json: tmp synced, renamed
+        assert name in full, name
+    assert any(n.endswith(".parquet") for n in full)  # the saved episode's data / meta
+    first = {e: syncs.log.index(("F_FULLFSYNC", "file", e)) for e in full}
+    # the new dataset (meta, calibration copy) is synced at open, before the first trial
+    assert first["calibration_follower.json"] < first["staged.json.tmp"]
+    assert first["info.json"] < first["staged.json.tmp"]
+    assert {f"episode_000000_{c}.png" for c in ("front", "wrist")} <= full  # the stills
+
+
+@pytest.mark.parametrize("how", ["missing", "ENOTSUP"])
+def test_darwin_real_arm_capture_sync_failure_keeps_the_journal_and_never_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    """Review F1 (round 2026-11-10): the first saved episode's sync (``sync_tree`` in
+    ``EvalCapture.finish``) meets an unsupported F_FULLFSYNC: the capture block records the
+    ``sync_error`` (FullFsyncRequired), the staged journal is kept for a resume, and no
+    ``os.fsync`` stands in on any file."""
+    from test_protocol_real import real_args
+
+    from src.robot import recording
+
+    syncs = _MacSyncs(monkeypatch)
+    _as_hardware_on_darwin(monkeypatch)
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    real_tree = recording.sync_tree
+    fired = [False]
+
+    def sync_tree(root: Path, *a: Any, **k: Any) -> int:
+        if k.get("since") is None or fired[0]:  # only the first episode save's sync
+            return int(real_tree(root, *a, **k))
+        fired[0] = True
+        syncs.fail(how)
+        try:
+            return int(real_tree(root, *a, **k))
+        finally:
+            syncs.heal()
+
+    monkeypatch.setattr(recording, "sync_tree", sync_tree)
+    rec = ev.main(real_args(tmp_path / "runs", "--task", "PickPlace", "--trials", "1"))
+    r = json.loads(rec.read_text())["results"]
+    assert fired[0] and r["mode"] == "hardware"
+    cap0 = r["trials"][0]["capture"]
+    assert cap0["episode_index"] == 0
+    assert "FullFsyncRequired" in cap0["sync_error"] and "staged journal is kept" in (
+        cap0["sync_error"]
+    )
+    sid = r["session"]["session_id"]
+    assert recording.has_staged(tmp_path / "runs" / sid / "capture", r["trials"][0]["trial_id"])
+    assert syncs.file_fsyncs_after_fail() == []
+    assert [e for e in syncs.log if e[:2] == ("fsync", "file")] == []
+
+
+def test_darwin_hardware_resume_preflights_before_the_capture_recovery_changes_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review F1 (round 2026-11-10): ``--resume --hardware`` of a real-0.1 session whose capture
+    a kill left mid-save. On a simulated macOS without F_FULLFSYNC the journal preflight refuses
+    FIRST: the capture is untouched (no quarantine, info.json and provenance as they were) and
+    nothing ran ``os.fsync`` on a file. F_FULLFSYNC lost after the preflight: the recovery's own
+    sync refuses the resume (the session policy reaches ``check_capture_resumable``), still no
+    fsync. With F_FULLFSYNC, the recovery's writes (provenance pruned, info.json, stats.json)
+    are F_FULLFSYNCed, never fsynced, before the session goes on to its next check
+    (``--i-am-present`` missing: refused, nothing opened)."""
+    from test_pr2_review_fixes import _simulate_kill_mid_save
+    from test_protocol_real import real_args
+
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    rec = ev.main(real_args(runs, "--task", "PickPlace", "--trials", "1"))
+    settings, _ = ev.load_prior(rec.parent)
+    capture = runs / str(settings["session_id"]) / "capture"
+    ds_root = capture / "dataset"
+    prov_path = ds_root / "meta" / "vla_rl_so101.json"
+    prov = json.loads(prov_path.read_text())
+    prov["episodes"]["3"] = {"trial_id": "lost-in-the-kill"}  # an entry the recovery prunes
+    prov_path.write_text(json.dumps(prov))
+    _simulate_kill_mid_save(ds_root, 3)
+    before = {p: p.read_bytes() for p in (prov_path, ds_root / "meta" / "info.json")}
+
+    syncs = _MacSyncs(monkeypatch)
+    monkeypatch.setattr(ev, "journal_sync_policy", functools.partial(
+        runs_mod.journal_sync_policy, platform="darwin"))  # fmt: skip
+    argv = ["--preset", "real", "--hardware", "--resume", rec.parent.name, "--runs-dir", str(runs)]
+    syncs.fail("missing")
+    with pytest.raises(SystemExit, match="refusing the hardware session; nothing was opened"):
+        ev.main(argv)
+    assert {p: p.read_bytes() for p in before} == before
+    assert not list(capture.glob("recovered-*")) and (ds_root / "images").exists()
+    assert syncs.file_fsyncs_after_fail() == []
+
+    syncs.heal()
+    real_preflight = ev.preflight_journal
+
+    def preflight_then_lost(runs_dir: Path) -> dict[str, Any]:
+        out: dict[str, Any] = real_preflight(runs_dir)
+        syncs.fail("ENOTSUP")  # the disk loses F_FULLFSYNC between the preflight and the recovery
+        return out
+
+    monkeypatch.setattr(ev, "preflight_journal", preflight_then_lost)
+    with pytest.raises(
+        SystemExit, match="--resume refused: .*F_FULLFSYNC required.*no fsync fallback"
+    ):
+        ev.main(argv)
+    assert syncs.file_fsyncs_after_fail() == []
+    monkeypatch.setattr(ev, "preflight_journal", real_preflight)
+
+    syncs.heal()
+    with pytest.raises(SystemExit) as e:
+        ev.main(argv)  # preflight passes, the capture is recovered, then --i-am-present refuses
+    assert e.value.code == 2
+    assert list(capture.glob("recovered-*")) and not (ds_root / "images").exists()
+    assert "3" not in json.loads(prov_path.read_text())["episodes"]  # pruned
+    heal = len(syncs.log) - syncs.log[::-1].index(("heal",))  # after the last heal
+    full = {e[2] for e in syncs.log[heal:] if e[:2] == ("F_FULLFSYNC", "file")}
+    assert {"vla_rl_so101.json.tmp", "info.json", "stats.json"} <= full
+    assert [e for e in syncs.log if e[:2] == ("fsync", "file")] == []
+
+
+def test_darwin_pilot_hardware_session_record_requires_f_fullfsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review F2 (round 2026-11-10): the pilot's hardware session on a simulated macOS: its Run
+    (``pilot.journal_policy("hardware")``) requires F_FULLFSYNC; every record.json sync is one and
+    none is an ``os.fsync``. The mock session on the same simulated macOS stays best effort."""
+    syncs = _MacSyncs(monkeypatch)
+    _as_hardware_on_darwin(monkeypatch, pilot)
+    argv = ["--preset", "real", "--mock", "--fake-clock", "--trials", "1"]
+    rec = pilot.main([*argv, "--runs-dir", str(tmp_path / "hw")])
+    data = json.loads(rec.read_text())
+    assert data["results"]["mode"] == "hardware" and data["results"]["session_end"] == "completed"
+    assert data["sync"]["policy"] == "full_fsync_required"
+    assert data["sync"]["methods"] == ["F_FULLFSYNC"]
+    assert "record.json.tmp" in _file_syncs(syncs, "F_FULLFSYNC")
+    assert [e for e in syncs.log if e[:2] == ("fsync", "file")] == []
+    assert pilot.journal_policy("hardware") is runs_mod.SyncPolicy.FULL_FSYNC_REQUIRED
+    assert pilot.journal_policy("mock") is runs_mod.SyncPolicy.BEST_EFFORT
