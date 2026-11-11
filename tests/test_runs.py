@@ -53,7 +53,7 @@ def _synced_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
     names: list[str] = []
     real_sync = runs.sync_fd
 
-    def sync(fd: int) -> str:
+    def sync(fd: int, *a: Any) -> str:
         st = os.fstat(fd)
         for p in [tmp_path, *tmp_path.rglob("*")]:
             q = p.stat()
@@ -62,7 +62,7 @@ def _synced_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
                 break
         else:
             names.append("?")
-        return real_sync(fd)
+        return real_sync(fd, *a)
 
     monkeypatch.setattr(runs, "sync_fd", sync)
     return names
@@ -106,7 +106,7 @@ def test_sync_uses_f_fullfsync_falls_back_only_when_unsupported_and_raises_other
 
     p = tmp_path / "f"
     p.write_text("x")
-    monkeypatch.setattr(runs, "_F_FULLFSYNC", None)
+    monkeypatch.delattr(fcntl, "F_FULLFSYNC", raising=False)
     assert runs.sync_path(p) == "fsync"
     run = Run(work_order="WO-01", script=__file__, cfg=load_config("tiny"), device="cpu",
               runs_dir=tmp_path / "r")  # fmt: skip
@@ -119,7 +119,7 @@ def test_sync_uses_f_fullfsync_falls_back_only_when_unsupported_and_raises_other
 
         return f
 
-    monkeypatch.setattr(runs, "_F_FULLFSYNC", 51)  # F_FULLFSYNC's value on macOS
+    monkeypatch.setattr(fcntl, "F_FULLFSYNC", 51, raising=False)  # its value on macOS
     monkeypatch.setattr(fcntl, "fcntl", failing(errno.ENOTSUP))
     assert runs.sync_path(p).startswith("fsync (F_FULLFSYNC unsupported here: E")
     assert cmds == [51]
@@ -129,3 +129,173 @@ def test_sync_uses_f_fullfsync_falls_back_only_when_unsupported_and_raises_other
     with pytest.raises(OSError, match="Input/output error"):
         run.log_durable(kind="trial_started")
     assert json.loads(run.metrics_path.read_text())["kind"] == "trial_started"
+
+
+# -- owner 2026-11-10: F_FULLFSYNC required for real-arm journal writes on macOS -----------------
+class _Syncs:
+    """``fcntl.fcntl`` / ``os.fsync`` spy on a simulated macOS: ``F_FULLFSYNC`` (51) present and
+    succeeding (logged, no real flush) unless ``missing`` (the attribute removed) or ``errno``
+    (fcntl raises it); every call logged as (method, "file" | "dir")."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import stat
+
+        self.log: list[tuple[str, str]] = []
+        self.errno: int | None = None
+        self._mp = monkeypatch
+        real_fcntl, real_fsync = fcntl.fcntl, os.fsync
+
+        def kind(fd: int) -> str:
+            return "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+
+        def fake_fcntl(fd: int, cmd: int, *a: Any) -> Any:
+            if cmd != 51:
+                return real_fcntl(fd, cmd, *a)
+            self.log.append(("F_FULLFSYNC", kind(fd)))
+            if self.errno is not None:
+                raise OSError(self.errno, os.strerror(self.errno))
+            return 0
+
+        def fsync(fd: int) -> None:
+            self.log.append(("fsync", kind(fd)))
+            real_fsync(fd)
+
+        monkeypatch.setattr(fcntl, "F_FULLFSYNC", 51, raising=False)
+        monkeypatch.setattr(fcntl, "fcntl", fake_fcntl)
+        monkeypatch.setattr(os, "fsync", fsync)
+
+    def missing(self) -> None:
+        self._mp.delattr(fcntl, "F_FULLFSYNC")
+
+
+def test_journal_sync_policy_requires_f_fullfsync_only_on_a_real_arm_on_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.runs import SyncPolicy, journal_sync_policy
+
+    req, best = SyncPolicy.FULL_FSYNC_REQUIRED, SyncPolicy.BEST_EFFORT
+    assert journal_sync_policy(real_arm=True, platform="darwin") is req
+    assert journal_sync_policy(real_arm=True, platform="linux") is best  # Linux: os.fsync
+    assert journal_sync_policy(real_arm=False, platform="darwin") is best  # mock / scripted
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert journal_sync_policy(real_arm=True) is req  # sys.platform, read per call
+    from test_real_eval import ev
+
+    assert ev.journal_policy("hardware") is req and ev.journal_policy("mock") is best
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert ev.journal_policy("hardware") is best
+
+
+@pytest.mark.parametrize("fail", ["missing", "ENOTSUP", "EINVAL", "ENOTTY", "EIO"])
+def test_required_f_fullfsync_never_falls_back_to_fsync_on_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    """Under ``full_fsync_required`` a FILE sync is a successful F_FULLFSYNC or it raises
+    ``FullFsyncRequired`` with the errno (ENOTSUP when fcntl has no F_FULLFSYNC): ``os.fsync`` is
+    never run on the file in its place. The best-effort policy falls back on the same failures
+    (except EIO), and a directory keeps the best-effort sync under either policy."""
+    from src import runs
+    from src.runs import FullFsyncRequired, SyncPolicy
+
+    req = SyncPolicy.FULL_FSYNC_REQUIRED
+    p = tmp_path / "metrics.jsonl"
+    p.write_text("{}\n")
+    s = _Syncs(monkeypatch)
+    assert runs.sync_path(p, req) == "F_FULLFSYNC" and s.log == [("F_FULLFSYNC", "file")]
+    s.log.clear()
+    if fail == "missing":
+        s.missing()
+    else:
+        s.errno = getattr(errno, fail)
+    with pytest.raises(FullFsyncRequired) as e:
+        runs.sync_path(p, req)
+    want = errno.ENOTSUP if fail == "missing" else getattr(errno, fail)
+    assert e.value.errno == want and "no fsync fallback" in str(e.value)
+    assert ("fsync", "file") not in s.log  # the mutation "fall back to fsync" fails here
+    with pytest.raises(FullFsyncRequired):
+        runs.write_durable(tmp_path / "record.json", "{}\n", req)
+    assert not (tmp_path / "record.json").exists()  # never renamed into place unsynced
+    assert ("fsync", "file") not in s.log
+    s.log.clear()
+    if fail == "EIO":  # a failing disk: best effort raises too, so does the directory
+        with pytest.raises(OSError):
+            runs.sync_path(p)
+        with pytest.raises(OSError):
+            runs.sync_path(tmp_path, req)
+        return
+    assert runs.sync_path(p).startswith("fsync")  # best effort (mock): the recorded fallback
+    assert runs.sync_path(tmp_path, req).startswith("fsync")  # a directory: best effort
+    assert s.log[-1] == ("fsync", "dir")
+
+
+def test_required_f_fullfsync_directories_and_linux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directories: F_FULLFSYNC where the filesystem takes it (APFS does), else os.fsync, under
+    either policy. Linux (no F_FULLFSYNC, best effort): os.fsync on files and directories."""
+    from src import runs
+    from src.runs import SyncPolicy
+
+    s = _Syncs(monkeypatch)
+    assert runs.sync_path(tmp_path, SyncPolicy.FULL_FSYNC_REQUIRED) == "F_FULLFSYNC"
+    assert s.log == [("F_FULLFSYNC", "dir")]
+    s.log.clear()
+    s.missing()  # Linux
+    p = tmp_path / "f"
+    p.write_text("x")
+    linux = runs.journal_sync_policy(real_arm=True, platform="linux")
+    assert runs.sync_path(p, linux) == "fsync" and runs.sync_path(tmp_path, linux) == "fsync"
+    assert runs.write_durable(tmp_path / "r.json", "{}", linux) == "fsync"
+    assert s.log == [("fsync", "file"), ("fsync", "dir"), ("fsync", "file"), ("fsync", "dir")]
+
+
+def test_run_records_its_sync_policy_and_a_required_run_never_uses_fsync_on_its_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.runs import FullFsyncRequired, SyncPolicy
+
+    s = _Syncs(monkeypatch)
+    run = Run(work_order="WO-07", script=__file__, cfg=load_config("tiny"), device="cpu",
+              runs_dir=tmp_path, sync_policy=SyncPolicy.FULL_FSYNC_REQUIRED)  # fmt: skip
+    assert run.log_durable(kind="session") == "F_FULLFSYNC"
+    run.flush()
+    rec = json.loads(run.record_path.read_text())
+    assert rec["sync"] == {"policy": "full_fsync_required", "methods": ["F_FULLFSYNC"]}
+    assert ("fsync", "file") not in s.log
+    s.missing()
+    with pytest.raises(FullFsyncRequired, match="fcntl has no F_FULLFSYNC"):
+        run.log_durable(kind="trial_started", trial_idx=0)
+    with pytest.raises(FullFsyncRequired):
+        run.flush()
+    assert ("fsync", "file") not in s.log
+    # a mock session's run: best effort; without F_FULLFSYNC it falls back, and says so
+    mock = Run(work_order="WO-07", script=__file__, cfg=load_config("tiny"), device="cpu",
+               runs_dir=tmp_path)  # fmt: skip
+    assert mock.log_durable(kind="session") == "fsync"
+    mock.flush()
+    assert json.loads(mock.record_path.read_text())["sync"] == {
+        "policy": "best_effort",
+        "methods": ["fsync"],
+    }
+
+
+@pytest.mark.parametrize("fail", ["missing", "ENOTSUP"])
+def test_probe_full_fsync_refuses_an_unsupported_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: str
+) -> None:
+    from src import runs
+    from src.runs import FullFsyncRequired, SyncPolicy
+
+    req = SyncPolicy.FULL_FSYNC_REQUIRED
+    s = _Syncs(monkeypatch)
+    d = tmp_path / "runs"
+    ok = runs.probe_full_fsync(d, req)
+    assert (ok["file"], ok["directory"], ok["policy"]) == ("F_FULLFSYNC",) * 2 + (str(req),)
+    if fail == "missing":
+        s.missing()
+    else:
+        s.errno = errno.ENOTSUP
+    with pytest.raises(FullFsyncRequired):
+        runs.probe_full_fsync(d, req)
+    assert list(d.iterdir()) == []  # the probe file is gone either way
+    assert runs.probe_full_fsync(d, SyncPolicy.BEST_EFFORT)["file"].startswith("fsync")

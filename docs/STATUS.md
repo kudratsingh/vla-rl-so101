@@ -1891,6 +1891,91 @@ max 5 steps, gRPC mock policy, fake checkpoint, Mac M3 Pro local SSD; single run
   `mypy --strict src`: clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/success.py`,
   `protocol_real.py` and the pins unchanged in this round.
 
+### PR 2: F_FULLFSYNC required on the real arm (owner 2026-11-10, $0)
+
+Owner: "For real-arm journal writes on macOS, require F_FULLFSYNC to succeed. If it is
+unsupported or fails, block the first policy goal and use the existing safe shutdown path. Keep
+platform-appropriate syncing for Linux and directories." Fakes and the mock rig only. The
+placement freeze stays PENDING (B' waits for the owner's cube / cup measurements and the
+unpowered fit results; the geometry checks rerun with the real dimensions before any freeze):
+`BOWL_XY_M`, `RUBRIC_VERSION`, `FREEZE_STATUS`, the placement-grid PDF and the protocol hash
+inputs are untouched.
+
+- **Sync policy** (`src/runs.py` `SyncPolicy`, `journal_sync_policy`). Fixed per `Run` at
+  construction and written to record.json (`sync: {policy, methods}`, every method used).
+  `full_fsync_required` when the session drives the real arm (`--hardware` of `wo07_real_eval`
+  and `wo07_pilot`) and `sys.platform == "darwin"`; `best_effort` otherwise (Linux keeps
+  `os.fsync`; mock / scripted sessions keep the F_FULLFSYNC -> fsync fallback, the method recorded).
+  Under the required policy a FILE sync is a successful `fcntl(F_FULLFSYNC)` or it raises
+  `FullFsyncRequired` (an `OSError` with the errno; ENOTSUP when fcntl has no F_FULLFSYNC, else the
+  fcntl error: ENOTSUP, EINVAL, ENOTTY, EIO, ...). There is no `os.fsync` fallback. F_FULLFSYNC is
+  read from `fcntl` at each call, not at import.
+- **Journal writes covered** (the ones a resume depends on): the `session`, `trial_started` and
+  `trial_start_retracted` rows (`Run.log_durable`); every record.json write (its tmp file before
+  the rename; a failed sync never renames an unsynced file into place); the evaluation capture's
+  provenance, staged journal index, saved episode files and end-state stills
+  (`EvalCapture.sync_policy`, the session Run's). The pilot never resumes, so only its record.json
+  is synced (strictly on the arm); its metrics rows stay plain appends.
+- **Directories** keep the platform's best-effort sync under both policies. The owner said to keep
+  it, and the computed brief assumed F_FULLFSYNC "does not apply to directories". That assumption
+  is wrong: on this Mac (macOS 26, APFS) `fcntl(dirfd, F_FULLFSYNC)` returns 0. So directories get
+  F_FULLFSYNC where the filesystem accepts it, else `os.fsync` (Linux, or a filesystem that rejects
+  it). A directory sync never blocks motion on its own, because the file's F_FULLFSYNC before it
+  has already flushed the drive.
+- **First goal.** A required F_FULLFSYNC that fails on the start row is a marker that could not be
+  saved, and it takes the existing path. The goal is blocked (zero policy writes). The attempt is
+  `not_started` / `start_marker_failed`, and its detail names `FullFsyncRequired`, `[Errno N]` and
+  the cause. The retraction is the same as today, then the existing safe shutdown runs (hold,
+  support / grace, torque off). If F_FULLFSYNC stays unavailable, the retraction and the record
+  flush fail too. The error then propagates after the shutdown, as with the full disk (F33-R5):
+  record.json is the last good synced one, and the attempt row is in metrics.jsonl.
+- **Preflight (added, as preferred).** `wo07_real_eval --hardware` and `wo07_pilot --hardware`
+  check the journal first (`probe_full_fsync`): a temp file in the runs directory is written,
+  synced under the hardware policy and removed, then the directory is synced. This runs once,
+  after the 'go' and config checks and before the policy server, camera or port is opened (so
+  before torque on). Without F_FULLFSYNC the session refuses with "refusing the hardware
+  session; nothing was opened". The run, session and capture directories are all created under
+  the runs directory, so they are on the probed filesystem. The per-write requirement still holds
+  after the probe. Why do both: the probe moves the common failure (a volume that cannot
+  F_FULLFSYNC) to before the arm is powered, and the per-write check covers a disk that fails
+  later. The result is recorded in `durability.preflight` (real eval) or `journal_preflight`
+  (pilot).
+- **Tests** (new: 6 cases in `tests/test_deploy_prewrite_stop.py`, 10 in `tests/test_runs.py`):
+  - A simulated macOS real-arm session (mock rig, `journal_sync_policy(real_arm=True,
+    platform="darwin")`, fake fcntl), with F_FULLFSYNC unsupported (attribute missing / ENOTSUP)
+    or failing (EIO) at slot 0's start row. Asserted: no `os.fsync` on any journal file (none in
+    the whole session), zero policy goals after the marker, the hold, torque off,
+    `start_marker_failed`, not_started with the errno, the retraction F_FULLFSYNCed, record
+    `sync == {full_fsync_required, [F_FULLFSYNC]}`, and `--resume` retries slot 0 at the same
+    placement.
+  - The same with F_FULLFSYNC gone for good (missing / ENOTSUP): no fsync, no goal, the shutdown
+    runs, the error propagates, and the resume retries the slot.
+  - A mutation test showing that restoring the fallback lets the first goal through.
+  - The preflight refusal for both scripts, with nothing opened.
+  - Unit tests for the policy matrix, the no-fallback file sync for missing / ENOTSUP / EINVAL /
+    ENOTTY / EIO, directories best effort, Linux `os.fsync`, the Run's record and the probe.
+  - Mutation check by hand: `src/runs.py` with the required branch disabled (fallback restored)
+    fails 13 of the 14 new required-policy cases (the policy-matrix case does not touch syncs).
+    The source was restored.
+
+**Reruns on this code** (Mac M3 Pro; same counts expected on CI's Linux, where the darwin
+behaviour is simulated):
+- PR #33's stop / resume list (all of `tests/test_deploy_prewrite_stop.py` plus the 10 named ids):
+  83 passed (76 + 7 new).
+- Sync failure (`-k` sync / fullfsync / marker_failure / disk_full / preflight / darwin, over
+  `test_runs.py` and `test_deploy_prewrite_stop.py`): 25 passed.
+- Recovery, which covers the power-loss rebuild, chained runs, capture recovery and the
+  score-before-save interruption (`after_record`, `mid_save`, `after_save`). The `-k` selection
+  over `test_capture_resume_gap.py`, `test_pr2_review_fixes.py` and `test_deploy_prewrite_stop.py`
+  gave 34 passed. The capture / recovery files in full gave 22 passed.
+- Export / protocol (`test_export_bundle.py`, `test_pr2_pipeline.py`, `test_protocol_real.py`): 58
+  passed + 1 skipped. `test_runs.py`: 14 passed (4 + 10).
+- Full pytest: 668 passed + 1 skipped (651 + 17 new). `ruff check src tests scripts`,
+  `black --check .` and `mypy --strict src` are clean. Pins unchanged.
+
+Unverified on hardware: F_FULLFSYNC on the bench Mac's own disk (the preflight will say so at
+the first `--hardware` start). Spend, credentials and the powered steps 9-10 stay on hold.
+
 ### PR 2: owner kit list (branch `feat/smolvla-real-kit`, 2026-11-10, $0)
 
 The owner's list of the items actually used for training, runs and evaluation, with "multimeter
