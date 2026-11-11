@@ -806,7 +806,8 @@ def pending_episodes(
 ) -> list[dict[str, Any]]:
     """Episodes saved but not confirmed durable (``recording.capture_unconfirmed``, the rule the
     session summary uses; owner hold on PR #32): a trial's pending block, a record that claims
-    its index beside the save's error, a provenance entry marked ``sync_pending``, or a saved
+    its index beside the save's error, a provenance entry marked ``sync_pending`` (its sync
+    failed, or its clips did not decode: ``confirm_error``, the reason given), or a saved
     episode (in the dataset, or claimed by a record) whose trial still has a whole staged journal
     (its sync failed or never ran). A resume confirms them (``EvalCapture.confirm_saved``)."""
     from src.robot.recording import capture_pending, capture_unconfirmed, has_staged
@@ -820,7 +821,8 @@ def pending_episodes(
         cap = t.get("capture") or {}
         tid = t.get("trial_id")
         if capture_pending(cap):
-            add(tid, cap["pending_episode_index"], str(cap.get("sync_error") or cap.get("reason")))
+            why = cap.get("confirm_error") or cap.get("sync_error") or cap.get("reason")
+            add(tid, cap["pending_episode_index"], str(why))
         elif capture_unconfirmed(cap, capture_root, tid):
             why = cap.get("sync_error") or cap.get("error") or "saved, its staged journal kept"
             add(tid, cap["episode_index"], str(why))
@@ -828,8 +830,8 @@ def pending_episodes(
     for i in episodes:
         entry = entries.get(str(i)) or {}
         tid = entry.get("trial_id")
-        if entry.get("sync_pending"):
-            add(tid, i, str(entry["sync_pending"]))
+        if entry.get("sync_pending"):  # a decode failure names its camera (confirm_error)
+            add(tid, i, str(entry.get("confirm_error") or entry["sync_pending"]))
         elif tid is not None and capture_root is not None and has_staged(capture_root, str(tid)):
             add(tid, i, "saved, its staged journal kept")
     return list(found.values())

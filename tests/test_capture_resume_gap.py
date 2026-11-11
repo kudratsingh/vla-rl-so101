@@ -972,6 +972,10 @@ def test_a_pending_episode_whose_video_does_not_decode_is_never_confirmed(
         assert (
             conv.IMAGE_KEYS[next(iter(corruption[i]))] in prov["episodes"][str(i)]["confirm_error"]
         )
+    got = X.recording_blockers(res["trials"], capture_root)  # the --report / export rule
+    assert [(p["trial_id"], "frames 0-" in p["why"]) for p in got["pending"]] == [
+        (tid, True) for tid in bad
+    ]  # pending, the decode error the reason
     for i in range(3):
         problems = recording.verify_episode_video(ds_root, i)
         assert bool(problems) == (i in corruption), problems
