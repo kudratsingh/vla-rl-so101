@@ -709,8 +709,82 @@ def test_a_saved_episode_is_synced_before_its_journal_is_dropped(
     rec2 = _new_session(tmp_path / "runs2", tmp_path / "pretrained_model")
     r2 = json.loads(rec2.read_text())["results"]
     for t in r2["trials"]:
-        assert t["capture"]["episode_index"] is not None  # saved: the score never changes
+        assert t["capture"]["episode_index"] is None  # saved, not durable: PENDING (owner)
+        assert t["capture"]["pending_episode_index"] is not None
         assert "Input/output error" in t["capture"]["sync_error"]
         assert recording.has_staged(rec2.parent.parent / r2["session"]["session_id"] / "capture",
                                     t["trial_id"])  # fmt: skip
     assert "drop" not in order
+
+
+def test_an_episode_whose_save_sync_failed_stays_pending_until_a_resume_syncs_it(
+    tmp_path: Path, hard_timeout: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner hold on PR #32 (P1): every episode save's sync fails (EIO), so the saved episodes
+    are not known to be durable. They stay PENDING: no record claims the index, the session is
+    not protocol-complete and the export refuses (allow-missing too), naming the trials. A
+    resume whose confirmation sync fails leaves them pending; one with a healthy sync verifies
+    and syncs them (journals dropped, indices attached), then the export is COMPLETE."""
+    real_tree = recording.sync_tree
+    fail = {"on": True, "confirm": False}
+
+    def sync_tree(
+        root: Path, skip: frozenset[str] = frozenset(), since: Any = None, policy: Any = None
+    ) -> int:
+        if since is not None and fail["on"]:  # an episode save's sync, not a dataset open
+            raise OSError(5, "Input/output error")
+        if since is None and skip == frozenset({"images"}) and fail["confirm"]:  # confirm_saved
+            raise OSError(5, "Input/output error (confirm)")
+        return int(real_tree(root, skip, since, *([] if policy is None else [policy])))
+
+    monkeypatch.setattr(recording, "sync_tree", sync_tree)
+    runs = tmp_path / "runs"
+    rec = _new_session(runs, _ckpt(tmp_path))
+    r = json.loads(rec.read_text())["results"]
+    capture_root = runs / r["session"]["session_id"] / "capture"
+    tids = [t["trial_id"] for t in r["trials"]]
+    assert len(tids) == 3
+    for out, extra in (("export", ()), ("export-allow", ("--allow-missing-recordings",))):
+        with pytest.raises(SystemExit, match="PENDING") as refused:
+            _export(runs, rec.parent.name, tmp_path / out, *extra)
+        assert all(tid in str(refused.value) for tid in tids)
+    for i, t in enumerate(r["trials"]):
+        cap = t["capture"]
+        assert t["outcome"] in ev.SCORED  # the score stands
+        assert cap["episode_index"] is None and cap["pending_episode_index"] == i, cap
+        assert "Input/output error" in cap["sync_error"]
+        assert recording.has_staged(capture_root, t["trial_id"])
+    assert r["summary"]["recordings_pending"] == tids
+
+    fail.update(on=False, confirm=True)
+    rec1 = _resume(runs, rec.parent)
+    _check_no_rerun(rec1)
+    assert rec1["results"]["capture"]["reconciled"]["pending_sync"] == tids
+    assert rec1["results"]["capture"]["recoverable_on_resume"] == tids
+    assert rec1["results"]["summary"]["recordings_pending"] == tids
+    assert not rec1["results"]["summary"]["protocol_complete"]
+    for t in rec1["results"]["trials"]:
+        assert (
+            recording.capture_pending(t["capture"]) and "confirm" in t["capture"]["confirm_error"]
+        )
+        assert recording.has_staged(capture_root, t["trial_id"])
+    with pytest.raises(SystemExit, match="PENDING"):
+        _export(runs, rec1["path"].parent.name, tmp_path / "export1")
+
+    fail["confirm"] = False
+    rec2 = _resume(runs, rec1["path"].parent)
+    scored = _check_no_rerun(rec2)
+    assert sorted(t["capture"]["episode_index"] for t in scored) == [0, 1, 2]
+    assert all(not recording.capture_pending(t["capture"]) for t in scored)
+    assert rec2["results"]["capture"]["reconciled"]["attached"] == tids
+    assert rec2["results"]["summary"]["recordings_pending"] == []
+    assert not list((capture_root / recording.STAGED_DIR).glob("*"))
+    prov = json.loads((capture_root / "dataset" / recording.PROVENANCE).read_text())
+    assert not [e for e in prov["episodes"].values() if "sync_pending" in e]
+    index = _export(runs, rec2["path"].parent.name, tmp_path / "export2")
+    assert index["status"] == "COMPLETE" and index["episodes"] == 3
+    ds_root = capture_root / "dataset"  # the confirmation's verification of a saved episode
+    frames = int(prov["episodes"]["0"]["frames"])
+    assert recording.episode_problem(ds_root, 0, frames) == ""
+    assert "frames" in recording.episode_problem(ds_root, 0, frames + 1)
+    assert "0 metadata rows" in recording.episode_problem(ds_root, 3)

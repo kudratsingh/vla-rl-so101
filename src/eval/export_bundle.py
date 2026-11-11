@@ -35,7 +35,9 @@ the planned start pose would claim a tracked pose. The planned poses travel in `
 Missing recordings (owner 2026-11-09): every scored trial (its policy started) needs its episode.
 A trial whose recording is missing (``recording_missing``: a kill between its scored record and
 its save that left nothing to recover, ``src/robot/recording.py``) or still only staged (a resume
-recovers it: resume first) makes the export INCOMPLETE. vishwaroop's declaration has no field for
+recovers it: resume first) makes the export INCOMPLETE. An episode saved but not confirmed
+durable (its save's sync failed: ``pending_episodes``) refuses every export, incomplete ones too,
+naming the trial, until a resume verifies and syncs it. vishwaroop's declaration has no field for
 an incomplete export (``docs/SO101_EXPORT.md`` section 2; its importer, ``parse_declaration`` /
 ``check_export``, only checks that the declared sessions equal the dataset's episodes), so a
 complete evaluation bundle is REFUSED. ``allow_missing_recordings`` builds one anyway, declared
@@ -632,6 +634,13 @@ def build_eval_bundle(
             if int(idx) in by_episode:
                 raise ExportRefused(f"episode {idx} is claimed by two trial records")
             by_episode[int(idx)] = t
+    pending = pending_episodes(recs, prov, eps, Path(capture_dataset).parent)
+    if pending:  # never dropped, never counted: always refused, allow_missing_recordings too
+        raise ExportRefused(
+            f"PENDING: {len(pending)} episode(s) saved but not confirmed durable "
+            f"({[(p['trial_id'], p['episode_index']) for p in pending]}): --resume the session "
+            "to verify and sync them first; nothing is exported while an episode is pending"
+        )
     by_trial = {str(t.get("trial_id")): t for t in recs if t.get("policy_started")}
     for i in sorted(set(eps) - set(by_episode)):  # saved, then killed before its capture row
         entry = (prov.get("episodes") or {}).get(str(i)) or {}
@@ -774,6 +783,45 @@ def build_eval_bundle(
     return index
 
 
+def pending_episodes(
+    trials: Sequence[Mapping[str, Any]],
+    prov: Mapping[str, Any],
+    episodes: Sequence[int],
+    capture_root: Path,
+) -> list[dict[str, Any]]:
+    """Episodes saved but not confirmed durable (``recording.capture_pending``; owner hold on PR
+    #32): a trial's pending block, a provenance entry marked ``sync_pending``, or a saved episode
+    (in the dataset, or claimed by a record) whose trial still has a whole staged journal (its
+    sync failed or never ran). A resume confirms them (``EvalCapture.confirm_saved``)."""
+    from src.robot.recording import capture_pending, has_staged
+
+    found: dict[str, dict[str, Any]] = {}
+
+    def add(tid: Any, idx: Any, why: str) -> None:
+        found.setdefault(str(tid), {"trial_id": tid, "episode_index": idx, "why": why})
+
+    for t in trials:
+        cap = t.get("capture") or {}
+        tid = t.get("trial_id")
+        if capture_pending(cap):
+            add(tid, cap["pending_episode_index"], str(cap.get("sync_error") or cap.get("reason")))
+        elif (
+            cap.get("episode_index") is not None
+            and tid is not None
+            and has_staged(capture_root, str(tid))
+        ):
+            add(tid, cap["episode_index"], "saved, its staged journal kept")
+    entries = prov.get("episodes") or {}
+    for i in episodes:
+        entry = entries.get(str(i)) or {}
+        tid = entry.get("trial_id")
+        if entry.get("sync_pending"):
+            add(tid, i, str(entry["sync_pending"]))
+        elif tid is not None and has_staged(capture_root, str(tid)):
+            add(tid, i, "saved, its staged journal kept")
+    return list(found.values())
+
+
 def missing_recordings(
     trials: Sequence[Mapping[str, Any]], capture_root: Path
 ) -> list[dict[str, Any]]:
@@ -782,7 +830,7 @@ def missing_recordings(
     index: ``recording_missing`` when flagged (no journal, or a damaged one) or nothing is
     staged, else ``recoverable_on_resume`` (a whole staged journal under ``capture_root``: a
     resume saves it). The same classification as ``wo07_real_eval.capture_gaps``."""
-    from src.robot.recording import has_staged, recording_required
+    from src.robot.recording import capture_pending, has_staged, recording_required
 
     out = []
     for t in trials:
@@ -790,7 +838,7 @@ def missing_recordings(
         if not recording_required(t) or cap.get("episode_index") is not None:
             continue
         tid = t.get("trial_id")
-        staged = (
+        staged = capture_pending(cap) or (
             not cap.get("recording_missing")
             and tid is not None
             and has_staged(capture_root, str(tid))
