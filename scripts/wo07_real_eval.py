@@ -108,7 +108,9 @@ run's earlier trials from the run it resumed from (recursively, S32-D1); a cut m
 line is skipped, and record.json's trials stand without metrics.jsonl. A real-0.1 capture
 episode is synced before its staged journal goes and before its ``capture`` row / record.json
 names it, and a resume treats a named episode the dataset no longer holds as missing
-(``reconcile_captures``, S32-D2). Closing the Terminal (SIGHUP / SIGTERM) is not a kill: the session takes the closed-stdin path (grace period, torque off, released_unconfirmed,
+(``reconcile_captures``, S32-D2). An episode whose save's sync failed is PENDING (owner hold on
+PR #32): no record claims its index, the summary lists it (``recordings_pending``, the session is
+not protocol-complete) and the export refuses, until a resume confirms it (verified, synced). Closing the Terminal (SIGHUP / SIGTERM) is not a kill: the session takes the closed-stdin path (grace period, torque off, released_unconfirmed,
 cause hangup) and writes its record. Ctrl-Z never suspends a hardware session (ignored with a
 message); the session must run in the terminal's foreground, and losing it takes the same path
 (cause lost_foreground).
@@ -256,8 +258,10 @@ from src.robot.recording import (
     NO_POLICY_WRITE,
     STAGED_NOT_STARTED,
     STAGED_UNREADABLE,
+    SYNC_PENDING,
     EvalCapture,
     RigFrameSource,
+    capture_pending,
     check_capture_resumable,
     has_staged,
     recording_required,
@@ -846,7 +850,15 @@ def table(
         s["real_rows"] = PR.cell_tables(scored)
         s["schedule"] = settings.get("schedule")
         s["reportable"] = settings.get("schedule") == "eval"
-        s["protocol_complete"] = bool(s["protocol_complete"] and s["reportable"])
+        # an outcome counts in the rates (the trial ran, its slot is never re-run), but a
+        # session with an episode saved and not yet durable is not a protocol table: a resume
+        # confirms it first (owner hold on PR #32; the export refuses until then)
+        s["recordings_pending"] = [
+            t.get("trial_id") for t in scored if capture_pending(t.get("capture") or {})
+        ]
+        s["protocol_complete"] = bool(
+            s["protocol_complete"] and s["reportable"] and not s["recordings_pending"]
+        )
         s["policy_identity"] = settings.get("policy_identity")
     s.update(
         protocol_version=settings["protocol"]["protocol_version"],
@@ -1069,7 +1081,8 @@ def session(
         if gaps.get("recoverable_on_resume"):
             print(
                 f"  {len(gaps['recoverable_on_resume'])} scored trial(s) have a staged, unsaved "
-                f"recording: --resume {run.id} recovers them before any new trial"
+                f"or not yet durable (PENDING) recording: --resume {run.id} recovers them before "
+                "any new trial"
             )
         if gaps.get("recording_missing"):
             print(
@@ -1290,7 +1303,9 @@ def reconcile_captures(
     scored trial of the earlier runs that has no episode gets one, never by re-running it:
 
     1. its trial id is in the capture provenance: the episode was saved, the run ended before
-       its ``capture`` row; attached (``filled_from``);
+       its ``capture`` row or the save's sync failed (PENDING); attached (``filled_from``) once
+       ``EvalCapture.confirm_saved`` verified and synced it, else it stays pending
+       (``pending_sync``: no index claimed, the journal kept, the next resume retries);
     2. else its staged journal is whole: the episode is rebuilt and saved under the next free
        index (``recording.EvalCapture.recover_staged``; ``recovered`` says so); a recovery that
        fails with the journal still whole and readable (e.g. a transient save error) is
@@ -1300,7 +1315,9 @@ def reconcile_captures(
        (sticky: its score stands; the export refuses a complete bundle).
 
     Only trials that need a recording (``recording.recording_required``: not a trial no policy
-    write reached). Each result is logged as a ``capture`` row (merged by ``load_prior``).
+    write reached). Each result is logged as a ``capture`` row (merged by ``load_prior``). A
+    record that claims its index while its journal is still staged (never confirmed durable)
+    is confirmed the same way, or made pending.
 
     First (S32-D2, power loss): a record whose ``episode_index`` the recovered dataset no longer
     holds (``>= num_episodes``), or whose provenance entry names another trial, has NO episode:
@@ -1357,8 +1374,21 @@ def reconcile_captures(
         "recovery_failed": [],
         "recording_missing": [],
         "discarded": [],
+        "pending_sync": [],
         "lost": lost,
     }
+
+    def pending(tid: str, idx: int, cap: dict[str, Any], err: Any) -> dict[str, Any]:
+        out["pending_sync"].append(tid)
+        return {
+            **cap,
+            "trial_id": tid,
+            "episode_index": None,
+            "pending_episode_index": idx,
+            "reason": SYNC_PENDING,
+            "confirm_error": err,
+        }
+
     started_tids = {str(t.get("trial_id")) for t in trials if t.get("policy_started")}
     for tid in sorted({str(t["trial_id"]) for t in trials if t.get("trial_id") is not None}):
         # a slot none of whose attempts started (e.g. a retracted start): no recording belongs
@@ -1368,27 +1398,45 @@ def reconcile_captures(
             out["discarded"].append({"trial_id": tid, "reason": STAGED_NOT_STARTED})
     for t in trials:
         cap = t.get("capture") or {}
-        if not recording_required(t) or cap.get("episode_index") is not None:
+        if not recording_required(t):
             continue
-        if cap.get("recording_missing"):
+        if cap.get("episode_index") is not None:
+            tid = str(t.get("trial_id"))
+            if t.get("trial_id") is None or not has_staged(capture.root, tid):
+                continue
+            idx = int(cap["episode_index"])  # saved, its journal kept: never confirmed durable
+            got = capture.confirm_saved(tid, idx)
+            block = {**cap, **got} if "error" not in got else pending(tid, idx, cap, got["error"])
+        elif cap.get("recording_missing"):
             out["recording_missing"].append(t.get("trial_id"))
             continue
-        tid = str(t.get("trial_id"))
-        idx = by_tid.get(tid)
-        if t.get("trial_id") is not None and idx is not None and idx not in claimed:
+        elif (
+            t.get("trial_id") is not None
+            and (idx := by_tid.get(str(t["trial_id"]))) is not None
+            and idx not in claimed
+        ):
+            tid = str(t["trial_id"])
             entry = entries[str(idx)]
-            block = {
-                **{k: entry[k] for k in saved_keys if k in entry},
-                "dataset": "dataset",
-                "trial_id": tid,
-                "episode_index": idx,
-                "filled_from": "capture provenance (the run ended before its capture row)",
-            }
-            capture.drop_staged(tid)
-            out["attached"].append(tid)
+            got = capture.confirm_saved(tid, idx)  # verified + synced, then the journal goes
+            if "error" in got:
+                block = pending(tid, idx, cap, got["error"])
+            else:
+                block = {
+                    **{k: entry[k] for k in saved_keys if k in entry},
+                    "dataset": "dataset",
+                    "trial_id": tid,
+                    "episode_index": idx,
+                    "filled_from": "capture provenance (the run ended before its capture row, "
+                    "or its sync failed)",
+                    **got,
+                }
+                out["attached"].append(tid)
         else:
+            tid = str(t.get("trial_id"))
             block = capture.recover_staged(tid, expect=t)
-            if (
+            if capture_pending(block):  # saved by the recovery, its sync failed: still pending
+                out["pending_sync"].append(tid)
+            elif (
                 block.get("episode_index") is None
                 and block.get("reason") != STAGED_UNREADABLE
                 and has_staged(capture.root, tid)
@@ -1480,7 +1528,9 @@ def capture_gaps(root: Path, trials: Sequence[dict[str, Any]]) -> dict[str, list
         if not recording_required(t) or cap.get("episode_index") is not None:
             continue
         tid = t.get("trial_id")
-        if not cap.get("recording_missing") and tid is not None and has_staged(root, str(tid)):
+        if capture_pending(cap) or (
+            not cap.get("recording_missing") and tid is not None and has_staged(root, str(tid))
+        ):
             out["recoverable_on_resume"].append(tid)
         else:
             out["recording_missing"].append(tid)

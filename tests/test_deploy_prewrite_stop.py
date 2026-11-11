@@ -1731,7 +1731,7 @@ def test_darwin_real_arm_capture_sync_failure_keeps_the_journal_and_never_falls_
     r = json.loads(rec.read_text())["results"]
     assert fired[0] and r["mode"] == "hardware"
     cap0 = r["trials"][0]["capture"]
-    assert cap0["episode_index"] == 0
+    assert cap0["episode_index"] is None and cap0["pending_episode_index"] == 0  # PENDING
     assert "FullFsyncRequired" in cap0["sync_error"] and "staged journal is kept" in (
         cap0["sync_error"]
     )

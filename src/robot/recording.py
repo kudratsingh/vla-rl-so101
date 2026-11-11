@@ -79,6 +79,14 @@ Evaluation capture (``EvalCapture``), one dataset per evaluation session, one ep
   the scored record's ``capture`` block (and the synced record.json that holds it) never names
   an episode the page cache still held. Between trials, never during motion; ``sync_s`` in the
   block says what it cost. A failed sync keeps the journal and says so (``sync_error``).
+  Such an episode is PENDING (owner hold on PR #32): the block names it only as
+  ``pending_episode_index`` (``episode_index`` None, so nothing counts it as present), its
+  provenance entry carries ``sync_pending``, and the export refuses while any episode is pending
+  (``export_bundle.pending_episodes``: a pending block, a ``sync_pending`` entry, or a saved
+  episode whose journal is still staged). A resume's reconcile confirms it
+  (``EvalCapture.confirm_saved``: the episode verified readable with its frame count, the
+  dataset, its stills and the provenance synced under the session's policy, then the journal
+  dropped) before attaching the index; a confirmation that fails leaves it pending.
   ``write_json`` (provenance, journals) is atomic and synced. A capture recovery
   (``recover_dataset``: rewritten ``meta/info.json`` / ``meta/stats.json``, quarantine moves) and a
   newly created dataset (a new session, or the empty restart: meta and the calibration copy) are
@@ -128,6 +136,59 @@ STAGED_OTHER_ATTEMPT = "staged journal of another attempt of the slot (discarded
 STAGED_NOT_STARTED = "staged journal of a slot no attempt of which started (discarded)"
 JOURNAL_KEYS = ("cell", "trial_idx", "start_utc", "attempt")  # the attempt a journal belongs to
 SCORED_OUTCOMES = ("success", "failure")
+SYNC_PENDING = (
+    "saved, not yet durable (its sync failed): PENDING until a resume verifies and syncs it "
+    "(the staged journal is kept)"
+)
+
+
+def capture_pending(cap: Mapping[str, Any]) -> bool:
+    """A capture block whose episode was saved but is not confirmed durable (module doc)."""
+    return cap.get("episode_index") is None and cap.get("pending_episode_index") is not None
+
+
+def episode_problem(ds_root: Path, index: int, frames: Any = None) -> str:
+    """Empty when episode ``index`` of a finalized recording dataset is readable and whole: one
+    metadata row (``length`` == ``frames`` when given), its data rows frame 0 .. length-1, its
+    video files present. Else what is wrong. Never raises."""
+    try:
+        import pyarrow.parquet as pq
+
+        root = Path(ds_root)
+        info = json.loads((root / "meta" / "info.json").read_text())
+        rows = [
+            r
+            for f in sorted((root / "meta" / "episodes").rglob("*.parquet"))
+            for r in pq.read_table(f).to_pylist()
+            if int(r["episode_index"]) == int(index)
+        ]
+        if len(rows) != 1:
+            return f"episode {index}: {len(rows)} metadata rows"
+        ep = rows[0]
+        n = int(ep["length"])
+        if frames is not None and n != int(frames):
+            return f"episode {index}: {n} frames, its capture recorded {frames}"
+        data = root / str(info["data_path"]).format(
+            chunk_index=ep["data/chunk_index"], file_index=ep["data/file_index"]
+        )
+        t = pq.read_table(data, columns=["episode_index", "frame_index"]).to_pydict()
+        got = sorted(
+            int(k) for e, k in zip(t["episode_index"], t["frame_index"], strict=True) if e == index
+        )
+        if got != list(range(n)):
+            return f"episode {index}: {len(got)} data rows for {n} frames"
+        for key, v in info["features"].items():
+            if v.get("dtype") == "video":
+                video = root / str(info["video_path"]).format(
+                    video_key=key,
+                    chunk_index=ep[f"videos/{key}/chunk_index"],
+                    file_index=ep[f"videos/{key}/file_index"],
+                )
+                if not video.is_file():
+                    return f"episode {index}: {video.relative_to(root)} missing"
+    except Exception as e:  # noqa: BLE001 - unreadable is the answer
+        return f"episode {index} unreadable: {type(e).__name__}: {e}"
+    return ""
 
 
 def recording_required(t: Mapping[str, Any]) -> bool:
@@ -923,9 +984,10 @@ class EvalCapture:
                 policy=self.sync_policy,
             )
             self.drop_staged(cur["trial_id"])  # saved, synced, in the provenance: done
-        except OSError as e:
+        except OSError as e:  # PENDING: no record claims the index until a resume confirms it
             log.error("eval capture: episode %d saved but not synced: %s", index, e)
             durable["sync_error"] = f"{type(e).__name__}: {e} (the staged journal is kept)"
+            entry["sync_pending"] = durable["sync_error"]
         durable["sync_s"] = round(time.perf_counter() - t_sync, 4)
         stills = self._stills(index, end_images)
         entry.update(end_state=stills, end_state_when=when)
@@ -937,7 +999,7 @@ class EvalCapture:
                 sync_path(self.root / END_STATE_DIR)
         except OSError as e:
             log.error("eval capture: provenance / stills not written: %s", e)
-        return {
+        block = {
             **base,
             **timing,
             "episode_index": index,
@@ -945,6 +1007,45 @@ class EvalCapture:
             "end_state_when": when,
             **durable,
         }
+        if "sync_error" in durable:
+            block.update(episode_index=None, pending_episode_index=index, reason=SYNC_PENDING)
+        return block
+
+    def confirm_saved(self, trial_id: str, index: int) -> dict[str, Any]:
+        """A saved episode not confirmed durable (its save's sync failed, or the run ended before
+        the sync: its journal is still staged), on a resume: verified (``episode_problem``, the
+        provenance's frame count), the dataset (but the PNG folder), its stills and the
+        provenance synced under the session's policy, then the journal dropped. Returns
+        ``{"synced_files", "sync_s"}``, or ``{"error"}`` with nothing dropped (still pending).
+        Never raises."""
+        t0 = time.perf_counter()
+        entry = (self.provenance.get("episodes") or {}).get(str(index)) or {}
+        try:
+            if entry.get("trial_id") != trial_id:
+                raise RuntimeError(
+                    f"the provenance maps episode {index} to {entry.get('trial_id')!r}"
+                )
+            problem = episode_problem(self.dataset_root, index, entry.get("frames"))
+            if problem:
+                raise RuntimeError(problem)
+            n = sync_tree(self.dataset_root, skip=frozenset({"images"}), policy=self.sync_policy)
+            stills = entry.get("end_state")
+            if isinstance(stills, dict):
+                for rel in stills.values():
+                    sync_path(self.root / rel, self.sync_policy)
+                sync_path(self.root / END_STATE_DIR)
+            if "sync_pending" in entry:
+                was = entry.pop("sync_pending")
+                try:
+                    self._write_provenance()
+                except Exception:
+                    entry["sync_pending"] = was
+                    raise
+        except Exception as e:  # noqa: BLE001 - stays pending, says why
+            log.error("eval capture: episode %d not confirmed durable: %s", index, e)
+            return {"error": f"{type(e).__name__}: {e}"}
+        self.drop_staged(trial_id)
+        return {"synced_files": n, "sync_s": round(time.perf_counter() - t0, 4)}
 
     def close(self) -> None:
         """Discard an unfinished episode, finalize the dataset (Parquet footers), write the
