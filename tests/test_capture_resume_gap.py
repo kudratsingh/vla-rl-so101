@@ -864,3 +864,128 @@ def test_an_episode_whose_checkpoint_failed_after_the_save_stays_pending(
     assert not list((capture_root / recording.STAGED_DIR).glob("*"))
     index = _export(runs, rec1["path"].parent.name, tmp_path / "export2")
     assert index["status"] == "COMPLETE" and index["episodes"] == 3
+
+
+def _clip(ds_root: Path, idx: int, key: str) -> Path:
+    """The video file holding episode ``idx`` of camera ``key`` (its episode-metadata row)."""
+    info = json.loads((ds_root / "meta" / "info.json").read_text())
+    (ep,) = [r for r in X._read_parquet_dir(ds_root / "meta" / "episodes")
+             if int(r["episode_index"]) == idx]  # fmt: skip
+    return ds_root / str(info["video_path"]).format(
+        video_key=key,
+        chunk_index=ep[f"videos/{key}/chunk_index"],
+        file_index=ep[f"videos/{key}/file_index"],
+    )
+
+
+def _corrupt(path: Path, how: str) -> None:
+    data = path.read_bytes()
+    if how == "middle":  # bytes overwritten inside the frame data
+        mid = len(data) // 2
+        path.write_bytes(data[:mid] + b"\x00" * 4096 + data[mid + 4096 :])
+    else:  # "tail": the file cut short (the index at its end gone)
+        path.write_bytes(data[: len(data) - 4000])
+
+
+def _tree_bytes(d: Path) -> dict[str, bytes]:
+    return {p.relative_to(d).as_posix(): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [  # episode 0: one camera; episode 1: both cameras; episode 2 healthy (still confirmed)
+        {0: {"front": "middle"}, 1: {"front": "tail", "wrist": "tail"}},
+        {0: {"wrist": "tail"}, 1: {"front": "middle", "wrist": "middle"}},
+    ],
+    ids=["front-middle_both-tail", "wrist-tail_both-middle"],
+)
+def test_a_pending_episode_whose_video_does_not_decode_is_never_confirmed(
+    tmp_path: Path,
+    hard_timeout: None,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: dict[int, dict[str, str]],
+) -> None:
+    """Owner 2026-11-11 (PR #32 hold, issue 1): a pending real-0.1 mock capture (every save's
+    sync failed) whose MP4s were corrupted before the resume. The resume decodes both cameras'
+    clips (torchcodec) across each pending episode's full frame range BEFORE it clears pending
+    or drops the journal: a clip that does not decode keeps the episode pending, its staged
+    journal byte-for-byte, the error recorded (camera, frame range), the score unchanged, the
+    export refused and the summary not complete. The healthy pending episode is confirmed;
+    once the good MP4s are restored, the next resume confirms the others."""
+    real_tree = recording.sync_tree
+    fail = {"on": True}
+
+    def sync_tree(
+        root: Path, skip: frozenset[str] = frozenset(), since: Any = None, policy: Any = None
+    ) -> int:
+        if since is not None and fail["on"]:  # an episode save's sync, not a dataset open
+            raise OSError(5, "Input/output error")
+        return int(real_tree(root, skip, since, *([] if policy is None else [policy])))
+
+    monkeypatch.setattr(recording, "sync_tree", sync_tree)
+    runs = tmp_path / "runs"
+    rec = _new_session(runs, _ckpt(tmp_path))
+    r = json.loads(rec.read_text())["results"]
+    capture_root = runs / r["session"]["session_id"] / "capture"
+    ds_root = capture_root / "dataset"
+    tids = [t["trial_id"] for t in r["trials"]]
+    assert all(recording.capture_pending(t["capture"]) for t in r["trials"])
+    good: dict[Path, bytes] = {}
+    for idx, cams in corruption.items():
+        for name, how in cams.items():
+            clip = _clip(ds_root, idx, conv.IMAGE_KEYS[name])
+            good[clip] = clip.read_bytes()
+            _corrupt(clip, how)
+    journals = {tid: _tree_bytes(recording.staged_path(capture_root, tid)) for tid in tids}
+
+    fail["on"] = False  # a healthy sync: only the decode can refuse
+    rec1 = _resume(runs, rec.parent)
+    _check_no_rerun(rec1)
+    bad = [tids[i] for i in sorted(corruption)]
+    res = rec1["results"]
+    assert res["capture"]["reconciled"]["pending_sync"] == bad
+    assert res["capture"]["reconciled"]["attached"] == [tids[2]]  # decoded, synced, confirmed
+    assert res["summary"]["recordings_pending"] == bad
+    assert not res["summary"]["protocol_complete"]
+    for i, (t0, t1) in enumerate(zip(r["trials"], res["trials"], strict=True)):
+        assert t1["outcome"] == t0["outcome"] and t1.get("success") == t0.get("success")
+        if i not in corruption:
+            assert t1["capture"]["episode_index"] == 2
+            assert not recording.has_staged(capture_root, t1["trial_id"])
+            continue
+        cap = t1["capture"]
+        assert recording.capture_pending(cap) and cap["pending_episode_index"] == i, cap
+        err = cap["confirm_error"]
+        frames = int(cap["frames"])
+        for name in conv.CAMERA_NAMES:  # names the camera that failed, and only it
+            assert (conv.IMAGE_KEYS[name] in err) == (name in corruption[i]), err
+        assert f"frames 0-{frames - 1}" in err, err
+        assert _tree_bytes(recording.staged_path(capture_root, t1["trial_id"])) == journals[
+            t1["trial_id"]
+        ]  # the journal is kept byte-for-byte
+    prov = json.loads((ds_root / recording.PROVENANCE).read_text())
+    for i in corruption:
+        assert prov["episodes"][str(i)]["sync_pending"]
+        assert conv.IMAGE_KEYS[next(iter(corruption[i]))] in prov["episodes"][str(i)][
+            "confirm_error"
+        ]
+    for i in range(3):
+        problems = recording.verify_episode_video(ds_root, i)
+        assert bool(problems) == (i in corruption), problems
+    with pytest.raises(SystemExit, match="PENDING") as refused:
+        _export(runs, rec1["path"].parent.name, tmp_path / "export1")
+    assert all(tid in str(refused.value) for tid in bad)
+
+    for clip, data in good.items():  # the good MP4s back: the next resume confirms them
+        clip.write_bytes(data)
+    rec2 = _resume(runs, rec1["path"].parent)
+    scored = _check_no_rerun(rec2)
+    assert rec2["results"]["capture"]["reconciled"]["attached"] == bad
+    assert sorted(t["capture"]["episode_index"] for t in scored) == [0, 1, 2]
+    assert rec2["results"]["summary"]["recordings_pending"] == []
+    assert all(t["outcome"] == t0["outcome"] for t, t0 in zip(scored, r["trials"], strict=True))
+    assert not list((capture_root / recording.STAGED_DIR).glob("*"))
+    prov = json.loads((ds_root / recording.PROVENANCE).read_text())
+    assert not [e for e in prov["episodes"].values() if "sync_pending" in e or "confirm_error" in e]
+    index = _export(runs, rec2["path"].parent.name, tmp_path / "export2")
+    assert index["status"] == "COMPLETE" and index["episodes"] == 3
