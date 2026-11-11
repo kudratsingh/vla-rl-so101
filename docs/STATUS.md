@@ -1722,6 +1722,9 @@ the bowl 5 mm closer; jaws not modelled):
 | D' | (0.180, 0.180) | separation -2.17 cm | 9.33 cm (+0.31) | +0.57 / +0.69 cm | 81% / 15 mm | pass, 175/175 | carry wrist_flex 4.2 x25, retreat 4.1 x25 | C4 |
 | C | (0.385, 0.0) | reach -10 cm | 11.88 cm (+2.86) | +0.07 / -1.06 cm (TCP 2.1 cm short) | 71% / 10 mm | pass, 175/175 | carry wrist_flex 1.6 x4 | C3 |
 
+- (Superseded figures: the windows in this table used the 3 cm cube and the half-edge release
+  radius. With the 25.4 mm cube and the half-diagonal radius, 27.0 mm on the sim-bowl fallback
+  (owner hold on PR #32), B' is 73% / 10 mm; see "PR 2: owner hold fixes at 5126daa".)
 - No option keeps the whole release region inside the box: B keeps half of it (a release more than 10 mm
   toward +y or -x of centre is rejected), B' 71%, D 81%. The box options with a 100% window
   ((0.205, 0.165), 7.85 cm) put the rim over the nearest cube (cube-only clearance -0.67 cm):
@@ -2099,14 +2102,14 @@ PDF unchanged; no regenerated PDF committed).
   `geometry` with per-value sources and `carry_rim_clearance_m`). While pending, the cube is the
   25.4 mm nominal and the cup values are the sim bowl's, labelled `PENDING measurement: sim bowl
   fallback`. After the owner's numbers: one edit of `MEASURED`, rerun the bowl check, then the
-  freeze. The bowl check's numbers now use the 25.4 mm cube (release radius 32.3 mm instead of
-  30 mm; in the tests the frozen bowl is still REJECT and B' still passes at C4); the B' / D tables above were
+  freeze. The bowl check's numbers now use the 25.4 mm cube (release radius then 32.3 mm instead of
+  30 mm, corrected to 27.0 mm below; in the tests the frozen bowl is still REJECT and B' still passes at C4); the B' / D tables above were
   computed with the 3 cm cube and are superseded by that rerun. Interim rerun of B' (0.205, 0.185)
   with the nominal 25.4 mm cube and the sim-bowl fallback (`wo07_bowl_check.py --preset real
   --bowl 0.205 0.185`, CPU, single run, NOT the real cup's numbers): safety-bounded IK passes
   every phase at all 25 slots x 7 yaws (only the intended gripper-floor clip), 175/175 cubes over
   the floor, box margin +0.14 cm (own TCP offset 8.6 mm), release window 70% / 10 mm (was 71% /
-  10 mm), cube-to-rim clearance +1.13 cm, carry over the rim +2.03 cm; the unchanged-oracle (urdf)
+  10 mm; both before the half-diagonal correction below, now 73% / 10 mm), cube-to-rim clearance +1.13 cm, carry over the rim +2.03 cm; the unchanged-oracle (urdf)
   variant clips wrist_flex in carry (3.3 deg, 6 slots) and retreat (5.0 deg, 25 slots), as with
   the 3 cm cube. Correction (owner hold on PR #32): the release radius kept only the cube's
   half-edge clear of the floor edge; the whole cube at any yaw needs its half-diagonal, so with
@@ -2118,7 +2121,8 @@ PDF unchanged; no regenerated PDF committed).
   failed stays PENDING (no `episode_index`, `summary.recordings_pending`, not protocol-complete,
   every export refused) until a resume verifies and syncs it (`EvalCapture.confirm_saved`);
   `--report` gives `protocol_complete` only for two hardware sessions and labels mock reports
-  MOCK; the bowl release radius uses the half-diagonal (above).
+  MOCK; the bowl release radius uses the half-diagonal (above). The review round and the
+  reruns: "PR 2: owner hold fixes at 5126daa" below.
 - **Scene facts as hash inputs** (`scene_spec()`): table all white; one 17-inch LED
   clamp lamp set ONCE to 5000 K, position recorded at the camera match; exposure / white balance
   locked on both cameras; C920x on the NEEWER UA057 magic arm at `front_left_45` (eye and target
@@ -2231,6 +2235,132 @@ STATUS conflict is resolved by keeping both entries, F_FULLFSYNC first.
   bowl position unchanged. The interim B' numbers above are unchanged (the pending floor height
   is the sim's, as before).
 - **Gates:** full pytest 677 passed + 1 skipped (674 after the merge + 3 new); `ruff check src tests scripts`, `black --check .`, `mypy --strict src` clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/**` unchanged; no PDF regenerated.
+
+### PR 2: owner hold fixes at 5126daa (2026-11-10, $0)
+
+The owner held PR #32 at `5126daa` (CI green there) for four issues. All four are fixed, with a
+regression test each, followed by one review round. CPU, fakes and the mock rig only: no arm,
+camera or serial port, no RunPod, nothing pushed to the Hub. The freeze stays PENDING
+(`FREEZE_STATUS`, `BOWL_XY_M`, `RUBRIC_VERSION`, slots, schedules, seeds unchanged; no PDF
+regenerated). Protocols 0.1-draft / 0.2, `src/env/**` and the pins are byte-identical. The
+real-0.1 hash `da110112...` is unchanged.
+
+- **P1a: a mock resume could change a hardware capture.** `--mock --resume` of a hardware session
+  reached the capture recovery under the best-effort sync. It then quarantined, pruned and
+  rewrote `meta/info.json` / `stats.json`, and with the session's own `--max-steps` it ran on as
+  a mock run of the hardware session. Fix: `check_resume_mode` runs first in `run()`, before the
+  journal preflight, `load_prior` and the recovery. It refuses either mismatch ("is recorded as
+  a hardware session; resume it with --hardware"). `precheck_capture` takes the recorded mode
+  and derives the sync policy from it (`journal_policy`; a hardware session on macOS requires
+  F_FULLFSYNC). The synced `session` row now carries `mode`, so a session whose record.json is
+  lost still has a recorded mode. When no mode is recorded, the resume is refused, never guessed.
+  Tests (`tests/test_deploy_prewrite_stop.py`): a mismatch either way leaves the whole runs tree
+  byte-identical; a missing mode is refused; a recorded hardware session's recovery runs under
+  FULL_FSYNC_REQUIRED. All 4 failed on `5126daa`.
+- **P1b: a failed capture sync could pass the export.** The saved episode kept its
+  `episode_index` beside `sync_error`, so the export counted it as present. Fix: such an episode
+  is PENDING. Its block has `episode_index` None plus `pending_episode_index`, its provenance
+  entry is marked `sync_pending` and its journal is kept. `summary.recordings_pending` lists it
+  and the session is not protocol-complete. Every export refuses, `--allow-missing-recordings`
+  too, naming the trial. A resume's `EvalCapture.confirm_saved` checks the provenance mapping
+  and `episode_problem` (one metadata row, the frame count, frames 0..n-1, the videos). It then
+  syncs the dataset, the stills and the provenance under the session's policy, and only then
+  drops the journal and attaches the index. A failed confirmation leaves the episode pending.
+  Test: a 3-trial session where every save sync fails (EIO) is PENDING, the export is refused,
+  a resume whose confirmation fails stays pending, and a healthy resume gives a COMPLETE export
+  with 3 episodes. On `5126daa` the export did not refuse.
+- **P1c: the comparison report accepted mock results.** Two complete 150-trial mock sessions
+  gave `protocol_complete=True`. Fix: `session_mode()` returns a mode only when the session and
+  every trial record agree. `--report` refuses a record with no mode and a hardware + mock pair.
+  It labels a mock report `MOCK - not a real-arm result` (top-level `mode` / `label`, first and
+  last printed line) and never sets `protocol_complete` for one (`mock_complete` instead). The
+  eval export uses the same `session_mode()`: a record with no mode is refused, where before it
+  was exported as mode `None`. Test: the two 150-trial mock sessions are labelled and not
+  protocol-complete; relabelled hardware they are; a mixed pair or a missing mode is refused.
+  On `5126daa` this failed with `protocol_complete` True.
+- **P2: the bowl check overstated the release window.** The release radius subtracted half the
+  cube edge from the floor radius. Keeping the whole cube on the floor at any yaw needs half the
+  diagonal. Fix: `bowl_fit.cube_half_diagonal_m`; `release_radius_m` = floor radius minus
+  half-diagonal. The cube-to-rim clearance already used the diagonal (unchanged). The carry
+  clearance keeps the half-edge because it is a vertical distance. Test: 25.4 mm cube and 90 mm
+  floor give 27.04 mm (`5126daa`: 32.3 mm).
+
+**P2 numbers** (nominal 25.4 mm cube and the 90 mm sim-bowl floor fallback, which is also the
+owner's example; NOT the real cup's values, `MEASURED` is still PENDING). Rerun on the final
+code: `wo07_bowl_check.py --preset real --bowl 0.205 0.185`, CPU, single run,
+`20261111T044930Z-wo07-bowl-check-real-b796` (scratch).
+
+| Quantity | 5126daa (half-edge) | Fixed (half-diagonal) |
+|---|---|---|
+| Release radius | 32.3 mm | 27.0 mm (27.04) |
+| B' (0.205, 0.185) release window inside / inscribed | 70% (69.6) / 10 mm | 73% (73.1) / 10 mm |
+| B' in-box release area | ~2281 mm2 | ~1679 mm2 |
+| Frozen BOWL_XY_M (0.195, 0.205) window | 30% / 0 mm | 27% / 0 mm |
+| B' verdict, safety-bounded IK | pass, C4, 175/175 | pass, C4, 175/175 |
+| B' verdict, unchanged oracle (urdf IK) | clip (wrist_flex carry 3.33 deg x6, retreat 5.0 x25) | same |
+| B' cube-to-rim clearance / nearest slot / box margin (9.3 mm / own TCP offset) | +1.13 cm / 9.83 cm / +0.07 / +0.14 cm | same |
+
+The window share went UP because the disc it is a share of shrank. The release area inside the
+box went down. No verdict changed: B' still passes at C4, the frozen bowl is still REJECT, and
+the search still has no passing candidate. The interim B' figures elsewhere in this file
+(kit-list section, round-2 table note, blocker line) now say 27.0 mm / 73% or are marked as the
+superseded 3 cm-cube, half-edge figures.
+
+**Review round** (two reviewers: durability / resume, report / geometry). Five confirmed findings,
+all fixed in `5503d00`:
+
+- **DR-1 / F1 (medium):** the CheckpointFailed path (the episode saved, then the provenance write
+  or the finalize / reopen failed) still claimed `episode_index`. The summary, `capture_gaps` and
+  `--report` missed it while the export refused it. Reproduced: a mock session with an EIO on the
+  3rd checkpoint had `recordings_pending == []`. Fix: that block is PENDING too (journal kept,
+  provenance `sync_pending`). One rule, `recording.capture_unconfirmed`, now decides "saved, not
+  confirmed durable" everywhere: `table()` (given the session's capture root), `capture_gaps`
+  (the `--resume` hint), `reconcile_captures` and the export's `pending_episodes`. It covers a
+  pending block, an index claimed beside a save error (`5126daa` records), and an index claimed
+  while the journal is still staged. A resume confirms a claimed index (`reconciled.confirmed`);
+  the old error moves to `confirmed_after`.
+- **DR-2 (low):** `recorded_mode` read only `results.mode`. A chain the pre-fix code mixed
+  (hardware run H, then a `--mock --resume H` run M) was still resumable with `--mock`. Fix: the
+  run's mode must agree with every trial record's, and every run of the session must record the
+  same mode, before anything is written.
+- **DR-3 (low):** five of the new guards survived mutation. New or extended tests: `table()` on
+  a full 150-trial session with one pending or `5126daa`-style block is not protocol-complete;
+  the CheckpointFailed session (pending, resume hint, export refused, then a claimed index with
+  its journal staged is refused and confirmed by a resume); provenance `sync_pending` asserted;
+  a confirmation of an episode whose frame count does not match fails before any sync and keeps
+  the journal. Mutation check on `5503d00`: all 9 mutations caught (pending gate, export staged
+  branches, reconcile confirm, `sync_pending`, `episode_problem`, CheckpointFailed block, chain
+  check, staged rule, mock suffix).
+- **F2 (medium):** a mock eval export was labelled mock only in `bundle.json` / `trials.json`.
+  The sealed vishwaroop declaration said plain `real-0.1`. Fix: a mock export declares
+  `protocol_version` `real-0.1-mock` (`-mock-dev`, `-mock-incomplete`). vishwaroop reads
+  `protocol_version` as a free string (scratch copy, `parse_declaration`), so the mock format
+  test still imports. Test: `test_eval_bundle_is_complete_and_valid`.
+
+**Reruns on the final code:** full pytest **694 passed, 1 skipped** (13 min, exit code 0; `6904871` gave 692 + 1, CI on `5126daa` 670 + 16). Targeted runs (the files exercised
+by the fixes): stop / mode resume `tests/test_deploy_prewrite_stop.py` 82 passed; sync failure
+and recovery `tests/test_capture_resume_gap.py` 16 passed and `tests/test_pr2_review_fixes.py`
+8 passed; export `tests/test_export_bundle.py` 36 passed; report
+`tests/test_protocol_real.py` 20 passed; bowl `tests/test_bowl_check.py` 6 passed.
+`ruff check src tests scripts`, `black --check .` and `mypy --strict src` are clean.
+
+**Unverified on hardware:** all of the above ran on the mock rig and on a simulated macOS
+F_FULLFSYNC (fakes). No real arm, camera or real-arm capture was run. The bowl numbers are the
+sim-bowl fallback, not the LE TAUCI cup.
+
+**Owner decisions / notes:** (1) a real-0.1 or 0.2 session written before this fix whose
+record.json is lost cannot be resumed: its session row has no mode. A session with an intact
+record.json is unaffected. (2) `--protocol` is still ignored on `--resume`; it cannot misdirect
+recovery. (3) A pending trial's outcome still counts in the per-cell rates (a started slot is
+never re-run), but the session is not protocol-complete and the export refuses until a resume
+confirms the episode. A failed confirmation (e.g. a frame-count mismatch) needs your decision:
+nothing re-saves it automatically. (4) Records with no mode, or whose trials disagree with it,
+are refused by `--report`, the export and `--resume`. (5) Mock exports now declare
+`real-0.1-mock`; earlier mock bundles in the scratch vishwaroop copy said `real-0.1`.
+
+**Next (owner):** collect the five measurements and do the unpowered fit check. Then rerun the
+bowl check with the measured props, freeze, and rerun CI and the vishwaroop import on the final
+commit.
 
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
@@ -2366,7 +2496,8 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
   from the carry on, and no position satisfies `derive_bowl`'s rule and the box together. The
   options are in "PR 2: owner follow-up" and its round 2 (B (0.115, +-0.185), B' (0.205,
   0.185) and D (0.205, 0.180) pass the filter with separation 10.1 / 9.8 / 9.3 cm and release
-  windows 50% / 71% / 81%; every option needs the oracle's wrist_flex clipped in the bowl phases).
+  windows 50% / 71% / 81% with the 3 cm cube and the half-edge radius; B' is 73% / 10 mm with the
+  25.4 mm cube and the half-diagonal radius, sim-bowl fallback, owner hold on PR #32; every option needs the oracle's wrist_flex clipped in the bowl phases).
   The hardware eval and the demo schedule refuse the frozen bowl until it is decided. Seen slots B2 B5 E2 E5 + C4, the cubes and the seeded schedules
   are approved. Owner 2026-11-09: B' (0.205, 0.185) m picked for an UNPOWERED fit check (jaws
   and cube at the bowl and at C1, D1, B2, E2); the placement freeze is held until he confirms
