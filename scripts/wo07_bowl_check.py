@@ -30,7 +30,8 @@ Per bowl candidate it also reports (review, 2026-11-09):
   ``urdf`` variant (the unchanged sim oracle, i.e. the motion the sim demos teach) is the one that
   tests the joint-limit constraint: both are run and reported;
 * the release window (``src/eval/bowl_fit.py`` ``release_window``): the share of the TCP disc
-  over the bowl floor (radius floor - cube half) inside the box after the 5 mm tolerance, and its
+  over the bowl floor (radius floor - cube half-diagonal: the whole cube on the floor at any
+  yaw) inside the box after the 5 mm tolerance, and its
   inscribed radius. The oracle releases at the centre; a learned or teleop release off centre that
   leaves the box is rejected, so this decides how much of the success region the filter allows;
 * the box margin with BOTH TCP offsets: the search's (measured at the frozen bowl, 9.3 mm, used
@@ -92,16 +93,17 @@ BOWL_PHASES = ("lower", "release", "retreat")
 # protocol_real.MEASURED; sim-bowl fallbacks while a cup measurement is pending, labelled in the
 # record): the hand2mind 1-inch cube, nominal 25.4 mm until measured, and the LE TAUCI cup.
 GEOMETRY = BF.geometry()
-CUBE_HALF_M = GEOMETRY.cube_half_m
+CUBE_HALF_M = GEOMETRY.cube_half_m  # half the edge: used only as the cube's half-HEIGHT
 GRIP_HOLD_RAD = 0.15  # the gripper reads at least this while it holds the cube (sim 3 cm value;
 # a 25.4 mm cube closes the jaws further: unverified, it only marks the hold in this kinematic run)
 MAX_STEPS = 700
 BOX_MARGIN_M = PR.BOWL_MARGIN_M  # the operator's placement tolerance (5 mm), as derive_bowl
 STATUS_ORDER = {"pass": 0, "clip(gripper floor)": 1, "clip": 2, "reject": 3, "not reached": 4}
 CARRY_AND_BOWL = ("carry", *BOWL_PHASES)
-RELEASE_RADIUS_M = BF.release_radius_m(GEOMETRY)  # TCP over the floor, the cube inside it
+# TCP over the floor, the whole cube inside it at any yaw (floor radius - cube half-diagonal)
+RELEASE_RADIUS_M = BF.release_radius_m(GEOMETRY)
 RIM_RADIUS_M = GEOMETRY.rim_radius_m  # the cup's outer rim (sim bowl fallback while pending)
-CUBE_CORNER_M = CUBE_HALF_M * math.sqrt(2.0)
+CUBE_CORNER_M = BF.cube_half_diagonal_m(GEOMETRY)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -333,6 +335,8 @@ def verify(
     # the kinematic scene models neither the rim nor the floor: the prop geometry fails it alone
     geometry_problems = BF.geometry_problems(GEOMETRY)
     bowl_ok = kinematic_ok and not geometry_problems
+    # the cube's CENTRE over the floor, as the frozen sim success check (src/env/success.py in_xy):
+    # not the whole-cube release window (release_radius_m), which is reported separately
     in_bowl = (scene.obj[:, :2] - torch.tensor(bowl)).norm(dim=-1) < GEOMETRY.floor_radius_m
     placed = sorted({rows[i][0] for i in range(len(rows)) if bool(scene.released[i] & in_bowl[i])})
     return {
