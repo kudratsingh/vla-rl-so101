@@ -126,7 +126,9 @@ message); the session must run in the terminal's foreground, and losing it takes
 run would fork the session and drop the newer runs' scored trials), and warns (``--hardware``: asks for
 'checked') when an earlier run ended with TORQUE OFF UNCONFIRMED, in a trial or at shutdown.
 
-Protocol real-0.1 (``--protocol real-0.1``, the default; ``src/eval/protocol_real.py``; owner
+Protocol real-0.1 (``--protocol real-0.1``, a new session's default; ``--resume`` takes the
+session's recorded protocol and refuses an explicit other one before anything is written,
+``check_resume_protocol``; ``src/eval/protocol_real.py``; owner
 2026-11-09, final2 item 6 and amendments D1-D5). PickPlace only. The frozen schedule (seen = 10 at
 each of B2 B5 E2 E5 C4, shifted = 50 over the 20 ring slots, unseen = 25 purple + 25 green cube at
 the seen slots, the bowl fixed at (0.195, +0.205) m) runs in ONE seeded order across all three
@@ -145,7 +147,13 @@ episode = trial; ``capture.episode_index`` in the trial record, the trial id in 
 shifted, unseen per object and unseen pooled (the headline). ``--report RUN RUN`` prints two
 sessions side by side and refuses unless they ran the same protocol hash and schedule in the same
 recorded mode; ``protocol_complete`` needs two hardware sessions, and two mock sessions print a
-report labelled MOCK (``mode: mock``, ``mock_complete``, ``protocol_complete: false``).
+report labelled MOCK (``mode: mock``, ``mock_complete``, ``protocol_complete: false``). The report
+never trusts a saved summary: it recomputes each session's table from its trial blocks and its
+capture on disk (owner, PR #32 hold). A REQUIRED recording (capture on, the scored trial's policy
+run produced a frame; a first-write fault with zero frames requires none) that is pending,
+staged-unsaved or lost (``recording_missing``) blocks ``protocol_complete`` in the summary and the
+report (``recording_gate``, the export's ``recording_blockers``); the trial stays scored in the
+rates with its original score, and nothing staged is deleted.
 Baseline cadence (owner 2026-11-09): 15 Hz nominal control, 30 fps cameras, the SAME 450-command
 cap for SmolVLA and ACT, synchronous inference (no overlap) and ``max_chunk_age_ms`` 800. Budget
 per 150-trial session (single-run MOCK-RIG rates with the capture on, 450-command trials, M3 Pro;
@@ -222,7 +230,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple, Protocol
 
 import numpy as np
 
@@ -236,6 +244,7 @@ from src.eval import protocol_real as PR
 from src.eval import protocol_v02 as P2
 from src.eval import real_grid as G
 from src.eval.bowl_fit import bowl_box_problem
+from src.eval.export_bundle import recording_blockers
 from src.robot import convention as conv
 from src.robot.camera import (
     CameraRig,
@@ -772,13 +781,18 @@ MODES = ("mock", "hardware")
 
 def _run_modes(run_dir: Path) -> tuple[Any, set[Any]]:
     """(session id, every mode a run records), read only: record.json ``results.mode`` and each
-    trial record's, else (record.json missing or unreadable, as in ``load_prior``) the ``mode``
-    of its last synced ``session`` row (its trials are an earlier run's: checked there)."""
+    trial record's, and the ``mode`` of its last synced ``session`` row when that row records
+    one (owner, PR #32 hold: an inconsistent mode refuses; rows written before the mode was
+    logged carry none); else (record.json missing or unreadable, as in ``load_prior``) the row's
+    alone (its trials are an earlier run's: checked there)."""
+    row = _last_session_row(run_dir)
     try:
         results = json.loads((run_dir / "record.json").read_text()).get("results") or {}
         modes = {results.get("mode")} | {t.get("mode") for t in results.get("trials") or []}
+        if row is not None and "mode" in row:
+            modes.add(row["mode"])
     except (OSError, ValueError, AttributeError):
-        results = _last_session_row(run_dir) or {}
+        results = row or {}
         modes = {results.get("mode")}
     return (results.get("session") or {}).get("session_id"), modes
 
@@ -820,6 +834,27 @@ def check_resume_mode(run_dir: Path, mode: str) -> str:
                     f"{sorted(map(str, modes))}, {run_dir.name} {recorded!r}: nothing was "
                     "opened or changed"
                 )
+    return recorded
+
+
+def check_resume_protocol(run_dir: Path, protocol: str | None) -> str:
+    """Read only, next to ``check_resume_mode`` (before anything is written): the protocol the
+    run to resume recorded (record.json ``results.session.protocol_id``, else its synced
+    ``session`` row's; a session recorded before ``protocol_id``: 0.2, as ``check_resume``).
+    ``--protocol`` omitted (None) resumes under it; an explicit one that differs refuses (owner,
+    PR #32 hold). Returns the recorded protocol."""
+    try:
+        results = json.loads((run_dir / "record.json").read_text()).get("results") or {}
+        settings = results.get("session") or {}
+    except (OSError, ValueError, AttributeError):
+        settings = (_last_session_row(run_dir) or {}).get("session") or {}
+    recorded = str(settings.get("protocol_id") or P2.PROTOCOL_VERSION)
+    if protocol is not None and protocol != recorded:
+        sys.exit(
+            f"--resume refused: {run_dir.name} is a protocol {recorded} session, not "
+            f"--protocol {protocol} (omit --protocol to resume it under {recorded}): nothing "
+            "was opened or changed"
+        )
     return recorded
 
 
@@ -883,18 +918,60 @@ def done_indices(trials: Sequence[dict[str, Any]], cell: str) -> set[int]:
     return {int(t["trial_idx"]) for t in trials if t["cell"] == cell and t.get("policy_started")}
 
 
+class LatencyTargets(Protocol):
+    """What ``table`` needs of the deploy config (``DeployConfig``; ``report``: the saved ones)."""
+
+    @property
+    def latency_target_ms(self) -> float: ...
+
+    @property
+    def capture_offset_ms(self) -> float | None: ...
+
+
+class SavedTargets(NamedTuple):
+    """A saved summary's latency targets (``report``; this module is loaded by path in tests,
+    so no dataclass)."""
+
+    latency_target_ms: float
+    capture_offset_ms: float | None = None
+
+
+def recording_gate(
+    trials: Sequence[dict[str, Any]], settings: dict[str, Any], capture_root: Path | None
+) -> dict[str, list[Any]]:
+    """The trial ids that block a real-0.1 session's ``protocol_complete``, by the export's rule
+    (``export_bundle.recording_blockers``: the same helper; owner, PR #32 hold).
+    ``recordings_pending``: saved, not confirmed durable. ``recordings_unsaved``: a required
+    recording only staged (a resume recovers it). ``recording_missing``: a required recording
+    lost. Required: capture on and the scored trial's policy run produced a frame
+    (``recording.recording_required``). Their scores stand; nothing is deleted."""
+    got = recording_blockers(trials, capture_root, required=bool(settings.get("capture")))
+    pending = [p["trial_id"] for p in got["pending"]]
+    return {
+        "recordings_pending": pending,
+        "recordings_unsaved": [
+            m["trial_id"]
+            for m in got["missing"]
+            if m["status"] == "recoverable_on_resume" and m["trial_id"] not in pending
+        ],
+        "recording_missing": [
+            m["trial_id"] for m in got["missing"] if m["status"] == "recording_missing"
+        ],
+    }
+
+
 def table(
     trials: Sequence[dict[str, Any]],
     settings: dict[str, Any],
-    cfg_deploy: DeployConfig,
+    cfg_deploy: LatencyTargets,
     capture_root: Path | None = None,
 ) -> dict[str, Any]:
     """client.summarize over the first started record per (cell, trial_idx) (a started slot is
     never re-run, so there is one) plus every not-started attempt, and completeness. Raises
     PoolingRefused when a trial's session fingerprint differs from the session's. A real-0.1
-    trial whose episode is not confirmed durable (``capture_unconfirmed``; with the session's
-    ``capture_root``, a claimed index whose journal is still staged too) is listed under
-    ``recordings_pending``: then the session is not protocol-complete."""
+    session with a required recording pending, unsaved or lost (``recording_gate``, the
+    export's rule; with the session's ``capture_root`` the capture on disk too) is not
+    protocol-complete; those trials stay scored in the rates."""
     if settings.get("fingerprint"):
         check_poolable(trials, settings["fingerprint"])
     first: dict[tuple[str, int], dict[str, Any]] = {}
@@ -925,15 +1002,12 @@ def table(
         s["schedule"] = settings.get("schedule")
         s["reportable"] = settings.get("schedule") == "eval"
         # an outcome counts in the rates (the trial ran, its slot is never re-run), but a
-        # session with an episode saved and not yet durable is not a protocol table: a resume
-        # confirms it first (owner hold on PR #32; the export refuses until then)
-        s["recordings_pending"] = [
-            t.get("trial_id")
-            for t in scored
-            if capture_unconfirmed(t.get("capture") or {}, capture_root, t.get("trial_id"))
-        ]
+        # session with a required recording pending, unsaved or lost is not a protocol table
+        # (owner hold on PR #32; the export refuses a complete bundle too)
+        gate = recording_gate(trials, settings, capture_root)
+        s.update(gate)
         s["protocol_complete"] = bool(
-            s["protocol_complete"] and s["reportable"] and not s["recordings_pending"]
+            s["protocol_complete"] and s["reportable"] and not any(gate.values())
         )
         s["policy_identity"] = settings.get("policy_identity")
     s.update(
@@ -993,8 +1067,20 @@ def print_table(
             f"  NOT a protocol table: needs {P1.REAL_TRIALS_PER_CELL} scored trials in each of "
             f"{', '.join(P1.CELLS)}"
         )
+    for line in recording_gate_lines(s):
+        print(line)
     if s.get("torque_off_unconfirmed") or end.startswith("torque_off_unconfirmed"):
         print("  TORQUE OFF UNCONFIRMED: keep the servo supply OFF at the inline power switch")
+
+
+def recording_gate_lines(s: Mapping[str, Any]) -> list[str]:
+    """The recordings that block ``protocol_complete`` (``recording_gate``), one line each."""
+    what = {
+        "recordings_pending": "saved, not confirmed durable (--resume confirms them)",
+        "recordings_unsaved": "staged, not saved (--resume recovers them)",
+        "recording_missing": "LOST (their scores stand; no complete export)",
+    }
+    return [f"  recordings {why}: {s[k]}" for k, why in what.items() if s.get(k)]
 
 
 # ------------------------------------------------------------------------------------------------
@@ -2056,6 +2142,10 @@ def run(
     if args.resume:  # the recorded mode, read only, before anything is written (PR #32 hold)
         prior_dir = Path(args.resume) if Path(args.resume).is_dir() else args.runs_dir / args.resume
         recorded = check_resume_mode(prior_dir, mode)
+        # the recorded protocol (--protocol omitted), an explicit other one refused: read only
+        args.protocol = check_resume_protocol(prior_dir, getattr(args, "protocol", None))
+    elif getattr(args, "protocol", "") is None:  # a new session: the default protocol
+        args.protocol = PR.PROTOCOL_VERSION
     # a hardware session's journal preflight comes next: before anything is opened AND before a
     # resume's capture recovery changes the capture (it syncs under the same policy)
     journal_preflight = preflight_journal(args.runs_dir) if args.hardware else None
@@ -2319,7 +2409,13 @@ def main(argv: Sequence[str] | None = None) -> Path:
     mode.add_argument(
         "--report", nargs=2, metavar="RUN", default=None, help="two sessions side by side"
     )
-    parser.add_argument("--protocol", choices=PROTOCOLS, default=PR.PROTOCOL_VERSION)
+    parser.add_argument(
+        "--protocol",
+        choices=PROTOCOLS,
+        default=None,
+        help=f"a new session's protocol (default {PR.PROTOCOL_VERSION}); --resume: the session's "
+        "recorded one (an explicit other one is refused)",
+    )
     parser.add_argument(
         "--schedule", choices=sorted(PR.SCHEDULES), default="eval", help="real-0.1: eval | dev"
     )
@@ -2374,7 +2470,13 @@ def main(argv: Sequence[str] | None = None) -> Path:
         )
     if args.hardware and args.no_capture:
         parser.error("--no-capture is for mock runs: every trial on the arm is captured")
-    if args.hardware and args.protocol == PR.PROTOCOL_VERSION and args.slot_seed is not None:
+    if args.protocol is None and not args.resume:  # a new session: the default protocol
+        args.protocol = PR.PROTOCOL_VERSION
+    if (
+        args.hardware
+        and args.protocol in (None, PR.PROTOCOL_VERSION)
+        and args.slot_seed is not None
+    ):
         parser.error("--slot-seed is a protocol 0.2 option; real-0.1's schedule is frozen")
     if args.report:
         report([_run_dir(args.runs_dir, r) for r in args.report])
@@ -2400,10 +2502,10 @@ def report(run_dirs: Sequence[Path]) -> dict[str, Any]:
     same protocol hash and the same evaluation schedule, under different policies, in the same
     mode. Only two hardware sessions can make a protocol table (``protocol_complete``); two mock
     sessions give a report labelled MOCK (``mode: mock``, ``mock_complete``), never a result."""
-    rows, modes = [], []
+    rows, modes, notes = [], [], []
     for d in run_dirs:
         results = json.loads((d / "record.json").read_text()).get("results") or {}
-        st, summ = results.get("session") or {}, results.get("summary") or {}
+        st, saved = results.get("session") or {}, results.get("summary") or {}
         if st.get("protocol_id") != PR.PROTOCOL_VERSION:
             sys.exit(f"--report: {d.name} is not a {PR.PROTOCOL_VERSION} session")
         mode = session_mode(results)
@@ -2412,6 +2514,20 @@ def report(run_dirs: Sequence[Path]) -> dict[str, Any]:
                 f"--report refused: {d.name} has no recorded session mode (or its trials disagree "
                 "with it): not a hardware record"
             )
+        # never the saved summary (owner, PR #32 hold: a legacy record's says complete beside a
+        # pending episode): the rows and completeness again from the trial blocks and the
+        # session's capture on disk, by the export's rule (``recording_gate``)
+        targets = SavedTargets(
+            float(saved.get("latency_target_ms") or math.nan), saved.get("capture_offset_ms")
+        )
+        capture_root = d.parent / str(st.get("session_id")) / "capture"
+        try:
+            summ = table(list(results.get("trials") or []), st, targets, capture_root)
+        except PoolingRefused as e:
+            sys.exit(f"--report refused: {d.name}: {e}")
+        if bool(saved.get("protocol_complete")) and not summ["protocol_complete"]:
+            notes.append(f"  {d.name}: its saved summary said protocol_complete; recomputed: not")
+        notes += [f"  {d.name}:{line}" for line in recording_gate_lines(summ)]
         rows.append((d.name, st, summ))
         modes.append(mode)
     if len(set(modes)) != 1:
@@ -2454,6 +2570,8 @@ def report(run_dirs: Sequence[Path]) -> dict[str, Any]:
         out["rows"][row] = cells
         print(f"| {row} | {cells[0]} | {cells[1]} |")
     complete = [bool(summ.get("protocol_complete")) for summ in (sa, sb)]
+    for line in notes:
+        print(line)
     if mock:  # a mock session is never a protocol result, however many trials it ran
         out["mock_complete"] = all(complete)
         print(MOCK_REPORT_LABEL)

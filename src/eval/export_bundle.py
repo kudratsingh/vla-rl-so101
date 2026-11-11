@@ -43,14 +43,16 @@ durable (its save's sync failed: ``pending_episodes``) refuses every export, inc
 naming the trial, until a resume verifies and syncs it. vishwaroop's declaration has no field for
 an incomplete export (``docs/SO101_EXPORT.md`` section 2; its importer, ``parse_declaration`` /
 ``check_export``, only checks that the declared sessions equal the dataset's episodes), so a
-complete evaluation bundle is REFUSED. ``allow_missing_recordings`` builds one anyway, declared
+complete evaluation bundle is REFUSED. ``allow_missing_recordings`` (kept, owner PR #32 hold: never a
+complete or baseline bundle) builds an explicitly INCOMPLETE one, declared
 ``protocol_version`` ``real-0.1-incomplete`` (the same in-spec mechanism as ``-dev``: the sealed
 declaration itself says it is not the full evaluation), with ``status: INCOMPLETE`` and the
 missing trials in ``bundle.json`` and ``trials.json``. Episodes are never dropped or re-mapped:
 each one keeps the trial id the capture provenance gave it. A started trial that no policy write
 reached (the first write faulted: frames 0, no capture error) cannot have a recording: it is
 listed under ``uncaptured_started_trials`` and does not make the export incomplete
-(``recording.recording_required``, review F2).
+(``recording.recording_required``, review F2). The pending and missing checks are one helper,
+``recording_blockers``, which the session summary and ``wo07_real_eval.py --report`` use too.
 
 Nothing is guessed: a missing or unknown value refuses the export (``ExportRefused``).
 ``validate_bundle`` mirrors the importer's checks of the declaration, the LeRobot tables and the
@@ -641,7 +643,10 @@ def build_eval_bundle(
             if int(idx) in by_episode:
                 raise ExportRefused(f"episode {idx} is claimed by two trial records")
             by_episode[int(idx)] = t
-    pending = pending_episodes(recs, prov, eps, Path(capture_dataset).parent)
+    # the session summary's and --report's rule (``recording_blockers``; owner, PR #32 hold):
+    # pending on the records as written (before the provenance fill below), missing after it
+    root = Path(capture_dataset).parent
+    pending = recording_blockers(recs, root, prov=prov, episodes=eps)["pending"]
     if pending:  # never dropped, never counted: always refused, allow_missing_recordings too
         raise ExportRefused(
             f"PENDING: {len(pending)} episode(s) saved but not confirmed durable "
@@ -670,7 +675,7 @@ def build_eval_bundle(
             raise ExportRefused(f"episode {i} is not a scored trial")
         if not t.get("labeler") and t.get("outcome_source") == "operator":
             raise ExportRefused(f"episode {i}: an operator score without a named labeler")
-    missing = missing_recordings(recs, Path(capture_dataset).parent)
+    missing = recording_blockers(recs, root, prov=prov, episodes=eps)["missing"]
     if missing and not allow_missing_recordings:
         pending = [m["trial_id"] for m in missing if m["status"] == "recoverable_on_resume"]
         raise ExportRefused(
@@ -797,7 +802,7 @@ def pending_episodes(
     trials: Sequence[Mapping[str, Any]],
     prov: Mapping[str, Any],
     episodes: Sequence[int],
-    capture_root: Path,
+    capture_root: Path | None,
 ) -> list[dict[str, Any]]:
     """Episodes saved but not confirmed durable (``recording.capture_unconfirmed``, the rule the
     session summary uses; owner hold on PR #32): a trial's pending block, a record that claims
@@ -825,13 +830,13 @@ def pending_episodes(
         tid = entry.get("trial_id")
         if entry.get("sync_pending"):
             add(tid, i, str(entry["sync_pending"]))
-        elif tid is not None and has_staged(capture_root, str(tid)):
+        elif tid is not None and capture_root is not None and has_staged(capture_root, str(tid)):
             add(tid, i, "saved, its staged journal kept")
     return list(found.values())
 
 
 def missing_recordings(
-    trials: Sequence[Mapping[str, Any]], capture_root: Path
+    trials: Sequence[Mapping[str, Any]], capture_root: Path | None
 ) -> list[dict[str, Any]]:
     """Scored trials that need a recording (``recording.recording_required``: not one no policy
     write reached, which is listed under ``uncaptured_started_trials`` only) with no episode
@@ -849,6 +854,7 @@ def missing_recordings(
         staged = capture_pending(cap) or (
             not cap.get("recording_missing")
             and tid is not None
+            and capture_root is not None
             and has_staged(capture_root, str(tid))
         )
         out.append(
@@ -862,6 +868,50 @@ def missing_recordings(
             }
         )
     return out
+
+
+def recording_blockers(
+    trials: Sequence[Mapping[str, Any]],
+    capture_root: Path | None,
+    *,
+    required: bool = True,
+    prov: Mapping[str, Any] | None = None,
+    episodes: Sequence[int] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """The ONE pending-recording rule of the eval export, the session summary and ``--report``
+    (``scripts/wo07_real_eval.py`` ``table``; owner, PR #32 hold). ``pending``: episodes saved
+    but not confirmed durable (``pending_episodes``). ``missing``: REQUIRED recordings without an
+    episode (``missing_recordings``), ``recoverable_on_resume`` (staged) or ``recording_missing``
+    (lost). A recording is required for every scored trial whose policy run produced a frame,
+    under a capture-enabled real-0.1 session (``required``; ``recording.recording_required``: a
+    scored trial whose first write faulted with zero frames requires none). Either list blocks a
+    complete baseline: the summary's ``protocol_complete`` and a complete export. The trials keep
+    their scores; read only (staged data is never touched). ``prov`` / ``episodes`` default to the
+    capture dataset on disk under ``capture_root`` (none there, or ``capture_root`` None: the
+    trial blocks alone)."""
+    if prov is None or episodes is None:
+        prov, episodes = _capture_on_disk(capture_root)
+    return {
+        "pending": pending_episodes(trials, prov, episodes, capture_root),
+        "missing": missing_recordings(trials, capture_root) if required else [],
+    }
+
+
+def _capture_on_disk(capture_root: Path | None) -> tuple[dict[str, Any], list[int]]:
+    """(provenance, episode indices) of the capture dataset under ``capture_root``; empty when
+    there is none or it cannot be read (the trial blocks still decide)."""
+    if capture_root is None:
+        return {}, []
+    dataset = Path(capture_root) / DATASET_ROOT
+    try:
+        prov = _provenance(dataset)
+    except (ExportRefused, OSError, ValueError):
+        prov = {}
+    try:
+        episodes = _episode_indices(dataset)
+    except (ExportRefused, OSError, ValueError, KeyError):
+        episodes = []
+    return prov, episodes
 
 
 def seal_command(index: Mapping[str, Any], bundle: Path, export_id: str, export_root: str) -> str:

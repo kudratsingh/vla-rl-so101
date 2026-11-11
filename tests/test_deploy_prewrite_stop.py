@@ -1986,3 +1986,68 @@ def test_darwin_pilot_hardware_session_record_requires_f_fullfsync(
     assert [e for e in syncs.log if e[:2] == ("fsync", "file")] == []
     assert pilot.journal_policy("hardware") is runs_mod.SyncPolicy.FULL_FSYNC_REQUIRED
     assert pilot.journal_policy("mock") is runs_mod.SyncPolicy.BEST_EFFORT
+
+
+def test_a_resume_whose_record_and_session_row_disagree_on_the_mode_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner, PR #32 hold: a resume refuses a missing OR inconsistent recorded mode. record.json
+    (and its trials) say mock, the run's synced ``session`` row says hardware: refused, read
+    only, before anything changes."""
+    runs = tmp_path / "runs"
+    run_dir = _killed_real_session(runs, monkeypatch, "mock")
+    metrics = run_dir / "metrics.jsonl"
+    rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+    for row in rows:
+        if row.get("kind") == "session":
+            row["mode"] = "hardware"
+    metrics.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    before = _tree_digest(runs)
+    argv = ["--preset", "real", "--mock", "--fake-clock", "--max-steps", "6", "--resume",
+            run_dir.name, "--runs-dir", str(runs)]  # fmt: skip
+    refused: str | None = None
+    try:
+        ev.main(argv)
+    except SystemExit as e:
+        refused = str(e.code)
+    assert _tree_digest(runs) == before, f"the resume changed the session's files ({refused})"
+    assert refused is not None and "records no session mode" in refused, refused
+
+
+def test_an_explicit_protocol_that_differs_from_the_recorded_one_is_refused_before_any_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner, PR #32 hold: ``--resume`` uses the session's RECORDED protocol when ``--protocol``
+    is omitted, and refuses an explicit ``--protocol`` that differs from it before anything is
+    written (before the journal preflight, ``load_prior`` and the capture recovery): the runs
+    tree is byte-identical. An explicit match resumes."""
+    runs = tmp_path / "runs"
+    run_dir = _killed_real_session(runs, monkeypatch, "mock")
+    argv = ["--preset", "real", "--mock", "--fake-clock", "--max-steps", "6", "--runs-dir",
+            str(runs)]  # fmt: skip
+    before = _tree_digest(runs)
+    refused: str | None = None
+    try:
+        ev.main([*argv, "--resume", run_dir.name, "--protocol", "0.2"])
+    except SystemExit as e:
+        refused = str(e.code)
+    assert _tree_digest(runs) == before, f"the resume changed the session's files ({refused})"
+    assert refused is not None and "--protocol 0.2" in refused and "real-0.1" in refused, refused
+    rec = ev.main([*argv, "--resume", run_dir.name, "--protocol", "real-0.1"])  # explicit match
+    assert json.loads(rec.read_text())["results"]["session"]["protocol_id"] == "real-0.1"
+
+    # a protocol 0.2 session: an omitted --protocol resumes it as 0.2 (never the new-session
+    # default real-0.1), an explicit real-0.1 is refused before any write
+    from test_real_eval import QuitAfter
+
+    monkeypatch.setattr(ev, "ScriptedOperator", lambda: QuitAfter(2))
+    rec02 = ev.main(_args(tmp_path / "r02", "--task", "PickPlace", "--trials", "2"))
+    monkeypatch.setattr(ev, "ScriptedOperator", ScriptedOperator)
+    argv02 = ["--preset", "real", "--mock", "--fake-clock", "--max-steps", "16", "--runs-dir",
+              str(tmp_path / "r02"), "--resume", rec02.parent.name]  # fmt: skip
+    before = _tree_digest(tmp_path / "r02")
+    with pytest.raises(SystemExit, match="--protocol real-0.1") as e:
+        ev.main([*argv02, "--protocol", "real-0.1"])
+    assert _tree_digest(tmp_path / "r02") == before, f"changed files ({e.value.code})"
+    r2 = json.loads(ev.main(argv02).read_text())["results"]
+    assert r2["session"]["protocol_id"] == "0.2" and r2["session_end"] == "completed"
