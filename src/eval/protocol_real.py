@@ -191,6 +191,7 @@ def measurement_problems(m: PropMeasurements | None = None) -> list[str]:
     h_rim, h_floor = m.bowl_table_to_rim_height_mm, m.bowl_table_to_inside_floor_height_mm
     if edge is not None and not 20.0 <= edge <= 30.0:
         out.append(f"red_cube_edge_mm {edge} not in [20, 30] mm (a 1-inch cube is ~25.4 mm)")
+    # the same rule as bowl_fit.release_radius_m > 0 (floor radius > the cube's half-diagonal)
     diag = (CUBE_EDGE_NOMINAL_MM if edge is None else edge) * 2.0**0.5
     if floor is not None and not diag < floor <= 200.0:
         out.append(
@@ -368,6 +369,8 @@ JUDGING_RULE: dict[str, str] = {
     "Push": "(deferred: not judged in real-0.1) the object's centre is inside the 2-inch (50.8 mm) "
     "matte black target disc, the object is on the table, it was never lifted off the table "
     "during the trial, and the gripper is not holding it",
+    # half the edge is right for Stack: a centre-offset tolerance (src/env/success.py), not a
+    # footprint clearance
     "Stack": "(deferred: not judged in real-0.1) the object rests on top of the blue cube (centred "
     f"within half the cube edge, ~{cube_edge_mm()[0] / 2:.1f} mm, flat), the blue cube is still on "
     "the table, and the object touches neither gripper jaw",

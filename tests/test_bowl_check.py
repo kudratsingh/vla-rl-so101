@@ -81,12 +81,13 @@ def test_release_window_and_the_pending_bowl_preflights(
     cfg = load_config("real")
     box = BF.workspace_box(cfg)
     r = bc.RELEASE_RADIUS_M
-    # sim floor radius 45 mm (the cup's floor is PENDING) less the nominal 1-inch cube's 12.7 mm
-    assert r == pytest.approx(0.045 - 0.0127) and r == BF.release_radius_m()
+    # sim floor radius 45 mm (the cup's floor is PENDING) less the nominal 1-inch cube's
+    # half-diagonal 17.96 mm (the whole cube on the floor at any yaw)
+    assert r == pytest.approx(0.045 - 0.0254 / 2**0.5) and r == BF.release_radius_m()
     assert BF.release_window((0.25, 0.0), box, r) == {
-        "radius_m": 0.0323,
+        "radius_m": 0.027,
         "inside_fraction": 1.0,
-        "inscribed_radius_m": 0.0323,
+        "inscribed_radius_m": 0.027,
     }
     b = BF.release_window((0.115, 0.185), box, r)  # two faces 15 mm away, 10 mm after the 5 mm
     assert b["inscribed_radius_m"] == 0.01 and 0.4 < b["inside_fraction"] < 0.6
@@ -119,6 +120,15 @@ def test_release_window_and_the_pending_bowl_preflights(
     assert PR.freeze_problem() in ev.real_hardware_problems(cfg, s)
 
 
+def test_release_radius_keeps_the_whole_cube_on_the_floor_at_any_yaw() -> None:
+    """Owner review of PR #32 (P2): a cube at any yaw stays on the floor only if its centre is
+    within the floor radius less half its DIAGONAL (edge / sqrt 2), not half its edge. 25.4 mm
+    cube, 90 mm floor: 45 - 17.96 = 27.04 mm (the half-edge rule overstated it as 32.3 mm)."""
+    g = BF.geometry(PR.PropMeasurements(25.4, 110.0, 90.0, 60.0, 8.0))
+    assert BF.release_radius_m(g) == pytest.approx(0.045 - 0.0254 / 2**0.5, abs=1e-5)
+    assert BF.release_radius_m(g) == pytest.approx(0.02704, abs=1e-5)
+
+
 def test_prop_geometry_reads_the_one_measurement_place() -> None:
     """Owner kit list 2026-11-10: the cube and cup geometry of every bowl check comes from
     protocol_real.MEASURED; pending values fall back to the sim bowl, labelled, and the nominal
@@ -148,7 +158,7 @@ def test_prop_geometry_reads_the_one_measurement_place() -> None:
         pytest.approx(0.055),
         pytest.approx(0.060),
     )
-    assert BF.release_radius_m(gm) == pytest.approx(0.0225)
+    assert BF.release_radius_m(gm) == pytest.approx(0.035 - 0.025 / 2**0.5)
     assert BF.carry_rim_clearance_m(gm) < 0  # a 60 mm cup: the oracle's carry hits the rim
     d = 0.0983  # B' to its nearest slot
     assert BF.cube_rim_clearance_m(d, gm) == pytest.approx(d - 0.055 - 0.0125 * 2**0.5 - 0.005)

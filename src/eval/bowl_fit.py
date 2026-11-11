@@ -8,9 +8,10 @@ a demo recording never starts at a bowl the filter would reject on every carry:
   the operator's 5 mm placement tolerance (``protocol_real.BOWL_MARGIN_M``) and the oracle's
   TCP-to-bowl offset at lower / release / retreat (>= 0 fits);
 * ``release_window``: how much of the release region (the TCP disc over the bowl floor, radius
-  floor radius less the cube half-size) stays inside the box after the tolerance: a learned or
+  floor radius less the cube's planar half-diagonal) stays inside the box after the tolerance: a learned or
   teleop release off centre that leaves the box is rejected by the filter, so this is the share of
-  in-bowl releases the filter allows.
+  in-bowl releases the filter allows (the region's radius is ``release_radius_m``: the floor
+  radius less the cube's planar half-DIAGONAL, so the whole cube is on the floor at any yaw).
 
 ``bowl_box_problem`` is the preflight (``scripts/wo07_real_eval.py`` ``real_hardware_problems``,
 ``scripts/wo06_teleop_record.py --demo-schedule``). It reads the protocol's bowl and the config's
@@ -24,8 +25,9 @@ height and table-to-inside-floor height. While a cup measurement is pending the 
 (``src/env/success.py``, read only) and its ``sources`` entry says ``PENDING ... sim fallback``,
 so no number derived from it is the real cup's. From it:
 
-* ``release_radius_m``: the TCP disc over the floor that keeps the whole cube inside it
-  (floor radius less the cube half-edge; the release-window input);
+* ``release_radius_m``: the TCP disc over the floor that keeps the whole cube inside it at any
+  yaw (floor radius less the cube's planar half-diagonal, edge / sqrt 2; the release-window
+  input; owner review of PR #32: half the edge holds only for a yaw-aligned cube);
 * ``cube_rim_clearance_m``: the outer rim to the nearest cube's corner at any yaw, the bowl placed
   the 5 mm tolerance closer (cube only: the open jaws reach further, not modelled);
 * ``carry_rim_clearance_m``: how far the cube's bottom passes above the rim at the sim oracle's
@@ -136,16 +138,24 @@ def geometry(m: PR.PropMeasurements | None = None) -> PropGeometry:
     )
 
 
-def release_radius_m(g: PropGeometry | None = None) -> float:
-    """TCP disc radius over the cup floor that keeps the whole cube on it."""
+def cube_half_diagonal_m(g: PropGeometry | None = None) -> float:
+    """The cube's planar half-diagonal (centre to a vertical edge, edge / sqrt 2): the footprint
+    radius at an arbitrary yaw. Half the edge is right only vertically or for a yaw-aligned cube."""
     g = geometry() if g is None else g
-    return g.floor_radius_m - g.cube_half_m
+    return g.cube_half_m * math.sqrt(2.0)
+
+
+def release_radius_m(g: PropGeometry | None = None) -> float:
+    """TCP disc radius over the cup floor that keeps the whole cube on it at any yaw: the floor
+    radius less the cube's half-diagonal (25.4 mm cube, 90 mm floor: 27.0 mm, not 32.3 mm)."""
+    g = geometry() if g is None else g
+    return g.floor_radius_m - cube_half_diagonal_m(g)
 
 
 def cube_rim_clearance_m(slot_distance_m: float, g: PropGeometry | None = None) -> float:
     """Outer rim to the nearest cube's corner (any yaw) with the bowl the 5 mm tolerance closer."""
     g = geometry() if g is None else g
-    return slot_distance_m - g.rim_radius_m - g.cube_half_m * math.sqrt(2.0) - TOLERANCE_M
+    return slot_distance_m - g.rim_radius_m - cube_half_diagonal_m(g) - TOLERANCE_M
 
 
 def carry_rim_clearance_m(g: PropGeometry | None = None) -> float:
@@ -153,6 +163,7 @@ def carry_rim_clearance_m(g: PropGeometry | None = None) -> float:
     from src.data.oracle import CARRY_Z  # read only
 
     g = geometry() if g is None else g
+    # half the edge is right here: a vertical distance (the cube lies flat, centre to bottom face)
     return CARRY_Z - TCP_ABOVE_CUBE_CENTRE_M - g.cube_half_m - g.rim_height_m
 
 
@@ -173,7 +184,7 @@ def geometry_problems(g: PropGeometry | None = None) -> list[str]:
     if release_radius_m(g) <= 0:
         out.append(
             f"release radius {1000 * release_radius_m(g):+.1f} mm: the inside floor is narrower "
-            "than the cube"
+            "than the cube's diagonal"
         )
     c = carry_rim_clearance_m(g)
     if c < 0:
