@@ -1976,6 +1976,86 @@ behaviour is simulated):
 Unverified on hardware: F_FULLFSYNC on the bench Mac's own disk (the preflight will say so at
 the first `--hardware` start). Spend, credentials and the powered steps 9-10 stay on hold.
 
+### PR 2: F_FULLFSYNC review round (2026-11-10, $0)
+
+Review of `0edfe69` (the F_FULLFSYNC round above): six confirmed findings (two pairs overlap), all
+applied. Fakes and the mock rig only. The placement freeze stays PENDING: `BOWL_XY_M`,
+`RUBRIC_VERSION`, `FREEZE_STATUS`, the placement-grid PDF and the protocol hash inputs are
+untouched. Spend, credentials and the powered steps 9-10 stay on hold.
+
+- **F1 (medium): resume capture recovery ran before the preflight, best effort.** A
+  `--resume --hardware` real-0.1 session ran `precheck_capture` (quarantine moves, provenance
+  pruned and rewritten) before `preflight_journal`, with no policy, so on macOS that provenance
+  write could fall back to `os.fsync`, and a volume without F_FULLFSYNC had its capture changed
+  before the refusal. Fix: `run()` runs `preflight_journal` FIRST for every `--hardware` session
+  (before `load_prior` and the capture precheck; `run_hardware` takes its result), and the session
+  policy is threaded `precheck_capture` -> `check_capture_resumable` -> `recover_capture` ->
+  `recover_dataset`.
+- **F3 (low): the capture recovery's own rewrites were never synced.** `recover_dataset`
+  (lerobot `write_info` / `write_stats`, quarantine moves) now syncs `meta/` under the session
+  policy every time (also when it finds nothing left to change: an earlier recovery whose sync
+  failed may have left its rewrites in the page cache) and, when anything moved, every directory of
+  the dataset and of the quarantine. A newly created capture dataset (a new session, or the empty
+  restart after a kill in the first save: meta, the calibration copy, the stash rename) is synced
+  at open, before the first trial.
+- **F4 (low): directory doc and record.** The module doc said a directory sync never blocks motion
+  "as the file sync before it already flushed the drive". Wrong for `write_durable`: the rename
+  comes after the file's F_FULLFSYNC, so only the directory sync (or the next F_FULLFSYNC, which
+  flushes the whole drive cache) makes it durable. Corrected. Directories stay best effort, as the
+  owner asked; on the arm the next journal F_FULLFSYNC is at the latest the next `trial_started`
+  row, before any motion. record.json now records the directory methods too
+  (`sync: {policy, methods, dir_methods}`), and the preflight adds a `directory_note` (printed as
+  a WARNING) when, under the required policy, the directory sync was not F_FULLFSYNC.
+- **F2 (medium) / F1b / F2b: tests did not pin the capture, the hardware mode or the pilot.** The
+  darwin helper now drives the session as the hardware one (`session(mode="hardware")`, the
+  script's own `journal_policy(mode)` with `sys.platform` simulated as darwin) instead of a
+  lambda that ignored the mode. The pilot got a `journal_policy(mode)` helper like the real eval.
+  New tests (`tests/test_deploy_prewrite_stop.py`, `tests/test_runs.py`):
+  - a real-0.1 capture session as the macOS hardware session: every capture file sync
+    (provenance, calibration copy, info.json, staged index, episode parquet files, the stills) is
+    an F_FULLFSYNC, the new dataset is synced before the first trial, no `os.fsync` on any file;
+  - the first episode save's sync meeting a missing / ENOTSUP F_FULLFSYNC: `sync_error` names
+    `FullFsyncRequired`, the staged journal is kept, no `os.fsync`;
+  - `--resume --hardware` of a capture killed mid-save: without F_FULLFSYNC the preflight
+    refuses first and the capture is byte-for-byte untouched (no quarantine); F_FULLFSYNC lost
+    between preflight and recovery: the recovery refuses the resume, no fsync; with F_FULLFSYNC:
+    provenance, info.json and stats.json F_FULLFSYNCed, then the `--i-am-present` refusal;
+  - the pilot's hardware session: record.json `sync.policy == full_fsync_required`, no fsync;
+  - `sync_tree` under the required policy raises on a file (missing / ENOTSUP), never fsync;
+  - a volume rejecting F_FULLFSYNC on directories only: recorded in `dir_methods`, noted by the
+    preflight, file syncs still F_FULLFSYNC.
+- **Mutation check** (`tests/test_runs.py` + `tests/test_deploy_prewrite_stop.py`, scratch
+  script, source restored after each): each of these now fails at least one test: open_capture
+  without the policy (the reviewer's mutation a); the real-eval Run on the mock policy (b); the
+  pilot Run best effort (c); `sync_tree` without the file policy; `run()` without the precheck
+  policy; `check_capture_resumable` / `recover_capture` -> `recover_dataset` without the policy;
+  the preflight after the precheck; the recovery's meta sync best effort; the new-dataset sync
+  removed; the fallback restored in `sync_fd` (19 failures). Not caught: dropping the record.json
+  rename's own directory method from `dir_methods` (the same method is recorded by the run's
+  other directory syncs).
+
+**Reruns on this code** (Mac M3 Pro; the darwin behaviour is simulated, so CI's Linux runs it too):
+- PR #33's stop / resume list (all of `tests/test_deploy_prewrite_stop.py` plus the 10 named ids):
+  88 passed (83 + 5 new).
+- Sync failure (`-k "sync or fullfsync or marker_failure or disk_full or preflight or darwin"`
+  over `test_runs.py` and `test_deploy_prewrite_stop.py`): 33 passed.
+- Recovery (`-k "power_loss or chained or recover or killed or after_record or mid_save or
+  after_save or rebuild or resume"` over `test_capture_resume_gap.py`, `test_pr2_review_fixes.py`
+  and `test_deploy_prewrite_stop.py`: the power-loss rebuild, chained runs, capture recovery, the
+  score-before-save interruption): 33 passed. The capture / recovery files in full: 22 passed
+  (`test_a_saved_episode_is_synced_before_its_journal_is_dropped` now tells the new dataset's
+  sync at open apart from the episode saves).
+- Export / protocol (`test_export_bundle.py`, `test_pr2_pipeline.py`, `test_protocol_real.py`): 58
+  passed + 1 skipped. `test_runs.py`: 17 passed (14 + 3 new).
+- Full pytest: 676 passed + 1 skipped (668 + 8 new). `ruff check src tests scripts`, `black --check .` and
+  `mypy --strict src` are clean. Pins unchanged.
+
+Known and left as is (not in the confirmed findings): the staged journal's `frames.npz` and frame
+PNG links are not synced (only `staged.json`, written last, is); after a power loss a journal
+whose frames did not reach the disk is flagged unreadable by `recover_staged` (never guessed).
+Unverified on hardware: F_FULLFSYNC on the bench Mac's own disk (the preflight reports it at the
+first `--hardware` start).
+
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
 Owner 2026-11-09: the stop check #30 added to teleop and the park now also guards the pilot and
