@@ -514,6 +514,127 @@ def test_report_on_two_full_mock_sessions_is_labelled_mock_never_protocol_comple
         ev.report([a.parent, b.parent])
 
 
+@pytest.fixture(scope="module")
+def full_pair(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str, str]:
+    """Two finished 150-trial real-0.1 mock sessions (no capture, one command per trial):
+    (runs dir, run id a, run id b). Tests copy the tree before changing it."""
+    runs = tmp_path_factory.mktemp("full_pair") / "runs"
+    full = ("--task", "PickPlace", "--trials", str(P1.REAL_TRIALS_PER_CELL), "--no-capture")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ev, "ScriptedOperator", ScriptedOperator)
+        a = ev.main(real_args(runs, *full, "--max-steps", "1", family="smolvla", payload=b"a"))
+        b = ev.main(real_args(runs, *full, "--max-steps", "1", family="act", payload=b"b"))
+    return runs, a.parent.name, b.parent.name
+
+
+def _captured_hardware_copy(full_pair: tuple[Path, str, str], tmp: Path) -> tuple[Path, Path]:
+    """A copy of ``full_pair`` relabelled as two captured hardware sessions: mode hardware,
+    capture on, every scored trial claiming its own episode. Their SAVED summaries still say
+    ``protocol_complete`` True. Returns the two record paths."""
+    import shutil
+
+    runs, ra, rb = full_pair
+    shutil.copytree(runs.parent, tmp, dirs_exist_ok=True)
+    recs = []
+    for rid in (ra, rb):
+        rec = tmp / "runs" / rid / "record.json"
+        data = json.loads(rec.read_text())
+        res = data["results"]
+        res["mode"] = "hardware"
+        res["session"]["capture"] = True
+        k = 0
+        for t in res["trials"]:
+            t["mode"] = "hardware"
+            if t.get("policy_started") and t["outcome"] in ev.SCORED:
+                t["capture"] = {"episode_index": k, "frames": 1}
+                k += 1
+        assert res["summary"]["protocol_complete"]  # the saved summary, as 5126daa wrote it
+        rec.write_text(json.dumps(data))
+        recs.append(rec)
+    return recs[0], recs[1]
+
+
+def _first_scored(rec: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    data = json.loads(rec.read_text())
+    t = next(t for t in data["results"]["trials"] if t.get("policy_started"))
+    return data, t
+
+
+def test_report_recomputes_completeness_and_never_trusts_a_stale_saved_summary(
+    full_pair: tuple[Path, str, str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Owner, PR #32 hold (issue 2): a legacy record (5126daa: an ``episode_index`` beside the
+    save's ``sync_error``, or an index claimed while its journal is still staged) whose SAVED
+    summary says ``protocol_complete`` True made ``--report`` print a complete table. The report
+    recomputes completeness from the trial blocks and the capture on disk with the export's
+    pending-recording rule."""
+    from src.robot import recording
+
+    a, b = _captured_hardware_copy(full_pair, tmp_path)
+    assert ev.report([a.parent, b.parent])["protocol_complete"]  # every recording confirmed
+    data, t0 = _first_scored(a)
+    t0["capture"] = {"episode_index": 0, "sync_error": "OSError: [Errno 5] (journal kept)"}
+    a.write_text(json.dumps(data))
+    assert data["results"]["summary"]["protocol_complete"]  # stale: still says complete
+    capsys.readouterr()
+    out = ev.report([a.parent, b.parent])
+    assert not out["protocol_complete"], "--report trusted the saved summary of a pending episode"
+    assert t0["trial_id"] in capsys.readouterr().out
+
+    t0["capture"] = {"episode_index": 0, "frames": 1}  # no error; its journal still staged
+    a.write_text(json.dumps(data))
+    sid = data["results"]["session"]["session_id"]
+    staged = recording.staged_path(a.parent.parent / sid / "capture", t0["trial_id"])
+    staged.mkdir(parents=True)
+    (staged / recording.STAGED_INDEX).write_text("{}")
+    out = ev.report([a.parent, b.parent])
+    assert not out["protocol_complete"], "--report ignored a claimed episode still staged"
+    assert staged.is_dir()  # the report never deletes staged data
+
+
+def test_required_recordings_gate_completeness_and_scores_stand(
+    full_pair: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    """Owner, PR #32 hold: every scored trial whose policy run produced a frame (capture on)
+    requires its recording; a scored trial whose FIRST write faulted (zero frames) requires
+    none. Either way the trial stays scored in the running rates with its original score. A
+    required recording pending, staged-unsaved or lost (``recording_missing``) blocks
+    ``protocol_complete`` in the session summary and in ``--report``."""
+    from src.eval import export_bundle as X
+    from src.robot import recording
+
+    class Dcfg:
+        latency_target_ms, capture_offset_ms = 150.0, None
+
+    a, b = _captured_hardware_copy(full_pair, tmp_path)
+    data, t0 = _first_scored(a)
+    res = data["results"]
+    trials, settings = res["trials"], res["session"]
+    root = a.parent.parent / str(settings["session_id"]) / "capture"
+    base = ev.table(trials, settings, Dcfg(), root)
+    assert base["protocol_complete"]
+    t0["capture"] = {"episode_index": None, "frames": 0, "reason": recording.NO_POLICY_WRITE}
+    summ = ev.table(trials, settings, Dcfg(), root)
+    assert summ["protocol_complete"] and summ["real_rows"] == base["real_rows"]
+    assert summ["cells"] == base["cells"]  # scored, in the rates, its score unchanged
+    for cap in (
+        {"episode_index": None, "recording_missing": True, "reason": "no journal"},
+        {"episode_index": None, "reason": "the session ended before the episode was saved"},
+        {"episode_index": None, "pending_episode_index": 0, "sync_error": "OSError"},
+    ):
+        t0["capture"] = cap
+        summ = ev.table(trials, settings, Dcfg(), root)
+        assert not summ["protocol_complete"], cap
+        assert summ["real_rows"] == base["real_rows"] and summ["cells"] == base["cells"]
+        got = X.recording_blockers(trials, root)
+        assert [g["trial_id"] for g in got["pending"] + got["missing"]][:1] == [t0["trial_id"]]
+        a.write_text(json.dumps(data))  # the saved summary still says complete
+        assert not ev.report([a.parent, b.parent])["protocol_complete"], cap
+    assert summ["recordings_pending"] == [t0["trial_id"]]
+    t0["capture"] = {"episode_index": None, "recording_missing": True}
+    assert ev.table(trials, settings, Dcfg(), root)["recording_missing"] == [t0["trial_id"]]
+
+
 def test_resume_refuses_a_changed_policy_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
