@@ -167,6 +167,7 @@ def test_eval_bundle_is_complete_and_valid(eval_session: _Session, tmp_path: Pat
     r = eval_session.results
     sid = r["session"]["session_id"]
     assert index["episodes"] == 3 and index["sessions"] == [sid] and index["mode"] == "mock"
+    assert index["mock_label"] == X.MOCK_EXPORT_LABEL  # labelled mock: a format test only
     decl = json.loads((out / X.DECLARATION_FILE).read_text())
     pol = decl["policy"]
     ident = X.checkpoint_identity(eval_session.ckpt)
@@ -182,6 +183,7 @@ def test_eval_bundle_is_complete_and_valid(eval_session: _Session, tmp_path: Pat
     assert set(decl["sessions"].values()) == {sid}
     trials = json.loads((out / X.TRIALS_FILE).read_text())
     assert [t["outcome_source"] for t in trials["trials"]] == ["scripted"] * 3
+    assert trials["mode"] == "mock" and trials["mock_label"] == X.MOCK_EXPORT_LABEL
     assert not (out / X.LABELS_FILE).exists()
     for name in ident["files"]:  # every checkpoint file travels, content-hashed
         assert (out / name).read_bytes() == (eval_session.ckpt / name).read_bytes()
@@ -192,6 +194,15 @@ def test_eval_bundle_is_complete_and_valid(eval_session: _Session, tmp_path: Pat
             ["--preset", "real", "eval", "--session", eval_session.record.parent.name]
             + ["--runs-dir", str(eval_session.runs), "--out", str(tmp_path / "x")]
         )
+    saved = eval_session.record.read_text()  # a record without its mode is not hardware
+    data = json.loads(saved)
+    data["results"].pop("mode")
+    try:
+        eval_session.record.write_text(json.dumps(data))
+        with pytest.raises(SystemExit, match="no recorded mode"):
+            _export(eval_session, tmp_path / "z")
+    finally:
+        eval_session.record.write_text(saved)
     other = tmp_path / "other"
     other.mkdir()
     (other / "model.safetensors").write_bytes(b"other")
