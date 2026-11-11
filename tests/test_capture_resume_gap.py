@@ -888,7 +888,9 @@ def _corrupt(path: Path, how: str) -> None:
 
 
 def _tree_bytes(d: Path) -> dict[str, bytes]:
-    return {p.relative_to(d).as_posix(): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
+    return {
+        p.relative_to(d).as_posix(): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()
+    }
 
 
 @pytest.mark.parametrize(
@@ -960,15 +962,16 @@ def test_a_pending_episode_whose_video_does_not_decode_is_never_confirmed(
         for name in conv.CAMERA_NAMES:  # names the camera that failed, and only it
             assert (conv.IMAGE_KEYS[name] in err) == (name in corruption[i]), err
         assert f"frames 0-{frames - 1}" in err, err
-        assert _tree_bytes(recording.staged_path(capture_root, t1["trial_id"])) == journals[
-            t1["trial_id"]
-        ]  # the journal is kept byte-for-byte
+        assert (
+            _tree_bytes(recording.staged_path(capture_root, t1["trial_id"]))
+            == journals[t1["trial_id"]]
+        )  # the journal is kept byte-for-byte
     prov = json.loads((ds_root / recording.PROVENANCE).read_text())
     for i in corruption:
         assert prov["episodes"][str(i)]["sync_pending"]
-        assert conv.IMAGE_KEYS[next(iter(corruption[i]))] in prov["episodes"][str(i)][
-            "confirm_error"
-        ]
+        assert (
+            conv.IMAGE_KEYS[next(iter(corruption[i]))] in prov["episodes"][str(i)]["confirm_error"]
+        )
     for i in range(3):
         problems = recording.verify_episode_video(ds_root, i)
         assert bool(problems) == (i in corruption), problems
@@ -989,3 +992,37 @@ def test_a_pending_episode_whose_video_does_not_decode_is_never_confirmed(
     assert not [e for e in prov["episodes"].values() if "sync_pending" in e or "confirm_error" in e]
     index = _export(runs, rec2["path"].parent.name, tmp_path / "export2")
     assert index["status"] == "COMPLETE" and index["episodes"] == 3
+
+
+def test_a_save_whose_video_does_not_decode_keeps_its_journal_and_stays_pending(
+    tmp_path: Path, hard_timeout: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner 2026-11-11 (issue 1), the save path (``EvalCapture.finish``, a recovery's save too):
+    episode 1 is saved and synced, its clip does not decode: PENDING (no index claimed, the
+    journal kept, ``confirm_error`` in the block and the provenance), the score stands."""
+    real = recording.verify_episode_video
+
+    def verify(ds_root: Path, index: int) -> list[str]:
+        if index == 1:
+            return ["observation.images.wrist: frames 0-4 of episode 1: RuntimeError: corrupt"]
+        return list(real(ds_root, index))
+
+    monkeypatch.setattr(recording, "verify_episode_video", verify)
+    runs = tmp_path / "runs"
+    rec = _new_session(runs, _ckpt(tmp_path))
+    r = json.loads(rec.read_text())["results"]
+    capture_root = runs / r["session"]["session_id"] / "capture"
+    caps = [t["capture"] for t in r["trials"]]
+    assert [c["episode_index"] for c in caps] == [0, None, 2]
+    assert recording.capture_pending(caps[1]) and caps[1]["pending_episode_index"] == 1
+    assert "frames 0-4" in caps[1]["confirm_error"] and "sync_error" not in caps[1]
+    assert r["trials"][1]["outcome"] in ev.SCORED
+    assert [recording.has_staged(capture_root, t["trial_id"]) for t in r["trials"]] == [
+        False,
+        True,
+        False,
+    ]
+    assert r["summary"]["recordings_pending"] == [r["trials"][1]["trial_id"]]
+    prov = json.loads((capture_root / "dataset" / recording.PROVENANCE).read_text())
+    assert "corrupt" in prov["episodes"]["1"]["confirm_error"]
+    assert prov["episodes"]["1"]["sync_pending"]

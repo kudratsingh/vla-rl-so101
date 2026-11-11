@@ -79,6 +79,10 @@ Evaluation capture (``EvalCapture``), one dataset per evaluation session, one ep
   the scored record's ``capture`` block (and the synced record.json that holds it) never names
   an episode the page cache still held. Between trials, never during motion; ``sync_s`` in the
   block says what it cost. A failed sync keeps the journal and says so (``sync_error``).
+  Decoded before the journal goes (owner 2026-11-11, PR #32 hold): ``verify_episode_video``
+  decodes both cameras' clips with torchcodec across the episode's full frame range (``finish``,
+  so a recovery's save too, and ``confirm_saved``); a clip that does not decode keeps the journal
+  and says so (``confirm_error``: camera, frame range, file, error; ``verify_s`` what it cost).
   Such an episode is PENDING (owner hold on PR #32): the block names it only as
   ``pending_episode_index`` (``episode_index`` None, so nothing counts it as present), its
   provenance entry carries ``sync_pending``, and the export refuses while any episode is pending
@@ -141,8 +145,8 @@ STAGED_NOT_STARTED = "staged journal of a slot no attempt of which started (disc
 JOURNAL_KEYS = ("cell", "trial_idx", "start_utc", "attempt")  # the attempt a journal belongs to
 SCORED_OUTCOMES = ("success", "failure")
 SYNC_PENDING = (
-    "saved, not yet durable (its sync failed): PENDING until a resume verifies and syncs it "
-    "(the staged journal is kept)"
+    "saved, not yet confirmed durable (its sync failed, or its clips did not decode): PENDING "
+    "until a resume verifies and syncs it (the staged journal is kept)"
 )
 
 
@@ -213,6 +217,75 @@ def episode_problem(ds_root: Path, index: int, frames: Any = None) -> str:
     except Exception as e:  # noqa: BLE001 - unreadable is the answer
         return f"episode {index} unreadable: {type(e).__name__}: {e}"
     return ""
+
+
+VERIFY_BATCH = 32  # frames decoded per call: a real episode's clip never sits in memory whole
+
+
+def verify_episode_video(ds_root: Path, index: int) -> list[str]:
+    """Decode every camera clip of episode ``index`` of a finalized recording dataset with
+    torchcodec (never PyAV, CLAUDE.md rule 6) across the episode's full frame range: frame ``i``
+    (0 .. length-1) is the frame played at its centre, ``from_timestamp + (i + 0.5) / fps``, of
+    the episode's chunked video file, and must be the episode's own (its pts within a quarter
+    frame of ``from_timestamp + i / fps``) in the feature's ``(height, width, channels)``; the
+    clip's span must be ``length / fps``. Every camera of the convention must be a declared video
+    feature: a dataset without one fails, it never passes silently. Owner 2026-11-11 (PR #32
+    hold): a journal is dropped only after this. Returns one problem per camera that failed
+    (camera key, frame range, file, error); empty when every clip decodes. Never raises."""
+    try:
+        import pyarrow.parquet as pq
+
+        root = Path(ds_root)
+        info = json.loads((root / "meta" / "info.json").read_text())
+        rows = [
+            r
+            for f in sorted((root / "meta" / "episodes").rglob("*.parquet"))
+            for r in pq.read_table(f).to_pylist()
+            if int(r["episode_index"]) == int(index)
+        ]
+        if len(rows) != 1:
+            return [f"episode {index}: {len(rows)} metadata rows"]
+        ep, fps = rows[0], float(info["fps"])
+        n = int(ep["length"])
+        keys = [k for k, v in info["features"].items() if v.get("dtype") == "video"]
+    except Exception as e:  # noqa: BLE001 - unreadable is the answer
+        return [f"episode {index} unreadable: {type(e).__name__}: {e}"]
+    problems = [
+        f"{key}: not a video feature of the dataset (episode {index})"
+        for key in conv.IMAGE_KEYS.values()
+        if key not in keys
+    ]
+    for key in keys:
+        where = f"{key}: frames 0-{n - 1} of episode {index}"
+        try:
+            rel = str(info["video_path"]).format(
+                video_key=key,
+                chunk_index=ep[f"videos/{key}/chunk_index"],
+                file_index=ep[f"videos/{key}/file_index"],
+            )
+            t0, t1 = (float(ep[f"videos/{key}/{b}_timestamp"]) for b in ("from", "to"))
+            where += f" ({rel}, t {t0:.3f}-{t1:.3f} s)"
+            if n < 1:
+                raise ValueError("the episode has no frames")
+            if abs((t1 - t0) - n / fps) > 0.5 / fps:
+                raise ValueError(f"the clip spans {t1 - t0:.4f} s, {n} frames at {fps:g} fps")
+            from torchcodec.decoders import VideoDecoder
+
+            want = tuple(int(x) for x in info["features"][key]["shape"])
+            dec = VideoDecoder(str(root / rel), seek_mode="exact", dimension_order="NHWC")
+            for s in range(0, n, VERIFY_BATCH):
+                ids = range(s, min(n, s + VERIFY_BATCH))
+                batch = dec.get_frames_played_at([t0 + (i + 0.5) / fps for i in ids])
+                if tuple(batch.data.shape) != (len(ids), *want):
+                    raise ValueError(
+                        f"decoded {tuple(batch.data.shape[1:])} frames, the feature is {want}"
+                    )
+                for i, pts in zip(ids, batch.pts_seconds.tolist(), strict=True):
+                    if abs(pts - (t0 + i / fps)) > 0.25 / fps:
+                        raise ValueError(f"frame {i} decodes the frame at {pts:.4f} s")
+        except Exception as e:  # noqa: BLE001 - a clip that does not decode is the answer
+            problems.append(f"{where}: {type(e).__name__}: {e}")
+    return problems
 
 
 def recording_required(t: Mapping[str, Any]) -> bool:
@@ -1019,12 +1092,21 @@ class EvalCapture:
                 since=t_save,
                 policy=self.sync_policy,
             )
-            self.drop_staged(cur["trial_id"])  # saved, synced, in the provenance: done
         except OSError as e:  # PENDING: no record claims the index until a resume confirms it
             log.error("eval capture: episode %d saved but not synced: %s", index, e)
             durable["sync_error"] = f"{type(e).__name__}: {e} (the staged journal is kept)"
             entry["sync_pending"] = durable["sync_error"]
         durable["sync_s"] = round(time.perf_counter() - t_sync, 4)
+        t_verify = time.perf_counter()
+        bad = verify_episode_video(self.dataset_root, index)  # both clips decode (module doc)
+        durable["verify_s"] = round(time.perf_counter() - t_verify, 4)
+        if bad:  # PENDING the same way: the journal kept, a resume verifies it again
+            log.error("eval capture: episode %d saved, its video does not decode: %s", index, bad)
+            durable["confirm_error"] = "; ".join(bad)
+            entry["confirm_error"] = durable["confirm_error"]
+            entry.setdefault("sync_pending", SYNC_PENDING)
+        elif "sync_error" not in durable:
+            self.drop_staged(cur["trial_id"])  # saved, synced, decoded, in the provenance: done
         stills = self._stills(index, end_images)
         entry.update(end_state=stills, end_state_when=when)
         try:
@@ -1043,17 +1125,19 @@ class EvalCapture:
             "end_state_when": when,
             **durable,
         }
-        if "sync_error" in durable:
+        if "sync_error" in durable or "confirm_error" in durable:
             block.update(episode_index=None, pending_episode_index=index, reason=SYNC_PENDING)
         return block
 
     def confirm_saved(self, trial_id: str, index: int) -> dict[str, Any]:
-        """A saved episode not confirmed durable (its save's sync failed, or the run ended before
-        the sync: its journal is still staged), on a resume: verified (``episode_problem``, the
-        provenance's frame count), the dataset (but the PNG folder), its stills and the
-        provenance synced under the session's policy, then the journal dropped. Returns
-        ``{"synced_files", "sync_s"}``, or ``{"error"}`` with nothing dropped (still pending).
-        Never raises."""
+        """A saved episode not confirmed durable (its save's sync failed, its clips did not
+        decode, or the run ended before the sync: its journal is still staged), on a resume:
+        verified (``episode_problem``, the provenance's frame count; ``verify_episode_video``:
+        both cameras' clips decode across its frame range), the dataset (but the PNG folder),
+        its stills and the provenance synced under the session's policy, then the journal
+        dropped. Returns ``{"synced_files", "sync_s"}``, or ``{"error"}`` with nothing dropped
+        (still pending; the error also in its provenance entry, ``confirm_error``). Never
+        raises."""
         t0 = time.perf_counter()
         entry = (self.provenance.get("episodes") or {}).get(str(index)) or {}
         try:
@@ -1064,22 +1148,33 @@ class EvalCapture:
             problem = episode_problem(self.dataset_root, index, entry.get("frames"))
             if problem:
                 raise RuntimeError(problem)
+            bad = verify_episode_video(self.dataset_root, index)
+            if bad:
+                raise RuntimeError("; ".join(bad))
             n = sync_tree(self.dataset_root, skip=frozenset({"images"}), policy=self.sync_policy)
             stills = entry.get("end_state")
             if isinstance(stills, dict):
                 for rel in stills.values():
                     sync_path(self.root / rel, self.sync_policy)
                 sync_path(self.root / END_STATE_DIR)
-            if "sync_pending" in entry:
-                was = entry.pop("sync_pending")
+            was = {k: entry.pop(k) for k in ("sync_pending", "confirm_error") if k in entry}
+            if was:
                 try:
                     self._write_provenance()
                 except Exception:
-                    entry["sync_pending"] = was
+                    entry.update(was)
                     raise
         except Exception as e:  # noqa: BLE001 - stays pending, says why
             log.error("eval capture: episode %d not confirmed durable: %s", index, e)
-            return {"error": f"{type(e).__name__}: {e}"}
+            err = f"{type(e).__name__}: {e}"
+            if entry.get("trial_id") == trial_id:  # its own entry: the error beside it
+                entry["confirm_error"] = err
+                entry.setdefault("sync_pending", SYNC_PENDING)
+                try:
+                    self._write_provenance()
+                except Exception:  # the trial block says it regardless
+                    log.exception("eval capture: provenance not written after the confirmation")
+            return {"error": err}
         self.drop_staged(trial_id)
         return {"synced_files": n, "sync_s": round(time.perf_counter() - t0, 4)}
 
