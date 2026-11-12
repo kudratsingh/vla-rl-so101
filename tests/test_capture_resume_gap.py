@@ -1180,3 +1180,172 @@ def test_a_save_whose_video_does_not_decode_keeps_its_journal_and_stays_pending(
     prov = json.loads((capture_root / "dataset" / recording.PROVENANCE).read_text())
     assert "corrupt" in prov["episodes"]["1"]["confirm_error"]
     assert prov["episodes"]["1"]["sync_pending"]
+
+
+# ------------------------------------------------------------------------------------------------
+# Owner 2026-11-11 (PR #32 hold): the session summary / --report and the export reach the SAME
+# verdict on the same capture on disk (``export_bundle.recording_blockers``, one reading:
+# ``_capture_on_disk``). A damaged capture never reads complete in one and refused in the other.
+# ------------------------------------------------------------------------------------------------
+GATE_KEYS = (
+    "recordings_pending",
+    "recordings_unsaved",
+    "recording_missing",
+    "recordings_unverified",
+)
+
+
+@pytest.fixture(scope="module")
+def healthy_capture(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
+    """One finished real-0.1 mock session with capture on (3 trials, 3 episodes with real
+    clips): (its base dir, run id). Each case copies it before damaging it."""
+    base = tmp_path_factory.mktemp("parity")
+    rec = _new_session(base / "runs", _ckpt(base))
+    return base, rec.parent.name
+
+
+def _meta_file(ds: Path, idx: int) -> Path:
+    import pyarrow.parquet as pq
+
+    (f,) = [
+        f
+        for f in sorted((ds / "meta" / "episodes").rglob("*.parquet"))
+        if idx in [int(r["episode_index"]) for r in pq.read_table(f).to_pylist()]
+    ]
+    return f
+
+
+def _edit_prov(ds: Path, edit: Any) -> None:
+    p = ds / recording.PROVENANCE
+    prov = json.loads(p.read_text())
+    edit(prov)
+    p.write_text(json.dumps(prov))
+
+
+def _damage(case: str, runs: Path, sid: str, trials: list[dict[str, Any]]) -> None:
+    cap = runs / sid / "capture"
+    ds = cap / "dataset"
+    prov = ds / recording.PROVENANCE
+    if case == "provenance_missing":
+        prov.unlink()
+    elif case == "provenance_unreadable":
+        prov.write_text(prov.read_text()[:40])
+    elif case == "provenance_wrong_shape":
+        prov.write_text(
+            json.dumps({"session_id": sid, "episodes": [t["trial_id"] for t in trials]})
+        )
+    elif case == "provenance_other_session":
+        _edit_prov(ds, lambda p: p.update(session_id="another-session"))
+    elif case == "provenance_extra_episode":  # an entry for an episode the dataset lacks
+        _edit_prov(ds, lambda p: p["episodes"].update({"7": {"trial_id": "x/PickPlace/seen/9"}}))
+    elif case == "provenance_gives_episode_to_another_trial":
+        _edit_prov(ds, lambda p: p["episodes"]["0"].update(trial_id=trials[1]["trial_id"]))
+    elif case == "info_missing":
+        (ds / "meta" / "info.json").unlink()
+    elif case == "info_unreadable":
+        (ds / "meta" / "info.json").write_bytes(b"\x00\xff{not json")
+    elif case == "episodes_meta_missing":
+        shutil.rmtree(ds / "meta" / "episodes")
+    elif case == "episodes_meta_unreadable":
+        for f in (ds / "meta" / "episodes").rglob("*.parquet"):
+            f.write_bytes(b"PAR1 garbage, not a footer")
+    elif case == "episodes_meta_lacks_one_episode":
+        _meta_file(ds, 2).unlink()
+    elif case == "video_file_missing":
+        _clip(ds, 1, conv.IMAGE_KEYS["wrist"]).unlink()
+    elif case == "data_file_missing":
+        info = json.loads((ds / "meta" / "info.json").read_text())
+        import pyarrow.parquet as pq
+
+        (ep,) = pq.read_table(_meta_file(ds, 1)).to_pylist()
+        (ds / str(info["data_path"]).format(
+            chunk_index=ep["data/chunk_index"], file_index=ep["data/file_index"])).unlink()  # fmt: skip
+    elif case == "capture_dir_missing":
+        shutil.rmtree(cap)
+    elif case == "staged_journal_present":
+        staged = recording.staged_path(cap, trials[0]["trial_id"])
+        staged.mkdir(parents=True)
+        (staged / recording.STAGED_INDEX).write_text("{}")
+    else:
+        assert case == "healthy", case
+
+
+def _export_category(msg: str) -> str:
+    """The blocker kind an export refusal names (the summary's gate key)."""
+    if msg.startswith("REFUSED: PENDING"):
+        return "recordings_pending"
+    if msg.startswith("REFUSED: UNVERIFIED") or X.PROVENANCE_UNREADABLE in msg:
+        return "recordings_unverified"
+    if msg.startswith("REFUSED: capture provenance"):  # readable, refused (another session's)
+        return "recordings_unverified"
+    return "recording_missing"
+
+
+PARITY_CASES = {  # case -> the one blocker kind both name (None: complete in both)
+    "healthy": None,
+    "provenance_missing": "recordings_unverified",
+    "provenance_unreadable": "recordings_unverified",
+    "provenance_wrong_shape": "recordings_unverified",
+    "provenance_other_session": "recordings_unverified",
+    "provenance_extra_episode": None,
+    "provenance_gives_episode_to_another_trial": "recording_missing",
+    "info_missing": "recordings_unverified",
+    "info_unreadable": "recordings_unverified",
+    "episodes_meta_missing": "recording_missing",
+    "episodes_meta_unreadable": "recording_missing",
+    "episodes_meta_lacks_one_episode": "recording_missing",
+    "video_file_missing": "recordings_unverified",
+    "data_file_missing": "recordings_unverified",
+    "capture_dir_missing": "recording_missing",
+    "staged_journal_present": "recordings_pending",
+}
+
+
+def parity_verdicts(base: Path, run_id: str, case: str, tmp: Path) -> dict[str, Any]:
+    """(report, export) verdicts on a copy of ``base`` damaged by ``case``. The report side is
+    ``table`` with the session's capture on disk (what ``--report`` recomputes per session;
+    its recording gate is the part of ``protocol_complete`` the capture decides), the export
+    side the CLI (``scripts/wo07_export_bundle.py eval``, its complete bundle)."""
+    shutil.copytree(base, tmp, dirs_exist_ok=True)
+    runs = tmp / "runs"
+    res = json.loads((runs / run_id / "record.json").read_text())["results"]
+    trials, settings = res["trials"], res["session"]
+    sid = str(settings["session_id"])
+    _damage(case, runs, sid, trials)
+    summ = ev.table(trials, settings, ev.SavedTargets(150.0), runs / sid / "capture")
+    gate = [k for k in GATE_KEYS if summ.get(k)]
+    reasons = [r.rsplit(" (", 1)[0] for r in summ.get("recording_reasons") or []]
+    try:
+        index = _export(runs, run_id, tmp / "export")
+        export, msg = index["status"] == "COMPLETE", index["status"]
+    except SystemExit as e:
+        export, msg = False, str(e)
+    except Exception as e:  # noqa: BLE001 - a crash is a refusal without a reason
+        export, msg = False, f"CRASH {type(e).__name__}: {e}"
+    return {
+        "report_ok": summ["complete"] and not gate,
+        "report_kind": gate[0] if gate else None,
+        "reasons": reasons,
+        "export_ok": export,
+        "export_kind": None if export else _export_category(msg),
+        "export_msg": msg,
+        "scores": [(t["trial_id"], t["outcome"]) for t in trials],
+        "cells": summ["cells"],
+    }
+
+
+@pytest.mark.parametrize("case", list(PARITY_CASES))
+def test_report_and_export_reach_the_same_verdict_on_a_damaged_capture(
+    healthy_capture: tuple[Path, str], tmp_path: Path, hard_timeout: None, case: str
+) -> None:
+    base, run_id = healthy_capture
+    v = parity_verdicts(base, run_id, case, tmp_path)
+    want = PARITY_CASES[case]
+    assert v["report_ok"] == v["export_ok"] == (want is None), (case, v)
+    assert v["report_kind"] == v["export_kind"] == want, (case, v)
+    if want is not None:  # the export names the summary's / --report's reason (or vice versa)
+        msg = v["export_msg"].removeprefix("REFUSED: ")
+        assert any(r in msg or msg in r for r in v["reasons"]), (case, v)
+        assert not v["export_msg"].startswith("CRASH"), (case, v)
+    healthy = parity_verdicts(base, run_id, "healthy", tmp_path / "healthy")
+    assert v["scores"] == healthy["scores"] and v["cells"] == healthy["cells"]  # scores kept

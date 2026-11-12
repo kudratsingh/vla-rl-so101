@@ -2471,6 +2471,60 @@ bowl check and brings back any change to B' or the 9.83 cm separation before fre
 freeze, CI and the vishwaroop imports (including `real-0.1-mock`) on the final freeze commit, then
 merge review. Spend, RunPod credentials and powered steps 9-10 stay on hold.
 
+### PR 2: report / export parity on a damaged capture (2026-11-11, $0)
+
+The owner confirmed the two regressions fixed on `06536ef` (CI green, 11 targeted tests rerun)
+and named one gap: with the capture's provenance file missing or unreadable but its episode
+metadata intact, `--report` marked the baseline complete while the export refused it. CPU, fakes
+and the mock rig only; the freeze stays PENDING (nothing in `src/eval/protocol_real.py`, the
+slots, schedules, seeds or PDFs changed; protocols 0.1-draft / 0.2, `src/env/**` and the pins
+byte-identical).
+
+- **Fix (one rule):** the provenance is the only record of which trial owns which episode.
+  `export_bundle.capture_provenance` reads and verifies it (readable, a JSON object whose
+  `episodes` maps each index to a `trial_id`, this session, this protocol / convention, units,
+  times, robot id, the calibration copy's hash). `_capture_on_disk` is the single reader of the
+  capture for the export, the session summary (`table()`) and `--report`. A claimed episode the
+  capture holds is now UNVERIFIED (`provenance_unreadable`) while the provenance is refused, and
+  `episode_unreadable` while `meta/info.json`, its metadata row, its data rows or a clip file is
+  missing or unreadable (`recording.episode_problems`, the resume's `episode_problem` batched).
+  An unverified recording blocks `protocol_complete` (`recordings_unverified`). It also refuses
+  every export, `--allow-missing-recordings` included. Report and export are read-only: nothing
+  rebuilds or rewrites the provenance. Scores and staged data are untouched. Resume behaviour is
+  unchanged: a resume with an unreadable provenance still stops in `recover_capture` before the
+  arm opens.
+- **Report explains why:** the summary carries `recording_reasons`, which `--report` prints as
+  `why:` lines. Its JSON has `recording_blockers` per run (session id, the blocked trials,
+  reasons). Export refusals name the same reasons.
+- **Tests:** `tests/test_protocol_real.py::test_an_unreadable_capture_provenance_blocks_the_report_as_it_refuses_the_export`
+  covers two 150-trial sessions relabelled hardware with capture on. The provenance is deleted,
+  truncated, overwritten with garbage bytes, a JSON list, or has `episodes` as a list. In each
+  case the report and summary are not complete, name the session and the provenance path, the
+  rows and cells are unchanged, and the export refuses (with and without
+  `--allow-missing-recordings`). On `06536ef` the report said complete (missing / truncated /
+  garbage) or crashed (`AttributeError`, wrong shape). The stand-in capture now also writes
+  `info.json`, the citations, a calibration copy, data rows and clip files.
+  `tests/test_capture_resume_gap.py::test_report_and_export_reach_the_same_verdict_on_a_damaged_capture`
+  covers 16 damage cases on a real mock capture and asserts the same verdict, the same blocker
+  kind and a shared reason. Mismatches on `06536ef`: provenance missing / truncated / another
+  session's, `info.json` missing / unreadable, and a data file missing (report complete, export
+  refused or crashed); wrong-shape provenance, an episode table without one episode, and a
+  missing clip or data file (report crashed). A missing clip file was COMPLETE in both, and the
+  vishwaroop importer would then fail; it is now refused in both. Rule: clips are decoded once,
+  at save and at a resume's confirmation (a clip that does not decode stays PENDING). Report and
+  export check that clip files exist and do not decode them again.
+- **Reruns:** full pytest **726 passed, 1 skipped** (12 min 45 s, exit code 0). `ruff check src
+  tests scripts`, `black --check .`, `mypy --strict src`: clean. The vishwaroop imports wait for
+  the final freeze commit.
+- **Still export-only** (the report does not repeat them): the checkpoint identity and hash, the
+  training-run verification, and the importer mirror's frame-level checks on the written bundle
+  (`check_dataset`: timestamps, finite values, the convention's `info.json` features).
+
+**Next (owner):** unchanged. Send the five measurements and the unpowered fit results; the agent
+reruns the bowl check and brings back any change to B' or the 9.83 cm separation before
+freezing. Then CI and the vishwaroop imports (including `real-0.1-mock`) on the final freeze
+commit, then merge review. Spend, RunPod credentials and powered steps 9-10 stay on hold.
+
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
 Owner 2026-11-09: the stop check #30 added to teleop and the park now also guards the pilot and

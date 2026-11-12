@@ -53,9 +53,19 @@ reached (the first write faulted: frames 0, no capture error) cannot have a reco
 listed under ``uncaptured_started_trials`` and does not make the export incomplete
 (``recording.recording_required``, review F2). The pending and missing checks are one helper,
 ``recording_blockers``, which the session summary and ``wo07_real_eval.py --report`` use too,
-with the same provenance fill (``fill_from_provenance``) and the same lost claims
-(``lost_claims``: a claimed episode the dataset does not hold, or whose provenance names another
-trial, which the export refuses outright).
+on the capture read the one same way (``_capture_on_disk``), with the same provenance fill
+(``fill_from_provenance``) and the same lost claims (``lost_claims``: a claimed episode the
+dataset does not hold, or whose provenance names another trial, which the export refuses
+outright). Owner 2026-11-11 (PR #32 hold): the provenance is the only record of which trial owns
+which episode, so a claimed episode is UNVERIFIED (never assumed fine) while the provenance is
+missing, unreadable, of the wrong shape or another session's (``capture_provenance``:
+``provenance_unreadable``), or while the episode is unreadable on disk (``meta/info.json``, its
+metadata row, its data rows or a clip file missing: ``recording.episode_problems``;
+``episode_unreadable``). An unverified recording blocks the summary's ``protocol_complete`` and
+refuses every export, ``allow_missing_recordings`` too; nothing rebuilds the provenance. Clips
+are decoded once, at the save and at a resume's confirmation (``recording.verify_episode_video``:
+a clip that does not decode is PENDING); the report and the export check the clip files exist,
+neither decodes them again.
 
 Nothing is guessed: a missing or unknown value refuses the export (``ExportRefused``).
 ``validate_bundle`` mirrors the importer's checks of the declaration, the LeRobot tables and the
@@ -451,14 +461,19 @@ def _need(block: Mapping[str, Any], key: str, where: str) -> Any:
     return v
 
 
-def _calibration(dataset: Path, prov: Mapping[str, Any], out: Path) -> None:
+def _calibration_copy(dataset: Path, prov: Mapping[str, Any]) -> Path:
+    """The follower's calibration copy the provenance names, hash-checked."""
     cal = _need(prov, "calibration", "the recording's provenance")
     src = dataset / str(_need(cal, "file", "provenance.calibration"))
     if not src.is_file():
         raise ExportRefused(f"{src} missing: the follower's calibration was not recorded")
     if _sha256(src) != _need(cal, "sha256", "provenance.calibration"):
         raise ExportRefused(f"{src} does not match the sha256 recorded with the session")
-    shutil.copyfile(src, out / CALIBRATION_FILE)
+    return src
+
+
+def _calibration(dataset: Path, prov: Mapping[str, Any], out: Path) -> None:
+    shutil.copyfile(_calibration_copy(dataset, prov), out / CALIBRATION_FILE)
 
 
 def _protocol(prov: Mapping[str, Any]) -> None:
@@ -475,6 +490,64 @@ def _protocol(prov: Mapping[str, Any]) -> None:
     conv_cite = _need(prov, "convention", "the recording's provenance")
     if conv_cite.get("hash") != conv.convention_hash():
         raise ExportRefused("recorded under a different observation/action convention hash")
+
+
+PROVENANCE_UNREADABLE = "capture provenance missing or unreadable"
+
+
+def capture_provenance(dataset: Path, session_id: Any = None) -> dict[str, Any]:
+    """An evaluation capture's provenance (``meta/vla_rl_so101.json``), verified as the export
+    needs it: readable, a JSON object whose ``episodes`` maps each episode index to an object
+    naming its ``trial_id`` (the only record of which trial owns which episode), of
+    ``session_id`` (when given), citing this protocol and convention, with the units, times,
+    robot id and the hash-checked calibration copy. Raises ExportRefused naming the file and
+    what is wrong. The export's, the session summary's and ``--report``'s one reading (owner
+    2026-11-11, PR #32 hold: ``recording_blockers``); read only, never rebuilt or rewritten."""
+    p = dataset / "meta" / "vla_rl_so101.json"
+    why = ""
+    prov: Any = None
+    try:
+        prov = json.loads(p.read_text())
+    except FileNotFoundError:
+        why = "missing"
+    except (OSError, ValueError) as e:  # truncated JSON, garbage bytes (UnicodeDecodeError)
+        why = f"unreadable: {type(e).__name__}: {e}"
+    if not why:
+        entries = prov.get("episodes") if isinstance(prov, dict) else None
+        if not isinstance(prov, dict):
+            why = f"not a JSON object ({type(prov).__name__})"
+        elif not isinstance(entries, dict):
+            why = f"its 'episodes' is not an object ({type(entries).__name__})"
+        else:
+            bad = [
+                k
+                for k, v in entries.items()
+                if not str(k).isdigit()
+                or not isinstance(v, dict)
+                or not isinstance(v.get("trial_id"), str)
+                or not v["trial_id"]
+            ]
+            if bad:
+                why = f"episode entries {sorted(bad)[:5]} name no trial_id"
+    if why:
+        raise ExportRefused(
+            f"{PROVENANCE_UNREADABLE}: {p} ({why}): which trial owns which episode cannot be "
+            "confirmed; restore the file (nothing here rebuilds or rewrites it)"
+        )
+    assert isinstance(prov, dict)
+    try:
+        if session_id is not None and prov.get("session_id") != session_id:
+            raise ExportRefused(
+                f"the capture belongs to session {prov.get('session_id')!r}, not {session_id!r}"
+            )
+        _protocol(prov)
+        for key in ("units", "recorded_at", "robot_id"):
+            _need(prov, key, "the recording's provenance")
+        _calibration_copy(dataset, prov)
+    except (ExportRefused, AttributeError, TypeError, OSError) as e:  # a field of the wrong type
+        why = str(e) if isinstance(e, ExportRefused) else f"{type(e).__name__}: {e}"
+        raise ExportRefused(f"capture provenance {p}: {why}") from e
+    return prov
 
 
 DEV_SUFFIX = "-dev"  # a development session's protocol_version (never reported; review F9)
@@ -614,13 +687,17 @@ def build_eval_bundle(
     (then declared ``-incomplete``; module doc)."""
     if mode not in ("hardware", "mock"):
         raise ExportRefused(f"session mode {mode!r} is neither hardware nor mock")
-    prov = _provenance(capture_dataset)
-    _protocol(prov)
     sid = str(_need(settings, "session_id", "the session"))
-    if prov.get("session_id") != sid:
-        raise ExportRefused(
-            f"the capture belongs to session {prov.get('session_id')!r}, not {sid!r}"
-        )
+    capture_dataset = Path(capture_dataset)
+    if capture_dataset.name != DATASET_ROOT:  # the declaration's dataset_root
+        raise ExportRefused(f"{capture_dataset}: the capture dataset is <capture>/{DATASET_ROOT}")
+    root = capture_dataset.parent
+    # the capture on disk read the way the session summary and --report read it (owner, PR #32
+    # hold: one verdict): the dataset, its provenance, its episode table
+    prov, eps, problems = _capture_on_disk(root, sid)
+    for kind in ("dataset", "provenance", "episodes"):
+        if problems.get(kind):
+            raise ExportRefused(problems[kind])
     if settings.get("protocol_id") != PR.PROTOCOL_VERSION:
         raise ExportRefused(f"session {sid} is not a {PR.PROTOCOL_VERSION} session")
     ident = _need(settings, "policy_identity", f"session {sid}")
@@ -637,7 +714,6 @@ def build_eval_bundle(
             f"{checkpoint_dir} hashes to {got['sha256'][:12]}, the session ran "
             f"{str(ident['checkpoint_sha256'])[:12]}: not the evaluated checkpoint"
         )
-    eps = _episode_indices(capture_dataset)
     recs = [dict(t) for t in trials]  # a filled capture block below never edits the caller's
     by_episode: dict[int, dict[str, Any]] = {}
     for t in recs:
@@ -648,22 +724,36 @@ def build_eval_bundle(
             by_episode[int(idx)] = t
     # the session summary's and --report's rule (``recording_blockers``; owner, PR #32 hold):
     # pending on the records as written, missing after the provenance fill (both inside it)
-    root = Path(capture_dataset).parent
-    blockers = recording_blockers(recs, root, prov=prov, episodes=eps)
+    blockers = recording_blockers(recs, root, session_id=sid)
     pending = blockers["pending"]
     if pending:  # never dropped, never counted: always refused, allow_missing_recordings too
         raise ExportRefused(
             f"PENDING: {len(pending)} episode(s) saved but not confirmed durable "
             f"({[(p['trial_id'], p['episode_index']) for p in pending]}): --resume the session "
-            "to verify and sync them first; nothing is exported while an episode is pending"
+            "to verify and sync them first; nothing is exported while an episode is pending ("
+            + "; ".join(sorted({str(p["why"]) for p in pending})[:3])
+            + ")"
+        )
+    unverified = [m for m in blockers["missing"] if m["status"] in UNVERIFIED]
+    if unverified:  # the capture cannot vouch for them: allow_missing_recordings too
+        raise ExportRefused(
+            f"UNVERIFIED: {len(unverified)} recording(s) the capture on disk cannot confirm "
+            f"({[m['trial_id'] for m in unverified][:5]}"
+            f"{' ...' if len(unverified) > 5 else ''}): "
+            + "; ".join(sorted({str(m["reason"]) for m in unverified})[:3])
         )
     by_episode.update(fill_from_provenance(recs, prov, eps))
     orphans = sorted(set(eps) - set(by_episode))
     if orphans:
         raise ExportRefused(f"episodes {orphans} have no trial record (a run killed mid-trial?)")
+    lost = "; ".join(  # the summary's and --report's reasons for the claims refused below
+        sorted({str(m["reason"]) for m in missing_claims(blockers)})[:3]
+    )
     unknown = sorted(set(by_episode) - set(eps))
     if unknown:
-        raise ExportRefused(f"trial records name episodes {unknown} that the dataset does not hold")
+        raise ExportRefused(
+            f"trial records name episodes {unknown} that the dataset does not hold ({lost})"
+        )
     entries = prov.get("episodes") or {}
     taken = sorted(  # never re-mapped: an episode keeps the trial its provenance names
         i for i, t in by_episode.items() if _owner(entries, i) not in (None, str(t.get("trial_id")))
@@ -671,14 +761,14 @@ def build_eval_bundle(
     if taken:
         raise ExportRefused(
             f"episodes {taken} belong to other trials in the capture provenance than the trial "
-            "records that claim them"
+            f"records that claim them ({lost})"
         )
     for i, t in by_episode.items():
         if not t.get("policy_started") or t.get("outcome") not in ("success", "failure"):
             raise ExportRefused(f"episode {i} is not a scored trial")
         if not t.get("labeler") and t.get("outcome_source") == "operator":
             raise ExportRefused(f"episode {i}: an operator score without a named labeler")
-    missing = blockers["missing"]
+    missing = blockers["missing"]  # the unverified ones refused above
     if missing and not allow_missing_recordings:
         pending = [m["trial_id"] for m in missing if m["status"] == "recoverable_on_resume"]
         raise ExportRefused(
@@ -875,41 +965,57 @@ def missing_recordings(
     return out
 
 
+UNVERIFIED = ("provenance_unreadable", "episode_unreadable")  # blocker statuses (module doc)
+
+
 def recording_blockers(
     trials: Sequence[Mapping[str, Any]],
     capture_root: Path | None,
     *,
     required: bool = True,
-    prov: Mapping[str, Any] | None = None,
-    episodes: Sequence[int] | None = None,
+    session_id: Any = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """The ONE pending-recording rule of the eval export, the session summary and ``--report``
-    (``scripts/wo07_real_eval.py`` ``table``; owner, PR #32 hold). ``pending``: episodes saved
-    but not confirmed durable (``pending_episodes``, on the records as written). ``missing``:
-    REQUIRED recordings without their episode, after the export's provenance fill
-    (``fill_from_provenance``: an episode saved before its capture row is the trial's):
-    ``recoverable_on_resume`` (staged) or ``recording_missing`` (lost: ``missing_recordings``;
-    or a claimed episode the capture dataset does not hold, is missing or unreadable, or whose
-    provenance names another trial: ``lost_claims``). A recording is required for every scored
+    (``scripts/wo07_real_eval.py`` ``table``; owner, PR #32 hold), on the capture dataset on
+    disk under ``capture_root`` (``_capture_on_disk``: the export reads it the same way).
+    ``pending``: episodes saved but not confirmed durable (``pending_episodes``, on the records
+    as written). ``missing``: REQUIRED recordings without a confirmed episode, after the
+    export's provenance fill (``fill_from_provenance``: an episode saved before its capture row
+    is the trial's): ``recoverable_on_resume`` (staged) or ``recording_missing`` (lost:
+    ``missing_recordings``; or a claimed episode the capture dataset does not hold, or whose
+    provenance names another trial), or unverified (``UNVERIFIED``; owner 2026-11-11): the
+    claimed episode is held but the capture provenance is missing, unreadable, of the wrong
+    shape or not this session's (``provenance_unreadable``: nothing confirms which trial owns
+    which episode, never assumed fine), or the episode itself is unreadable on disk
+    (``episode_unreadable``: ``meta/info.json``, its metadata row, data rows or a clip file;
+    ``recording.episode_problems``) (``lost_claims``). A recording is required for every scored
     trial whose policy run produced a frame, under a capture-enabled real-0.1 session
     (``required``; ``recording.recording_required``: a scored trial whose first write faulted
-    with zero frames requires none). Either list blocks a complete baseline: the summary's
-    ``protocol_complete`` and a complete export. The trials keep their scores; read only (the
-    caller's records and staged data are never touched). ``prov`` / ``episodes`` default to the
-    capture dataset on disk under ``capture_root`` (``capture_root`` None and neither given: the
-    trial blocks alone, no claim checked)."""
-    problem, known = "", prov is not None and episodes is not None
-    if prov is None or episodes is None:
-        prov, episodes, problem = _capture_on_disk(capture_root)
+    with zero frames requires none). Each list blocks a complete baseline: the summary's
+    ``protocol_complete`` and a complete export (the export refuses pending and unverified ones
+    outright). The trials keep their scores; read only (the caller's records, the capture and
+    staged data are never touched). ``capture_root`` None: the trial blocks alone, no claim
+    checked."""
+    prov, episodes, problems = _capture_on_disk(capture_root, session_id)
     recs = [dict(t) for t in trials]  # the fill below replaces capture blocks of these copies
     pending = pending_episodes(recs, prov, episodes, capture_root)
     if not required:
         return {"pending": pending, "missing": []}
     fill_from_provenance(recs, prov, episodes)
     missing = missing_recordings(recs, capture_root)
-    if known or capture_root is not None:
-        missing += lost_claims(recs, prov, episodes, problem)
+    if capture_root is not None:
+        missing += lost_claims(recs, prov, episodes, problems, Path(capture_root) / DATASET_ROOT)
     return {"pending": pending, "missing": missing}
+
+
+def missing_claims(blockers: Mapping[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """The lost CLAIMS of ``recording_blockers`` (``lost_claims``: a claimed episode the dataset
+    does not hold or its provenance gives another trial), which the export refuses outright."""
+    return [
+        m
+        for m in blockers["missing"]
+        if m["status"] == "recording_missing" and str(m.get("reason") or "").startswith("episode ")
+    ]
 
 
 def fill_from_provenance(
@@ -940,26 +1046,43 @@ def lost_claims(
     trials: Sequence[Mapping[str, Any]],
     prov: Mapping[str, Any],
     episodes: Sequence[int],
-    problem: str = "",
+    problems: Mapping[str, str] | None = None,
+    dataset: Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Required recordings whose claimed ``episode_index`` is not the trial's on disk: the
-    capture dataset does not hold it (``problem``: the dataset missing or unreadable), or its
-    provenance names another trial (an older record of a session a later resume re-mapped).
-    Lost (``recording_missing``); the export refuses these sessions outright."""
-    from src.robot.recording import recording_required
+    """Required recordings whose claimed ``episode_index`` is not confirmed the trial's on disk:
+    the capture dataset does not hold it (``problems``: the dataset or its episode table
+    missing or unreadable) or its provenance names another trial (an older record of a session
+    a later resume re-mapped): lost (``recording_missing``; the export refuses these sessions
+    outright); the provenance cannot say (``problems["provenance"]``:
+    ``provenance_unreadable``); the episode is unreadable under ``dataset``
+    (``problems["info"]``, ``recording.episode_problems``: ``episode_unreadable``)."""
+    from src.robot.recording import episode_problems, recording_required
 
+    problems = problems or {}
     held, entries = set(episodes), prov.get("episodes") or {}
+    claims = [
+        (t, int(idx))
+        for t in trials
+        if (idx := (t.get("capture") or {}).get("episode_index")) is not None
+        and recording_required(t)
+    ]
+    on_disk: dict[int, str] = {}
+    if dataset is not None and not problems.get("provenance") and not problems.get("info"):
+        on_disk = episode_problems(dataset, {i: None for _, i in claims if i in held})
     out = []
-    for t in trials:
-        idx = (t.get("capture") or {}).get("episode_index")
-        if idx is None or not recording_required(t):
-            continue
-        tid, owner = t.get("trial_id"), _owner(entries, int(idx))
-        if int(idx) not in held:
+    for t, idx in claims:
+        tid, owner = t.get("trial_id"), _owner(entries, idx)
+        status = "recording_missing"
+        if idx not in held:
             why = f"episode {idx} is not in the capture dataset"
-            why += f" ({problem})" if problem else ""
+            gone = "; ".join(problems[k] for k in ("dataset", "episodes") if problems.get(k))
+            why += f" ({gone})" if gone else ""
+        elif problems.get("provenance"):
+            status, why = "provenance_unreadable", problems["provenance"]
         elif owner is not None and owner != str(tid):
             why = f"episode {idx} is trial {owner}'s in the capture provenance"
+        elif problems.get("info") or on_disk.get(idx):
+            status, why = "episode_unreadable", problems.get("info") or on_disk[idx]
         else:
             continue
         out.append(
@@ -968,7 +1091,7 @@ def lost_claims(
                 "cell": t.get("cell"),
                 "trial_idx": t.get("trial_idx"),
                 "outcome": t.get("outcome"),
-                "status": "recording_missing",
+                "status": status,
                 "reason": why,
             }
         )
@@ -981,27 +1104,42 @@ def _owner(entries: Mapping[str, Any], index: int) -> str | None:
     return None if tid is None else str(tid)
 
 
-def _capture_on_disk(capture_root: Path | None) -> tuple[dict[str, Any], list[int], str]:
-    """(provenance, episode indices, problem) of the capture dataset under ``capture_root``;
-    empty values and what is wrong when there is none or it cannot be read (then a claimed
-    episode is not held: ``lost_claims``)."""
+def _capture_on_disk(
+    capture_root: Path | None, session_id: Any = None
+) -> tuple[dict[str, Any], list[int], dict[str, str]]:
+    """(provenance, episode indices, problems) of the capture dataset under ``capture_root``,
+    read the one way the export, the session summary and ``--report`` read it. ``problems``
+    names what is wrong, by kind: ``dataset`` (no capture dataset), ``provenance``
+    (``capture_provenance`` refused it: then the provenance is empty, nothing is taken from
+    it), ``episodes`` (the episode table unreadable: no episode is held), ``info``
+    (``meta/info.json`` unreadable). ``capture_root`` None: nothing read, no problem."""
     if capture_root is None:
-        return {}, [], ""
+        return {}, [], {}
     dataset = Path(capture_root) / DATASET_ROOT
+    if not dataset.is_dir():
+        return {}, [], {"dataset": f"capture dataset {dataset} missing or unreadable"}
     prov: dict[str, Any] = {}
     episodes: list[int] = []
-    problems = []
+    problems: dict[str, str] = {}
     try:
-        prov = _provenance(dataset)
-    except (ExportRefused, OSError, ValueError) as e:
-        problems.append(f"provenance: {e}")
+        prov = capture_provenance(dataset, session_id)
+    except ExportRefused as e:
+        problems["provenance"] = str(e)
     try:
         episodes = _episode_indices(dataset)
-    except (ExportRefused, OSError, ValueError, KeyError) as e:
-        problems.append(f"episodes: {type(e).__name__}: {e}")
-    if problems:
-        problems.insert(0, f"capture dataset {dataset} missing or unreadable")
-    return prov, episodes, "; ".join(problems)
+    except (ExportRefused, OSError, ValueError, KeyError, TypeError) as e:
+        problems["episodes"] = (
+            f"capture dataset {dataset} missing or unreadable: its episode table: "
+            f"{type(e).__name__}: {e}"
+        )
+    info = dataset / "meta" / "info.json"
+    try:
+        why = "" if isinstance(json.loads(info.read_text()), dict) else "not a JSON object"
+    except (OSError, ValueError) as e:
+        why = f"{type(e).__name__}: {e}"
+    if why:
+        problems["info"] = f"capture dataset {info} missing or unreadable: {why}"
+    return prov, episodes, problems
 
 
 def seal_command(index: Mapping[str, Any], bundle: Path, export_id: str, export_root: str) -> str:

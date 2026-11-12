@@ -529,17 +529,61 @@ def full_pair(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str, str]
 
 def _write_capture(capture_root: Path, sid: str, owners: dict[int, str]) -> None:
     """A stand-in capture dataset with what the recording rule reads (``recording_blockers``):
-    its provenance (episode -> trial id) and its episode index table. No frames or video."""
+    its provenance (episode -> trial id, the citations and the calibration copy the export
+    checks), ``meta/info.json``, its episode table, one data row per episode and a (zero-byte)
+    clip file per camera. No real frames or video (nothing here decodes them)."""
+    import hashlib
+
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    meta = capture_root / "dataset" / "meta"
+    from src.robot import recording
+
+    ds = capture_root / "dataset"
+    meta = ds / "meta"
     (meta / "episodes" / "chunk-000").mkdir(parents=True, exist_ok=True)
-    episodes = {str(k): {"trial_id": tid} for k, tid in sorted(owners.items())}
-    (meta / "vla_rl_so101.json").write_text(json.dumps({"session_id": sid, "episodes": episodes}))
+    (ds / "data" / "chunk-000").mkdir(parents=True, exist_ok=True)
+    cal = ds / recording.CALIBRATION_COPY
+    cal.write_text("{}\n")
+    info = {
+        "codebase_version": "v3.0",
+        "fps": conv.FPS,
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+        "features": {key: {"dtype": "video"} for key in conv.IMAGE_KEYS.values()},
+    }
+    (meta / "info.json").write_text(json.dumps(info))
+    prov = {
+        "session_id": sid,
+        "protocol": {"version": PR.PROTOCOL_VERSION, "hash": PR.protocol_hash()},
+        "convention": {"hash": conv.convention_hash()},
+        "units": {"shoulder_pan": "deg"},
+        "recorded_at": "2026-11-11T00:00:00Z",
+        "robot_id": "so101-follower",
+        "calibration": {
+            "file": recording.CALIBRATION_COPY,
+            "sha256": hashlib.sha256(cal.read_bytes()).hexdigest(),
+        },
+        "episodes": {str(k): {"trial_id": tid} for k, tid in sorted(owners.items())},
+    }
+    (ds / recording.PROVENANCE).write_text(json.dumps(prov))
+    idx = sorted(owners)
+    cols: dict[str, list[int]] = {
+        "episode_index": idx,
+        "length": [1] * len(idx),
+        "data/chunk_index": [0] * len(idx),
+        "data/file_index": [0] * len(idx),
+    }
+    for key in conv.IMAGE_KEYS.values():
+        cols[f"videos/{key}/chunk_index"] = [0] * len(idx)
+        cols[f"videos/{key}/file_index"] = [0] * len(idx)
+        clip = ds / "videos" / key / "chunk-000" / "file-000.mp4"
+        clip.parent.mkdir(parents=True, exist_ok=True)
+        clip.write_bytes(b"")
+    pq.write_table(pa.table(cols), meta / "episodes" / "chunk-000" / "file-000.parquet")
     pq.write_table(
-        pa.table({"episode_index": sorted(owners)}),
-        meta / "episodes" / "chunk-000" / "file-000.parquet",
+        pa.table({"episode_index": idx, "frame_index": [0] * len(idx)}),
+        ds / "data" / "chunk-000" / "file-000.parquet",
     )
 
 
@@ -729,6 +773,83 @@ def test_a_lost_capture_or_a_claim_it_does_not_hold_blocks_the_report(
     lost = ev.recording_blockers(trials, root)["missing"]
     assert "missing or unreadable" in lost[0]["reason"], lost[0]
     assert not ev.report([a.parent, b.parent])["protocol_complete"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "truncated", "garbage", "list", "episodes_list"])
+def test_an_unreadable_capture_provenance_blocks_the_report_as_it_refuses_the_export(
+    full_pair: tuple[Path, str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    damage: str,
+) -> None:
+    """Owner 2026-11-11 (PR #32 hold): the capture's provenance file missing or unreadable (or
+    valid JSON of the wrong shape) with its episode metadata intact made ``--report`` mark the
+    baseline complete while the export refused it. Which trial owns which episode is confirmed
+    by the provenance only: the report, the session summary and the export now all block on it,
+    and the report says which session and why. Every trial's score stands."""
+    from src.eval import export_bundle as X
+    from src.robot import recording
+
+    a, b = _captured_hardware_copy(full_pair, tmp_path)
+    data = json.loads(a.read_text())
+    res = data["results"]
+    trials, settings = res["trials"], res["session"]
+    root, sid, owners = _capture_owners(a)
+    targets = ev.SavedTargets(150.0)
+    base = ev.table(trials, settings, targets, root)
+    assert base["protocol_complete"] and ev.report([a.parent, b.parent])["protocol_complete"]
+
+    prov = root / "dataset" / recording.PROVENANCE
+    text = prov.read_text()
+    if damage == "missing":
+        prov.unlink()
+    elif damage == "truncated":
+        prov.write_text(text[: len(text) // 2])
+    elif damage == "garbage":
+        prov.write_bytes(b"\xff\xfe\x00garbage\x9c")
+    elif damage == "list":
+        prov.write_text(json.dumps([sid]))
+    else:  # an object whose episode map is not a map
+        prov.write_text(json.dumps({**json.loads(text), "episodes": list(owners.values())}))
+    meta = sorted((root / "dataset" / "meta" / "episodes").rglob("*.parquet"))
+    assert meta and X._episode_indices(root / "dataset") == sorted(owners)  # metadata intact
+
+    summ = ev.table(trials, settings, targets, root)
+    assert not summ["protocol_complete"], damage
+    assert sorted(summ["recordings_unverified"]) == sorted(owners.values())
+    assert summ["real_rows"] == base["real_rows"] and summ["cells"] == base["cells"]
+    assert any("capture provenance missing or unreadable" in r for r in summ["recording_reasons"])
+    assert any(str(prov) in r for r in summ["recording_reasons"])
+
+    capsys.readouterr()
+    out = ev.report([a.parent, b.parent])
+    printed = capsys.readouterr().out
+    assert not out["protocol_complete"], f"--report marked the baseline complete ({damage})"
+    why = out["recording_blockers"][a.parent.name]
+    assert why["session_id"] == sid and b.parent.name not in out["recording_blockers"]
+    assert any(str(prov) in r for r in why["reasons"]), why["reasons"]
+    assert "capture provenance missing or unreadable" in printed and a.parent.name in printed
+    assert "NOT a protocol table" in printed
+    assert out["rows"] == ev.report([a.parent, b.parent])["rows"]  # the scores are the same
+    for row, r in base["real_rows"].items():
+        assert out["rows"][row][0].startswith(f"{r['successes']}/{r['n']}")
+
+    with pytest.raises(X.ExportRefused, match="capture provenance missing or unreadable"):
+        X.build_eval_bundle(
+            root / "dataset", settings, trials, tmp_path / "export", checkpoint_dir=tmp_path
+        )
+    with pytest.raises(X.ExportRefused, match="capture provenance missing or unreadable"):
+        X.build_eval_bundle(
+            root / "dataset",
+            settings,
+            trials,
+            tmp_path / "export2",
+            checkpoint_dir=tmp_path,
+            allow_missing_recordings=True,
+        )
+    assert not (tmp_path / "export").exists()  # refused before anything is written
+    if damage != "missing":  # read only: nothing rebuilt or rewritten
+        assert prov.is_file()
 
 
 def test_resume_refuses_a_changed_policy_identity(

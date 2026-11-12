@@ -151,9 +151,12 @@ report labelled MOCK (``mode: mock``, ``mock_complete``, ``protocol_complete: fa
 never trusts a saved summary: it recomputes each session's table from its trial blocks and its
 capture on disk (owner, PR #32 hold). A REQUIRED recording (capture on, the scored trial's policy
 run produced a frame; a first-write fault with zero frames requires none) that is pending,
-staged-unsaved or lost (``recording_missing``) blocks ``protocol_complete`` in the summary and the
-report (``recording_gate``, the export's ``recording_blockers``); the trial stays scored in the
-rates with its original score, and nothing staged is deleted.
+staged-unsaved, lost (``recording_missing``) or unverified (``recordings_unverified``: the
+capture's provenance missing, unreadable, of the wrong shape or another session's, or the episode
+unreadable on disk; owner 2026-11-11) blocks ``protocol_complete`` in the summary and the report
+(``recording_gate``, the export's ``recording_blockers``: the export refuses the same session);
+the report names the session and why (``recording_blockers`` in its JSON, ``why:`` lines); the
+trial stays scored in the rates with its original score, and nothing staged is deleted.
 Baseline cadence (owner 2026-11-09): 15 Hz nominal control, 30 fps cameras, the SAME 450-command
 cap for SmolVLA and ACT, synchronous inference (no overlap) and ``max_chunk_age_ms`` 800. Budget
 per 150-trial session (single-run MOCK-RIG rates with the capture on, 450-command trials, M3 Pro;
@@ -227,6 +230,7 @@ import json
 import math
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -244,7 +248,7 @@ from src.eval import protocol_real as PR
 from src.eval import protocol_v02 as P2
 from src.eval import real_grid as G
 from src.eval.bowl_fit import bowl_box_problem
-from src.eval.export_bundle import recording_blockers
+from src.eval.export_bundle import UNVERIFIED, recording_blockers
 from src.robot import convention as conv
 from src.robot.camera import (
     CameraRig,
@@ -936,6 +940,14 @@ class SavedTargets(NamedTuple):
     capture_offset_ms: float | None = None
 
 
+RECORDING_GATE_KEYS = (
+    "recordings_pending",
+    "recordings_unsaved",
+    "recording_missing",
+    "recordings_unverified",
+)
+
+
 def recording_gate(
     trials: Sequence[dict[str, Any]], settings: dict[str, Any], capture_root: Path | None
 ) -> dict[str, list[Any]]:
@@ -944,12 +956,24 @@ def recording_gate(
     ``recordings_pending``: saved, not confirmed durable. ``recordings_unsaved``: a required
     recording only staged (a resume recovers it). ``recording_missing``: a required recording
     lost (no episode, or a claimed one the capture dataset under ``capture_root`` does not hold,
-    is missing or unreadable, or gives another trial). An episode saved before its trial's
-    capture row is the trial's (the export's provenance fill). Required: capture on and the
-    scored trial's policy run produced a frame (``recording.recording_required``). Their scores
-    stand; nothing is deleted."""
-    got = recording_blockers(trials, capture_root, required=bool(settings.get("capture")))
+    is missing or unreadable, or gives another trial). ``recordings_unverified``: a claimed
+    episode the capture holds but cannot confirm (owner 2026-11-11: its provenance missing,
+    unreadable, of the wrong shape or another session's; or the episode unreadable on disk:
+    ``export_bundle.UNVERIFIED``). ``recording_reasons``: why, one line per distinct reason
+    with its trial count. An episode saved before its trial's capture row is the trial's (the
+    export's provenance fill). Required: capture on and the scored trial's policy run produced
+    a frame (``recording.recording_required``). Their scores stand; nothing is deleted."""
+    got = recording_blockers(
+        trials,
+        capture_root,
+        required=bool(settings.get("capture")),
+        session_id=settings.get("session_id"),
+    )
     pending = [p["trial_id"] for p in got["pending"]]
+    why = Counter(
+        str(b.get("why") or b.get("reason") or b.get("status"))
+        for b in got["pending"] + got["missing"]
+    )
     return {
         "recordings_pending": pending,
         "recordings_unsaved": [
@@ -960,6 +984,10 @@ def recording_gate(
         "recording_missing": [
             m["trial_id"] for m in got["missing"] if m["status"] == "recording_missing"
         ],
+        "recordings_unverified": [
+            m["trial_id"] for m in got["missing"] if m["status"] in UNVERIFIED
+        ],
+        "recording_reasons": [f"{r} ({n} trial(s))" for r, n in sorted(why.items())],
     }
 
 
@@ -1082,8 +1110,11 @@ def recording_gate_lines(s: Mapping[str, Any]) -> list[str]:
         "recordings_pending": "saved, not confirmed durable (--resume confirms them)",
         "recordings_unsaved": "staged, not saved (--resume recovers them)",
         "recording_missing": "LOST (their scores stand; no complete export)",
+        "recordings_unverified": "UNVERIFIED: the capture on disk cannot confirm them (their "
+        "scores stand; no export)",
     }
-    return [f"  recordings {why}: {s[k]}" for k, why in what.items() if s.get(k)]
+    lines = [f"  recordings {why}: {s[k]}" for k, why in what.items() if s.get(k)]
+    return lines + [f"    why: {r}" for r in s.get("recording_reasons") or []]
 
 
 # ------------------------------------------------------------------------------------------------
@@ -2506,6 +2537,7 @@ def report(run_dirs: Sequence[Path]) -> dict[str, Any]:
     mode. Only two hardware sessions can make a protocol table (``protocol_complete``); two mock
     sessions give a report labelled MOCK (``mode: mock``, ``mock_complete``), never a result."""
     rows, modes, notes = [], [], []
+    blockers: dict[str, dict[str, Any]] = {}
     for d in run_dirs:
         results = json.loads((d / "record.json").read_text()).get("results") or {}
         st, saved = results.get("session") or {}, results.get("summary") or {}
@@ -2531,6 +2563,12 @@ def report(run_dirs: Sequence[Path]) -> dict[str, Any]:
         if bool(saved.get("protocol_complete")) and not summ["protocol_complete"]:
             notes.append(f"  {d.name}: its saved summary said protocol_complete; recomputed: not")
         notes += [f"  {d.name}:{line}" for line in recording_gate_lines(summ)]
+        if summ.get("recording_reasons"):  # which session, which trials, why (owner, PR #32)
+            blockers[d.name] = {
+                "session_id": st.get("session_id"),
+                **{k: summ[k] for k in RECORDING_GATE_KEYS if summ.get(k)},
+                "reasons": summ["recording_reasons"],
+            }
         rows.append((d.name, st, summ))
         modes.append(mode)
     if len(set(modes)) != 1:
@@ -2553,6 +2591,7 @@ def report(run_dirs: Sequence[Path]) -> dict[str, Any]:
         "protocol_version": PR.PROTOCOL_VERSION,
         "protocol_hash": pa["protocol_hash"],
         "rows": {},
+        "recording_blockers": blockers,
     }
     if mock:
         print(MOCK_REPORT_LABEL)

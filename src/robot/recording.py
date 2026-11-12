@@ -179,44 +179,67 @@ def episode_problem(ds_root: Path, index: int, frames: Any = None) -> str:
     """Empty when episode ``index`` of a finalized recording dataset is readable and whole: one
     metadata row (``length`` == ``frames`` when given), its data rows frame 0 .. length-1, its
     video files present. Else what is wrong. Never raises."""
-    try:
-        import pyarrow.parquet as pq
+    return episode_problems(ds_root, {int(index): frames})[int(index)]
 
-        root = Path(ds_root)
+
+def episode_problems(ds_root: Path, frames: Mapping[int, Any]) -> dict[int, str]:
+    """``episode_problem`` for every episode index in ``frames`` (index -> expected frame count,
+    or None), the metadata read once (the export's, the session summary's and ``--report``'s
+    check of every claimed episode: ``export_bundle.recording_blockers``). Never raises."""
+    import pyarrow.parquet as pq
+
+    out = {int(i): "" for i in frames}
+    root = Path(ds_root)
+    try:
         info = json.loads((root / "meta" / "info.json").read_text())
-        rows = [
-            r
-            for f in sorted((root / "meta" / "episodes").rglob("*.parquet"))
-            for r in pq.read_table(f).to_pylist()
-            if int(r["episode_index"]) == int(index)
-        ]
-        if len(rows) != 1:
-            return f"episode {index}: {len(rows)} metadata rows"
-        ep = rows[0]
-        n = int(ep["length"])
-        if frames is not None and n != int(frames):
-            return f"episode {index}: {n} frames, its capture recorded {frames}"
-        data = root / str(info["data_path"]).format(
-            chunk_index=ep["data/chunk_index"], file_index=ep["data/file_index"]
-        )
-        t = pq.read_table(data, columns=["episode_index", "frame_index"]).to_pydict()
-        got = sorted(
-            int(k) for e, k in zip(t["episode_index"], t["frame_index"], strict=True) if e == index
-        )
-        if got != list(range(n)):
-            return f"episode {index}: {len(got)} data rows for {n} frames"
-        for key, v in info["features"].items():
-            if v.get("dtype") == "video":
-                video = root / str(info["video_path"]).format(
-                    video_key=key,
-                    chunk_index=ep[f"videos/{key}/chunk_index"],
-                    file_index=ep[f"videos/{key}/file_index"],
-                )
-                if not video.is_file():
-                    return f"episode {index}: {video.relative_to(root)} missing"
+        rows: dict[int, list[dict[str, Any]]] = {i: [] for i in out}
+        for f in sorted((root / "meta" / "episodes").rglob("*.parquet")):
+            for r in pq.read_table(f).to_pylist():
+                if int(r["episode_index"]) in rows:
+                    rows[int(r["episode_index"])].append(r)
     except Exception as e:  # noqa: BLE001 - unreadable is the answer
-        return f"episode {index} unreadable: {type(e).__name__}: {e}"
-    return ""
+        return {i: f"episode {i} unreadable: {type(e).__name__}: {e}" for i in out}
+    tables: dict[Path, dict[str, list[Any]]] = {}
+    for index in out:
+        try:
+            if len(rows[index]) != 1:
+                out[index] = f"episode {index}: {len(rows[index])} metadata rows"
+                continue
+            ep = rows[index][0]
+            n = int(ep["length"])
+            want = frames[index]
+            if want is not None and n != int(want):
+                out[index] = f"episode {index}: {n} frames, its capture recorded {want}"
+                continue
+            data = root / str(info["data_path"]).format(
+                chunk_index=ep["data/chunk_index"], file_index=ep["data/file_index"]
+            )
+            if data not in tables:
+                tables[data] = pq.read_table(
+                    data, columns=["episode_index", "frame_index"]
+                ).to_pydict()
+            t = tables[data]
+            got = sorted(
+                int(k)
+                for e, k in zip(t["episode_index"], t["frame_index"], strict=True)
+                if e == index
+            )
+            if got != list(range(n)):
+                out[index] = f"episode {index}: {len(got)} data rows for {n} frames"
+                continue
+            for key, v in info["features"].items():
+                if v.get("dtype") == "video":
+                    video = root / str(info["video_path"]).format(
+                        video_key=key,
+                        chunk_index=ep[f"videos/{key}/chunk_index"],
+                        file_index=ep[f"videos/{key}/file_index"],
+                    )
+                    if not video.is_file():
+                        out[index] = f"episode {index}: {video.relative_to(root)} missing"
+                        break
+        except Exception as e:  # noqa: BLE001 - unreadable is the answer
+            out[index] = f"episode {index} unreadable: {type(e).__name__}: {e}"
+    return out
 
 
 VERIFY_BATCH = 32  # frames decoded per call: a real episode's clip never sits in memory whole
