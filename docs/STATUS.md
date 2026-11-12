@@ -2471,7 +2471,7 @@ bowl check and brings back any change to B' or the 9.83 cm separation before fre
 freeze, CI and the vishwaroop imports (including `real-0.1-mock`) on the final freeze commit, then
 merge review. Spend, RunPod credentials and powered steps 9-10 stay on hold.
 
-### PR 2: report / export parity on a damaged capture (2026-11-11, $0)
+### PR 2: third owner hold at 06536ef (2026-11-11, $0)
 
 The owner confirmed the two regressions fixed on `06536ef` (CI green, 11 targeted tests rerun)
 and named one gap: with the capture's provenance file missing or unreadable but its episode
@@ -2494,8 +2494,9 @@ byte-identical).
   unchanged: a resume with an unreadable provenance still stops in `recover_capture` before the
   arm opens.
 - **Report explains why:** the summary carries `recording_reasons`, which `--report` prints as
-  `why:` lines. Its JSON has `recording_blockers` per run (session id, the blocked trials,
-  reasons). Export refusals name the same reasons.
+  `why:` lines (the CLI's output; it prints no JSON). `report()`'s return value has
+  `recording_blockers` per run (session id, the blocked trials, reasons) for Python callers and
+  the tests. Export refusals name the same reasons.
 - **Tests:** `tests/test_protocol_real.py::test_an_unreadable_capture_provenance_blocks_the_report_as_it_refuses_the_export`
   covers two 150-trial sessions relabelled hardware with capture on. The provenance is deleted,
   truncated, overwritten with garbage bytes, a JSON list, or has `episodes` as a list. In each
@@ -2513,17 +2514,77 @@ byte-identical).
   vishwaroop importer would then fail; it is now refused in both. Rule: clips are decoded once,
   at save and at a resume's confirmation (a clip that does not decode stays PENDING). Report and
   export check that clip files exist and do not decode them again.
-- **Reruns:** full pytest **726 passed, 1 skipped** (12 min 45 s, exit code 0). `ruff check src
-  tests scripts`, `black --check .`, `mypy --strict src`: clean. The vishwaroop imports wait for
-  the final freeze commit.
+- **First fix commit** `046af89` (full pytest 726 passed, 1 skipped, 12 min 45 s, exit 0).
+
+**Review round on `046af89`** (two reviewers: report / export parity; safety coverage). Six
+confirmed findings, all fixed in ``57d7474``, none skipped:
+
+- **P1 (medium): orphan episodes.** The export refused a held episode no trial record owns,
+  the shared rule did not check it, so `--report` said complete. Fix: `unmatched_episodes`
+  (after the provenance fill) lists it as a new blocker status `episode_unmatched`
+  (`export_bundle.UNMATCHED`); the summary's new gate key `recordings_unmatched` names it
+  (`episode N`); the export takes its refusal (`UNMATCHED: ...`) from the shared result.
+- **P2 (medium): double and non-scored claims.** The export refused an episode claimed by two
+  records; the shared rule only looked at required claims, so a legacy not-started attempt
+  carrying its retry's capture block, or a trial row written twice, read complete. Fix: the
+  claim map is built from every record holding an `episode_index`; an index claimed twice, or
+  claimed by a record that is not a scored trial, is `episode_unmatched` with its reason.
+- **P3 (medium): a readable provenance with no entry for a held claimed episode** (`episodes`
+  partial or `{}`) read COMPLETE in both. Fix: `lost_claims` gives it `provenance_unreadable`
+  (the provenance is the only ownership record; the recorder writes the entry before its
+  checkpoint, so a missing entry is damage); the export's ownership check requires the entry to
+  name the claiming trial (no entry is no confirmation).
+- **P4 / H3-SAFETY-1 (low / medium): unpinned guards.** Mutants of `capture_provenance` and
+  `episode_problems` survived. Fix (tests only): parity cases for another protocol hash, another
+  convention hash, `"protocol": "x"` (no crash), `units` / `recorded_at` / `robot_id` removed, an
+  episode entry that is a bare string, a non-string `trial_id`, the calibration copy missing or
+  changed by one byte, the data parquet one row short; and a direct test of the
+  `<capture>/dataset` path check.
+- **H3-SAFETY-2 (low): the docs promised JSON from `--report`.** The CLI prints the table and the
+  `why:` lines only. Fix: the module doc and this section now say so (`report()`'s return value
+  holds `recording_blockers`); no CLI change.
+
+**Parity matrix** (R = summary / `--report`, E = export; 33 cases in
+`test_report_and_export_reach_the_same_verdict_on_a_damaged_capture`, every case the same verdict,
+the same blocker kind and a shared reason, scores and rows unchanged):
+
+| Damage | `06536ef` | `046af89` | now |
+|---|---|---|---|
+| provenance missing / truncated / another session's | R complete, E refused or crash | both unverified | both unverified |
+| provenance wrong shape | R crash | both unverified | both unverified |
+| `info.json` missing / unreadable; data file missing | R complete, E refused or crash | both unverified | both unverified |
+| clip file missing | both COMPLETE (importer would fail) | both unverified | both unverified |
+| episode table missing / unreadable / lacks one; capture dir gone | both lost (E crash on unreadable) | both lost | both lost |
+| provenance gives an episode to another trial | both lost | both lost | both lost |
+| staged journal present | both pending | both pending | both pending |
+| provenance has no entry for a held episode, or `episodes: {}` (P3) | both COMPLETE | both COMPLETE | both unverified |
+| orphan episode (P1) | R complete, E refused | R complete, E refused | both unmatched |
+| trial row twice; not-started attempt with its retry's block, or as an episode's only claimant (P2) | R complete, E refused | R complete, E refused | both unmatched |
+| 11 guard cases (P4 / M1-M10: hashes, `"protocol": "x"`, units / times / robot id, entry shape, calibration copy, data rows short) | | both unverified (unpinned) | both unverified (pinned) |
+| provenance lists an episode the dataset lacks; healthy | both complete | both complete | both complete |
+
+The 6 new behaviour cases (P1, P2 x3, P3 x2) fail on `046af89`; the 11 guard cases pass there (the
+code was right, the tests were missing). Mutation checks on the fix (`tests/test_capture_resume_gap.py`,
+`tests/test_protocol_real.py`, `tests/test_export_bundle.py`): 12 of 12 mutants fail a test (no per-entry `trial_id` check, no `_protocol`, no data-row count, no calibration-copy check, no units / times / robot id check, `units` alone dropped, the except narrowed to `ExportRefused`, no `<capture>/dataset` check, no orphan rule, no double-claim rule, no non-scored-claim rule, a missing entry accepted); the non-scored mutant first survived (the not-started case also double-claims) and is caught by the added single-claimant case.
+
+- **Reruns on the final code:** full pytest **744 passed, 1 skipped** (11 min 54 s, pytest exit code 0; `046af89` gave 726 + 1; the difference is the 17 new parity cases and the dataset-path test). The docs commit after `57d7474` changes no code. `ruff check src tests scripts`, `black
+  --check .`, `mypy --strict src`: clean. CI: [run 43150769204](https://github.com/kudratsingh/vla-rl-so101/actions/runs/43150769204) on `57d7474`: success, 729 passed, 16 skipped. The vishwaroop imports wait for the final
+  freeze commit.
 - **Still export-only** (the report does not repeat them): the checkpoint identity and hash, the
-  training-run verification, and the importer mirror's frame-level checks on the written bundle
-  (`check_dataset`: timestamps, finite values, the convention's `info.json` features).
+  training-run verification, an operator score without a named labeler, and the importer
+  mirror's frame-level checks on the written bundle (`check_dataset`: timestamps, finite values,
+  the convention's `info.json` features). A capture problem with no claim to attach it to (e.g.
+  a capture-on session whose dataset is gone and that holds no required recording) is refused by
+  the export and not named by the report (no scored trial produced a frame, so no protocol
+  table either).
+
+**Unverified on hardware:** everything above ran on the mock rig with fake cameras; no real
+capture has been damaged and reread.
 
 **Next (owner):** unchanged. Send the five measurements and the unpowered fit results; the agent
 reruns the bowl check and brings back any change to B' or the 9.83 cm separation before
-freezing. Then CI and the vishwaroop imports (including `real-0.1-mock`) on the final freeze
-commit, then merge review. Spend, RunPod credentials and powered steps 9-10 stay on hold.
+freezing. Then the freeze, CI and the vishwaroop imports (including `real-0.1-mock`) on the final
+freeze commit, then merge review. Spend, RunPod credentials and powered steps 9-10 stay on hold.
 
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
