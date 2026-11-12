@@ -1187,12 +1187,7 @@ def test_a_save_whose_video_does_not_decode_keeps_its_journal_and_stays_pending(
 # verdict on the same capture on disk (``export_bundle.recording_blockers``, one reading:
 # ``_capture_on_disk``). A damaged capture never reads complete in one and refused in the other.
 # ------------------------------------------------------------------------------------------------
-GATE_KEYS = (
-    "recordings_pending",
-    "recordings_unsaved",
-    "recording_missing",
-    "recordings_unverified",
-)
+GATE_KEYS = ev.RECORDING_GATE_KEYS
 
 
 @pytest.fixture(scope="module")
@@ -1222,7 +1217,49 @@ def _edit_prov(ds: Path, edit: Any) -> None:
     p.write_text(json.dumps(prov))
 
 
+def _data_file(ds: Path, idx: int) -> Path:
+    import pyarrow.parquet as pq
+
+    info = json.loads((ds / "meta" / "info.json").read_text())
+    (ep,) = pq.read_table(_meta_file(ds, idx)).to_pylist()
+    return ds / str(info["data_path"]).format(
+        chunk_index=ep["data/chunk_index"], file_index=ep["data/file_index"]
+    )
+
+
+def _append_episode_row(ds: Path, src: int, new: int) -> None:
+    """A metadata row for episode ``new`` (a copy of episode ``src``'s) in the episode table."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    f = _meta_file(ds, src)
+    table = pq.read_table(f)
+    rows = table.to_pylist()
+    rows.append({**next(r for r in rows if int(r["episode_index"]) == src), "episode_index": new})
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), f)
+
+
+def _drop_last_data_row(ds: Path, idx: int) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    f = _data_file(ds, idx)
+    table = pq.read_table(f)
+    rows = table.to_pylist()
+    last = max(i for i, r in enumerate(rows) if int(r["episode_index"]) == idx)
+    pq.write_table(pa.Table.from_pylist(rows[:last] + rows[last + 1 :], schema=table.schema), f)
+
+
+RECORD_CASES = (
+    "duplicate_trial_row",
+    "not_started_attempt_holds_retry_capture",
+    "not_started_attempt_claims_an_episode",
+)
+
+
 def _damage(case: str, runs: Path, sid: str, trials: list[dict[str, Any]]) -> None:
+    """Damage the copied capture (or, ``RECORD_CASES``, the trial records in place: the caller
+    writes them back to record.json)."""
     cap = runs / sid / "capture"
     ds = cap / "dataset"
     prov = ds / recording.PROVENANCE
@@ -1254,12 +1291,46 @@ def _damage(case: str, runs: Path, sid: str, trials: list[dict[str, Any]]) -> No
     elif case == "video_file_missing":
         _clip(ds, 1, conv.IMAGE_KEYS["wrist"]).unlink()
     elif case == "data_file_missing":
-        info = json.loads((ds / "meta" / "info.json").read_text())
-        import pyarrow.parquet as pq
-
-        (ep,) = pq.read_table(_meta_file(ds, 1)).to_pylist()
-        (ds / str(info["data_path"]).format(
-            chunk_index=ep["data/chunk_index"], file_index=ep["data/file_index"])).unlink()  # fmt: skip
+        _data_file(ds, 1).unlink()
+    elif case == "data_rows_short":  # episode 1's data parquet one row short (review M6)
+        _drop_last_data_row(ds, 1)
+    elif case == "provenance_other_protocol_hash":  # review P4
+        _edit_prov(ds, lambda p: p["protocol"].update(hash="0" * 64))
+    elif case == "provenance_other_convention_hash":
+        _edit_prov(ds, lambda p: p["convention"].update(hash="0" * 64))
+    elif case == "provenance_protocol_not_object":  # no crash in either path (AttributeError)
+        _edit_prov(ds, lambda p: p.update(protocol="x"))
+    elif case.startswith("provenance_missing_"):  # units / recorded_at / robot_id (review M10)
+        _edit_prov(ds, lambda p: p.pop(case.removeprefix("provenance_missing_")))
+    elif case == "provenance_entry_not_object":  # review M1: a bare trial id string
+        _edit_prov(ds, lambda p: p["episodes"].update({"0": trials[0]["trial_id"]}))
+    elif case == "provenance_entry_trial_id_not_string":
+        _edit_prov(ds, lambda p: p["episodes"]["0"].update(trial_id=7))
+    elif case == "provenance_has_no_entry_for_a_held_episode":  # review P3
+        _edit_prov(ds, lambda p: p["episodes"].pop("1"))
+    elif case == "provenance_episodes_empty":
+        _edit_prov(ds, lambda p: p.update(episodes={}))
+    elif case in ("calibration_copy_missing", "calibration_copy_changed"):  # review M9
+        cal = ds / json.loads(prov.read_text())["calibration"]["file"]
+        if case.endswith("missing"):
+            cal.unlink()
+        else:
+            cal.write_bytes(cal.read_bytes() + b" ")
+    elif case == "orphan_episode":  # review P1: a held episode no trial record owns
+        _append_episode_row(ds, 2, 3)
+        tid = f"{sid}/PickPlace/seen/099"
+        _edit_prov(ds, lambda p: p["episodes"].update({"3": {"trial_id": tid}}))
+    elif case == "duplicate_trial_row":  # review P2: record.json holds a trial row twice
+        trials.append(dict(trials[1]))
+    elif case == "not_started_attempt_holds_retry_capture":  # review P2: a pre-F4 legacy block
+        t0 = trials[0]
+        trials.insert(0, {**t0, "policy_started": False, "outcome": "not_started"})
+    elif case == "not_started_attempt_claims_an_episode":  # review P2: its only claimant
+        _append_episode_row(ds, 2, 3)
+        t0 = trials[0]
+        _edit_prov(ds, lambda p: p["episodes"].update({"3": {"trial_id": t0["trial_id"]}}))
+        cap = {**t0["capture"], "episode_index": 3}
+        trials.insert(0, {**t0, "policy_started": False, "outcome": "not_started", "capture": cap})
     elif case == "capture_dir_missing":
         shutil.rmtree(cap)
     elif case == "staged_journal_present":
@@ -1274,6 +1345,8 @@ def _export_category(msg: str) -> str:
     """The blocker kind an export refusal names (the summary's gate key)."""
     if msg.startswith("REFUSED: PENDING"):
         return "recordings_pending"
+    if msg.startswith("REFUSED: UNMATCHED"):
+        return "recordings_unmatched"
     if msg.startswith("REFUSED: UNVERIFIED") or X.PROVENANCE_UNREADABLE in msg:
         return "recordings_unverified"
     if msg.startswith("REFUSED: capture provenance"):  # readable, refused (another session's)
@@ -1298,6 +1371,24 @@ PARITY_CASES = {  # case -> the one blocker kind both name (None: complete in bo
     "data_file_missing": "recordings_unverified",
     "capture_dir_missing": "recording_missing",
     "staged_journal_present": "recordings_pending",
+    # third owner hold (2026-11-11) review: each guard of the shared rule pinned (P1-P4, M1-M10)
+    "data_rows_short": "recordings_unverified",
+    "provenance_other_protocol_hash": "recordings_unverified",
+    "provenance_other_convention_hash": "recordings_unverified",
+    "provenance_protocol_not_object": "recordings_unverified",
+    "provenance_missing_units": "recordings_unverified",
+    "provenance_missing_recorded_at": "recordings_unverified",
+    "provenance_missing_robot_id": "recordings_unverified",
+    "provenance_entry_not_object": "recordings_unverified",
+    "provenance_entry_trial_id_not_string": "recordings_unverified",
+    "provenance_has_no_entry_for_a_held_episode": "recordings_unverified",
+    "provenance_episodes_empty": "recordings_unverified",
+    "calibration_copy_missing": "recordings_unverified",
+    "calibration_copy_changed": "recordings_unverified",
+    "orphan_episode": "recordings_unmatched",
+    "duplicate_trial_row": "recordings_unmatched",
+    "not_started_attempt_holds_retry_capture": "recordings_unmatched",
+    "not_started_attempt_claims_an_episode": "recordings_unmatched",
 }
 
 
@@ -1308,10 +1399,14 @@ def parity_verdicts(base: Path, run_id: str, case: str, tmp: Path) -> dict[str, 
     side the CLI (``scripts/wo07_export_bundle.py eval``, its complete bundle)."""
     shutil.copytree(base, tmp, dirs_exist_ok=True)
     runs = tmp / "runs"
-    res = json.loads((runs / run_id / "record.json").read_text())["results"]
+    record = json.loads((runs / run_id / "record.json").read_text())
+    res = record["results"]
     trials, settings = res["trials"], res["session"]
     sid = str(settings["session_id"])
+    scores = [(t["trial_id"], t["outcome"]) for t in trials]  # before any record damage
     _damage(case, runs, sid, trials)
+    if case in RECORD_CASES:  # the export reads the records from disk
+        (runs / run_id / "record.json").write_text(json.dumps(record))
     summ = ev.table(trials, settings, ev.SavedTargets(150.0), runs / sid / "capture")
     gate = [k for k in GATE_KEYS if summ.get(k)]
     reasons = [r.rsplit(" (", 1)[0] for r in summ.get("recording_reasons") or []]
@@ -1329,8 +1424,9 @@ def parity_verdicts(base: Path, run_id: str, case: str, tmp: Path) -> dict[str, 
         "export_ok": export,
         "export_kind": None if export else _export_category(msg),
         "export_msg": msg,
-        "scores": [(t["trial_id"], t["outcome"]) for t in trials],
+        "scores": scores,
         "cells": summ["cells"],
+        "real_rows": summ["real_rows"],
     }
 
 
@@ -1348,4 +1444,20 @@ def test_report_and_export_reach_the_same_verdict_on_a_damaged_capture(
         assert any(r in msg or msg in r for r in v["reasons"]), (case, v)
         assert not v["export_msg"].startswith("CRASH"), (case, v)
     healthy = parity_verdicts(base, run_id, "healthy", tmp_path / "healthy")
-    assert v["scores"] == healthy["scores"] and v["cells"] == healthy["cells"]  # scores kept
+    assert v["scores"] == healthy["scores"] and v["real_rows"] == healthy["real_rows"]
+    if case in RECORD_CASES:  # an added not-started attempt is counted as one; scores kept
+        keep = ("n", "successes", "success_rate")
+        cells = [{n: {k: c[k] for k in keep} for n, c in x["cells"].items()} for x in (v, healthy)]
+        assert cells[0] == cells[1]
+    else:
+        assert v["cells"] == healthy["cells"]  # scores kept
+
+
+def test_the_export_takes_the_capture_dataset_only_at_capture_dataset(tmp_path: Path) -> None:
+    """Review P4: the capture's root is the dataset's parent (the summary reads the capture
+    there), so a dataset at any other path is refused before anything is read."""
+    with pytest.raises(X.ExportRefused, match="<capture>/dataset"):
+        X.build_eval_bundle(
+            tmp_path / "capture" / "data", {"session_id": "s"}, [], tmp_path / "out",
+            checkpoint_dir=tmp_path,
+        )  # fmt: skip

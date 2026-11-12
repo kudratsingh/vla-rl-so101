@@ -61,8 +61,12 @@ which episode, so a claimed episode is UNVERIFIED (never assumed fine) while the
 missing, unreadable, of the wrong shape or another session's (``capture_provenance``:
 ``provenance_unreadable``), or while the episode is unreadable on disk (``meta/info.json``, its
 metadata row, its data rows or a clip file missing: ``recording.episode_problems``;
-``episode_unreadable``). An unverified recording blocks the summary's ``protocol_complete`` and
-refuses every export, ``allow_missing_recordings`` too; nothing rebuilds the provenance. Clips
+``episode_unreadable``), or while the provenance has no entry for it (owner 2026-11-11, review
+P3). The capture's episodes and the trial records must match one to one (``unmatched_episodes``:
+``episode_unmatched``): an episode no record claims (an orphan), one claimed by two records, or
+one claimed by a record that is not a scored trial. An unverified or unmatched recording blocks
+the summary's ``protocol_complete`` and refuses every export, ``allow_missing_recordings`` too;
+nothing rebuilds the provenance. Clips
 are decoded once, at the save and at a resume's confirmation (``recording.verify_episode_video``:
 a clip that does not decode is PENDING); the report and the export check the clip files exist,
 neither decodes them again.
@@ -715,15 +719,8 @@ def build_eval_bundle(
             f"{str(ident['checkpoint_sha256'])[:12]}: not the evaluated checkpoint"
         )
     recs = [dict(t) for t in trials]  # a filled capture block below never edits the caller's
-    by_episode: dict[int, dict[str, Any]] = {}
-    for t in recs:
-        idx = (t.get("capture") or {}).get("episode_index")
-        if idx is not None:
-            if int(idx) in by_episode:
-                raise ExportRefused(f"episode {idx} is claimed by two trial records")
-            by_episode[int(idx)] = t
     # the session summary's and --report's rule (``recording_blockers``; owner, PR #32 hold):
-    # pending on the records as written, missing after the provenance fill (both inside it)
+    # pending on the records as written, missing and unmatched after the provenance fill
     blockers = recording_blockers(recs, root, session_id=sid)
     pending = blockers["pending"]
     if pending:  # never dropped, never counted: always refused, allow_missing_recordings too
@@ -742,9 +739,22 @@ def build_eval_bundle(
             f"{' ...' if len(unverified) > 5 else ''}): "
             + "; ".join(sorted({str(m["reason"]) for m in unverified})[:3])
         )
+    unmatched = [m for m in blockers["missing"] if m["status"] == UNMATCHED]
+    if unmatched:  # an orphan, a double or a non-scored claim (review P1, P2): outright
+        raise ExportRefused(
+            f"UNMATCHED: the capture's episodes and the trial records do not match one to one "
+            f"({len(unmatched)}): " + "; ".join(sorted({str(m["reason"]) for m in unmatched})[:3])
+        )
+    by_episode: dict[int, dict[str, Any]] = {}
+    for t in recs:  # one claim per episode (``unmatched_episodes`` refused a double above)
+        idx = (t.get("capture") or {}).get("episode_index")
+        if idx is not None:
+            if int(idx) in by_episode:
+                raise ExportRefused(f"episode {idx} is claimed by two trial records")
+            by_episode[int(idx)] = t
     by_episode.update(fill_from_provenance(recs, prov, eps))
     orphans = sorted(set(eps) - set(by_episode))
-    if orphans:
+    if orphans:  # unreachable after ``unmatched_episodes``; kept as the export's own guard
         raise ExportRefused(f"episodes {orphans} have no trial record (a run killed mid-trial?)")
     lost = "; ".join(  # the summary's and --report's reasons for the claims refused below
         sorted({str(m["reason"]) for m in missing_claims(blockers)})[:3]
@@ -756,8 +766,8 @@ def build_eval_bundle(
         )
     entries = prov.get("episodes") or {}
     taken = sorted(  # never re-mapped: an episode keeps the trial its provenance names
-        i for i, t in by_episode.items() if _owner(entries, i) not in (None, str(t.get("trial_id")))
-    )
+        i for i, t in by_episode.items() if _owner(entries, i) != str(t.get("trial_id"))
+    )  # no entry is no confirmation (review P3): the provenance is the only ownership record
     if taken:
         raise ExportRefused(
             f"episodes {taken} belong to other trials in the capture provenance than the trial "
@@ -966,6 +976,7 @@ def missing_recordings(
 
 
 UNVERIFIED = ("provenance_unreadable", "episode_unreadable")  # blocker statuses (module doc)
+UNMATCHED = "episode_unmatched"  # the capture and the records not one to one (module doc)
 
 
 def recording_blockers(
@@ -988,12 +999,16 @@ def recording_blockers(
     shape or not this session's (``provenance_unreadable``: nothing confirms which trial owns
     which episode, never assumed fine), or the episode itself is unreadable on disk
     (``episode_unreadable``: ``meta/info.json``, its metadata row, data rows or a clip file;
-    ``recording.episode_problems``) (``lost_claims``). A recording is required for every scored
+    ``recording.episode_problems``), or the provenance has no entry for it
+    (``provenance_unreadable``) (``lost_claims``), or the capture's episodes and the records do
+    not match one to one (``UNMATCHED``, ``unmatched_episodes``: an episode no record claims, an
+    episode claimed twice, a claim by a record that is not a scored trial; the provenance
+    readable). A recording is required for every scored
     trial whose policy run produced a frame, under a capture-enabled real-0.1 session
     (``required``; ``recording.recording_required``: a scored trial whose first write faulted
     with zero frames requires none). Each list blocks a complete baseline: the summary's
-    ``protocol_complete`` and a complete export (the export refuses pending and unverified ones
-    outright). The trials keep their scores; read only (the caller's records, the capture and
+    ``protocol_complete`` and a complete export (the export refuses pending, unverified and
+    unmatched ones outright). The trials keep their scores; read only (the caller's records, the capture and
     staged data are never touched). ``capture_root`` None: the trial blocks alone, no claim
     checked."""
     prov, episodes, problems = _capture_on_disk(capture_root, session_id)
@@ -1005,7 +1020,61 @@ def recording_blockers(
     missing = missing_recordings(recs, capture_root)
     if capture_root is not None:
         missing += lost_claims(recs, prov, episodes, problems, Path(capture_root) / DATASET_ROOT)
+        if not problems.get("provenance"):  # else no fill ran: nothing can be called an orphan
+            missing += unmatched_episodes(recs, prov, episodes)
     return {"pending": pending, "missing": missing}
+
+
+def unmatched_episodes(
+    recs: Sequence[Mapping[str, Any]], prov: Mapping[str, Any], episodes: Sequence[int]
+) -> list[dict[str, Any]]:
+    """The capture's episodes and the trial records (after ``fill_from_provenance``) not one to
+    one, the export's rule (review P1, P2): every record holding an ``episode_index`` claims it,
+    scored or not. An index claimed by two or more records (a legacy not-started attempt
+    carrying its retry's capture block, a trial row written twice), an index claimed by a record
+    that is not a scored trial (``recording.recording_required`` false with an index), or a held
+    episode no record claims (an orphan: a run killed mid-trial?) is ``UNMATCHED``, one entry
+    per claimant (or per orphan, trial id None), with the reason the export refuses with."""
+    from src.robot.recording import recording_required
+
+    by_idx: dict[int, list[Mapping[str, Any]]] = {}
+    for t in recs:
+        if (idx := (t.get("capture") or {}).get("episode_index")) is not None:
+            by_idx.setdefault(int(idx), []).append(t)
+    entries = prov.get("episodes") or {}
+
+    def row(t: Mapping[str, Any] | None, idx: int, why: str) -> dict[str, Any]:
+        t = t or {}
+        return {
+            "trial_id": t.get("trial_id"),
+            "cell": t.get("cell"),
+            "trial_idx": t.get("trial_idx"),
+            "outcome": t.get("outcome"),
+            "episode_index": idx,
+            "status": UNMATCHED,
+            "reason": why,
+        }
+
+    out = []
+    for idx, ts in sorted(by_idx.items()):
+        if len(ts) > 1:
+            ids = sorted({str(t.get("trial_id")) for t in ts})
+            why = f"episode {idx} is claimed by {len(ts)} trial records ({', '.join(ids)})"
+            out += [row(t, idx, why) for t in ts]
+            continue
+        (t,) = ts
+        if not recording_required(t):
+            why = (
+                f"episode {idx} is claimed by {t.get('trial_id')}, not a scored trial (outcome "
+                f"{t.get('outcome')!r}, policy_started {bool(t.get('policy_started'))})"
+            )
+            out.append(row(t, idx, why))
+    for idx in sorted(set(episodes) - set(by_idx)):
+        owner = _owner(entries, idx)
+        named = f"; its provenance names {owner}" if owner is not None else ""
+        why = f"episode {idx} has no trial record (a run killed mid-trial?{named})"
+        out.append(row(None, idx, why))
+    return out
 
 
 def missing_claims(blockers: Mapping[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -1054,7 +1123,8 @@ def lost_claims(
     missing or unreadable) or its provenance names another trial (an older record of a session
     a later resume re-mapped): lost (``recording_missing``; the export refuses these sessions
     outright); the provenance cannot say (``problems["provenance"]``:
-    ``provenance_unreadable``); the episode is unreadable under ``dataset``
+    ``provenance_unreadable``; or it has no entry for the held episode, review P3: nothing
+    confirms the claim); the episode is unreadable under ``dataset``
     (``problems["info"]``, ``recording.episode_problems``: ``episode_unreadable``)."""
     from src.robot.recording import episode_problems, recording_required
 
@@ -1079,7 +1149,15 @@ def lost_claims(
             why += f" ({gone})" if gone else ""
         elif problems.get("provenance"):
             status, why = "provenance_unreadable", problems["provenance"]
-        elif owner is not None and owner != str(tid):
+        elif owner is None:  # the recorder writes the entry before its checkpoint: damage
+            where = dataset / "meta" / "vla_rl_so101.json" if dataset is not None else "it"
+            status = "provenance_unreadable"
+            why = (
+                f"{PROVENANCE_UNREADABLE}: {where} has no entry for episode {idx}: which trial "
+                "owns it cannot be confirmed; restore the file (nothing here rebuilds or "
+                "rewrites it)"
+            )
+        elif owner != str(tid):
             why = f"episode {idx} is trial {owner}'s in the capture provenance"
         elif problems.get("info") or on_disk.get(idx):
             status, why = "episode_unreadable", problems.get("info") or on_disk[idx]

@@ -153,9 +153,12 @@ capture on disk (owner, PR #32 hold). A REQUIRED recording (capture on, the scor
 run produced a frame; a first-write fault with zero frames requires none) that is pending,
 staged-unsaved, lost (``recording_missing``) or unverified (``recordings_unverified``: the
 capture's provenance missing, unreadable, of the wrong shape or another session's, or the episode
-unreadable on disk; owner 2026-11-11) blocks ``protocol_complete`` in the summary and the report
-(``recording_gate``, the export's ``recording_blockers``: the export refuses the same session);
-the report names the session and why (``recording_blockers`` in its JSON, ``why:`` lines); the
+unreadable on disk, or the provenance has no entry for it; owner 2026-11-11), or a capture whose
+episodes and trial records do not match one to one (``recordings_unmatched``: an orphan episode,
+an episode claimed twice or by a record that is not a scored trial) blocks ``protocol_complete``
+in the summary and the report (``recording_gate``, the export's ``recording_blockers``: the
+export refuses the same session); the printed report names the session and why (its ``why:``
+lines; ``report()``'s return value has them per session under ``recording_blockers``); the
 trial stays scored in the rates with its original score, and nothing staged is deleted.
 Baseline cadence (owner 2026-11-09): 15 Hz nominal control, 30 fps cameras, the SAME 450-command
 cap for SmolVLA and ACT, synchronous inference (no overlap) and ``max_chunk_age_ms`` 800. Budget
@@ -248,7 +251,7 @@ from src.eval import protocol_real as PR
 from src.eval import protocol_v02 as P2
 from src.eval import real_grid as G
 from src.eval.bowl_fit import bowl_box_problem
-from src.eval.export_bundle import UNVERIFIED, recording_blockers
+from src.eval.export_bundle import UNMATCHED, UNVERIFIED, recording_blockers
 from src.robot import convention as conv
 from src.robot.camera import (
     CameraRig,
@@ -945,6 +948,7 @@ RECORDING_GATE_KEYS = (
     "recordings_unsaved",
     "recording_missing",
     "recordings_unverified",
+    "recordings_unmatched",
 )
 
 
@@ -959,7 +963,9 @@ def recording_gate(
     is missing or unreadable, or gives another trial). ``recordings_unverified``: a claimed
     episode the capture holds but cannot confirm (owner 2026-11-11: its provenance missing,
     unreadable, of the wrong shape or another session's; or the episode unreadable on disk:
-    ``export_bundle.UNVERIFIED``). ``recording_reasons``: why, one line per distinct reason
+    ``export_bundle.UNVERIFIED``). ``recordings_unmatched``: the capture's episodes and the
+    records not one to one (``export_bundle.UNMATCHED``; the claimant trial ids, or ``episode
+    N`` for an episode no record claims). ``recording_reasons``: why, one line per distinct reason
     with its trial count. An episode saved before its trial's capture row is the trial's (the
     export's provenance fill). Required: capture on and the scored trial's policy run produced
     a frame (``recording.recording_required``). Their scores stand; nothing is deleted."""
@@ -986,6 +992,11 @@ def recording_gate(
         ],
         "recordings_unverified": [
             m["trial_id"] for m in got["missing"] if m["status"] in UNVERIFIED
+        ],
+        "recordings_unmatched": [
+            m["trial_id"] if m["trial_id"] is not None else f"episode {m['episode_index']}"
+            for m in got["missing"]
+            if m["status"] == UNMATCHED
         ],
         "recording_reasons": [f"{r} ({n} trial(s))" for r, n in sorted(why.items())],
     }
@@ -1112,6 +1123,8 @@ def recording_gate_lines(s: Mapping[str, Any]) -> list[str]:
         "recording_missing": "LOST (their scores stand; no complete export)",
         "recordings_unverified": "UNVERIFIED: the capture on disk cannot confirm them (their "
         "scores stand; no export)",
+        "recordings_unmatched": "UNMATCHED: the capture's episodes and the trial records are not "
+        "one to one (their scores stand; no export)",
     }
     lines = [f"  recordings {why}: {s[k]}" for k, why in what.items() if s.get(k)]
     return lines + [f"    why: {r}" for r in s.get("recording_reasons") or []]
