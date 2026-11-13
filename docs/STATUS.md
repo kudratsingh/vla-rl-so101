@@ -2586,6 +2586,47 @@ reruns the bowl check and brings back any change to B' or the 9.83 cm separation
 freezing. Then the freeze, CI and the vishwaroop imports (including `real-0.1-mock`) on the final
 freeze commit, then merge review. Spend, RunPod credentials and powered steps 9-10 stay on hold.
 
+### PR 2: Mac runbook and decoder preflight (2026-11-12, $0)
+
+The owner is assembling the arm (WO-06 steps 0-8) and asked for the exact Mac commands for the
+first supervised rehearsal, the sanity recordings and the 50 scheduled PickPlace demos, with an
+FFmpeg / torchcodec preflight. The freeze stays PENDING: nothing in `src/eval/protocol_real.py`,
+the slots, schedules, seeds, configs or PDFs changed. Protocols 0.1-draft / 0.2, `src/env/**` and
+the pins are byte-identical.
+
+- **`scripts/preflight_decoder.py --preset real`:** loads torchcodec + FFmpeg and prints the
+  versions and the library files loaded. Checks the PyAV `libsvtav1` encoder and
+  `convention.check_config`. Writes a throwaway two-camera dataset through the recorder's own
+  path (`create_dataset`, `DurableDataset`, `recording_frame`) and runs `verify_episode_video`
+  plus a first/last-frame pixel check. Opens no port or camera and removes its temp dir. Prints
+  PASS, or FAIL with the fix, and exits 1 on failure. With `DYLD_FALLBACK_LIBRARY_PATH` unset it
+  prints `[torchcodec] FAIL ... fix: export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/ffmpeg@7/lib`
+  (reproduced on this Mac; no traceback). `--dataset <dir> [--episodes N]` checks a recorded
+  dataset, read only: every clip decodes, the episode count, and for a demo-schedule recording
+  the real-0.1 / convention hashes and episode i = demo i. Tests: `tests/test_preflight_decoder.py`.
+- **`docs/runbooks/real-arm-mac.md`:** per-terminal setup, preflight, a config gate check, step 9,
+  step 10, and the 50 demos (schedule listing, sittings / resume, the refusal text before the
+  freeze, the decode check, the local export). Linked from checklist steps 9-10 and WO-07. In the
+  checklist: step 10's stale `224x224 video` line now reads 480x640, both cameras; the resume
+  command now includes `--task PickPlace`.
+- **Gaps found (proposals, not implemented):** (1) the teleop demo recorder never decode-verifies
+  its saved episodes (the eval capture does), and the export checks only that clip files exist.
+  Interim: `preflight_decoder.py --dataset` after each sitting. (2) The recorder first loads
+  torchcodec at the first episode's finalize/reopen, i.e. with torque on after a recorded demo.
+  A broken FFmpeg would fail there; calling `install_torchcodec_compat()` before the leader
+  connects would move it before anything opens. (3) Step 10 sanity episodes and the demo schedule
+  write to the same `data/real_teleop/vla-rl-so101-real-teleop`, and `--overwrite` would delete
+  the sanity episodes. The runbook moves them aside. (4) No command prints servo temperatures
+  after a teleop session, though the checklist asks for them. (5) `NOT_A_TERMINAL`'s log hint
+  says `script -q log.txt uv run ...`, against the `.venv/bin/python` rule.
+- **Gates:** full pytest **747 passed, 1 skipped** (11 min 59 s, exit code 0). `ruff check src
+  tests scripts`, `black --check .`, `mypy --strict src` are clean.
+
+**Next (owner):** unchanged. Send the five measurements and the unpowered fit results. The agent
+then reruns the bowl check, flags any change to B' or the 9.83 cm separation, freezes, regenerates
+both grids, and reruns CI and the vishwaroop imports. Powered steps 9-10, RunPod credentials and
+spend stay on hold.
+
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
 Owner 2026-11-09: the stop check #30 added to teleop and the park now also guards the pilot and
