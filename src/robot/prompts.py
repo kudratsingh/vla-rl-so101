@@ -510,8 +510,8 @@ SHARED_JOB = (
 NOT_A_TERMINAL = (
     "{what}: stdin and stdout must be an interactive terminal for the real arm ({bad} is not a "
     "tty): the torque-on prompts need an operator who sees them and answers them. Run it "
-    "directly in Terminal (no pipe, no redirect; to keep a log use `script -q log.txt uv run "
-    "...`); nothing was opened"
+    "directly in Terminal as `.venv/bin/python scripts/...` (no pipe, no redirect, no `uv run`; "
+    "to keep a log use Terminal's Shell > Export Text As... afterwards); nothing was opened"
 )
 
 

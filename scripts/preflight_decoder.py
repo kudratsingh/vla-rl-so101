@@ -118,7 +118,8 @@ def ffmpeg_fix() -> str:
         )
     return (
         f"{BREW_FFMPEG7_LIB} is set but did not load: brew reinstall ffmpeg@7; then rerun "
-        "uv sync --frozen --extra dev --extra gpu --extra robot (torchcodec 0.2.1)"
+        "uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla "
+        "(= make setup; torchcodec 0.2.1)"
     )
 
 
@@ -129,6 +130,7 @@ def stage_torchcodec() -> str:
         from torchcodec.decoders._core import get_ffmpeg_library_versions
     except (ImportError, OSError, RuntimeError) as e:
         first = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+        first = first.split(" Likely causes:")[0]  # torchcodec's list follows on later lines
         raise StageFailed(f"torchcodec cannot load FFmpeg: {first}", ffmpeg_fix()) from e
     versions = get_ffmpeg_library_versions()
     libs = loaded_libraries()  # before PyAV and LeRobot load their own copies
@@ -154,8 +156,8 @@ def stage_encoder() -> str:
     except Exception as e:
         raise StageFailed(
             f"PyAV encoder {conv.VIDEO_CODEC!r} unavailable: {type(e).__name__}: {e}",
-            "uv sync --frozen --extra dev --extra gpu --extra robot   (the pinned PyAV wheel "
-            "bundles libsvtav1)",
+            "uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla   "
+            "(= make setup; the pinned PyAV wheel bundles libsvtav1)",
         ) from e
     libav = av.library_versions.get("libavcodec", ())
     return (

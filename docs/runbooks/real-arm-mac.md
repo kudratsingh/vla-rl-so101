@@ -11,7 +11,8 @@ freeze, regenerated grids). Sections A and B open no port and no camera except w
 the owner runs it.
 
 Every flag below was checked against the argparse of the scripts at commit `3f1eceb` on
-`feat/smolvla-real`, and every no-device command was run there. The powered commands have never
+`feat/smolvla-real`, and every no-device command was run there (and again after the
+follow-through fixes, 2026-11-12). The powered commands have never
 run on the arm: their expected output is what the code prints, not observed behaviour.
 
 **One rule for every hardware session.** Start it as `.venv/bin/python scripts/...` directly in
@@ -21,9 +22,39 @@ before anything opens. To keep a log, use Terminal's Shell > Export Text As... a
 
 ---
 
+## A0. Once, before checklist steps 0-8 write any value: the bring-up branch (no motion)
+
+The main checkout is on `main`, which does not have this runbook's commands, and has no local
+`feat/smolvla-real`. Steps 0-8 edit `configs/real.yaml` in place (port, limits, intrinsics,
+leader, camera controls), and that file differs between `main` and `feat/smolvla-real` (the
+`cameras.<name>.controls` block, the wrist camera, the power section). So make the bring-up branch
+from `feat/smolvla-real` **first**, and commit the step 0-8 values on it (checklist step 0: a
+branch of its own; the values reach `main` through their own PR).
+
+```zsh
+cd ~/Robotics/vla-rl-so101
+git status --short                 # configs/real.yaml must not be listed (no edits yet)
+git fetch origin
+git switch -c wo-06-hardware-values origin/feat/smolvla-real
+```
+
+- If `git switch` refuses with `untracked working tree files would be overwritten`, move the
+  files it names out of the repo (today: `docs/reviews/2026-11-08-implementation-prompt.md` and
+  `docs/reviews/2026-11-09-smolvla-pivot-handoff.md`, both untracked on `main`), e.g.
+  `mkdir -p ~/vla-rl-aside && mv <the files> ~/vla-rl-aside/`, then rerun the switch.
+- If you already edited `configs/real.yaml` on `main`: `git stash push -m steps0-8 --
+  configs/real.yaml`, then the switch, then `git stash pop`. If the pop reports a conflict, the
+  stash is kept: edit `configs/real.yaml` to keep both the branch's blocks and your values, then
+  `git stash drop`.
+- After each bring-up step: `git add configs/real.yaml && git commit -m "chore(robot): WO-06
+  step N hardware values"` on `wo-06-hardware-values`.
+- When the real-0.1 freeze lands (section E gate 1), bring it in on this branch:
+  `git fetch origin && git merge origin/feat/smolvla-real` (or `origin/main` once PR #32 has
+  merged).
+
 ## A. Every new Terminal window (no motion)
 
-Gate: none. Run these in each new window before anything else in this file.
+Gate: A0 done once. Run these in each new window before anything else in this file.
 
 ```zsh
 cd ~/Robotics/vla-rl-so101
@@ -37,7 +68,7 @@ uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla
 
 - **Expected:** `checkout has the runbook's commands`, three `brew` version lines, and `uv sync`
   finishes with no error. If the first line prints nothing, the checkout is older than this
-  runbook: switch to `feat/smolvla-real`, or to a branch made from it (e.g. the bring-up branch).
+  runbook (e.g. still on `main`): do A0.
 - `scripts/mac_env.sh` sets `VK_ICD_FILENAMES` (MoltenVK), `DYLD_FALLBACK_LIBRARY_PATH`
   (Homebrew's keg-only `ffmpeg@7`, which torchcodec 0.2.1 needs) and `MVK_CONFIG_LOG_LEVEL`. It
   keeps a value that is already set. If a wrong value is already set, the preflight below says
@@ -52,7 +83,8 @@ uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla
 It loads torchcodec and FFmpeg, checks the PyAV `libsvtav1` encoder and the camera convention in
 `configs/real.yaml`, then writes a throwaway two-camera dataset in a temp folder through the
 recorder's own code. It decodes every frame of both clips with `verify_episode_video` and deletes
-the folder. It opens no port and no camera. It takes about 10-40 s.
+the folder. It opens no port and no camera. It takes about 10-60 s (the first run after
+`uv sync` is the slow one).
 
 - **Expected (this Mac, 2026-11-12):**
   ```
@@ -71,7 +103,8 @@ the folder. It opens no port and no camera. It takes about 10-40 s.
 - **FAIL:** the line says what failed, and the next line is `fix:`. Do what it says, then rerun.
   Without `DYLD_FALLBACK_LIBRARY_PATH` it prints `[torchcodec] FAIL: torchcodec cannot load
   FFmpeg ...` and `fix: export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/ffmpeg@7/lib ...`
-  (exit code 1). Without `ffmpeg@7` it says `brew install ffmpeg@7`.
+  (exit code 1). Without `ffmpeg@7` it says `brew install ffmpeg@7`. A `fix:` that says
+  `uv sync` means the four-extra line of section A (`make setup`), never a shorter set.
 - **Why it matters:** the recorder loads torchcodec only after the first demo has been saved
   (finalize and reopen). A missing FFmpeg would otherwise first show up with the arm under torque,
   after a recorded episode.
@@ -244,8 +277,33 @@ green cube.
   (encoding video, a few seconds; Ctrl-C is ignored) ...`. Wait for the next prompt. Ending:
   support prompt, ENTER, `saved 15 episodes to .../data/real_teleop/vla-rl-so101-real-teleop`.
 - **No resume** for these episodes. If the folder exists, the script refuses with
-  `... exists; pass --overwrite to replace it, or --resume to continue`, and `--overwrite`
-  deletes it. Never pass `--push` (a Hub upload is a separate owner decision).
+  `... exists; pass --overwrite to replace it, or --resume to continue`. Ignore its `--resume`
+  hint: `--resume` is only for the demo schedule (here it is an argparse error). `--overwrite`
+  deletes the folder. Never pass `--push` (a Hub upload is a separate owner decision).
+- **If the session stopped before any episode was saved** (it printed `saved 0 episodes`, or a
+  traceback such as `ConnectionError: Could not connect on port ...` on a wrong leader port, or it
+  ended at the camera check or at `TORQUE ENABLE REFUSED`), the folder it created holds no
+  episode, and a plain rerun refuses because it exists. Check, then move it aside and rerun the
+  same line:
+  ```zsh
+  .venv/bin/python scripts/preflight_decoder.py --preset real --dataset data/real_teleop/vla-rl-so101-real-teleop --episodes 0
+  mv data/real_teleop/vla-rl-so101-real-teleop data/real_teleop/vla-rl-so101-real-teleop-empty-$(date +%H%M%S)
+  ```
+  The check must say `[dataset] OK: 0 episodes ...` and `PASS`. If it FAILs on the count, the
+  folder holds episodes: do the next bullet instead.
+- **If the session was interrupted part-way** (some episodes saved): never `--overwrite`. Move
+  the folder to a numbered part, rerun only what is missing, and check each part on its own count:
+  ```zsh
+  mv data/real_teleop/vla-rl-so101-real-teleop data/real_teleop/vla-rl-so101-real-teleop-sanity-part1
+  # e.g. PickPlace done, Push had 2 of 5: two runs, since --episodes applies to every --task given
+  .venv/bin/python scripts/wo06_teleop_record.py --preset real --task Push --episodes 3
+  mv data/real_teleop/vla-rl-so101-real-teleop data/real_teleop/vla-rl-so101-real-teleop-sanity-part2
+  .venv/bin/python scripts/wo06_teleop_record.py --preset real --task Stack --episodes 5
+  mv data/real_teleop/vla-rl-so101-real-teleop data/real_teleop/vla-rl-so101-real-teleop-sanity-part3
+  .venv/bin/python scripts/preflight_decoder.py --preset real --dataset data/real_teleop/vla-rl-so101-real-teleop-sanity-part1 --episodes 7
+  ```
+  Run the decode check on every part with that part's `saved N episodes` count. The parts then
+  replace the single `-sanity` folder in the block below (skip its `mv`).
 - **Writes:** `data/real_teleop/vla-rl-so101-real-teleop/`, a LeRobotDataset v3.0 at 15 fps:
   `observation.images.front` and `observation.images.wrist` (480 x 640 AV1 video), state and
   action float32[6] canonical radians, `timing_s`, and `meta/vla_rl_so101.json`.
@@ -274,12 +332,24 @@ Gates, all of them:
    the safety box). The last line of the section B command says `ready`.
 2. The regenerated grid is printed at 100% (each 100 mm scale bar measures 100 mm), aligned to the
    base `+`, and the bowl centre marked on the table (A3: the bowl line, 100 mm left of its end
-   tick; tabloid2: the BOWL CENTRE cross on sheet 2). Today the committed PDFs are pre-freeze:
-   `.venv/bin/python scripts/make_placement_grid.py --preset real --check` exits 1 (`... is
-   stale`) until the freeze regenerates them. Do not print them before then.
+   tick; tabloid2: the BOWL CENTRE cross on sheet 2). Check the PDF you print against the freeze:
+   ```zsh
+   .venv/bin/python scripts/make_placement_grid.py --preset real --check                    # A3
+   .venv/bin/python scripts/make_placement_grid.py --preset real --layout tabloid2 --check  # two tabloids
+   ```
+   Each must exit 0. Today both exit 1 (`... is stale`): the committed A3 PDF is pre-freeze and
+   the tabloid2 PDF is not committed yet. The freeze commit regenerates and commits both. Do not
+   print either before then.
 3. A4 prints `camera controls: locked`. Sections C and D were clean, and the sanity folder has
    been moved aside (D).
 4. Every row of section B, plus a spare 12 V gripper servo on hand (hardware floor).
+5. The servo position P gain is recorded, or you have deferred it in writing (hardware floor:
+   LeRobot 0.4.4 writes `P_Coefficient` 16 at each connect, the firmware default is 32). No
+   script reads it back yet; keeping 16 or setting 32 is your call, and it stays the same for the
+   demos and the evaluation.
+6. Agent side: the vishwaroop mock imports (`real-0.1-mock`: a mock demo export and a mock
+   evaluation export through vishwaroop's own seal and import tools, WO-07 D6) pass on the
+   freeze commit, as reported in `docs/STATUS.md`.
 
 ### E1. See the schedule (no motion; reads code only)
 
@@ -323,6 +393,17 @@ and yaw come next.
   calibration than the recorded demos ...; torque was never enabled`. A kill costs at most the
   demo being saved. Never rerun without `--resume`: with the folder present that refuses, and
   `--overwrite` deletes the recorded demos.
+- **If the first sitting stopped before demo 1 was saved** (`saved 0 episodes`, a traceback such
+  as a wrong leader port, a `no` at the camera check, `TORQUE ENABLE REFUSED`), `--resume`
+  refuses with `no episode was saved: record it anew with --overwrite`, and a plain rerun refuses
+  because the folder exists. Nothing is lost: check that it holds 0 episodes, move it aside, and
+  rerun the first-sitting line (not `--overwrite`):
+  ```zsh
+  .venv/bin/python scripts/preflight_decoder.py --preset real --dataset data/real_teleop/vla-rl-so101-real-teleop --episodes 0
+  mv data/real_teleop/vla-rl-so101-real-teleop data/real_teleop/vla-rl-so101-real-teleop-empty-$(date +%H%M%S)
+  ```
+  The check must say `[dataset] OK: 0 episodes ...` and `PASS`. If it FAILs on the count, demos
+  are saved: use the `--resume` line.
 - Other refusals: `--resume: all 50 demos are recorded`; `--episodes must be in [1, 50] with
   --demo-schedule`; without `--task PickPlace`, `--demo-schedule records PickPlace only: pass
   --task PickPlace`.
@@ -383,9 +464,11 @@ Sections C and D are not refused by the freeze. Their gates are B and your go.
   off, and let them cool for at least 10 minutes. After a `SERVO FAULT`, do the same and find the
   cause before resuming. The monitor's thresholds (55 C, 1500 mA for 1 s) are provisional: report
   what you felt. No command prints servo temperatures after a teleop session.
-- **Start of every session:** section A (preflight `PASS`), A4 (controls still locked after any
-  replug or reboot), section B row 5 (drift check), the camera-role check (built into every
-  sitting). Keep the lamp at 5000 K and in its recorded position, and the room light the same.
+- **Start of every session:** section A (preflight `PASS`) and A4 (controls still locked after
+  any replug or reboot), then **every row of section B** and its verification command: the 12 V
+  switch tested in reach (row 2), clamped, workspace clear and nobody in reach (row 3), the drift
+  check (row 5), hands (row 7) and the owner's in-person go for this session (row 8). Then the
+  camera-role check (built into every sitting). Keep the lamp at 5000 K and in its recorded position, and the room light the same.
 - **Mac:** on AC power, `caffeinate -dims` running in its own tab (A2).
 - **Send back after each sitting:** the `saved N episodes` line, the `resuming ... at demo N/50`
   line, and any `STOPPED` / `SERVO FAULT` / refusal line.

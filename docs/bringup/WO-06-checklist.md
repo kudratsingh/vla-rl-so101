@@ -108,16 +108,17 @@ Agent notes on these items:
 
 **Software.** Use the main checkout, on this branch or on `main` once it merges.
 `configs/real.yaml` gets edited in place during bring-up. Do bring-up on a branch of its own
-(e.g. `git switch -c wo-06-hardware-values`) and commit those values through a PR. As of this
+(`git fetch origin && git switch -c wo-06-hardware-values origin/feat/smolvla-real`, before
+any value is written: runbook section A0) and commit those values through a PR. As of this
 branch, the tests no longer read those values (`tests/real_fixture.py`).
 
 ```bash
 brew install uv molten-vk ffmpeg@7
 cd ~/Robotics/vla-rl-so101
 source scripts/mac_env.sh
-# uv sync is EXACT: it uninstalls every extra you leave out. This set = CI (dev, gpu) + robot.
-# Add `--extra smolvla` only if you also want SmolVLA on the Mac. Never run a bare `uv sync --extra robot`.
-uv sync --frozen --extra dev --extra gpu --extra robot
+# uv sync is EXACT: it uninstalls every extra you leave out. This set = `make setup` = the Mac
+# runbook (docs/runbooks/real-arm-mac.md section A). Never run a bare `uv sync --extra robot`.
+uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla
 uv run python -c "import scservo_sdk, serial, cv2, grpc; print('robot deps ok')"
 uv run pytest -q tests/test_safety.py tests/test_driver.py tests/test_units.py tests/test_camera.py tests/test_teleop.py tests/test_calibrate.py
 ```
@@ -604,7 +605,9 @@ What happens and what you do:
    holding their last goal under torque until the switch is off). Teleop, the pilot and the real eval refuse to start unless
    stdin and stdout are the Terminal itself (no `| tee`, no `< file`, no `yes |`) and the
    process is the Terminal's foreground job (no trailing `&`, not resumed with `bg`): run them
-   directly in Terminal; to keep a log use `script -q log.txt uv run ...`. If the session ever
+   directly in Terminal as `.venv/bin/python scripts/...`; to keep a log use Terminal's Shell >
+   Export Text As... after the session (not `script ... uv run`, which brings back the `uv run`
+   Ctrl-Z problem above). If the session ever
    loses the foreground (e.g. another program takes the Terminal), it ends like a closed
    Terminal: motion stops, `LOST THE TERMINAL'S FOREGROUND ... SUPPORT THE ARM NOW`, torque off
    after 10 s, recorded as `released_unconfirmed` (cause `lost_foreground`). `null` restores the
