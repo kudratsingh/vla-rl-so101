@@ -14,6 +14,10 @@ PR #32 is open at `5b9d5d6`, with passing CI for the integrated SmolVLA/ACT code
 cube/cup measurements and unpowered placement checks still gate the protocol freeze. Real-arm
 policy success has not been measured. Spend, credentials and powered steps 9–10 remain on hold.
 
+On the PR #32 branch since then (sections below): F_FULLFSYNC is required for real-arm journal
+writes on macOS (with its review round), and the owner kit list is merged in (1-inch wood cubes,
+LE TAUCI cup, white table, 5000 K lamp; five pending prop measurements gate the freeze).
+
 ## Pivot to SmolVLA (owner decision 2026-11-09, ADR-0003)
 
 The OpenVLA-OFT / SimpleVLA-RL reproduction is deferred under the amendment above. The project is
@@ -57,9 +61,10 @@ started before its predecessors merge is listed here, marked **out of order**, b
 | 01 | done, merged | #7 (merged) | See benchmarks. Demos on the Hub (`KudratSingh22/vla-rl-so101-demos`, private, built at commit `0dffe51`). |
 | 02 | closed by owner decision, **below the original target band**; PR open | `wo-02-sft` | OpenVLA-OFT LoRA SFT, 4 attempts, all below the 20-60% band on seen positions (ADR-0001). Owner (2026-10-27): keep OFT, amend rule 3, close with the full protocol table of attempt 4 `step_004000` (25 demos/task): seen PickPlace 17.0%, Push 10.0%, Stack 2.7% (`docs/results.md`). |
 | 03 | done, merged after owner review | #4 (merged) | **Out of order** (started before WO-01/02). CPU only, toy env. |
-| 06 | **current WO** (bring-up, new table); part 1 merged, kit arrived, physical bring-up pending | #5, #24 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. |
+| 06 | **current WO** (bring-up, new table); part 1 merged, kit arrived, physical bring-up pending | #5, #24 (merged) | **Out of order**: robot-side code (safety, units, driver, calibration/camera scripts) written ahead of hardware and WO-01–05. Calibration, camera match and teleop are pending verification. Hardware: the owner's bill of materials, [`docs/bringup/kit.md`](bringup/kit.md) (2026-11-10; "PR 2: owner kit list" below). |
 | 04 | **benchmark not met; track stopped 2026-11-09 (ADR-0003)**, partial result recorded, **out of order** (started before WO-02 merged) | #11, #13, #14, #16 (merged) | Two-task seed 0 finished (PickPlace seen 22.0%, +5.0); seeds 1-2 stopped flat at step 38. PickPlace-only finished at 20.7% (+3.7), below the owner's 27.0% bar, so stratified multi-task is not run. `docs/results.md`, ADR-0002 amendment 2. |
 | 07 | now "real demos + SmolVLA/ACT baseline"; code only, **out of order** (started before WO-06 bring-up is verified): pilot client/server and real-eval harness on fakes, **unverified on hardware** | #23, #29 (merged); SmolVLA/ACT code is PR 2 (`feat/smolvla-real`) | Mock pilot, gRPC server, `scripts/wo07_real_eval.py` (protocol 0.2), placement grid. No real trials. |
+| SmolVLA pivot, PR 2 | PR #32 open, code only, $0 (PR 1 #31 merged) | `feat/smolvla-real` | Convention, SmolVLA / ACT trainer, Mac in-process inference, protocol real-0.1, eval capture, vishwaroop export. **Unverified on hardware and GPU.** See "PR 2: SmolVLA and ACT on the real arm" below. |
 | 05 | cancelled with the OFT track (ADR-0003) | | |
 | 08, 09 | not started (08 is now filtered behaviour cloning in sim; plan in `docs/work-orders/WO-08-filtered-bc-sim.md`) | | |
 | pre-run hardening | merged | #28 (`fix/pre-run-hardening`) | Review `docs/reviews/2026-11-07-project-review.md` section 9, $0. See "Pre-run hardening" below. |
@@ -1062,6 +1067,1589 @@ process group?), Ctrl-Z in the Mac Terminal during motion and at a prompt (and N
 delivery to the Python child under `uv run` when the Terminal window closes, the port-busy recovery on a real interrupted packet, the capture offset, and the printed
 grid's scale and alignment with the real base.
 
+## PR 2: SmolVLA and ACT on the real arm (branch `feat/smolvla-real`, 2026-11-09, $0)
+
+### PR 2: train
+
+SmolVLA and ACT fine-tune code for the real arm (SmolVLA pivot handoff, PR 2 items 1-2), branch
+`feat/smolvla-real-train` on `feat/smolvla-real`, 2026-11-09. $0: nothing was launched.
+
+- `scripts/wo07_train.py --preset {tiny,real} --policy {smolvla,act}` calls LeRobot 0.4.4's
+  `lerobot_train.train` in-process, the path `wo01_smolvla_smoke.py` uses. The configs are
+  `configs/wo07_train.yaml` and `configs/wo07_train_tiny.yaml`, with `policies.<p>.base` from config.
+  - Before training, the script refuses any dataset whose `meta/info.json` departs from
+    `src/robot/convention.py`, and any whose `meta/vla_rl_so101.json` does not cite this convention
+    hash. It also refuses rehearsal recordings.
+  - SmolVLA gets `convention.SMOLVLA_RENAME_MAP`. LeRobot saves that map in the checkpoint's
+    preprocessor, and the reload check verifies it.
+  - Each run record holds the config hash, git commit, device, the convention citation, a dataset
+    hash (SHA-256 over every file) and a checkpoint content hash (`src/policy/lerobot_ckpt.py`).
+- Real defaults:
+  - SmolVLA: `lerobot/smolvla_base`, 20k steps, batch 64, LeRobot's dtypes (the VLM in bf16), chunk
+    50, 10 flow steps, images resized to 512.
+  - ACT: LeRobot defaults (100k steps, batch 8, ResNet-18 ImageNet), with chunk 50 from the
+    convention.
+- `--probe` runs N timed steps and writes s/step, peak VRAM and the projected h and $ to
+  `probe.json`. Exit code 3 means CUDA OOM.
+- `scripts/pod/wo07_train_job.sh` runs one policy per pod, in this order:
+  - checks the launch-gate token (before setup);
+  - runs setup;
+  - downloads the dataset at `DATASET_REVISION`;
+  - runs the probe at batch 64, then 32, then 16 on OOM;
+  - waits at the pod-scoped approval gate;
+  - runs the full training with periodic uploads;
+  - uploads the final checkpoint and runs/ to the private `KudratSingh22/vla-rl-so101-real-policies`;
+  - deletes the pod.
+  `DRY_RUN=1` runs every stage and gate on the Mac in a sandbox, on the `tiny` preset, and makes no
+  apt, Hub or RunPod call (tested with failing stubs).
+- Tiny check, Mac M3 Pro CPU, fp32. These are plumbing numbers, never results. Each run trains 3
+  steps at batch 2, saves, reloads, and computes the same chunk on dataset frame 0:
+
+  | Policy | Wall time | Median step | In-memory vs reloaded chunk | Note |
+  |---|---|---|---|---|
+  | SmolVLA (full `smolvla_base`, no reduced model) | 28.6 s | 1.6 s | 0.0 rad (same explicit noise) | a different noise seed moves the chunk by 1.20 rad |
+  | ACT (small dims, no ImageNet download) | 9.5 s | 0.49 s | 0.0 rad | |
+
+- Defect found and fixed (`lerobot_ckpt.load_checkpoint`): LeRobot builds SmolVLA's action expert in
+  bf16, so `from_pretrained` rounded fp32 weights trained on CPU to bf16. The effect was 0.156 rad on
+  a chunk after 3 tiny steps. The CPU path now loads the saved weights into the fp32 model. CUDA
+  and MPS checkpoints are bf16 already and are not affected. `wo01_smolvla_smoke.py load_policy` has
+  the same CPU issue and is left unchanged.
+- Cost, PROVISIONAL. Reprice from the probe before requesting spend. The live RTX 4090 Secure price
+  is $0.89/h (public GraphQL, 2026-11-09T05:35Z; community $0.34, A100 PCIe Secure $1.79). A 50 GB
+  volume costs $0.10/GB-month, about $0.17/day while it exists.
+  - SmolVLA reference: the guide quotes about 4 h on one A100, about $7.16 at $1.79/h.
+  - The 4090 speeds below are not measured. They assume a 4090 step takes 1.5–2.5× an A100 step at
+    batch 64, if that batch fits in 24 GB.
+
+  | Line | Estimate | Assumption |
+  |---|---|---|
+  | SmolVLA, batch 64 | RTX 4090 × 6.35–10.35 h = $5.65–$9.21 | includes 0.35 h of setup |
+  | SmolVLA, batch 32 (OOM fallback) | RTX 4090 × 3.35–5.35 h = $2.98–$4.76 | 0.54–0.90 s/step (half the batch-64 step), steps not rescaled, so half the samples; corrected in review round 1 (was 3.6–6.4 h = $3.2–$5.7, not derivable) |
+  | ACT | RTX 4090 × 1.75–3.15 h = $1.56–$2.80 | 0.05–0.10 s/step guessed |
+  | Probe, per pod | RTX 4090 × 0.5–1.0 h = $0.45–$0.89 | setup, probe and up to 30 min waiting for approval |
+- Open:
+  - Pin `dataset.revision` once the 50 demos are pushed.
+  - Owner choice: if SmolVLA drops to batch 32, keep 20k steps (the guide's count) or rescale them.
+  - Size `SPEND_CAP_SECONDS` from the probe.
+
+### PR 2: infer
+
+Branch `feat/smolvla-real-infer` (sub-branch of `feat/smolvla-real`, no PR), 2026-11-09, $0, mock
+rig only, **unverified on hardware**. Handoff PR 2 item 4: the Mac inference path.
+
+- `src/robot/local_policy.py`: `LocalPolicyClient`, an in-process SmolVLA / ACT client for the
+  existing `DeployLoop` with `PolicyClient`'s contract (`ActReply` or `ServerFault`). Deadman,
+  safety clip, servo-health torque-off, prompts and trial records are the loop's own, unchanged.
+  Observations go through `convention.policy_observation` and actions through
+  `convention.action_targets`. In between are the checkpoint's own LeRobot processors; for
+  SmolVLA that includes `SMOLVLA_RENAME_MAP` when the checkpoint saved no map.
+- Checkpoint identity: `checkpoint_sha256` over config, weights, both processor JSONs and the
+  processor state files (normalization stats), plus `checkpoint_revision` (Hub snapshot commit).
+  `local_policy.checkpoint_sha256` refuses a mismatch before the weights load and again in
+  `check_local`, before the arm is opened.
+- Deadline: inference runs on a worker thread with a deadline, `local_policy.request_timeout_ms`
+  (700 ms, below `deploy.max_chunk_age_ms` 800). A late or hung call is `server_timeout`, which
+  holds the arm. A hung call refuses every later query.
+- `DeployLoop` now takes a `CameraRig` (`pipe` gets every camera's frame). `configs/real.yaml`
+  gains a `local_policy` block, with `base: null` until a fine-tune exists.
+
+Latency on the mock rig, measured with `scripts/wo07_local_latency.py --preset real`. **Single
+run, mock rig** (fake arm, two fake 640x480 cameras; real deploy loop, safety filter, sim FK and
+model). **Excludes camera capture.** Mac: Apple M3 Pro (Mac15,7, 36 GB), macOS 26.5.2, torch from
+`uv.lock`, commit `32f057d`. 300 bus writes per run, 15 Hz (66.7 ms period). Each run warms up
+twice before the first trial.
+
+| Policy | Device | Chunk (in-process query) p50 / p95 / max ms | Model only p50 / p95 / max ms | Gap between bus writes p50 / p95 / max ms | Actions per chunk | Write Hz | Run |
+|---|---|---|---|---|---|---|---|
+| SmolVLA `lerobot/smolvla_base` (bf16) | MPS | 448.4 / 463.5 / 471.8 | 441.8 / 453.3 / 468.3 | 76.5 / 526.8 / 547.9 | 5.0 | 6.2 | `20261109T055550Z-wo07-local-latency-real-e73b` |
+| ACT, fresh untrained init, LeRobot defaults, chunk 50 (fp32) | MPS | 52.5 / 60.8 / 66.6 | 44.6 / 51.5 / 52.8 | 74.9 / 124.1 / 136.0 | 10.7 | 12.8 | `20261109T055653Z-wo07-local-latency-real-c3a2` |
+| SmolVLA `lerobot/smolvla_base` (fp32) | CPU fallback | warm-up 914 / 869 ms; first query timed out (`server_timeout`, hold), 0 writes | | | | | `20261109T055723Z-wo07-local-latency-real-aa28` |
+
+- No trained checkpoint exists yet. The ACT row is a freshly initialised ACT: random ResNet18,
+  placeholder stats centred on `home_qpos`. The SmolVLA row is the pretrained base. Neither
+  model's actions mean anything for this arm. All actions went through the safety filter
+  (SmolVLA: 193 clipped, 106 rejected). To time full chunks, the script sets
+  `deploy.stop_on_reject: false` for itself only. A rejected tick still writes the filter's
+  hold command on schedule.
+- **SmolVLA on MPS takes about 450 ms per chunk.** With `max_chunk_age_ms: 800` it executes only
+  5 of its 50 actions before re-querying. Writes then arrive at about 6 Hz: about 520 ms at each
+  chunk boundary, about 77 ms inside a chunk. CPU fallback (about 0.87 s per chunk) misses the
+  700 ms deadline, so it is not usable at these settings.
+- **Write gap inside a chunk is about 75 ms, not 66.7 ms.** On this Mac `time.sleep` overshoots
+  by about 8.8 ms p50 (60 x 60 ms sleeps, standalone). This affects the existing loop pacing on
+  both the gRPC and in-process paths.
+- Records show `dirty: true` for the second and third runs. The cause is the previous run's
+  untracked record directory; the code is commit `32f057d`.
+- Owner decisions before real SmolVLA trials: (a) overlap inference with execution (async
+  chunking; the loop's documented WO-08 item); (b) raise `max_chunk_age_ms`, a safety parameter
+  that is the owner's call; or (c) accept about 6 Hz. No change has been made.
+
+### PR 2: eval
+
+Branch `feat/smolvla-real-eval` (sub-branch of `feat/smolvla-real`, no PR), 2026-11-09, $0, CPU
+only, fakes and the mock rig only (no arm, camera, serial port, Hub push or RunPod action).
+Handoff final2 items 5-7 and the owner's amendments D1-D6. **Unverified on hardware.**
+
+**Protocol `real-0.1`** (`src/eval/protocol_real.py`, new; 0.1-draft and 0.2 untouched, sim keeps
+its objects). Composite hash `a39c1be29ec5f49d1bd2243842077eba2a1abf6690d12987d08fcf74a763d395`,
+pinned in `tests/test_protocol_real.py`; it covers the slot ids and the rules that chose them, the
+bowl and the constraint values it was derived from, the objects, the eval / demo / dev schedules
+in full, the grid geometry, the judging rule and rubric, the horizon and settle, and the
+convention hash (`b8701c57...`). Values, not file bytes.
+
+| Item | Frozen value | Why |
+|---|---|---|
+| Seen slots | `B2 B5 E2 E5` (corners of the inner 4x4) + `C4` | D1: one near each corner, one central. The block has no centre slot; `C4` is the central slot whose bowl distance (22.3 cm) is nearest the corners' mean (20.9 cm), so the middle training position is also mid-range in carry distance |
+| Bowl | (0.195, +0.205) m, fixed for every demo and trial | D2: derived (`derive_bowl`) on a 5 mm lattice: every one of the 36 slot centres >= MIN_SEP 11 cm + 5 mm away, >= keep-out 15 cm + 5 mm and <= PUSH_REACH 29 cm - 5 mm from the base; nearest the grid centre; tie to +y (front camera side). 11.75 cm from the nearest slot (C1), 28.3 cm from the base. Sim IK reaches it at release / carry / retreat heights (< 0.1 mm, tilt <= 20 deg). No position ahead of the grid fits (it would be >= 37 cm out) |
+| Objects | seen red cube; unseen purple cube + green cube (3 cm, the red cube's material; only colour differs) | D3: replaces the green cylinder on the real arm only |
+| Eval schedule | 150 trials, one seeded order across all cells; seen 10 x 5 slots; shifted 50 over the 20 ring slots (3 at every other slot around the ring, 2 at the rest); unseen 5 per slot per object | D3/D4; interleaving keeps drift off any one cell; `schedule_sha256` `dd1345de...` |
+| Demo schedule | 50 = 10 per seen slot (all seven 15 deg yaws + 3), red cube, fixed bowl | D1 |
+| Dev schedule | 30 trials (10 per cell), never reported; yaws on the half-step grid so no placement equals an eval placement | D5 |
+| Horizon / settle | 450 steps (30 s at 15 Hz = the teleop demo cap) / 3 s | the 0.2 horizon (150 = 10 s) fits OFT sim parity, not a teleop-paced real task |
+| Scoring | binary (real-judge-2 + rubric R1-R4); partial credit only as a secondary column from the blinded review | CLAUDE.md rule 4 |
+
+Placement sheet regenerated (`docs/assets/placement-grid-a3.pdf`): the five SEEN slots outlined,
+the 11 other inner slots "not used", the protocol hash, and a "bowl line" at x = 0.195 m: the bowl
+centre is 56.5 mm beyond the A3 sheet's left edge, so the sheet prints a reference tick at
+y = +0.105 m and the centre is 100.0 mm further along the line.
+
+**Real eval audit** (final2 item 5; `scripts/wo07_real_eval.py`):
+
+| Requirement | Before this branch | Now |
+|---|---|---|
+| Randomized trial order, seeded, recorded, same for both policies | partly: per-cell seeded slot permutation (`real_grid.sample_plan`), cells in fixed order, `placement_plan_sha256` per record, `--hardware` refuses another `--slot-seed` | real-0.1: one frozen order across cells, `schedule_pos` + `schedule_sha256` per record |
+| Initial object pose per trial from the grid | yes: `placement` per record (`client.run_trials`) | `planned_*` keys + `pose_source` |
+| Named labeler and success rubric in the record | judging rule text and hash only | `labeler` (`--labeler`, required on the arm) and `rubric` per record |
+| Fault after start = failure with reason | yes (`client._score`, `trial_fault`) | unchanged |
+| Resume skips started, retries never-started | yes (`done_indices`, `load_prior`) | unchanged; also re-hashes the checkpoint |
+| Two policies | one `--label` | `--family {smolvla,act}` (stable `family_id`), `--training-run-id`, `--checkpoint-dir` (content hash in the fingerprint); `--report A B` refuses unless same protocol hash and schedule, different checkpoints and the same recorded mode; `protocol_complete` only for two hardware sessions, two mock sessions give a report labelled MOCK (`mode: mock`, `mock_complete`) |
+
+Protocol 0.2 stays available as `--protocol 0.2` (the existing tests run it). On the arm, real-0.1
+refuses `--trials/--cells/--slot-seed`, a missing labeler or policy identity, a settle other than
+3 s and any convention departure (both cameras), before anything opens.
+
+**Evaluation capture** (6b; `src/robot/recording.py`, new): one LeRobotDataset v3.0 per session at
+`runs/<session>/capture/dataset`, episode = trial, written through the same
+`convention.recording_frame` and `create_dataset` as the demos (the recorder now imports them).
+`DeployLoop.on_write` (`src/robot/client.py`, a 10-line hook) hands each policy write's frame and
+step result to the capture; the loop reads both cameras through `RigFrameSource` (a fault on either
+is a lost frame). A not-started attempt is never an episode; a capture failure never reaches the
+arm or the score (recorded in `capture.error`). After the score one frame of each camera is saved as
+end-state stills for the blinded review. Resume appends (LeRobot's own resume path); a dataset left
+unfinalized by a SIGKILL cannot be reopened and the resume says so. Measured on the M3 Pro:
+0.40 ms per control tick, 4.5 s / 7.3 s to save a 10 s / 30 s episode of both cameras (single
+run, mock rig, synthetic solid-colour / still frames). Bench budget: superseded in review round 1
+(below): ~4.5 h for SmolVLA, ~2.9 h for ACT per 150 trials.
+
+**Label provenance** (6c): `scripts/wo07_blind_review.py` (new) pools the captured episodes of one
+or more sessions, shuffles them (seed recorded), and shows packets named by random ids (contact
+sheet of both cameras decoded with torchcodec + end-state stills), never the policy. Its
+`review.json` is the only input that makes an export declare `blinded_review`; live operator scores
+and automatic fault outcomes stay in the trial records with their own `outcome_source`. Label
+rule (decision, see open issues): `success` = every blinded reviewer said yes (R1) AND no fault
+after the start (R2, from the recorded fault).
+
+**Export** (7; `src/eval/export_bundle.py` + `scripts/wo07_export_bundle.py`, new): `demo` (dataset
+from `wo06_teleop_record.py --demo-schedule`) or `eval --session <run>` writes `declaration.json`
+(every section-2 field), `calibration.json` (the follower calibration copied into the dataset at
+record time, sha-checked), `rubric.json`, `placements.json` (demos) or `trials.json` (eval: every
+trial and attempt), `labels.json` only with `--review`, and for trained policies every checkpoint
+file + `checkpoint_files.json` (`checkpoint_id = sha256:` over all files, matched against the hash
+the session recorded). `object_pose` is null: only planned poses exist and vishwaroop reads
+`object_pose` as a per-frame stream. Family ids `so101-real-smolvla` / `so101-real-act`; session id
+= the recording session's id (demo: the recorder's run id; eval: the session's first run id).
+Refuses a missing or unknown value, a session without a recorded `mode` (not hardware), a mock
+session without `--allow-mock` (with it, `bundle.json` / `trials.json` carry `mock_label`), a dev session without
+`--include-dev`, an incomplete session without `--allow-incomplete`, other weights, a protocol or
+convention hash other than this code's. Sealing stays in vishwaroop.
+
+**Mock export against the real importer (D6), 2026-11-09.** vishwaroop `ba0eef6`, copied (read
+only; the original was never written) and run in the copy:
+
+```bash
+S=<scratchpad>; V="$HOME/Machine Learning Projects/vishwaroop"; C=$S/vishwaroop-copy
+rsync -a --exclude .git --exclude .venv --exclude '/data/' --exclude __pycache__ \
+  --exclude .pytest_cache --exclude .mypy_cache --exclude .ruff_cache "$V/" "$C/"
+cd "$C" && uv venv --python 3.13 .venv && VIRTUAL_ENV=$C/.venv uv pip install -r requirements-dev.txt
+# bundles: 2 demos via the real recorder path on fakes (--demo-schedule placements), a mock
+# real-0.1 session (1 trial per cell, capture on), its bundle, a blinded review and a 2nd bundle
+PYTHONPATH=src .venv/bin/python -m vishwaroop.data.so101_import seal --dataset <dataset> \
+  --declaration <bundle>/declaration.json --extra <bundle>/<each file in bundle.json extras> \
+  --export-id mock-demo-2026-11-09a --out $S/vw-exports        # and mock-eval-2026-11-09a / b
+PYTHONPATH=src .venv/bin/python -m vishwaroop.data.so101_import verify --export $S/vw-exports/<id>
+PYTHONPATH=src .venv/bin/python -m vishwaroop.data.so101_import import --export $S/vw-exports/<id> \
+  --split config/splits/so101-mock-v1.json --repo-root "$C"
+```
+
+Split (in the copy): demo session `train`, eval session `dev`, distinct scene groups. Results:
+all three seals `{"sealed": ...}` exit 0; verify exit 0 (demo: 2 episodes, cameras front + wrist,
+teleop; eval: 3 episodes, trained); import exit 0 for all three (`audit.status:
+declared_group_and_lineage_checks_passed`, contract v1 validator passed). Derived episodes:
+demo `teleop`, `assessment_method: unknown`, `success: null`; eval (labels null) the same with
+`family_id: so101-real-smolvla`; the labelled eval export `assessment_method: blinded_review`,
+`success` true/true/false, `reviewer_ids: [mock-reviewer]`; streams `state`, `rgb_front`,
+`rgb_wrist`. The real seal also refused, as the mirrored validator does, a unit `degrees`, a
+missing `robot_id`, a teleop policy with a `family_id`, and a labels method `operator`.
+
+**Gates:** full pytest 520 passed (+48 new: `tests/test_protocol_real.py` 13,
+`tests/test_export_bundle.py` 35); ruff, black, mypy --strict src clean; no shell files changed.
+`pyproject.toml`, `uv.lock`, `src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/env/success.py`
+and every reported number untouched.
+
+**Open issues for the owner:**
+- Horizon 450 steps (30 s) and the label rule (blinded R1 AND no recorded fault) are frozen in
+  real-0.1: confirm or overrule before the first demo (a change is a new protocol version).
+- The deploy loop still feeds the policy the front camera at the 224 crop (`PolicyImagePipeline`);
+  the two-camera SmolVLA / ACT input is the inference branch's (`RigFrameSource` already carries
+  both images). Its checkpoint identity should hash the same files as `checkpoint_identity`.
+- Bowl at 28.3 cm is 7 mm inside PUSH_REACH: reachable in the sim IK; check the real arm's reach
+  over it during the camera match before recording.
+- A capture refusal on resume (unfinalized dataset) happens after the arm is connected; the trial
+  records stay intact, but the session's capture cannot continue.
+- vishwaroop's ET-M5-1 wording is the owner's to amend there (final2).
+
+### PR 2: integration
+
+Branch `feat/smolvla-real` (the PR), 2026-11-09, $0, CPU / MPS, fakes and the mock rig only
+(no arm, camera, serial port, Hub push or RunPod action). `feat/smolvla-real-train`
+(`ba99ab2`), `-infer` (`c0362d8`) and `-eval` (`8d2fb2a`) merged as merge commits on Stage A
+(`b7faab8`); the only conflicts were the three STATUS sections, combined here under one heading.
+`src/robot/client.py` auto-merged (the infer branch's `PolicyBackend` / two-camera frame plus the
+eval branch's `on_write` / `object_fn` / `record_hook`).
+
+How the pieces were made to fit (all through `src/robot/convention.py`, `so101-real-obs-action`
+1.0, hash `b8701c57...c912b5`, unchanged):
+- **One checkpoint identity.** There were three (trainer: sorted globs incl. `train_config.json`;
+  local path: a fixed list without it; export: every file in the dir). Now
+  `src/policy/lerobot_ckpt.checkpoint_identity` is the only one: `local_policy.checkpoint_identity`
+  is it, `export_bundle.checkpoint_identity` hashes and bundles exactly `lerobot_ckpt.checkpoint_files`
+  (and refuses if its hash ever differs), and the Hub download of the local path fetches the same
+  globs. Trainer run record = deploy `checkpoint_sha256` = session `policy_identity` = export
+  `checkpoint_id` (`sha256:<same>`).
+- **One loader.** `local_policy.load_local_policy` now loads through the trainer's
+  `lerobot_ckpt.load_checkpoint` (new keyword args `config`, `n_action_steps`,
+  `preprocessor_overrides`), so the CPU fallback gets the train branch's bf16 fix (fp32 weights
+  re-read past LeRobot's bf16 action expert; `strict=False` as LeRobot's own `from_pretrained`).
+- **Real eval through the local path.** `scripts/wo07_real_eval.py --backend {grpc,local}`:
+  `local` loads the `--checkpoint-dir` checkpoint in process, refusing it unless it hashes to the
+  session's `policy_identity.checkpoint_sha256`, then `check_local` (convention, chunk 50,
+  protocol), all before the arm is connected; the loop reads the `CameraRig` itself (front +
+  wrist, uncropped, `local_pipe`), deadline and chunk from `local_policy`. It is the only backend
+  of a real-0.1 session on the arm (`grpc` refused there; the server serves OFT) and opt-in for the
+  mock (default stays the gRPC MockPolicy); protocol 0.2 refuses `local`; a resume keeps the
+  session's backend (older sessions = `grpc`). The evaluation capture (`open_capture`,
+  `EvalCapture.on_write`) takes the rig from either source; `DeployLoop.on_write` is typed for the
+  `RigFrame` the local path delivers. This closes the Stage A / eval open issue "the deploy loop
+  feeds the policy the front camera at the 224 crop" for real-0.1. `scripts/wo07_pilot.py` is
+  still gRPC / front only.
+- **Recorder -> trainer.** The trainer reads a dataset written by the real recorder unchanged
+  (tested: `dataset.synthetic: false` on a recorder session).
+
+New test `tests/test_pr2_pipeline.py` (7; SmolVLA cases skip without the cached base, as on CI):
+two demos through the real recorder on fakes (both cameras) -> `scripts/wo07_train.py --preset
+tiny` ON that dataset (ACT and SmolVLA) -> one identity across trainer / local / export -> the
+saved checkpoint loaded by `LocalPolicy` -> one `run_trials` tick through the real `DeployLoop`
+on the fakes (ACT: the deploy-path chunk equals the trainer loader's `predict_chunk` within 1e-5
+rad) -> `wo07_real_eval --mock --backend local` (1 trial per cell, capture on: 3 episodes, both
+image keys, `check_dataset_info` passes) -> eval bundle of that session + demo bundle of those
+demos through the importer mirror; plus the backend refusals. 6 pipeline cases in 77 s on the M3
+Pro CPU.
+
+**Mock export against the real importer (D6), again, on the integrated pipeline.** Same
+vishwaroop copy (`ba0eef6`, original never written). Scratch builder
+`<scratchpad>/mockexport-tools/make_pr2_bundles.py`: 2 demos (real recorder, fakes) -> tiny ACT
+and tiny SmolVLA trained on them -> one mock real-0.1 session per family through
+`--backend local` with `configs/real.yaml`'s `local_policy` as is (device `mps`) -> bundles; then
+`<scratchpad>/mockexport-tools/run_importer_pr2.sh` (seal, verify, import with split
+`so101-mock-pr2-v1`: demo session `train`, the two eval sessions `dev`). All 3 seals, 3 verifies
+and 3 imports exit 0 (`audit.status: declared_group_and_lineage_checks_passed`); verify reports
+cameras front + wrist for all three; derived eval episodes carry `family_id`
+`so101-real-act` / `so101-real-smolvla` and `checkpoint_id` `sha256:c5348af7...` /
+`sha256:2c6d5afd...`, equal to the training runs' `checkpoint_sha256`; labels undeclared
+(`assessment_method: unknown`, no blinded review in this run). Mock only, never a result.
+
+**Gates:** full pytest 550 passed after merging main (#30) (+7 in `tests/test_pr2_pipeline.py`), `ruff check src tests scripts`, `black --check .`, `mypy --strict src`
+clean; no shell file changed. `pyproject.toml`, `uv.lock`,
+`src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/eval/protocol_real.py`,
+`src/env/success.py`, `src/robot/convention.py` and every reported number untouched.
+
+**First paid run awaiting approval (provisional, reprice from the probe):** SmolVLA,
+`scripts/pod/wo07_train_job.sh` `POLICY=smolvla`, batch 64 (32 on OOM), 20k steps, estimated
+RTX 4090 (Secure $0.89/h) x 6.35-10.35 h = $5.65-$9.21, plus the probe per pod
+($0.45-$0.89). Needs the 50 demos pushed and `DATASET_REVISION` pinned first. Not launched.
+
+### PR 2: review round 1 (fixer)
+
+2026-11-09, $0, CPU / MPS, fakes and the mock rig only (no arm, camera, serial port, Hub push or
+RunPod action). Commits `dc7d09c` (the fixes) and `02d04ce` (a loader regression found while
+re-measuring). All 18 confirmed findings applied; none skipped.
+
+**Frozen values that changed (nothing was recorded under the old ones):**
+- Convention `so101-real-obs-action` **1.1**, hash `c387f175...b807b30c` (1.0 `b8701c57...` kept
+  pinned in the test as history). It adds one feature, `timing_s`, float32 `[write,
+  camera_frame]`: seconds since the episode's first command write, at the write and at the camera
+  grab (conv-3 / F6). A `[1]`-shaped scalar does not survive LeRobot 0.4.4's `save_episode` with
+  numpy 2, hence the pair. It has no `observation.` / `action` prefix, so LeRobot never makes it a
+  policy input.
+- real-0.1 composite hash is now **`edee44aa...83f279d749`**: it covers the convention hash. The
+  schedules are unchanged (eval `dd1345de...`, dev `21fe5598...`). The placement-grid PDF was
+  regenerated.
+
+**Per finding**
+- **conv-1 / F1 / F8, checkpoint provenance.** The trainer writes `vla_rl_so101.json` into every
+  `pretrained_model` dir, and it is part of the checkpoint hash. It holds the training run id, the
+  dataset's convention citation, `unit_map` (`robot.units`: arm sign / offset), calibration
+  sha256, dataset sha256 and session, the protocol citation and, for SmolVLA, the VLM. The VLM is
+  `HuggingFaceTB/SmolVLM2-500M-Video-Instruct`, resolved to a commit at training with the sha256
+  of every non-weight file (tokenizer, processor, configs), and re-checked after training.
+  - `load_local_policy` refuses another convention hash or `unit_map`.
+  - SmolVLA loads its VLM, processor and tokenizer from that exact snapshot
+    (`lerobot_ckpt.pinned_vlm_path`; `vlm_model_name` and the tokenizer step are pointed at the
+    local snapshot in memory only).
+  - The real arm requires the provenance. `--training-run-id` must equal the provenance's run id
+    (mismatch refused, F8). The real arm refuses an unverified run id; so does the export, except
+    for mock sessions.
+  - `local_mismatches` now compares the CHECKPOINT's cited convention, not this module's own.
+  - The convention docstring now says that `arm_sign` -1 mirrors a joint rather than rescaling
+    it.
+- **conv-2, demo-only training.** `wo07_train.py` refuses any recorded dataset that is not the
+  real-0.1 demo recording: purpose demonstration, `--demo-schedule`, this protocol hash, and every
+  episode placement equal to a demo of the frozen schedule at a seen slot. Only the tiny
+  synthetic dataset is exempt. The protocol citation is in the run record.
+- **conv-4, camera roles.** `camera.confirm_camera_roles` runs before torque, in every demo sitting
+  and every real-0.1 hardware session. It writes one labelled frame of each camera (FRONT /
+  WRIST) as a PNG, opens it in Preview, and requires the operator to type `yes`; anything else
+  ends with nothing recorded. The record (sheet, indices, time) goes into the sitting's provenance,
+  the run record and the capture provenance. macOS gives no stable camera id through OpenCV, so
+  this is an operator check, not an automatic one.
+- **conv-5.** The unused `convention.task_string` was removed. The task string comes only from
+  `protocol.instruction`, whose templates are in the convention hash.
+- **F1 (high) + F5, durable recordings.**
+  - `recording.DurableDataset` finalizes (Parquet footers) and reopens through LeRobot's resume
+    path after every saved episode, so each episode goes to new files.
+  - A kill can cost only the episode being saved. `recover_dataset` quarantines what that kill
+    leaves (a footerless data file, a video no episode references, the frame-PNG folder) and
+    rebuilds `meta/info.json` and `meta/stats.json` from the finalized episodes. Leftover PNGs
+    would otherwise be encoded into the next episode with the same index.
+  - The evaluation capture and the demo recorder both use it, and the provenance entry is written
+    before each checkpoint.
+  - A resumed real-0.1 session recovers and reopens its capture in `precheck_capture` before
+    anything is opened.
+  - `wo06_teleop_record.py --demo-schedule --resume` continues at the next demo after recovery.
+    It refuses a different protocol, convention, `robot.units`, calibration, or a broken prefix of
+    the schedule. The session id is kept and each sitting is listed under `sittings`.
+  - Cost: about 2.3 s per 10-frame episode on the M3 Pro, including the reopen.
+- **F2, device.** On the arm, MPS unavailable is refused (`DeviceUnavailable`), never a silent CPU
+  run. The in-process device and dtype are in the session fingerprint's policy component, and the
+  session run record's `device` is the policy's.
+- **F2 (eval), blinding.** `wo07_blind_review.py` records each session's checkpoint hash. It
+  declares `blinded_review` / `policy_identity_hidden` only when the clips pool at least two
+  different policies; otherwise it writes `unblinded_clip_review`. The export requires at least
+  two policies, this session's among them. The tests now review the SmolVLA and the ACT session
+  together, and a single-session review is refused.
+- **F3, retry in place.** `_run_schedule` re-runs a never-started item before the next one, up to
+  `MAX_START_ATTEMPTS` = 3 per run; after that the run ends and a resume retries the item first.
+  Every record carries `attempt`.
+- **F3 (latency).** `wo07_local_latency.py --capture` measures with the evaluation capture on
+  textured frames (table below).
+- **F4.** A resume loads the checkpoint path it just verified. `resolve_checkpoint` treats
+  anything path-like as local only and refuses it if it is not a directory, so a mistyped path is
+  never fetched from the Hub.
+- **F4 (budget).** The bench budget is now computed from the measured write rates (below).
+- **F6 / conv-3, timing.** Each trial's capture block and `trials.json` carry `write_rate_hz`,
+  `write_time_span_s` and `nominal_fps`. `bundle.json` warns when a rate is more than 10% off
+  15 fps and notes that LeRobot's timestamps are nominal.
+- **F7, capture order.** `DeployLoop.on_settled`, called at the end of the settle and before the
+  servo read and score prompt, reads the end-state stills; the record says when they were taken
+  (a faulted trial has no settle). The episode is saved after the scored record is logged and
+  flushed, then a `capture` row logs its index; `load_prior` merges those rows. The export fills
+  an episode whose capture row a kill lost from the capture provenance.
+- **F9.** Development sessions are declared `protocol_version` `real-0.1-dev`. A rehearsal, or a
+  recording without `--demo-schedule`, is refused by the demo export.
+- **F10.** Cost lines corrected above: batch 32 = 3.35–5.35 h = $2.98–$4.76; ACT $1.56–$2.80.
+- **Found while re-measuring (`02d04ce`).** In a fresh process, `load_local_policy` failed with
+  "Couldn't find a choice class for 'smolvla'". The integration's loader no longer imported
+  `lerobot.policies.factory` before `PreTrainedConfig.from_pretrained`. The tests had not caught
+  it because the trainer had already imported the factory in the same process. Fixed, with a
+  subprocess regression test that fails without the fix.
+
+**Latency, with and without the evaluation capture.** Single run, MOCK RIG (fake arm, two fake
+640×480 cameras; real loop, safety filter, sim FK and model). Excludes camera capture. Apple M3
+Pro (Mac15,7), macOS 26.5.2, commit `02d04ce` (ACT runs at `dc7d09c`, same loop code), 300 bus
+writes at 15 Hz, `max_chunk_age_ms` 800. Capture on = `EvalCapture` with LeRobot's 8 PNG threads,
+on a ring of 30 random-noise frames per camera (the worst case for PNG and AV1), saved and
+checkpointed after each 150-write trial. Untrained ACT and the pretrained `smolvla_base`: their
+actions mean nothing for this arm.
+
+| Policy | Capture | Chunk p50 / p95 / max ms | Gap between writes p50 / p95 / max ms | Actions per chunk | Episode save + checkpoint (150 frames) | Run |
+|---|---|---|---|---|---|---|
+| SmolVLA `smolvla_base` (bf16, MPS) | off | 439.7 / 484.1 / 527.4 | 71.8 / 517.2 / 596.4 | 5.56 | n/a | `...075558Z-...-c7cf` |
+| SmolVLA `smolvla_base` (bf16, MPS) | on | 433.9 / 476.4 / 535.7 | 71.7 / 507.3 / 607.6 | 5.66 | 4.99 / 5.10 s | `...075655Z-...-42ad` |
+| ACT, untrained (fp32, MPS) | off | 53.8 / 62.1 / 74.6 | 71.6 / 121.8 / 130.8 | 10.71 | n/a | `...075342Z-...-564e` |
+| ACT, untrained (fp32, MPS) | on | 45.3 / 61.5 / 70.9 | 71.5 / 114.1 / 139.5 | 10.71 | 5.28 / 5.50 s | `...075412Z-...-9df9` |
+
+In this single run, the capture's PNG threads did not push SmolVLA's chunk p95 toward the
+700 ms deadline. A save of a full 450-frame trial was not measured here; the earlier synthetic
+figure was 7.3 s.
+
+**Bench budget (estimate, from these single-run write rates).** A trial is 450 writes with no
+success latch. SmolVLA writes about 6.2–6.6 per second, so about 70 s of policy; ACT writes about
+12.8–13.2 per second, so about 35 s. Adding home ~5 s, place ~15 s, settle 3 s, score ~5 s and the
+save ~7 s gives:
+- SmolVLA: about 108 s per trial, about 4.5 h for 150 trials.
+- ACT: about 70 s per trial, about 2.9 h for 150 trials.
+
+The 450-step horizon is a fixed number of commands, so it covers different wall-clock times for
+the two families (stated in `scripts/wo07_real_eval.py` and `src/eval/protocol_real.py`). The
+SmolVLA session needs two bench sittings through `--resume`, or a command-rate decision first.
+
+**Mock export through vishwaroop's own tools, re-run on round 1.** Same scratch copy
+(`<scratchpad>/vishwaroop-copy`, vishwaroop `ba0eef6`; the original repo was never written).
+- Commands: `uv run python <scratchpad>/mockexport-tools/make_pr2r1_bundles.py <worktree>
+  <scratchpad>/mockexport-pr2r1`, then `bash <scratchpad>/mockexport-tools/run_importer_pr2r1.sh
+  <scratchpad>`.
+- Inputs: 2 demos through the durable recorder; tiny ACT and tiny SmolVLA trained on them (with
+  provenance); one mock real-0.1 session per family through `--backend local` (MPS, capture on);
+  a blinded review pooling the two sessions (6 clips, reviewer `mock-reviewer`); and one ACT dev
+  session.
+- Results: 4 seals, 4 verifies and 4 imports, all exit 0, `declared_group_and_lineage_checks_passed`.
+  Every bundle has both cameras and streams `state`, `rgb_front`, `rgb_wrist`.
+- The eval episodes import with `assessment_method: blinded_review` and `checkpoint_id`
+  `sha256:60f1845c...` (ACT) / `sha256:2f5846da...` (SmolVLA), equal to the training runs'
+  hashes; the bundled checkpoint files now include `vla_rl_so101.json`.
+- The dev session imports with `protocol_version` `real-0.1-dev`; the demos import as teleop.
+- Mock only, never a result.
+
+**Gates.** Full pytest 564 passed + 1 skipped (the SmolVLA-only case on its ACT parameter) at
+`2afaf5c`; shellcheck on `scripts/pod/wo07_train_job.sh` clean. `ruff check src tests scripts`, `black --check .` and
+`mypy --strict src` are clean. No shell file changed. `pyproject.toml`, `uv.lock`,
+`src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/env/success.py` and `docs/results.md`
+are unchanged.
+
+**Owner decisions still open (before the first demo):** items 1, 3 and 4 below were decided
+on 2026-11-09 (see "PR 2: owner follow-up"); item 2's horizon too (the label rule stands).
+1. ~~15 Hz instead of LeRobot's 30 fps (Stage A).~~ Kept: 15 Hz control, 30 fps cameras.
+2. ~~The 450-step horizon~~ (kept, shared by both policies) and the label rule (blinded verdict
+   AND no recorded fault).
+3. ~~The SmolVLA command rate~~: synchronous inference, `max_chunk_age_ms` 800, ~6.3 writes/s,
+   two sittings.
+4. ~~Whether to keep 20k steps if SmolVLA drops to batch 32~~: kept (half the samples, recorded).
+
+### PR 2: owner follow-up (capture gap, bowl check, baseline cadence)
+
+2026-11-09, $0, CPU / MPS, fakes, the mock rig and offline kinematics only (no arm, camera,
+serial port, Hub push, RunPod or workflow action). Main is NOT merged in here and the #33
+conflicts are not resolved here (a later step, after #33 lands).
+
+**1. Capture / resume gap (owner item 2).** A kill after a trial's scored record was flushed and
+before its episode was saved left three scored trials and two recordings.
+- Mechanism: the record hook now runs `EvalCapture.stage` BEFORE the record is logged. It waits
+  for LeRobot's PNG writer, writes the episode's state, action and timing (`frames.npz`),
+  hard-links the frame PNGs (a copy if a link fails) and the end-state stills into
+  `<capture>/staged/<trial id>/`, and writes `staged.json` last (renamed into place, so a journal
+  is whole or absent). A saved episode deletes its journal. Measured cost: 0.26 s per 450-frame
+  trial (mock rig, both cameras).
+- Resume (`reconcile_captures`, before any new trial), for each scored trial with no episode:
+  (1) its trial id is in the capture provenance (saved, then killed before its `capture` row):
+  attached; (2) else a whole journal exists: rebuilt and saved under the next free episode index
+  (`recovered`); (3) else flagged `recording_missing` with the reason. The slot is never re-run
+  and keeps its score; indices follow save order and the provenance maps each to its trial id.
+- Limits: nothing that was never staged can be recovered. That covers a trial the process died
+  in before its record (`session_lost`; staged at the session end only if the process lived to
+  run its `finally`), a kill while staging, a capture error, or a deleted or damaged journal.
+- Export: vishwaroop's declaration has no "incomplete" field (`docs/SO101_EXPORT.md` section 2;
+  `parse_declaration` / `check_export` read the copy at `<scratchpad>/vishwaroop-copy`), so a
+  scored trial without its recording REFUSES the evaluation bundle. A staged one says "resume
+  first". `--allow-missing-recordings` builds it declared `protocol_version`
+  `real-0.1-incomplete` (the same in-spec mechanism as `-dev`), with `status: INCOMPLETE` and the
+  missing trials in `bundle.json` and `trials.json`.
+- Regression test (`tests/test_capture_resume_gap.py`): a real SIGKILL of a child mock session
+  (`tests/capture_kill_child.py`) at the 3rd trial (a) after the scored record and before the save
+  (the owner's case), (b) inside LeRobot's save (data and video written, nothing finalized), and
+  (c) after the save, before its `capture` row; then a resume. Each case gives 3 scored trials, no
+  slot re-run, episodes {0, 1, 2} each mapped to its own trial, and a COMPLETE export. With the
+  journal deleted: `recording_missing`, the export refused, `--allow-missing-recordings` gives
+  INCOMPLETE with 2 episodes, and a second resume changes nothing. Hard timeout: SIGALRM raising
+  a BaseException, re-armed every second once it fires; the child has its own 240 s timeout.
+
+**2. Bowl check (owner item 3), offline through the REAL safety filter.**
+`scripts/wo07_bowl_check.py` runs the sim PickPlace oracle kinematically: hover, descend, close,
+lift, carry, lower, release, retreat, at all 25 used slots (5 seen + 20 ring) x the 7 schedule
+yaws. Every command passes through `src/robot/safety.py` built from `configs/real.yaml` with the
+sim FK. Two oracle variants: IK bounded by the safety joint limits (what a controller respecting
+the real limits commands), and the sim oracle unchanged (URDF range). Run
+`20261109T091250Z-wo07-bowl-check-real-0125` (scratch, not committed).
+- The limit: `workspace_box_m` y <= 0.20 m (TCP, base frame). The bowl centre at y 0.205 is
+  beyond it, and the oracle's TCP sits up to 9.3 mm from the bowl centre at lower / release /
+  retreat (grasp clearance + retreat offset).
+- Frozen bowl (0.195, 0.205): carry, lower, release and retreat are REJECTED at all 25 slots and
+  every yaw, with the TCP up to 1.05 cm outside the box. The pick phases pass. With the IK
+  bounded by the safety limits, they pass with only the gripper's intended -5 deg floor clip.
+  The unchanged sim oracle also clips wrist_flex (up to 5 deg) at the pick at 16 slots (its IK
+  uses the URDF range, the filter the URDF range less 5 deg), AND in the bowl phases, where the
+  clip DOES depend on the bowl position (corrected in review round 2 below: every option clips
+  wrist_flex at the carry or the retreat under the unchanged oracle).
+- Constrained re-derivation: `derive_bowl`'s rule (>= 11.5 cm from all 36 slots, keep-out,
+  reach - 5 mm) PLUS the box, shrunk by the 5 mm tolerance and the 9.3 mm TCP offset, on the
+  same 5 mm lattice. **No position satisfies all constraints.** The grid spans y +-8.75 cm, so 11.5
+  cm of separation needs |y| >= 0.2025 beside it, x <= 0.0275 behind it (outside the box's x >=
+  0.10) or x >= 0.3825 in front of it (beyond reach).
+- Closest options (each verified through the filter with safety-bounded IK, 175 placements):
+
+| Option | xy (m) | Violates | Separation | Base dist. | Box margin* | Filter verdict at the bowl | Central slot |
+|---|---|---|---|---|---|---|---|
+| frozen | (0.195, 0.205) | box | 11.75 cm | 28.3 cm | -1.93 cm | REJECT (carry..retreat) | C4 |
+| A: rule kept | (0.115, +-0.200) | box | 11.58 cm | 23.1 cm | -1.30 cm | REJECT (carry..retreat) | C4 |
+| B: box kept, max separation | (0.115, +-0.185) | separation (-1.37 cm vs 11.5) | 10.13 cm | 21.8 cm | +0.16 cm (own 8.4 mm offset; +0.07 at 9.3 mm) | pass with the safety-bounded IK (gripper floor clip only), cube over the floor 175/175; the unchanged oracle clips wrist_flex in the bowl phases (round 2) | C4 |
+| B': box kept, beside the grid | (0.205, +-0.185) | separation (-1.67 cm) | 9.83 cm | 27.6 cm | +0.12 cm (own 8.8 mm; +0.07 at 9.3 mm) | as B (round 2) | C4 |
+| C: in front | (0.385, 0.0) | reach (-10 cm vs 28.5) | 11.88 cm | 38.5 cm | (TCP 2.1 cm short of the centre: IK at full reach) | pass, 175/175 | C3 |
+
+  *Bowl centre to the nearest box face, after the 5 mm tolerance and the measured TCP offset.
+  Separation is a sim placement constraint (`MIN_SEP` 11 cm), not a safety limit. At 10 cm the
+  bowl's outer rim (~6.4 cm radius) still clears a 3 cm cube's corner (2.1 cm) by ~1.5 cm: a
+  CUBE-ONLY figure (round 2: +1.1 cm for B and +0.8 cm for B' with the 5 mm tolerance; the open
+  jaws at the nearest slot are not checked, no collision model). The
+  safety filter was not loosened. `protocol_real.py` is unchanged (the bowl, the hash and the
+  schedules stay as frozen). The central-slot rule still picks C4 for A, B and B'. Only C changes
+  it (to C3). The bowl stays PENDING: the owner chooses.
+
+**3. Baseline cadence (owner item 4).** Kept and now stated in `configs/real.yaml` and the eval
+docstring: 15 Hz nominal control, 30 fps cameras, ONE 450-command cap for SmolVLA and ACT,
+synchronous inference (no overlap), `max_chunk_age_ms` 800.
+Measured: single run, MOCK RIG (fake arm, two fake 640x480 cameras with 30 noise frames each;
+real loop, safety filter, sim FK and model), capture on, 450-command trials, Apple M3 Pro. These
+are untrained ACT and the pretrained `smolvla_base`, whose actions mean nothing for this arm.
+
+| Policy | writes/s per trial (p50) | Chunk p50 / p95 ms | Boundary gap p50 / p95 ms | In-chunk gap p50 ms | Actions / chunk | Policy s / trial | Stage s | Save + checkpoint s | Run |
+|---|---|---|---|---|---|---|---|---|---|
+| SmolVLA (bf16, MPS) | 6.27 | 438.6 / 476.6 | 513.7 / 547.5 | 76.5 | 5.14 | 68.5 (71.7 at 450 writes) | 0.26 | 7.87 | `20261109T091606Z-...-0977` |
+| ACT (fp32, MPS) | 12.86 | 41.1 / 48.3 | 115.1 / 122.9 | 75.5 | 10.84 | 34.9 | 0.26 | 7.50 | `20261109T091924Z-...-c2ba` |
+
+- Inside a chunk the loop writes every ~76 ms (about 13.1 Hz), not the nominal 66.7 ms, with the
+  capture on.
+- One SmolVLA chunk in 176 exceeded the 700 ms in-process deadline (`server_timeout`, 20 writes
+  into the 2nd trial, just after the 1st trial's 7.9 s save). On the arm that is a fault failure
+  for that trial. It is a single run: watch for it in the rehearsal. No setting was changed.
+
+Budget per 150-trial session (POLICY = the policy commanding; BENCH = everything else):
+
+| | Policy per trial | Bench per trial | Policy h | Bench h | Total h |
+|---|---|---|---|---|---|
+| SmolVLA | 71.7 s (450 / 6.27) | 36.1 s | 2.99 | 1.51 | 4.49 |
+| ACT | 35.0 s (450 / 12.86) | 35.8 s | 1.46 | 1.49 | 2.95 |
+
+Bench per trial = staging 0.26 s + save and checkpoint 7.5-7.9 s (both measured) + settle 3 s
+(protocol) + home ~5 s + placement / reset ~15 s + score ~5 s (the last three ESTIMATES; the mock
+cannot time them). The SmolVLA session needs two sittings through `--resume`.
+
+**4. Batch 32.** If the 24 GB probe needs batch 32, SmolVLA keeps 20,000 steps = 640k samples,
+HALF of batch 64's 1.28M. `configs/wo07_train.yaml` says so. `wo07_train.py` writes
+`results.batch_deviation` (reference batch, samples, fraction) whenever the batch is not the
+configured one, and the probe's projection carries it. Cost line unchanged: estimated RTX 4090 x
+3.35-5.35 h = $2.98-$4.76 at batch 32.
+
+**5. real-judge-3 rename: prepared, NOT applied** (the owner sequences it after #33 lands and the
+bowl is approved). It will touch:
+- `src/eval/protocol_real.py`: `JUDGING_RULE_VERSION` -> `real-judge-3`; `JUDGING_GENERAL`'s
+  start definition (the first policy goal write to the bus BEGAN; a definitively blocked first
+  goal is not started; a write that began and failed counts); `RUBRIC.rules` R2 / R4 to match;
+  recommended `RUBRIC_VERSION` "1" -> "2", which moves `TASK_VERSION` (the vishwaroop
+  `task_version`).
+- Hash inputs that move: `hash_components()["judging"]` (version and text) and `["rubric"]`. The
+  real-0.1 composite hash `edee44aa...f279d749` changes. The schedules (eval `dd1345de...`, dev
+  `21fe5598...`), slots, bowl, objects and convention hash do not.
+- `scripts/wo07_real_eval.py`: 6 references (docstring, the pooling and resume refusal text,
+  `JUDGING_RULE_VERSION` re-export). `src/robot/client.py`: 4 docstring references plus #33's
+  start semantics. `configs/real.yaml`: the `eval.settle_s` comment.
+- Tests: `tests/test_protocol_real.py` (`FROZEN` hash and the `real-judge-2` literal),
+  `tests/test_real_eval.py` (2 literals).
+- Docs: `docs/STATUS.md`, `docs/PLAN.md`, ADR-0003, `docs/bringup/WO-06-checklist.md`,
+  `docs/work-orders/WO-07-real-demos-baseline.md`.
+- The placement-grid PDF prints the hash's first 12 characters: regenerate it.
+- Effect on data: none (nothing has been recorded). A real-0.1 session started under real-judge-2
+  would be refused on `--resume` (the hash differs), as intended.
+
+**Gates.** Full pytest 570 passed + 1 skipped. `ruff check src tests scripts`, `black --check .` and
+`mypy --strict src` are clean. No shell file changed. `pyproject.toml`, `uv.lock`,
+`src/eval/protocol.py`, `src/eval/protocol_v02.py`, `src/eval/protocol_real.py` and
+`src/env/success.py` are unchanged; so is the real-0.1 hash `edee44aa...`.
+
+### PR 2: owner follow-up, review round 2
+
+2026-11-09, $0, CPU / MPS, fakes, the mock rig and offline kinematics only. Main still NOT merged
+in; the #33 conflicts are still not resolved here. Twelve confirmed findings, all applied.
+
+**Capture / resume (F1-F5).**
+- F1: a started trial that ended `session_lost` (a client error after the start, or a kill) had
+  no `trial_id`, so the session end never staged its open episode and the resume flagged it
+  `recording_missing` under `None`. The trial id now travels in `record_extra` (the start marker
+  and the `session_lost` record carry it); `load_prior` derives it for older rows. Test: a client
+  error at trial 2's score stages its 5 frames; the resume recovers them as episode 1; COMPLETE.
+- F2: a trial whose first write faulted on the bus (started, frames 0, no capture error) needs no
+  recording. One predicate, `recording.recording_required`, now drives `reconcile_captures`,
+  `capture_gaps` and `export_bundle.missing_recordings`; the stage records `frames 0` so a kill
+  between the record and the save does not turn it into a missing recording. Test: a bus fault on
+  trial 3's first write gives no RECORDING MISSING and a COMPLETE export with the trial under
+  `uncaptured_started_trials`.
+- F3: a recovery that fails while the journal is whole (a transient save error) is now
+  `recovery_failed`, NOT the sticky `recording_missing`; the next resume retries it. Only an
+  absent or damaged (`staged journal unreadable`) journal is flagged. The trial record, the
+  session's `capture` block and the export now classify alike. Test: one `OSError` on the first
+  resume's save; the second resume recovers it; COMPLETE.
+- F4: `load_prior` keyed rows by (cell, trial_idx, start_utc) at one-second resolution, so a
+  not-started attempt retried in the same second received its retry's episode ("episode 0 is
+  claimed by two trial records"). Rows are now keyed by attempt too, and a capture row is merged
+  only into a started record. Test: a failed move home, retried in the same (pinned) second.
+- F5: the regression test now compares the recovered episode with the capture as it stood before
+  the kill (state, action, timing exactly; the first and last frame of each camera by a per-read
+  pixel stamp, decoded with torchcodec), and a kill at trial 2 of 3 recovers episode 1 before the
+  resume records trial 3 as episode 2.
+
+**Bowl (round 2).** Run `20261109T100819Z-wo07-bowl-check-real-98ba` (scratch). Per option, both
+IK variants, the release window (share of the 3 cm TCP disc over the bowl floor inside the box
+after the 5 mm tolerance, and its inscribed radius), the box margin with the search's 9.3 mm and
+the option's own TCP offset, and the CUBE-ONLY rim clearance (the nearest of the 36 slots, any yaw,
+the bowl 5 mm closer; jaws not modelled):
+
+| Option | xy (m) | Violates | Nearest slot (rim-cube, cube only) | Box margin 9.3 mm / own | Release window inside / inscribed | Filter, safety-bounded IK | Unchanged oracle (URDF IK): bowl-phase joint clips | Central |
+|---|---|---|---|---|---|---|---|---|
+| frozen | (0.195, 0.205) | box | 11.75 cm (+2.73) | -1.93 / -1.93 cm | 29% / 0 mm | REJECT | reject; carry wrist_flex 3.9 deg x7 slots | C4 |
+| A | (0.115, +-0.200) | box | 11.58 cm (+2.56) | -1.43 / -1.30 cm | 29% / 0 mm | REJECT | reject; carry wrist_flex 5.0 x25, retreat 2.6 x25 | C4 (C3 at -y) |
+| B | (0.115, +-0.185) | separation -1.37 cm | 10.13 cm (+1.11) | +0.07 / +0.16 cm | 50% / 10 mm | pass, 175/175 placed | carry wrist_flex 5.0 x10, retreat 1.1 x25 | C4 (C3 at -y) |
+| B' | (0.205, 0.185) | separation -1.67 cm | 9.83 cm (+0.81) | +0.07 / +0.12 cm | 71% / 10 mm | pass, 175/175 | carry wrist_flex 3.6 x6, retreat 5.0 x25 | C4 |
+| D (new: box kept, largest window, cube clear) | (0.205, 0.180) | separation -2.17 cm | 9.33 cm (+0.31) | +0.57 / +0.63 cm | 81% / 15 mm | pass, 175/175 | carry wrist_flex 5.0 x25, lower 1.5 x25, retreat 5.0 x25 | C4 |
+| D' | (0.180, 0.180) | separation -2.17 cm | 9.33 cm (+0.31) | +0.57 / +0.69 cm | 81% / 15 mm | pass, 175/175 | carry wrist_flex 4.2 x25, retreat 4.1 x25 | C4 |
+| C | (0.385, 0.0) | reach -10 cm | 11.88 cm (+2.86) | +0.07 / -1.06 cm (TCP 2.1 cm short) | 71% / 10 mm | pass, 175/175 | carry wrist_flex 1.6 x4 | C3 |
+
+- (Superseded figures: the windows in this table used the 3 cm cube and the half-edge release
+  radius. With the 25.4 mm cube and the half-diagonal radius, 27.0 mm on the sim-bowl fallback
+  (owner hold on PR #32), B' is 73% / 10 mm; see "PR 2: owner hold fixes at 5126daa".)
+- No option keeps the whole release region inside the box: B keeps half of it (a release more than 10 mm
+  toward +y or -x of centre is rejected), B' 71%, D 81%. The box options with a 100% window
+  ((0.205, 0.165), 7.85 cm) put the rim over the nearest cube (cube-only clearance -0.67 cm):
+  infeasible, excluded from the ranking.
+- Joint limits: with the IK bounded by the filter's limits nothing clips (by construction); the
+  UNCHANGED sim oracle (the motion the sim demos teach) clips wrist_flex by up to 5 deg in the
+  carry and / or retreat at EVERY option, so the joint-limit constraint holds for none of them
+  under that oracle. The clip is the oracle using the last 5 deg of the URDF range that
+  `urdf_limit_margin_deg` withholds; teleop demos go through the filter and cannot exceed it.
+- No position satisfies all constraints. `protocol_real.py`, the bowl, the hash and the PDF are
+  unchanged; the filter is not loosened. The bowl stays PENDING.
+- Preflight: `src/eval/bowl_fit.py` (`bowl_box_problem`) now refuses a real-0.1 hardware session
+  (`real_hardware_problems`) and `wo06_teleop_record.py --demo-schedule` while the protocol bowl
+  lies outside the box after the tolerance and the 9.3 mm offset. Not a hash input.
+
+**Other.** The real-0.1 mock now defaults to the protocol's 450-command cap and the CLI text
+names it (it said `deploy.trial_max_steps`, 150). `wo07_train.py` writes
+`results.batch_deviation` BEFORE training, so a stopped or OOM run's record carries it.
+
+**Gates.** Full pytest 577 passed + 1 skipped. `ruff check src tests scripts`, `black --check .` and
+`mypy --strict src` are clean. No shell file changed. `pyproject.toml`, `uv.lock`,
+`src/eval/protocol.py`, `protocol_v02.py`, `protocol_real.py` and `src/env/success.py` are
+unchanged; so is the real-0.1 hash `edee44aa...`.
+
+### PR 2: sync with main (#33), durable start rows, real-judge-3 (2026-11-09, $0)
+
+Owner 2026-11-09: #33 merged as `10ced52` (CI green on main); sync #32 and integrate while the
+owner checks the bowl. Merge commit, no rebase or force push.
+
+**Conflicts and resolutions.**
+- `src/robot/client.py` `DeployLoop.__init__`: both hooks kept (#32's `on_write` / `on_settled`,
+  #33's `on_policy_start_retracted`). `_read_frame`: #33's `_pre_write_stop` / `_stopped` added,
+  #32's `Frame | RigFrame | None` signature kept. The step in `_loop`: #33's `stop_fn` selection
+  (`_first_goal_check(res, mark_ms, frame_time, t_capture)`), `try / except MotionStopped`, no
+  `finally`; #32's `self._wrote(frame, out)` after the step. `run_trial`'s retraction net is #33's.
+- `scripts/wo07_real_eval.py`: `JUDGING_GENERAL` stays #32's re-export from
+  `src/eval/protocol_real.py` (#33's wording ported there, see real-judge-3). `load_prior`: #33's
+  retraction handling combined with #32's capture rows, `trial_id` and attempt key (F4); every row,
+  the retraction too, is keyed by (cell, trial_idx, start_utc, attempt).
+- `docs/STATUS.md`: both sections kept.
+
+**Capture x retraction.** The `trial_start_retracted` row carries the attempt's
+`RETRACTION_KEYS` (attempt, trial_id, schedule_pos), so it cancels its own marker and never a
+same-second retry's. A retracted attempt is `not_started`: no policy write reached the capture,
+nothing is staged, `finish` discards its buffer, no recording is required. `load_prior` drops a
+retracted attempt's capture row. A staged journal now records its attempt (`JOURNAL_KEYS`):
+`recover_staged` discards a journal of another attempt (`STAGED_OTHER_ATTEMPT`), and the resume's
+reconcile discards any journal of a slot none of whose attempts started (`STAGED_NOT_STARTED`).
+
+**Durable start rows (`src/runs.py`).**
+- Synced metrics rows: `trial_started`, `trial_start_retracted` (`client.DURABLE_ROW_KINDS`) and a
+  new `session` row (the session settings, written once per run at its start), through
+  `Run.log_durable` (append, then sync metrics.jsonl; the run directory on the first durable row).
+  Not synced: decision rows, trial rows and capture rows (each trial / capture row is followed by a
+  synced record.json that holds it).
+- record.json: every write (start, each flush, the end) is tmp + sync + rename + directory sync;
+  the runs directory is synced once for the new run directory's entry.
+- Sync = `fcntl(F_FULLFSYNC)` where the OS has it (macOS; measured here), `os.fsync` otherwise
+  (Linux CI), and `os.fsync` when a filesystem rejects F_FULLFSYNC as unsupported (ENOTSUP /
+  EINVAL / ENOTTY). `Run.sync_method` and `results.durability` record which ran. Any other
+  `OSError` propagates.
+- Order on the first goal: write the marker, sync it, freshness re-check, final stop check, write.
+  A failed sync blocks the first goal exactly like a failed write (`start_marker_failed`:
+  `not_started`, hold, torque off, the session ends); the retraction row is synced too.
+- Recovery: `load_prior` rebuilds the session from the last `session` row when record.json is
+  missing or cut short (that run's torque off then counts as unconfirmed: the operator checks the
+  bus); `session_runs` reads it for a run whose record is lost. Without metrics.jsonl the trials
+  in record.json stand.
+
+**Latency** (mock `wo07_real_eval`, REAL clock, protocol 0.2, 30 trials, max 5 steps, gRPC mock
+policy, Mac M3 Pro, local SSD; single run each, MOCK RIG):
+
+| `policy_start_mark_ms` | p50 | p95 | max |
+|---|---|---|---|
+| with the sync (F_FULLFSYNC) | 4.32 | 5.86 | 6.69 |
+| without (append only) | 1.01 | 1.80 | 1.93 |
+| added | +3.3 | +4.1 | +4.8 |
+
+One F_FULLFSYNC call: p50 3.4 ms, p95 5.3 ms, max 6.1 ms (99 calls). Frame return to the first
+write of a trial: p50 80.6 ms with the sync, 76.3 ms without. Inside the 300 ms frame deadman and
+the 800 ms chunk limit; the freshness re-check after the sync covers a slow disk.
+
+**real-judge-3** (applied; the freeze stays PENDING).
+- `src/eval/protocol_real.py`: `JUDGING_RULE_VERSION = "real-judge-3"`; `JUDGING_GENERAL` carries
+  #33's start rule (the bus write of the first policy action was begun, even if that write then
+  failed; a first goal blocked before its write, also after the start marker, never started).
+  `protocol_hash()` moves `edee44aa957d...` -> `dca199e6da6275bddc047812e1ea83379a70f21778f564315c5483811c0954f2`
+  (judging version and text only); the test pins the new computed value, labelled PENDING.
+- `FREEZE_STATUS = "pending: bowl fit check"` and `freeze_problem()`: the hardware session and the
+  demo schedule refuse on it, next to `bowl_fit.bowl_box_problem` (which still refuses).
+- Not changed (owner: after the fit confirmation): `BOWL_XY_M`, `RUBRIC_VERSION` "1" and the
+  rubric rules text, the placement-grid PDF. The committed PDF is stale by the printed hash prefix
+  only; the tests check exactly that while the freeze is pending.
+- Literals: `scripts/wo07_real_eval.py`, `src/robot/client.py` (4), `configs/real.yaml`,
+  `docs/PLAN.md`, ADR-0003, WO-06 checklist, WO-07 work order. The resume refusal now covers
+  real-judge-1 and real-judge-2 sessions.
+
+**Reruns on the combined code (final head).**
+- PR #33's stop / resume list (all of `tests/test_deploy_prewrite_stop.py` plus the 10 named ids;
+  the judging test now has 2 cases): 71 passed.
+- Capture / recovery (`tests/test_capture_resume_gap.py`, `tests/test_pr2_review_fixes.py`): 20
+  passed, including the score-before-save interruption (`after_record`, `mid_save`,
+  `after_save`) and the 3 new retraction tests.
+- Export / protocol (`test_export_bundle.py`, `test_pr2_pipeline.py`, `test_protocol_real.py`):
+  58 passed + 1 skipped. `test_runs.py`: 4 passed.
+- vishwaroop importer mock on the final code (scratch copy, `make_pr2r1_bundles.py` +
+  `run_importer_s32b.sh`): 4 seals, 4 verifies, 4 imports exit 0,
+  `declared_group_and_lineage_checks_passed`; 11 episodes, both cameras; the eval rubric extra
+  says real-judge-3, hash `dca199e6da62`; the sessions' record says `F_FULLFSYNC`.
+- Full pytest 644 passed + 1 skipped. `ruff check src tests scripts`, `black --check .`,
+  `mypy --strict src`: clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/success.py`
+  and the pins unchanged.
+
+### PR 2: sync review (fixer, 2026-11-09, $0)
+
+Review of head `9041423`: S32-R1 / D1 (same defect), D2, D3, D4 confirmed; all applied, none skipped.
+The placement freeze stays ON HOLD (B' fit check): `BOWL_XY_M`, `RUBRIC_VERSION`, the rubric
+rules, the placement-grid PDF and the protocol hash are untouched; `bowl_box_problem` and
+`freeze_problem` still refuse.
+
+- **S32-R1 / D1 (power-loss rebuild of a resumed run dropped the earlier runs' trials).** A resumed
+  run writes the earlier runs' trials only to its record.json. `results_from_metrics` now takes
+  them from the run its synced `session` row says it resumed from (`load_prior` of that run,
+  recursively, so a lost parent record is rebuilt too), and `load_prior` merges this run's rows on
+  top with the usual (cell, trial_idx, start_utc, attempt) dedupe. A parent run that is gone, or a
+  cycle, refuses the resume (it would re-run scored slots). Tests: two-run chain with run 2's
+  record.json missing / cut (slots 0, 1 stand; the resume runs slot 2 only; run 1's record of
+  slot 0 is the session's), and the refusal. Both fail on `9041423`.
+- **S32-D2 (capture episode named by a synced record but not itself synced).** `EvalCapture.finish`
+  now syncs the files the save wrote (`src.runs.sync_tree`, mtime since the save, PNG folder
+  skipped) and every dataset directory BEFORE it drops the staged journal; the block carries
+  `sync_s` / `synced_files`, a failed sync keeps the journal (`sync_error`); the stills are synced
+  too; `recording.write_json` (provenance, journals) is atomic and synced (`write_durable`). And
+  `reconcile_captures` first clears a record's `episode_index` that the recovered dataset no
+  longer holds (or that the provenance maps to another trial): the trial is then attached,
+  recovered or flagged `recording_missing` (`lost_episode` keeps the old claim, `reconciled.lost`
+  lists it), never left claiming an index the next save reuses. Tests: episode 1 deleted from the
+  dataset while record.json claims it (trial 2 `recording_missing`, trial 3's journal recovered as
+  episode 1, export refuses COMPLETE and builds INCOMPLETE naming trial 2; fails on `9041423`:
+  trial 2 keeps claiming index 1), and the sync-before-drop order with a failing sync.
+- **S32-D3 (latency on the capture path).** Re-measured on real-0.1 with the capture on (below).
+- **S32-D4 (tests).** A cut back to the last synced metrics.jsonl offset (every later decision /
+  trial / capture row gone) with record.json as of its last write before it, over one run and a
+  two-run chain: `load_prior` scores the in-flight trial `session_lost`, `--resume` never re-runs a
+  started slot.
+
+Synced on stable storage now: the `trial_started` / `trial_start_retracted` / `session` rows,
+every record.json write, every saved capture episode (and its provenance / stills), staged
+journal index files. Still plain writes: decision / trial / capture rows (each trial / capture
+row is followed by a synced record.json holding it), staged frame files (a lost journal is
+flagged `recording_missing`, never attached).
+
+**Latency, real-0.1 with capture** (mock `wo07_real_eval`, REAL clock, 42 trials (14 per cell),
+max 5 steps, gRPC mock policy, fake checkpoint, Mac M3 Pro local SSD; single run each, MOCK RIG;
+`s32r2-measure-tools/measure_sync_real01.py` in the scratchpad):
+
+| `policy_start_mark_ms` | p50 | p95 | max |
+|---|---|---|---|
+| with the start-row sync (F_FULLFSYNC) | 4.73 | 6.00 | 6.95 |
+| without (append only; capture syncs on) | 1.52 | 1.94 | 2.59 |
+| added | +3.2 | +4.1 | +4.4 |
+
+- Protocol 0.2 (no capture, earlier run): 4.32 / 5.86 / 6.69 with, 1.01 / 1.80 / 1.93 without.
+- The reviewer's own real-0.1 run before the capture sync (about 120 first decisions) saw a max of
+  13.48 ms. This run, with the episode synced between trials, saw 6.95 ms. Both are single runs;
+  the bench Mac's disk is unmeasured. Both are far inside the 800 ms chunk limit, and the
+  freshness re-check after the sync covers a slow disk.
+- Capture episode sync (new, between trials, never during motion): p50 23.3 ms, p95 26.6 ms, max
+  31.7 ms; 7 to 8 files per episode. Frame return to a trial's first write: p50 80.1 ms with the
+  start-row sync, 75.0 ms without.
+
+**Reruns on the combined code (`d26e275`; the docs commit after it changes no code).**
+- PR #33's stop / resume list (all of `tests/test_deploy_prewrite_stop.py` plus the 10 named ids):
+  76 passed (71 + the 5 new power-loss tests).
+- Capture / recovery (`test_capture_resume_gap.py`, `test_pr2_review_fixes.py`): 22 passed (20 + 2
+  new), including the score-before-save interruption (`after_record`, `mid_save`, `after_save`).
+- Export / protocol (`test_export_bundle.py`, `test_pr2_pipeline.py`, `test_protocol_real.py`): 58
+  passed + 1 skipped. `test_runs.py`: 4 passed.
+- vishwaroop importer mock (scratch copy's real tools, `make_pr2r1_bundles.py` +
+  `run_importer_s32c.sh`): 4 seals, 4 verifies, 4 imports exit 0,
+  `declared_group_and_lineage_checks_passed` x4; 11 episodes, both cameras; eval rubric
+  real-judge-3 / `dca199e6da62`; records `F_FULLFSYNC`; every eval episode synced (9 to 12 files,
+  20 to 25 ms, no `sync_error`).
+- Full pytest 651 passed + 1 skipped. `ruff check src tests scripts`, `black --check .`,
+  `mypy --strict src`: clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/success.py`,
+  `protocol_real.py` and the pins unchanged in this round.
+
+### PR 2: F_FULLFSYNC required on the real arm (owner 2026-11-10, $0)
+
+Owner: "For real-arm journal writes on macOS, require F_FULLFSYNC to succeed. If it is
+unsupported or fails, block the first policy goal and use the existing safe shutdown path. Keep
+platform-appropriate syncing for Linux and directories." Fakes and the mock rig only. The
+placement freeze stays PENDING (B' waits for the owner's cube / cup measurements and the
+unpowered fit results; the geometry checks rerun with the real dimensions before any freeze):
+`BOWL_XY_M`, `RUBRIC_VERSION`, `FREEZE_STATUS`, the placement-grid PDF and the protocol hash
+inputs are untouched.
+
+- **Sync policy** (`src/runs.py` `SyncPolicy`, `journal_sync_policy`). Fixed per `Run` at
+  construction and written to record.json (`sync: {policy, methods}`, every method used).
+  `full_fsync_required` when the session drives the real arm (`--hardware` of `wo07_real_eval`
+  and `wo07_pilot`) and `sys.platform == "darwin"`; `best_effort` otherwise (Linux keeps
+  `os.fsync`; mock / scripted sessions keep the F_FULLFSYNC -> fsync fallback, the method recorded).
+  Under the required policy a FILE sync is a successful `fcntl(F_FULLFSYNC)` or it raises
+  `FullFsyncRequired` (an `OSError` with the errno; ENOTSUP when fcntl has no F_FULLFSYNC, else the
+  fcntl error: ENOTSUP, EINVAL, ENOTTY, EIO, ...). There is no `os.fsync` fallback. F_FULLFSYNC is
+  read from `fcntl` at each call, not at import.
+- **Journal writes covered** (the ones a resume depends on): the `session`, `trial_started` and
+  `trial_start_retracted` rows (`Run.log_durable`); every record.json write (its tmp file before
+  the rename; a failed sync never renames an unsynced file into place); the evaluation capture's
+  provenance, staged journal index, saved episode files and end-state stills
+  (`EvalCapture.sync_policy`, the session Run's). The pilot never resumes, so only its record.json
+  is synced (strictly on the arm); its metrics rows stay plain appends.
+- **Directories** keep the platform's best-effort sync under both policies. The owner said to keep
+  it, and the computed brief assumed F_FULLFSYNC "does not apply to directories". That assumption
+  is wrong: on this Mac (macOS 26, APFS) `fcntl(dirfd, F_FULLFSYNC)` returns 0. So directories get
+  F_FULLFSYNC where the filesystem accepts it, else `os.fsync` (Linux, or a filesystem that rejects
+  it). A directory sync never blocks motion on its own, because the file's F_FULLFSYNC before it
+  has already flushed the drive.
+- **First goal.** A required F_FULLFSYNC that fails on the start row is a marker that could not be
+  saved, and it takes the existing path. The goal is blocked (zero policy writes). The attempt is
+  `not_started` / `start_marker_failed`, and its detail names `FullFsyncRequired`, `[Errno N]` and
+  the cause. The retraction is the same as today, then the existing safe shutdown runs (hold,
+  support / grace, torque off). If F_FULLFSYNC stays unavailable, the retraction and the record
+  flush fail too. The error then propagates after the shutdown, as with the full disk (F33-R5):
+  record.json is the last good synced one, and the attempt row is in metrics.jsonl.
+- **Preflight (added, as preferred).** `wo07_real_eval --hardware` and `wo07_pilot --hardware`
+  check the journal first (`probe_full_fsync`): a temp file in the runs directory is written,
+  synced under the hardware policy and removed, then the directory is synced. This runs once,
+  after the 'go' and config checks and before the policy server, camera or port is opened (so
+  before torque on). Without F_FULLFSYNC the session refuses with "refusing the hardware
+  session; nothing was opened". The run, session and capture directories are all created under
+  the runs directory, so they are on the probed filesystem. The per-write requirement still holds
+  after the probe. Why do both: the probe moves the common failure (a volume that cannot
+  F_FULLFSYNC) to before the arm is powered, and the per-write check covers a disk that fails
+  later. The result is recorded in `durability.preflight` (real eval) or `journal_preflight`
+  (pilot).
+- **Tests** (new: 6 cases in `tests/test_deploy_prewrite_stop.py`, 10 in `tests/test_runs.py`):
+  - A simulated macOS real-arm session (mock rig, `journal_sync_policy(real_arm=True,
+    platform="darwin")`, fake fcntl), with F_FULLFSYNC unsupported (attribute missing / ENOTSUP)
+    or failing (EIO) at slot 0's start row. Asserted: no `os.fsync` on any journal file (none in
+    the whole session), zero policy goals after the marker, the hold, torque off,
+    `start_marker_failed`, not_started with the errno, the retraction F_FULLFSYNCed, record
+    `sync == {full_fsync_required, [F_FULLFSYNC]}`, and `--resume` retries slot 0 at the same
+    placement.
+  - The same with F_FULLFSYNC gone for good (missing / ENOTSUP): no fsync, no goal, the shutdown
+    runs, the error propagates, and the resume retries the slot.
+  - A mutation test showing that restoring the fallback lets the first goal through.
+  - The preflight refusal for both scripts, with nothing opened.
+  - Unit tests for the policy matrix, the no-fallback file sync for missing / ENOTSUP / EINVAL /
+    ENOTTY / EIO, directories best effort, Linux `os.fsync`, the Run's record and the probe.
+  - Mutation check by hand: `src/runs.py` with the required branch disabled (fallback restored)
+    fails 13 of the 14 new required-policy cases (the policy-matrix case does not touch syncs).
+    The source was restored.
+
+**Reruns on this code** (Mac M3 Pro; same counts expected on CI's Linux, where the darwin
+behaviour is simulated):
+- PR #33's stop / resume list (all of `tests/test_deploy_prewrite_stop.py` plus the 10 named ids):
+  83 passed (76 + 7 new).
+- Sync failure (`-k` sync / fullfsync / marker_failure / disk_full / preflight / darwin, over
+  `test_runs.py` and `test_deploy_prewrite_stop.py`): 25 passed.
+- Recovery, which covers the power-loss rebuild, chained runs, capture recovery and the
+  score-before-save interruption (`after_record`, `mid_save`, `after_save`). The `-k` selection
+  over `test_capture_resume_gap.py`, `test_pr2_review_fixes.py` and `test_deploy_prewrite_stop.py`
+  gave 34 passed. The capture / recovery files in full gave 22 passed.
+- Export / protocol (`test_export_bundle.py`, `test_pr2_pipeline.py`, `test_protocol_real.py`): 58
+  passed + 1 skipped. `test_runs.py`: 14 passed (4 + 10).
+- Full pytest: 668 passed + 1 skipped (651 + 17 new). `ruff check src tests scripts`,
+  `black --check .` and `mypy --strict src` are clean. Pins unchanged.
+
+Unverified on hardware: F_FULLFSYNC on the bench Mac's own disk (the preflight will say so at
+the first `--hardware` start). Spend, credentials and the powered steps 9-10 stay on hold.
+
+### PR 2: F_FULLFSYNC review round (2026-11-10, $0)
+
+Review of `0edfe69` (the F_FULLFSYNC round above): six confirmed findings (two pairs overlap), all
+applied. Fakes and the mock rig only. The placement freeze stays PENDING: `BOWL_XY_M`,
+`RUBRIC_VERSION`, `FREEZE_STATUS`, the placement-grid PDF and the protocol hash inputs are
+untouched. Spend, credentials and the powered steps 9-10 stay on hold.
+
+- **F1 (medium): resume capture recovery ran before the preflight, best effort.** A
+  `--resume --hardware` real-0.1 session ran `precheck_capture` (quarantine moves, provenance
+  pruned and rewritten) before `preflight_journal`, with no policy, so on macOS that provenance
+  write could fall back to `os.fsync`, and a volume without F_FULLFSYNC had its capture changed
+  before the refusal. Fix: `run()` runs `preflight_journal` FIRST for every `--hardware` session
+  (before `load_prior` and the capture precheck; `run_hardware` takes its result), and the session
+  policy is threaded `precheck_capture` -> `check_capture_resumable` -> `recover_capture` ->
+  `recover_dataset`.
+- **F3 (low): the capture recovery's own rewrites were never synced.** `recover_dataset`
+  (lerobot `write_info` / `write_stats`, quarantine moves) now syncs `meta/` under the session
+  policy every time (also when it finds nothing left to change: an earlier recovery whose sync
+  failed may have left its rewrites in the page cache) and, when anything moved, every directory of
+  the dataset and of the quarantine. A newly created capture dataset (a new session, or the empty
+  restart after a kill in the first save: meta, the calibration copy, the stash rename) is synced
+  at open, before the first trial.
+- **F4 (low): directory doc and record.** The module doc said a directory sync never blocks motion
+  "as the file sync before it already flushed the drive". Wrong for `write_durable`: the rename
+  comes after the file's F_FULLFSYNC, so only the directory sync (or the next F_FULLFSYNC, which
+  flushes the whole drive cache) makes it durable. Corrected. Directories stay best effort, as the
+  owner asked; on the arm the next journal F_FULLFSYNC is at the latest the next `trial_started`
+  row, before any motion. record.json now records the directory methods too
+  (`sync: {policy, methods, dir_methods}`), and the preflight adds a `directory_note` (printed as
+  a WARNING) when, under the required policy, the directory sync was not F_FULLFSYNC.
+- **F2 (medium) / F1b / F2b: tests did not pin the capture, the hardware mode or the pilot.** The
+  darwin helper now drives the session as the hardware one (`session(mode="hardware")`, the
+  script's own `journal_policy(mode)` with `sys.platform` simulated as darwin) instead of a
+  lambda that ignored the mode. The pilot got a `journal_policy(mode)` helper like the real eval.
+  New tests (`tests/test_deploy_prewrite_stop.py`, `tests/test_runs.py`):
+  - a real-0.1 capture session as the macOS hardware session: every capture file sync
+    (provenance, calibration copy, info.json, staged index, episode parquet files, the stills) is
+    an F_FULLFSYNC, the new dataset is synced before the first trial, no `os.fsync` on any file;
+  - the first episode save's sync meeting a missing / ENOTSUP F_FULLFSYNC: `sync_error` names
+    `FullFsyncRequired`, the staged journal is kept, no `os.fsync`;
+  - `--resume --hardware` of a capture killed mid-save: without F_FULLFSYNC the preflight
+    refuses first and the capture is byte-for-byte untouched (no quarantine); F_FULLFSYNC lost
+    between preflight and recovery: the recovery refuses the resume, no fsync; with F_FULLFSYNC:
+    provenance, info.json and stats.json F_FULLFSYNCed, then the `--i-am-present` refusal;
+  - the pilot's hardware session: record.json `sync.policy == full_fsync_required`, no fsync;
+  - `sync_tree` under the required policy raises on a file (missing / ENOTSUP), never fsync;
+  - a volume rejecting F_FULLFSYNC on directories only: recorded in `dir_methods`, noted by the
+    preflight, file syncs still F_FULLFSYNC.
+- **Mutation check** (`tests/test_runs.py` + `tests/test_deploy_prewrite_stop.py`, scratch
+  script, source restored after each): each of these now fails at least one test: open_capture
+  without the policy (the reviewer's mutation a); the real-eval Run on the mock policy (b); the
+  pilot Run best effort (c); `sync_tree` without the file policy; `run()` without the precheck
+  policy; `check_capture_resumable` / `recover_capture` -> `recover_dataset` without the policy;
+  the preflight after the precheck; the recovery's meta sync best effort; the new-dataset sync
+  removed; the fallback restored in `sync_fd` (19 failures). Not caught: dropping the record.json
+  rename's own directory method from `dir_methods` (the same method is recorded by the run's
+  other directory syncs).
+
+**Reruns on this code** (Mac M3 Pro; the darwin behaviour is simulated, so CI's Linux runs it too):
+- PR #33's stop / resume list (all of `tests/test_deploy_prewrite_stop.py` plus the 10 named ids):
+  88 passed (83 + 5 new).
+- Sync failure (`-k "sync or fullfsync or marker_failure or disk_full or preflight or darwin"`
+  over `test_runs.py` and `test_deploy_prewrite_stop.py`): 33 passed.
+- Recovery (`-k "power_loss or chained or recover or killed or after_record or mid_save or
+  after_save or rebuild or resume"` over `test_capture_resume_gap.py`, `test_pr2_review_fixes.py`
+  and `test_deploy_prewrite_stop.py`: the power-loss rebuild, chained runs, capture recovery, the
+  score-before-save interruption): 33 passed. The capture / recovery files in full: 22 passed
+  (`test_a_saved_episode_is_synced_before_its_journal_is_dropped` now tells the new dataset's
+  sync at open apart from the episode saves).
+- Export / protocol (`test_export_bundle.py`, `test_pr2_pipeline.py`, `test_protocol_real.py`): 58
+  passed + 1 skipped. `test_runs.py`: 17 passed (14 + 3 new).
+- Full pytest: 676 passed + 1 skipped (668 + 8 new). `ruff check src tests scripts`, `black --check .` and
+  `mypy --strict src` are clean. Pins unchanged.
+
+Known and left as is (not in the confirmed findings): the staged journal's `frames.npz` and frame
+PNG links are not synced (only `staged.json`, written last, is); after a power loss a journal
+whose frames did not reach the disk is flagged unreadable by `recover_staged` (never guessed).
+Unverified on hardware: F_FULLFSYNC on the bench Mac's own disk (the preflight reports it at the
+first `--hardware` start).
+
+### PR 2: owner kit list (branch `feat/smolvla-real-kit`, 2026-11-10, $0)
+
+The owner's list of the items actually used for training, runs and evaluation, with "multimeter
+not needed, table will be all white". Bill of materials: [`docs/bringup/kit.md`](bringup/kit.md),
+linked from the WO-06 checklist, the WO-06 / WO-07 work orders, `docs/PLAN.md` (hardware line)
+and here. Code and docs only, no device opened. **The placement freeze stays PENDING**
+(`FREEZE_STATUS` "pending: bowl fit check"; `BOWL_XY_M`, `RUBRIC_VERSION` and the committed A3
+PDF unchanged; no regenerated PDF committed).
+
+- **Real-0.1 objects** (`src/eval/protocol_real.py`, real only; protocols 0.1-draft / 0.2 and
+  `src/env/**` untouched). One set, hand2mind 1-inch wood cubes: RED seen (PickPlace), PURPLE and
+  GREEN unseen, BLUE recorded as the seen Stack base (`STACK_BASE_OBJECT`, deferred, unused in
+  real-0.1). Edge 25.4 mm NOMINAL until measured; "wood, same set: same edge, mass and finish;
+  only the colour differs"; colours as supplied in the set (the sim RGBA is no longer a hash
+  input). Every real-arm "3 cm cube" statement replaced (protocol, bowl check, checklist step 10,
+  ENVIRONMENT hardware, START_HERE). Bowl = LE TAUCI 8 oz bouillon cup, white (`bowl_spec()`).
+- **Pending measurements in ONE place:** `protocol_real.MEASURED` (`PropMeasurements`, mm, None =
+  PENDING): `red_cube_edge_mm`, `bowl_outer_rim_diameter_mm`, `bowl_inside_floor_diameter_mm`,
+  `bowl_table_to_rim_height_mm`. `freeze_problem()` refuses while any is None (also with
+  `FREEZE_STATUS` frozen); they are hash inputs (`props`, `bowl`); `src/eval/bowl_fit.py`
+  `geometry()` reads them for the release radius, the cube-to-rim clearance and the new
+  carry-over-rim clearance, used by `scripts/wo07_bowl_check.py` (its record now carries
+  `geometry` with per-value sources and `carry_rim_clearance_m`). While pending, the cube is the
+  25.4 mm nominal and the cup values are the sim bowl's, labelled `PENDING measurement: sim bowl
+  fallback`. After the owner's numbers: one edit of `MEASURED`, rerun the bowl check, then the
+  freeze. The bowl check's numbers now use the 25.4 mm cube (release radius then 32.3 mm instead of
+  30 mm, corrected to 27.0 mm below; in the tests the frozen bowl is still REJECT and B' still passes at C4); the B' / D tables above were
+  computed with the 3 cm cube and are superseded by that rerun. Interim rerun of B' (0.205, 0.185)
+  with the nominal 25.4 mm cube and the sim-bowl fallback (`wo07_bowl_check.py --preset real
+  --bowl 0.205 0.185`, CPU, single run, NOT the real cup's numbers): safety-bounded IK passes
+  every phase at all 25 slots x 7 yaws (only the intended gripper-floor clip), 175/175 cubes over
+  the floor, box margin +0.14 cm (own TCP offset 8.6 mm), release window 70% / 10 mm (was 71% /
+  10 mm; both before the half-diagonal correction below, now 73% / 10 mm), cube-to-rim clearance +1.13 cm, carry over the rim +2.03 cm; the unchanged-oracle (urdf)
+  variant clips wrist_flex in carry (3.3 deg, 6 slots) and retreat (5.0 deg, 25 slots), as with
+  the 3 cm cube. Correction (owner hold on PR #32): the release radius kept only the cube's
+  half-edge clear of the floor edge; the whole cube at any yaw needs its half-diagonal, so with
+  the 25.4 mm cube and the 90 mm sim-bowl floor it is 27.0 mm, not 32.3 mm. B' window now 73% /
+  10 mm: the share rose because the disc shrank (in-box release area ~2281 -> ~1679 mm2). No
+  verdict changed (B' passes at C4, frozen bowl REJECT, 175/175). Still sim-fallback numbers.
+- **PR #32 owner hold fixes** (2026-11-10, CPU/mock only): `--resume` refuses a session recorded
+  in the other mode before anything is written (`check_resume_mode`); an episode whose save sync
+  failed stays PENDING (no `episode_index`, `summary.recordings_pending`, not protocol-complete,
+  every export refused) until a resume verifies and syncs it (`EvalCapture.confirm_saved`);
+  `--report` gives `protocol_complete` only for two hardware sessions and labels mock reports
+  MOCK; the bowl release radius uses the half-diagonal (above). The review round and the
+  reruns: "PR 2: owner hold fixes at 5126daa" below.
+- **Scene facts as hash inputs** (`scene_spec()`): table all white; one 17-inch LED
+  clamp lamp set ONCE to 5000 K, position recorded at the camera match; exposure / white balance
+  locked on both cameras; C920x on the NEEWER UA057 magic arm at `front_left_45` (eye and target
+  read from `src/env/cameras.py`); 32 mm wrist module on the gripper mount. **New real-0.1 hash
+  `1d5674420b6d3a55636a98b63c72ccd9bafcce40a2515caf2d7abcbdf74cf19c`** (was `dca199e6da62`;
+  allowed, the freeze is pending; pin updated in `tests/test_protocol_real.py`). Slots,
+  schedules (eval / dev sha256 unchanged), seeds and the bowl position unchanged.
+- **White table + white cup (RISK).** Low contrast of the cup rim on the white table for both
+  cameras. Recorded in the protocol (`WHITE_ON_WHITE_RISK`), the WO-06 checklist step 7 (item 5:
+  the rim must be visible in both cameras under the 5000 K lamp with exposure locked; adjust the
+  lamp or the locked exposure once, never the table or the cup) and `docs/bringup/kit.md`. The sim
+  stays wood-coloured (0.2 frozen); the WO-08 plan says the two-camera sim protocol should use a
+  white table, a white cup of the measured size and 25.4 mm cubes.
+- **Cameras and light** (`configs/real.yaml`, checklist steps 6-7): the C920x on the magic arm at
+  the sim pose (numbers in the config comment and the checklist), the wrist module on the gripper
+  mount (3D-printed from the LeRobot SO-101 files if the kit has none), the lamp set once to
+  5000 K, then `cameras.front.controls` / `cameras.wrist.controls` (auto exposure / auto WB off,
+  `white_balance_k: 5000`, exposure / gain / tool recorded; C920x autofocus off). On macOS
+  OpenCV / AVFoundation cannot set UVC controls, so they are set with a UVC tool and recorded by
+  hand; no code sets or checks them (unverified: whether the 32 mm module exposes a WB
+  temperature). Both at 640 x 480 @ 30 fps as frozen.
+- **Checkerboard** (`scripts/wo06_camera_intrinsics.py`): 10 x 7 squares (9 x 6 inner corners) on
+  letter paper glued to cardboard; `--square-mm` is now REQUIRED (no 25 mm default) and recorded
+  in `cameras.<camera>.intrinsics.board`; `--camera front|wrist` (the wrist skips the front's
+  crop check); `cameras.wrist.intrinsics: null` added. Test: synthetic board, wrist written, front
+  dry run, missing `--square-mm` refused.
+- **Placement grid on two tabloid sheets** (`scripts/make_placement_grid.py --layout tabloid2`):
+  two portrait 11 x 17 in pages; sheet 1 = grid + base with a dashed CUT line, sheet 2 = the
+  robot's-left side with the BOWL CENTRE cross on the sheet (the cup's rim circle once its
+  diameter is measured), the title block and a ruler check (bowl cross to slot C1's cross,
+  117.5 mm, across the join); 10 mm overlap, registration ticks R1-R3 at the same heights on both
+  sheets, a 100 mm scale bar and a label on each sheet; deterministic bytes; A3 unchanged and
+  still the default. Not committed (generated with the freeze). Rendered locally (macOS `sips`)
+  to check the layout.
+- **No multimeter** (checklist step 0 rewritten): read the servo and supply labels (follower
+  12 V STS3215 on the 12 V supply, leader 7.4 V servos on the 5 V supply), never cross them; new
+  step 2b `wo06_calibrate.py --preset real voltage [--device leader]` reads each servo's
+  `Present_Voltage` and EEPROM `Min/Max_Voltage_Limit` (read only: port open, three
+  `sync_read(normalize=False)`, `disconnect(disable_torque=False)`; `read_voltages` /
+  `voltage_report` in `src/robot/servo_health.py`, 0.1 V per count per the Feetech STS table,
+  unverified on this arm) against `configs/real.yaml` `power` (follower 12.0 V, leader 5.0 V,
+  15% tolerance), flags a crossed supply and a reading outside the servo's own limits; tested
+  with a fake bus. Reporting table updated. No multimeter mention left in the repo.
+- **Servo facts.** Follower = 12 V STS3215 (Seeed Pro). Retailer listings for the 12 V STS3215
+  (C018 / C047) give about 2.7 A stall at 12 V and a 4-14 V range (robotshop, openelab, the
+  servodatabase page; the Feetech datasheet itself was not re-checked: unverified). The owner's
+  provisional thresholds stay (55 C, 1500 mA for 1 s): 1500 mA is about 55% of that stall
+  current, so a stalled 12 V servo trips and normal motion should not; 55 C stays 15 C under the
+  firmware's 70 C limit. Nothing in the config assumed a voltage before; the new `power` block
+  is the only one. Spare gripper servo (12 V STS3215, still to buy) in the checklist hardware
+  floor and step 9.
+- **Deferred items recorded:** the 2-inch (50.8 mm) matte black disc is the Push target (Push
+  deferred; the sim's disc is 5 cm); the green cylinder is replaced by the green cube; Push and
+  Stack props beyond the disc wait for the PickPlace baseline.
+- **Not done / flagged:** the cup may have handles (bouillon cups often do): their orientation is
+  recorded at the fit check. An 8 oz cup may be taller than the sim bowl's 36 mm: if the measured
+  height makes `carry_rim_clearance_m` negative, the sim oracle's carry (the bowl check's proxy)
+  passes through the rim and the check must be read with that in mind. The sim gripper's grasp
+  centre and the bowl check's 0.15 rad hold reading are 3 cm values; a 25.4 mm cube closes the
+  jaws further (rough estimate +0.1 rad at contact, unverified), still above the -5 deg floor.
+- **Gates:** full pytest 657 passed + 1 skipped (651 + 6 new); `ruff check src tests scripts`,
+  `black --check .`, `mypy --strict src` clean. `src/eval/protocol.py`, `protocol_v02.py` and
+  `src/env/**` unchanged; the committed A3 PDF still matches the drawing except the hash prefix.
+
+### PR 2: owner kit list, review fixes (branch `feat/smolvla-real-kit`, 2026-11-10, $0)
+
+The review's confirmed findings on the kit commit, all applied. The freeze stays PENDING
+(`FREEZE_STATUS`, `BOWL_XY_M`, `RUBRIC_VERSION`, the committed A3 PDF unchanged; no PDF
+regenerated). `feat/smolvla-real` (the F_FULLFSYNC commits, up to `0edfe69`) is merged in; the
+STATUS conflict is resolved by keeping both entries, F_FULLFSYNC first.
+
+- **Rim and floor fail the bowl check.** `bowl_fit.geometry_problems()`: a measurement out of
+  range, no release disc, the carry through the rim (`carry_rim_clearance_m` < 0) or the oracle's
+  lower into the cup's floor (new `lower_floor_clearance_m` < 0) fails the check at every
+  position; a nearest-slot cube that overlaps the rim (`cube_rim_clearance_m` < 0) fails that
+  position. `scripts/wo07_bowl_check.py` folds them into `passes_carry_and_bowl_phases` and
+  `_verdict` (`FAIL (...)`), keeps the kinematic result as `kinematic_phases_ok`, records
+  `geometry_problems` (top level, per bowl, in the search) and prints `PROBLEM` lines. Test: a
+  60 mm cup (carry through the rim) and a footed cup (floor 25 mm) both FAIL at B' while every
+  phase passes.
+- **Fifth measurement: the cup's inside-floor height** (`bowl_table_to_inside_floor_height_mm`,
+  table top to the top of the inside floor). It feeds `geometry().floor_height_m`, the release
+  height in the kinematic scene and the lower-over-floor clearance; pending, the sim floor (6 mm)
+  stands in, labelled. `kit.md`, WO-07 and the blocker line list five measurements now.
+- **Ranges.** `protocol_real.measurement_problems()`: cube edge 20-30 mm, floor wider than the
+  cube's diagonal, rim 30-250 mm and wider than the floor, rim height 20-120 mm, floor height
+  0-40 mm and below the rim. `freeze_problem()` refuses while any holds (a value in inches or cm
+  never freezes).
+- **Deferred judging text uses the real props.** `JUDGING_RULE["Push"]`: the 2-inch (50.8 mm)
+  matte black disc; `["Stack"]`: centred within half the cube edge (~12.7 mm nominal); both
+  marked deferred (not judged in real-0.1). Only PickPlace's text is a hash input, so the hash
+  moves through the new measurement field only; `judging_rule_sha256` moves with the text.
+- **Camera controls checked, focus before intrinsics.** `convention.camera_controls_problems()`:
+  a real-0.1 session (`real_hardware_problems`) and the demo schedule refuse while either camera's
+  auto exposure / auto white balance is not false, its `exposure` or `set_with` is null, or the
+  C920x's `autofocus` is not false / `focus` (new field) is null. Checklist step 6 now says to do
+  step 7 items 1-4 first (focus changes fx / fy and the distortion); the intrinsics script refuses
+  to write the front intrinsics while focus is not locked and records the controls in
+  `intrinsics.board.controls_at_capture`. The wrong "step 7, item 3" reference is gone.
+- **Wrist gate.** The step 7 gate no longer asks for a wrist camera match (the script and the sim
+  have only the front camera until WO-08): the wrist is mounted, calibrated, locked and shows the
+  rim in a saved frame (`lerobot-find-cameras opencv`).
+- **Printed grid recorded.** `configs/real.yaml` `eval.grid_layout: a3 | tabloid2` replaces the
+  comment-only `eval.grid`; every session records `grid_layout`, `grid_pdf` and that PDF's
+  sha256 (`wo07_real_eval.grid_pdf_fields`), and a hardware session refuses while the selected
+  PDF is not generated. `make_placement_grid.py --check` names the layout in its stale hint.
+- **`SCENE` citations** replaced by `scene_spec()` (protocol docstring, `kit.md`, here).
+- **New real-0.1 hash (pending): `da110112b5d06c9b4a1f17cea62547defc8cad7f63de3ec98d1f9caa9511d4ab`**
+  (was `1d5674420b6d`; the new measurement field). Pin updated; schedules, slots, seeds and the
+  bowl position unchanged. The interim B' numbers above are unchanged (the pending floor height
+  is the sim's, as before).
+- **Gates:** full pytest 677 passed + 1 skipped (674 after the merge + 3 new); `ruff check src tests scripts`, `black --check .`, `mypy --strict src` clean. `src/eval/protocol.py`, `protocol_v02.py`, `src/env/**` unchanged; no PDF regenerated.
+
+### PR 2: owner hold fixes at 5126daa (2026-11-10, $0)
+
+The owner held PR #32 at `5126daa` (CI green there) for four issues. All four are fixed, with a
+regression test each, followed by one review round. CPU, fakes and the mock rig only: no arm,
+camera or serial port, no RunPod, nothing pushed to the Hub. The freeze stays PENDING
+(`FREEZE_STATUS`, `BOWL_XY_M`, `RUBRIC_VERSION`, slots, schedules, seeds unchanged; no PDF
+regenerated). Protocols 0.1-draft / 0.2, `src/env/**` and the pins are byte-identical. The
+real-0.1 hash `da110112...` is unchanged.
+
+- **P1a: a mock resume could change a hardware capture.** `--mock --resume` of a hardware session
+  reached the capture recovery under the best-effort sync. It then quarantined, pruned and
+  rewrote `meta/info.json` / `stats.json`, and with the session's own `--max-steps` it ran on as
+  a mock run of the hardware session. Fix: `check_resume_mode` runs first in `run()`, before the
+  journal preflight, `load_prior` and the recovery. It refuses either mismatch ("is recorded as
+  a hardware session; resume it with --hardware"). `precheck_capture` takes the recorded mode
+  and derives the sync policy from it (`journal_policy`; a hardware session on macOS requires
+  F_FULLFSYNC). The synced `session` row now carries `mode`, so a session whose record.json is
+  lost still has a recorded mode. When no mode is recorded, the resume is refused, never guessed.
+  Tests (`tests/test_deploy_prewrite_stop.py`): a mismatch either way leaves the whole runs tree
+  byte-identical; a missing mode is refused; a recorded hardware session's recovery runs under
+  FULL_FSYNC_REQUIRED. All 4 failed on `5126daa`.
+- **P1b: a failed capture sync could pass the export.** The saved episode kept its
+  `episode_index` beside `sync_error`, so the export counted it as present. Fix: such an episode
+  is PENDING. Its block has `episode_index` None plus `pending_episode_index`, its provenance
+  entry is marked `sync_pending` and its journal is kept. `summary.recordings_pending` lists it
+  and the session is not protocol-complete. Every export refuses, `--allow-missing-recordings`
+  too, naming the trial. A resume's `EvalCapture.confirm_saved` checks the provenance mapping
+  and `episode_problem` (one metadata row, the frame count, frames 0..n-1, the videos). It then
+  syncs the dataset, the stills and the provenance under the session's policy, and only then
+  drops the journal and attaches the index. A failed confirmation leaves the episode pending.
+  Test: a 3-trial session where every save sync fails (EIO) is PENDING, the export is refused,
+  a resume whose confirmation fails stays pending, and a healthy resume gives a COMPLETE export
+  with 3 episodes. On `5126daa` the export did not refuse.
+- **P1c: the comparison report accepted mock results.** Two complete 150-trial mock sessions
+  gave `protocol_complete=True`. Fix: `session_mode()` returns a mode only when the session and
+  every trial record agree. `--report` refuses a record with no mode and a hardware + mock pair.
+  It labels a mock report `MOCK - not a real-arm result` (top-level `mode` / `label`, first and
+  last printed line) and never sets `protocol_complete` for one (`mock_complete` instead). The
+  eval export uses the same `session_mode()`: a record with no mode is refused, where before it
+  was exported as mode `None`. Test: the two 150-trial mock sessions are labelled and not
+  protocol-complete; relabelled hardware they are; a mixed pair or a missing mode is refused.
+  On `5126daa` this failed with `protocol_complete` True.
+- **P2: the bowl check overstated the release window.** The release radius subtracted half the
+  cube edge from the floor radius. Keeping the whole cube on the floor at any yaw needs half the
+  diagonal. Fix: `bowl_fit.cube_half_diagonal_m`; `release_radius_m` = floor radius minus
+  half-diagonal. The cube-to-rim clearance already used the diagonal (unchanged). The carry
+  clearance keeps the half-edge because it is a vertical distance. Test: 25.4 mm cube and 90 mm
+  floor give 27.04 mm (`5126daa`: 32.3 mm).
+
+**P2 numbers** (nominal 25.4 mm cube and the 90 mm sim-bowl floor fallback, which is also the
+owner's example; NOT the real cup's values, `MEASURED` is still PENDING). Rerun on the final
+code: `wo07_bowl_check.py --preset real --bowl 0.205 0.185`, CPU, single run,
+`20261111T044930Z-wo07-bowl-check-real-b796` (scratch).
+
+| Quantity | 5126daa (half-edge) | Fixed (half-diagonal) |
+|---|---|---|
+| Release radius | 32.3 mm | 27.0 mm (27.04) |
+| B' (0.205, 0.185) release window inside / inscribed | 70% (69.6) / 10 mm | 73% (73.1) / 10 mm |
+| B' in-box release area | ~2281 mm2 | ~1679 mm2 |
+| Frozen BOWL_XY_M (0.195, 0.205) window | 30% / 0 mm | 27% / 0 mm |
+| B' verdict, safety-bounded IK | pass, C4, 175/175 | pass, C4, 175/175 |
+| B' verdict, unchanged oracle (urdf IK) | clip (wrist_flex carry 3.33 deg x6, retreat 5.0 x25) | same |
+| B' cube-to-rim clearance / nearest slot / box margin (9.3 mm / own TCP offset) | +1.13 cm / 9.83 cm / +0.07 / +0.14 cm | same |
+
+The window share went UP because the disc it is a share of shrank. The release area inside the
+box went down. No verdict changed: B' still passes at C4, the frozen bowl is still REJECT, and
+the search still has no passing candidate. The interim B' figures elsewhere in this file
+(kit-list section, round-2 table note, blocker line) now say 27.0 mm / 73% or are marked as the
+superseded 3 cm-cube, half-edge figures.
+
+**Review round** (two reviewers: durability / resume, report / geometry). Five confirmed findings,
+all fixed in `5503d00`:
+
+- **DR-1 / F1 (medium):** the CheckpointFailed path (the episode saved, then the provenance write
+  or the finalize / reopen failed) still claimed `episode_index`. The summary, `capture_gaps` and
+  `--report` missed it while the export refused it. Reproduced: a mock session with an EIO on the
+  3rd checkpoint had `recordings_pending == []`. Fix: that block is PENDING too (journal kept,
+  provenance `sync_pending`). One rule, `recording.capture_unconfirmed`, now decides "saved, not
+  confirmed durable" everywhere: `table()` (given the session's capture root), `capture_gaps`
+  (the `--resume` hint), `reconcile_captures` and the export's `pending_episodes`. It covers a
+  pending block, an index claimed beside a save error (`5126daa` records), and an index claimed
+  while the journal is still staged. A resume confirms a claimed index (`reconciled.confirmed`);
+  the old error moves to `confirmed_after`.
+- **DR-2 (low):** `recorded_mode` read only `results.mode`. A chain the pre-fix code mixed
+  (hardware run H, then a `--mock --resume H` run M) was still resumable with `--mock`. Fix: the
+  run's mode must agree with every trial record's, and every run of the session must record the
+  same mode, before anything is written.
+- **DR-3 (low):** five of the new guards survived mutation. New or extended tests: `table()` on
+  a full 150-trial session with one pending or `5126daa`-style block is not protocol-complete;
+  the CheckpointFailed session (pending, resume hint, export refused, then a claimed index with
+  its journal staged is refused and confirmed by a resume); provenance `sync_pending` asserted;
+  a confirmation of an episode whose frame count does not match fails before any sync and keeps
+  the journal. Mutation check on `5503d00`: all 9 mutations caught (pending gate, export staged
+  branches, reconcile confirm, `sync_pending`, `episode_problem`, CheckpointFailed block, chain
+  check, staged rule, mock suffix).
+- **F2 (medium):** a mock eval export was labelled mock only in `bundle.json` / `trials.json`.
+  The sealed vishwaroop declaration said plain `real-0.1`. Fix: a mock export declares
+  `protocol_version` `real-0.1-mock` (`-mock-dev`, `-mock-incomplete`). vishwaroop reads
+  `protocol_version` as a free string (scratch copy, `parse_declaration`), so the mock format
+  test still imports. Test: `test_eval_bundle_is_complete_and_valid`.
+
+**Reruns on the final code:** full pytest **694 passed, 1 skipped** (13 min, exit code 0; `6904871` gave 692 + 1, CI on `5126daa` 670 + 16). Targeted runs (the files exercised
+by the fixes): stop / mode resume `tests/test_deploy_prewrite_stop.py` 82 passed; sync failure
+and recovery `tests/test_capture_resume_gap.py` 16 passed and `tests/test_pr2_review_fixes.py`
+8 passed; export `tests/test_export_bundle.py` 36 passed; report
+`tests/test_protocol_real.py` 20 passed; bowl `tests/test_bowl_check.py` 6 passed.
+`ruff check src tests scripts`, `black --check .` and `mypy --strict src` are clean.
+
+**Unverified on hardware:** all of the above ran on the mock rig and on a simulated macOS
+F_FULLFSYNC (fakes). No real arm, camera or real-arm capture was run. The bowl numbers are the
+sim-bowl fallback, not the LE TAUCI cup.
+
+**Owner decisions / notes** (DECIDED by the owner on 2026-11-11, implemented in "PR 2: second
+owner hold at 4d9f66e" below): (1) a real-0.1 or 0.2 session written before this fix whose
+record.json is lost cannot be resumed: its session row has no mode. A session with an intact
+record.json is unaffected. (2) `--protocol` is still ignored on `--resume`; it cannot misdirect
+recovery. (3) A pending trial's outcome still counts in the per-cell rates (a started slot is
+never re-run), but the session is not protocol-complete and the export refuses until a resume
+confirms the episode. A failed confirmation (e.g. a frame-count mismatch) needs your decision:
+nothing re-saves it automatically. (4) Records with no mode, or whose trials disagree with it,
+are refused by `--report`, the export and `--resume`. (5) Mock exports now declare
+`real-0.1-mock`; earlier mock bundles in the scratch vishwaroop copy said `real-0.1`.
+
+**Next (owner):** collect the five measurements and do the unpowered fit check. Then rerun the
+bowl check with the measured props, freeze, and rerun CI and the vishwaroop import on the final
+commit.
+
+### PR 2: second owner hold at 4d9f66e (2026-11-11, $0)
+
+The owner kept PR #32 open at `4d9f66e` with the freeze PENDING. The four fixes of the previous
+hold checked out there (12 targeted tests passed). Two issues remained; both are fixed, each with
+a regression test, followed by one review round. CPU, fakes and the mock rig only: no arm, camera
+or serial port, no RunPod, nothing pushed to the Hub. The freeze stays PENDING (`FREEZE_STATUS`,
+`BOWL_XY_M`, `RUBRIC_VERSION`, `MEASURED`, slots, schedules, seeds unchanged; no PDF regenerated).
+Protocols 0.1-draft / 0.2, `src/env/**` and the pins are byte-identical. The real-0.1 hash
+`da110112...` is unchanged.
+
+- **Issue 1: a resume confirmed a pending episode whose MP4s were corrupt.** The owner corrupted
+  the clips of a pending mock capture; the resume accepted the episode and deleted its staged
+  journal. `confirm_saved` checked the metadata rows, the frame count and that the video files
+  existed, never that they decoded. Fix: `recording.verify_episode_video` decodes every camera
+  clip of the episode with torchcodec (never PyAV) across its full frame range (frame `i` at
+  `from_timestamp + (i + 0.5) / fps`, its pts within a quarter frame of `from_timestamp + i / fps`,
+  the feature's shape, the clip span `length / fps`; a convention camera that is not a declared
+  video feature fails). `EvalCapture.confirm_saved` (every resume path: pending blocks, claimed
+  indices, the kill-after-save fill) runs it before any sync or journal drop; a failure keeps the
+  journal, keeps the episode PENDING and records `confirm_error` (camera, `frames 0-N`, file,
+  exception) in the block and the provenance (`sync_pending`). `EvalCapture.finish` (a live save
+  and a recovery's save) runs it too, after the sync: a clip that does not decode leaves the
+  trial pending, never claimed; `verify_s` records the cost. The score is never touched. The
+  shared rule names the decode error as the pending reason. Tests
+  (`tests/test_capture_resume_gap.py`): a pending session with clips overwritten mid-file, cut
+  short at the tail, or damaged only inside the final frame's packet stays pending with its
+  journals byte-identical and the export refused, the healthy episode is confirmed, and with the
+  good MP4s restored a second resume attaches them and the export is COMPLETE; a save whose clip
+  does not decode stays pending; each guard of `verify_episode_video` on its own. On `4d9f66e`
+  the resume attached every corrupt episode (`pending_sync: []`).
+- **Issue 2: `--report` trusted a stale saved summary.** A legacy record with an `episode_index`
+  beside `sync_error` still produced `protocol_complete=True` because the report read the saved
+  summary. Fix: `export_bundle.recording_blockers` is the one pending-recording rule; the session
+  summary (`table()` via `recording_gate`), `--report` and the export all use it. `--report`
+  recomputes each session's rows and completeness from its trial blocks and its capture on disk
+  (`<runs>/<session id>/capture`), never from the saved summary, and prints a note when the saved
+  summary said complete and the recount does not. Test
+  (`tests/test_protocol_real.py`): two full 150-trial sessions relabelled hardware with capture
+  on, one record carrying `{episode_index, sync_error}` (or a claim with its journal staged) and
+  a saved summary still saying complete: the report is not complete and names the trial. On
+  `4d9f66e` it said complete.
+
+**Owner decisions, as now implemented** (the previous hold's open decisions are decided):
+
+- **Mode:** a resume is refused when the recorded mode is missing or inconsistent (record.json,
+  every trial record, and the last synced session row when it has a mode), before anything is
+  opened or written (`check_resume_mode` / `_run_modes`).
+- **Protocol:** `--protocol` defaults to None. A resume without it uses the recorded
+  `protocol_id` (a session recorded without one is 0.2). An explicit `--protocol` that differs is
+  refused by `check_resume_protocol` before the journal preflight, `load_prior` or the capture
+  precheck: the runs tree stays byte-identical. New sessions still default to real-0.1.
+- **Rates:** every scored trial stays in the running rates with its original score, including a
+  first-write fault that produced zero frames (that trial requires no recording:
+  `recording.recording_required`).
+- **Completeness:** a REQUIRED recording that is pending (`recordings_pending`), staged but not
+  saved (`recordings_unsaved`) or lost (`recording_missing`) blocks `protocol_complete` in the
+  session summary and in `--report`, and blocks a complete export (pending refuses every
+  export; missing refuses a complete one, `--allow-missing-recordings` builds only the labelled
+  `real-0.1-incomplete` bundle). Staged journals and data are never deleted by the summary, the
+  report or a failed confirmation.
+
+**Review round** (two reviewers: recovery, report / decisions). Four confirmed findings, all
+fixed in `05915c4`, none skipped:
+
+- **REC-1 (low):** five of seven mutants of `verify_episode_video` survived (skip the last
+  frame, no camera-presence, span, pts or shape check): no test damaged only the final frames.
+  Fix (tests only): a corruption of 16 bytes inside the last video packet only (located from the
+  MP4 `stsz` / `stco` / `stsc` tables) joins the parametrized resume test, and a direct test
+  drives each guard on a healthy mock episode (wrist feature undeclared, span 2 frames long, a
+  feature shape of half size, twice the fps and frames over the same span). All 5 mutants are
+  now caught.
+- **F1 (medium):** the shared rule treated a missing or unreadable capture dataset as no
+  blockers and never checked a claimed `episode_index` against the dataset or its provenance, so
+  `--report` could print complete where the export refused. Fix: `lost_claims` counts a required
+  recording lost when its claimed episode is not in the dataset (the dataset missing or
+  unreadable is named), or the provenance gives it to another trial. The export now refuses that
+  last case outright, incomplete bundles too (episodes are never re-mapped). The report test
+  fixture now writes a stand-in capture dataset (provenance + episode table) instead of
+  asserting completeness with none. Test: dataset deleted, a claim the dataset does not hold, a
+  claim against the provenance (report, summary), and a mock session whose swapped claims are
+  refused by the export.
+- **F2 (low):** `--report` called a saved, synced, decoded episode LOST when the run ended
+  before its capture row, while the export filled it from the provenance. Fix: the fill is one
+  function, `fill_from_provenance`, used by the export and by `recording_blockers` (on copies).
+  Tests: the killed-after-save session (`after_save`) has no blockers before its resume; the
+  placeholder block on a stand-in capture is complete.
+- **F3 (low):** no test proved a staged-unsaved required recording blocks `protocol_complete`.
+  Fix (test only): the staged case now has a whole journal on disk; it is listed under
+  `recordings_unsaved` only, blocks `table()` and `--report`, and the journal is still there.
+
+**Reruns on the final code (`05915c4`; the docs commit after it changes no code):** full pytest **705 passed, 1 skipped** (11 min 47 s, pytest exit code 0; `45bd1c5` gave 701 + 1). Targeted: capture / recovery
+`tests/test_capture_resume_gap.py` 22 passed; report / protocol `tests/test_protocol_real.py`
+23 passed; export `tests/test_export_bundle.py` 36 passed. Mutation checks: the 5 REC-1 mutants
+and 5 report-rule mutants (dropped unsaved bucket, no lost claims, no provenance fill, no owner
+check, no export refusal) all fail a test. `ruff check src tests scripts`, `black --check .`,
+`mypy --strict src`: clean. vishwaroop import (informational, scratch copy, not the final
+freeze commit): one mock demo export (2 episodes, `real-0.1`) and one mock eval export (3 episodes, COMPLETE, declared `real-0.1-mock`) built from `05915c4`: 2 seals, 2 verifies, 2 imports exit 0, `declared_group_and_lineage_checks_passed` x2. The official rerun is on the final freeze commit.
+
+**Unverified on hardware:** all of the above ran on the mock rig with fake cameras. The decode
+check's cost on a real 20-30 s two-camera 640x480 episode is not measured (mock: about 0.1-0.4 s
+per episode; `verify_s` records it). If torchcodec or FFmpeg cannot load, every episode stays
+pending (fails closed).
+
+**Next (owner):** send the five measurements and the unpowered fit results; the agent reruns the
+bowl check and brings back any change to B' or the 9.83 cm separation before freezing. Then the
+freeze, CI and the vishwaroop imports (including `real-0.1-mock`) on the final freeze commit, then
+merge review. Spend, RunPod credentials and powered steps 9-10 stay on hold.
+
+### PR 2: third owner hold at 06536ef (2026-11-11, $0)
+
+The owner confirmed the two regressions fixed on `06536ef` (CI green, 11 targeted tests rerun)
+and named one gap: with the capture's provenance file missing or unreadable but its episode
+metadata intact, `--report` marked the baseline complete while the export refused it. CPU, fakes
+and the mock rig only; the freeze stays PENDING (nothing in `src/eval/protocol_real.py`, the
+slots, schedules, seeds or PDFs changed; protocols 0.1-draft / 0.2, `src/env/**` and the pins
+byte-identical).
+
+- **Fix (one rule):** the provenance is the only record of which trial owns which episode.
+  `export_bundle.capture_provenance` reads and verifies it (readable, a JSON object whose
+  `episodes` maps each index to a `trial_id`, this session, this protocol / convention, units,
+  times, robot id, the calibration copy's hash). `_capture_on_disk` is the single reader of the
+  capture for the export, the session summary (`table()`) and `--report`. A claimed episode the
+  capture holds is now UNVERIFIED (`provenance_unreadable`) while the provenance is refused, and
+  `episode_unreadable` while `meta/info.json`, its metadata row, its data rows or a clip file is
+  missing or unreadable (`recording.episode_problems`, the resume's `episode_problem` batched).
+  An unverified recording blocks `protocol_complete` (`recordings_unverified`). It also refuses
+  every export, `--allow-missing-recordings` included. Report and export are read-only: nothing
+  rebuilds or rewrites the provenance. Scores and staged data are untouched. Resume behaviour is
+  unchanged: a resume with an unreadable provenance still stops in `recover_capture` before the
+  arm opens.
+- **Report explains why:** the summary carries `recording_reasons`, which `--report` prints as
+  `why:` lines (the CLI's output; it prints no JSON). `report()`'s return value has
+  `recording_blockers` per run (session id, the blocked trials, reasons) for Python callers and
+  the tests. Export refusals name the same reasons.
+- **Tests:** `tests/test_protocol_real.py::test_an_unreadable_capture_provenance_blocks_the_report_as_it_refuses_the_export`
+  covers two 150-trial sessions relabelled hardware with capture on. The provenance is deleted,
+  truncated, overwritten with garbage bytes, a JSON list, or has `episodes` as a list. In each
+  case the report and summary are not complete, name the session and the provenance path, the
+  rows and cells are unchanged, and the export refuses (with and without
+  `--allow-missing-recordings`). On `06536ef` the report said complete (missing / truncated /
+  garbage) or crashed (`AttributeError`, wrong shape). The stand-in capture now also writes
+  `info.json`, the citations, a calibration copy, data rows and clip files.
+  `tests/test_capture_resume_gap.py::test_report_and_export_reach_the_same_verdict_on_a_damaged_capture`
+  covers 16 damage cases on a real mock capture and asserts the same verdict, the same blocker
+  kind and a shared reason. Mismatches on `06536ef`: provenance missing / truncated / another
+  session's, `info.json` missing / unreadable, and a data file missing (report complete, export
+  refused or crashed); wrong-shape provenance, an episode table without one episode, and a
+  missing clip or data file (report crashed). A missing clip file was COMPLETE in both, and the
+  vishwaroop importer would then fail; it is now refused in both. Rule: clips are decoded once,
+  at save and at a resume's confirmation (a clip that does not decode stays PENDING). Report and
+  export check that clip files exist and do not decode them again.
+- **First fix commit** `046af89` (full pytest 726 passed, 1 skipped, 12 min 45 s, exit 0).
+
+**Review round on `046af89`** (two reviewers: report / export parity; safety coverage). Six
+confirmed findings, all fixed in ``57d7474``, none skipped:
+
+- **P1 (medium): orphan episodes.** The export refused a held episode no trial record owns,
+  the shared rule did not check it, so `--report` said complete. Fix: `unmatched_episodes`
+  (after the provenance fill) lists it as a new blocker status `episode_unmatched`
+  (`export_bundle.UNMATCHED`); the summary's new gate key `recordings_unmatched` names it
+  (`episode N`); the export takes its refusal (`UNMATCHED: ...`) from the shared result.
+- **P2 (medium): double and non-scored claims.** The export refused an episode claimed by two
+  records; the shared rule only looked at required claims, so a legacy not-started attempt
+  carrying its retry's capture block, or a trial row written twice, read complete. Fix: the
+  claim map is built from every record holding an `episode_index`; an index claimed twice, or
+  claimed by a record that is not a scored trial, is `episode_unmatched` with its reason.
+- **P3 (medium): a readable provenance with no entry for a held claimed episode** (`episodes`
+  partial or `{}`) read COMPLETE in both. Fix: `lost_claims` gives it `provenance_unreadable`
+  (the provenance is the only ownership record; the recorder writes the entry before its
+  checkpoint, so a missing entry is damage); the export's ownership check requires the entry to
+  name the claiming trial (no entry is no confirmation).
+- **P4 / H3-SAFETY-1 (low / medium): unpinned guards.** Mutants of `capture_provenance` and
+  `episode_problems` survived. Fix (tests only): parity cases for another protocol hash, another
+  convention hash, `"protocol": "x"` (no crash), `units` / `recorded_at` / `robot_id` removed, an
+  episode entry that is a bare string, a non-string `trial_id`, the calibration copy missing or
+  changed by one byte, the data parquet one row short; and a direct test of the
+  `<capture>/dataset` path check.
+- **H3-SAFETY-2 (low): the docs promised JSON from `--report`.** The CLI prints the table and the
+  `why:` lines only. Fix: the module doc and this section now say so (`report()`'s return value
+  holds `recording_blockers`); no CLI change.
+
+**Parity matrix** (R = summary / `--report`, E = export; 33 cases in
+`test_report_and_export_reach_the_same_verdict_on_a_damaged_capture`, every case the same verdict,
+the same blocker kind and a shared reason, scores and rows unchanged):
+
+| Damage | `06536ef` | `046af89` | now |
+|---|---|---|---|
+| provenance missing / truncated / another session's | R complete, E refused or crash | both unverified | both unverified |
+| provenance wrong shape | R crash | both unverified | both unverified |
+| `info.json` missing / unreadable; data file missing | R complete, E refused or crash | both unverified | both unverified |
+| clip file missing | both COMPLETE (importer would fail) | both unverified | both unverified |
+| episode table missing / unreadable / lacks one; capture dir gone | both lost (E crash on unreadable) | both lost | both lost |
+| provenance gives an episode to another trial | both lost | both lost | both lost |
+| staged journal present | both pending | both pending | both pending |
+| provenance has no entry for a held episode, or `episodes: {}` (P3) | both COMPLETE | both COMPLETE | both unverified |
+| orphan episode (P1) | R complete, E refused | R complete, E refused | both unmatched |
+| trial row twice; not-started attempt with its retry's block, or as an episode's only claimant (P2) | R complete, E refused | R complete, E refused | both unmatched |
+| 11 guard cases (P4 / M1-M10: hashes, `"protocol": "x"`, units / times / robot id, entry shape, calibration copy, data rows short) | | both unverified (unpinned) | both unverified (pinned) |
+| provenance lists an episode the dataset lacks; healthy | both complete | both complete | both complete |
+
+The 6 new behaviour cases (P1, P2 x3, P3 x2) fail on `046af89`; the 11 guard cases pass there (the
+code was right, the tests were missing). Mutation checks on the fix (`tests/test_capture_resume_gap.py`,
+`tests/test_protocol_real.py`, `tests/test_export_bundle.py`): 12 of 12 mutants fail a test (no per-entry `trial_id` check, no `_protocol`, no data-row count, no calibration-copy check, no units / times / robot id check, `units` alone dropped, the except narrowed to `ExportRefused`, no `<capture>/dataset` check, no orphan rule, no double-claim rule, no non-scored-claim rule, a missing entry accepted); the non-scored mutant first survived (the not-started case also double-claims) and is caught by the added single-claimant case.
+
+- **Reruns on the final code:** full pytest **744 passed, 1 skipped** (11 min 54 s, pytest exit code 0; `046af89` gave 726 + 1; the difference is the 17 new parity cases and the dataset-path test). The docs commit after `57d7474` changes no code. `ruff check src tests scripts`, `black
+  --check .`, `mypy --strict src`: clean. CI: [run 43150769204](https://github.com/kudratsingh/vla-rl-so101/actions/runs/43150769204) on `57d7474`: success, 729 passed, 16 skipped. The vishwaroop imports wait for the final
+  freeze commit.
+- **Still export-only** (the report does not repeat them): the checkpoint identity and hash, the
+  training-run verification, an operator score without a named labeler, and the importer
+  mirror's frame-level checks on the written bundle (`check_dataset`: timestamps, finite values,
+  the convention's `info.json` features). A capture problem with no claim to attach it to (e.g.
+  a capture-on session whose dataset is gone and that holds no required recording) is refused by
+  the export and not named by the report (no scored trial produced a frame, so no protocol
+  table either).
+
+**Unverified on hardware:** everything above ran on the mock rig with fake cameras; no real
+capture has been damaged and reread.
+
+**Next (owner):** unchanged. Send the five measurements and the unpowered fit results; the agent
+reruns the bowl check and brings back any change to B' or the 9.83 cm separation before
+freezing. Then the freeze, CI and the vishwaroop imports (including `real-0.1-mock`) on the final
+freeze commit, then merge review. Spend, RunPod credentials and powered steps 9-10 stay on hold.
+
+### PR 2: Mac runbook for the rehearsal, sanity recordings and scheduled demos (2026-11-12, $0)
+
+The owner is assembling the arm (WO-06 steps 0-8) and asked for the exact Mac commands for the
+first supervised rehearsal, the sanity recordings and the 50 scheduled PickPlace demos, with an
+FFmpeg / torchcodec preflight. The freeze stays PENDING: nothing in `src/eval/protocol_real.py`,
+the slots, schedules, seeds, configs or PDFs changed. Protocols 0.1-draft / 0.2, `src/env/**` and
+the pins are byte-identical.
+
+- **`scripts/preflight_decoder.py --preset real`:** loads torchcodec + FFmpeg and prints the
+  versions and the library files loaded. Checks the PyAV `libsvtav1` encoder and
+  `convention.check_config`. Writes a throwaway two-camera dataset through the recorder's own
+  path (`create_dataset`, `DurableDataset`, `recording_frame`) and runs `verify_episode_video`
+  plus a first/last-frame pixel check. Opens no port or camera and removes its temp dir. Prints
+  PASS, or FAIL with the fix, and exits 1 on failure. With `DYLD_FALLBACK_LIBRARY_PATH` unset it
+  prints `[torchcodec] FAIL ... fix: export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/ffmpeg@7/lib`
+  (reproduced on this Mac; no traceback). `--dataset <dir> [--episodes N]` checks a recorded
+  dataset, read only: every clip decodes, the episode count, and for a demo-schedule recording
+  the real-0.1 / convention hashes and episode i = demo i. Tests: `tests/test_preflight_decoder.py`.
+- **`docs/runbooks/real-arm-mac.md`:** per-terminal setup, preflight, a config gate check, step 9,
+  step 10, and the 50 demos (schedule listing, sittings / resume, the refusal text before the
+  freeze, the decode check, the local export). Linked from checklist steps 9-10 and WO-07. In the
+  checklist: step 10's stale `224x224 video` line now reads 480x640, both cameras; the resume
+  command now includes `--task PickPlace`.
+- **Gaps found (proposals, not implemented):** (1) the teleop demo recorder never decode-verifies
+  its saved episodes (the eval capture does), and the export checks only that clip files exist.
+  Interim: `preflight_decoder.py --dataset` after each sitting. (2) The recorder first loads
+  torchcodec at the first episode's finalize/reopen, i.e. with torque on after a recorded demo.
+  A broken FFmpeg would fail there; calling `install_torchcodec_compat()` before the leader
+  connects would move it before anything opens. (3) Step 10 sanity episodes and the demo schedule
+  write to the same `data/real_teleop/vla-rl-so101-real-teleop`, and `--overwrite` would delete
+  the sanity episodes. The runbook moves them aside. (4) No command prints servo temperatures
+  after a teleop session, though the checklist asks for them. (5) `NOT_A_TERMINAL`'s log hint
+  said `script -q log.txt uv run ...`, against the `.venv/bin/python` rule (fixed below).
+- **What refuses before the freeze:** only the `--demo-schedule` lines (first sitting and
+  `--resume`), before any port, camera or dataset folder opens, on the first failing gate: the
+  bowl (`... 1.93 cm outside the safety filter's workspace box ...`, true at this head), then the
+  freeze (`protocol real-0.1 is not frozen (pending: bowl fit check) ... MEASURED PENDING`), then
+  the camera controls (`camera controls not locked: ...`). The rehearsal (step 9) and the sanity
+  episodes (step 10) are not refused in code: their gate is the owner's in-person go.
+- **Follow-through (10 findings, all checked against the code; 10 applied, commit `cfb641e`):**
+  runbook A0 makes the bring-up branch from `origin/feat/smolvla-real` before steps 0-8 write
+  `configs/real.yaml` (the main checkout is on `main`, which lacks the commands; its two untracked
+  `docs/reviews/` files would block the switch, one of them differs from the branch copy). D and
+  E2 cover a sitting that saved 0 episodes (`--dataset ... --episodes 0`, then `mv` aside, never
+  `--overwrite`) and an interrupted sanity session (numbered parts, each checked on its count).
+  "Start of every session" now requires all of section B. E gates add the tabloid2 `--check`, the
+  P gain recorded or deferred, and the agent-side vishwaroop mock imports. `NOT_A_TERMINAL` and
+  checklist step 9 now say Shell > Export Text As...; the preflight fix lines and checklist step 0
+  use the four-extra `uv sync` (= `make setup`); the torchcodec FAIL detail no longer ends on
+  `Likely causes:`; A1 says 10-60 s. Rerun here: preflight PASS (exit 0) and, with DYLD unset,
+  `[torchcodec] FAIL: torchcodec cannot load FFmpeg: Could not load libtorchcodec.` + fix (exit 1);
+  the pipe refusal's new text; `--dataset --episodes 0` PASS on an empty dataset made by
+  `create_dataset`, FAIL with `--episodes 3`; both grid `--check`s exit 1 (stale / tabloid2 not
+  committed; the freeze commit regenerates and commits both).
+- **Unverified on hardware:** every powered command (C, D, E2) and A3; their expected text is
+  what the code prints. The pty / real-terminal refusal paths were not run here.
+- **Gates:** full pytest on `cfb641e` **747 passed, 1 skipped** (11 min 50 s, exit code 0). `ruff check src tests scripts`, `black --check .`,
+  `mypy --strict src` are clean.
+
+**Next (owner):** unchanged. Send the five measurements and the unpowered fit results. The agent
+then reruns the bowl check, flags any change to B' or the 9.83 cm separation, freezes, regenerates
+both grids, and reruns CI and the vishwaroop imports. Powered steps 9-10, RunPod credentials and
+spend stay on hold.
+
 ## Pre-write stop in the policy loop (branch `fix/deploy-prewrite-stop`, 2026-11-09, $0)
 
 Owner 2026-11-09: the stop check #30 added to teleop and the park now also guards the pilot and
@@ -1133,7 +2721,8 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
     final stop check) median 0.34 ms, max 0.68 ms; the first decision's frame-return-to-
     first-write median 68.3 ms vs 67.9 ms for the other decisions (mock policy). The append is
     not fsynced (`src/runs.Run.log_metrics`): the marker survives SIGKILL; across power loss
-    only as far as the OS flushed it.
+    only as far as the OS flushed it. (Superseded in PR #32's sync: the marker and retraction
+    rows are synced, F_FULLFSYNC on macOS; "PR 2: sync with main (#33)" above.)
   - The judging text is unchanged ("one stopped before its write never started" already covers
     it), so the rule text hash is unchanged.
   - Tests (new, `tests/test_deploy_prewrite_stop.py`): stop during the marker for SIGHUP /
@@ -1181,6 +2770,28 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
 
 ## Blockers and decisions pending the owner
 
+- 2026-11-10 kit list: the five prop measurements (red cube edge; cup outer rim diameter, inside
+  floor diameter, table-to-rim height, table-to-inside-floor height) are PENDING in
+  `src/eval/protocol_real.py` `MEASURED` (mm); `freeze_problem()` refuses until they are in and
+  in range. The camera controls (exposure, white balance, C920x focus) are also still to be
+  locked and recorded (`configs/real.yaml` `cameras.<name>.controls`; demos and sessions refuse
+  until then). Then: fill `MEASURED`, rerun
+  `scripts/wo07_bowl_check.py --preset real --search` with the real cup, and freeze together with
+  the B' fit check. Risk to watch at the camera match: the white cup rim on the white table
+  (checklist step 7 item 5). Still to buy: the spare 12 V gripper servo and, if the kit has none,
+  the 3D-printed wrist camera mount (`docs/bringup/kit.md`).
+- 2026-11-09 PR 2: the bowl is PENDING. The frozen (0.195, 0.205) is rejected by the safety box
+  from the carry on, and no position satisfies `derive_bowl`'s rule and the box together. The
+  options are in "PR 2: owner follow-up" and its round 2 (B (0.115, +-0.185), B' (0.205,
+  0.185) and D (0.205, 0.180) pass the filter with separation 10.1 / 9.8 / 9.3 cm and release
+  windows 50% / 71% / 81% with the 3 cm cube and the half-edge radius; B' is 73% / 10 mm with the
+  25.4 mm cube and the half-diagonal radius, sim-bowl fallback, owner hold on PR #32; every option needs the oracle's wrist_flex clipped in the bowl phases).
+  The hardware eval and the demo schedule refuse the frozen bowl until it is decided. Seen slots B2 B5 E2 E5 + C4, the cubes and the seeded schedules
+  are approved. Owner 2026-11-09: B' (0.205, 0.185) m picked for an UNPOWERED fit check (jaws
+  and cube at the bowl and at C1, D1, B2, E2); the placement freeze is held until he confirms
+  (`protocol_real.FREEZE_STATUS` "pending: bowl fit check": hardware and demo schedule refuse).
+  If it passes: keep C4, document the 9.83 cm separation as a real-only exception, then move the
+  bowl, bump the rubric, regenerate the hash and the placement-grid PDF together.
 - Resolved 2026-11-09 by the pivot (ADR-0003): the OFT track is stopped, so the WO-04 item below
   is closed. Open for the owner: the seen slots, bowl position and schedule freeze (PR 2), the
   servo P gain to use (LeRobot writes 16 at connect, firmware default 32; WO-06 checklist), and
@@ -1193,6 +2804,15 @@ real-eval control loop (`DeployLoop`, `src/robot/client.py`), before powered pol
 
 ## Owner decisions in effect
 
+- 2026-11-09 PR 2 baseline cadence: 15 Hz nominal control, 30 fps cameras, one 450-command cap
+  for SmolVLA and ACT, synchronous inference, `max_chunk_age_ms` 800; SmolVLA keeps 20,000 steps
+  at batch 32 (half the samples, recorded). Placement: seen slots B2 B5 E2 E5 + C4, the cubes and
+  the seeded schedules approved; the bowl pending. Judging: real-judge-3 for #33's start rule,
+  applied in PR #32 after #33 landed (the rubric bump, bowl and PDF follow the fit check).
+- 2026-11-09 Durable start: the `trial_started` / `trial_start_retracted` rows are synced to
+  stable storage (F_FULLFSYNC on macOS) before the first goal, after-sync freshness and final stop
+  checks kept, a failed sync blocks the first goal; record.json atomic and synced, the session
+  recoverable from metrics.jsonl (PR #32).
 - 2026-11-09 Pivot to SmolVLA + ACT on the real SO-101 (ADR-0003); decisions D1-D6
   (`docs/reviews/2026-11-09-pivot-decisions.md`): five seen slots x 10 demos, bowl fixed, cells of
   50 binary trials, freeze before recording, development trials on a disjoint schedule, mock

@@ -146,7 +146,8 @@ def main() -> None:
             ev.So101Driver, ev.load_sim_fk = Driver, lambda: toy_fk
             ev.load_config = lambda *_a, **_k: cfg
             argv = ["--preset", "real", "--hardware", "--i-am-present", "--task", "PickPlace"]
-            argv += ["--cells", "seen", "--trials", "1", "--runs-dir", str(a.runs_dir)]
+            argv += ["--protocol", "0.2", "--cells", "seen", "--trials", "1"]
+            argv += ["--runs-dir", str(a.runs_dir)]
             path = ev.main(argv)
         mark(f"DONE {path}")
     finally:

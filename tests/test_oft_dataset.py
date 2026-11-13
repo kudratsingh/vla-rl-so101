@@ -23,12 +23,19 @@ from src.data.oft_dataset import (
     load_sft_frames,
     synthetic_frames,
 )
+from src.data.recorder import datasets_write_compat
 
 TASKS = {"PickPlace": "pick up the red cube and place it in the bowl", "Push": "push the red cube"}
 LENGTHS = [5, 4, 6, 3]  # two episodes per task
 
 
 def _make_dataset(root: Path) -> None:
+    # an earlier test may have decoded video (torchcodec imported): datasets' row writes need this
+    with datasets_write_compat():
+        _write_dataset(root)
+
+
+def _write_dataset(root: Path) -> None:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]

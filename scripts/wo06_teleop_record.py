@@ -1,13 +1,16 @@
 #!/usr/bin/env python
-"""WO-06 item 4: record real teleop episodes (5 per task, sanity only - not training data).
+"""WO-06 item 4 / WO-07: record real teleop episodes (leader arm, front + wrist cameras).
 
 Leader arm (so101_leader) -> canonical radians -> src/robot/safety.py -> follower, at control_hz,
-with the front camera through the policy's image pipeline. Writes one LeRobotDataset (v3.0,
-lerobot 0.4.4) with the SAME schema as WO-01's sim demos: ``observation.images.front``
-(crop_to x crop_to RGB video), ``observation.state`` and ``action`` (float32[6] canonical radians;
-action = the safe command actually sent), per-frame ``task`` = the protocol instruction
-(``src.eval.protocol.instruction(task, RED_CUBE)``, the sim demos' string), also recorded with the
-protocol hash in ``meta/vla_rl_so101.json``.
+with BOTH cameras on every tick. Writes one LeRobotDataset (v3.0, lerobot 0.4.4) in the frozen
+real-arm convention ``src/robot/convention.py`` (``CONVENTION_ID`` + ``convention_hash()``, cited
+in ``meta/vla_rl_so101.json``): ``observation.images.front`` and ``observation.images.wrist``
+(uncropped 480 x 640 RGB video), ``observation.state`` (the measured pose) and ``action`` (the safe
+command actually sent; absolute targets), both float32[6] canonical radians, per-frame ``task`` =
+the protocol instruction (``src.eval.protocol.instruction(task, RED_CUBE)``), also recorded with
+the protocol hash. Every frame goes through ``convention.recording_frame``: a frame without both
+cameras is never written, and the session refuses to start unless ``convention.check_config``
+passes (both cameras configured at 640 x 480 / 30 fps, control_hz 15, the gripper encoding).
 
 Needs: a leader arm in ``teleop.leader`` (otherwise exits with a message), both arms calibrated
 (scripts/wo06_calibrate.py), and the shared FK from WO-01 for the workspace check.
@@ -15,6 +18,41 @@ Needs: a leader arm in ``teleop.leader`` (otherwise exits with a message), both 
     .venv/bin/python scripts/wo06_teleop_record.py --preset real --task Push --rehearsal  # 1 episode
     .venv/bin/python scripts/wo06_teleop_record.py --preset real                  # 5 x 3 tasks
     .venv/bin/python scripts/wo06_teleop_record.py --preset real --push           # also upload
+    .venv/bin/python scripts/wo06_teleop_record.py --preset real --task PickPlace --demo-schedule
+    .venv/bin/python scripts/wo06_teleop_record.py --preset real --task PickPlace --demo-schedule \
+        --resume                                                          # continue the 50 demos
+
+WO-07 demos (``--demo-schedule``; owner 2026-11-09, final2 item 6 / amendments D1, D2, D4): the 50
+PickPlace demos of protocol real-0.1 (``src/eval/protocol_real.py`` ``demo_schedule()``): 10 at each
+of the five frozen seen slots B2 B5 E2 E5 C4, the red cube, the bowl FIXED on its mark at
+(x 0.195, y +0.205) m for every demo (``docs/assets/placement-grid-a3.pdf`` marks the slots and the
+bowl). Never the other 11 inner slots, the 20-slot ring or the unseen objects (purple / green cube),
+and none of them in a camera-match frame either. Each episode's prompt names its slot and yaw (a
+PLANNED pose); a redo keeps the same placement; ``meta/vla_rl_so101.json`` maps every saved episode
+to its placement and cites the protocol hash, the session id, the time, the follower id and the
+calibration copied to ``meta/calibration_follower.json`` (what ``scripts/wo07_export_bundle.py
+demo`` needs; it refuses a dataset recorded without ``--demo-schedule``).
+The bowl is PENDING (owner 2026-11-09): the frozen bowl lies outside the safety filter's TCP
+workspace box once the placement tolerance and the oracle's TCP offset are counted, so every carry
+would be rejected; ``--demo-schedule`` refuses before anything opens while that holds
+(``src/eval/bowl_fit.py`` ``bowl_box_problem``, ``scripts/wo07_bowl_check.py``), and while the
+protocol is not frozen (``src/eval/protocol_real.py`` ``FREEZE_STATUS``, ``freeze_problem``), and
+while either camera's exposure / white balance (and the front's focus) is not recorded as locked
+(``src/robot/convention.py`` ``camera_controls_problems``, WO-06 step 7).
+
+Durable and resumable (review F1 / F5). Every kept episode is saved, its placement written to
+``meta/vla_rl_so101.json``, then the dataset is finalized and reopened (``src/robot/recording.py``
+``DurableDataset``): a power loss or a kill costs at most the episode being saved. A session that
+ended early (a servo fault, a timeout, ``q``, a closed Terminal) continues with ``--resume``: it
+recovers the dataset (``recover_dataset``), refuses unless the dataset cites the same protocol
+hash, convention hash, demo schedule and ``robot.units`` and the follower loads the same
+calibration, and continues the frozen schedule at the next demo index (the session id stays the
+dataset's; each sitting is listed under ``sittings``).
+
+Camera roles (review conv-4): before torque goes on, one frame of each camera is written as a
+labelled sheet (``meta/camera_check_<n>.png``, opened in Preview) and the operator types ``yes``
+only if FRONT shows the front view and WRIST the gripper (``src/robot/camera.py``
+``confirm_camera_roles``); OpenCV indices follow USB enumeration on macOS. Recorded per sitting.
 
 (``.venv/bin/python``, not ``uv run``: under ``uv run`` a Ctrl-Z also stops ``uv`` and the session
 ends; ``src/robot/prompts.py``.)
@@ -53,7 +91,7 @@ A failed torque-off write ("TORQUE OFF UNCONFIRMED", ``So101Driver.torque_off_un
 blocks every further goal-position and torque-enable write; the script tells the operator to
 switch off the inline power switch and ends.
 
-Any other error (the dataset, the image pipeline, a bug) holds the follower, discards the
+Any other error (the dataset, a frame outside the convention, a bug) holds the follower, discards the
 episode and goes through the same support prompt before it is re-raised.
 
 A lost frame / stall holds the arm and asks you; a serial error cuts torque; a servo
@@ -66,9 +104,12 @@ while an episode saves. ``--verbose`` also prints the safety filter's per-tick I
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import hashlib
 import json
 import logging
 import shutil
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -83,6 +124,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import add_config_args, load_config
+from src.data.recorder import datasets_write_compat
+from src.eval import protocol_real as PR
+from src.eval.bowl_fit import bowl_box_problem
 from src.eval.protocol import (
     PROTOCOL_VERSION,
     RED_CUBE,
@@ -90,10 +134,14 @@ from src.eval.protocol import (
     instruction,
     protocol_hash,
 )
+from src.robot import convention as conv
+from src.robot import recording
 from src.robot.camera import (
     CameraFault,
-    OpenCVFrameSource,
-    PolicyImagePipeline,
+    CameraRig,
+    CameraRoleError,
+    RigFrame,
+    confirm_camera_roles,
     sim_mismatches,
 )
 from src.robot.driver import (
@@ -125,12 +173,12 @@ from src.robot.prompts import (
 )
 from src.robot.safety import DeadmanResponse, load_sim_fk
 from src.robot.units import JOINT_NAMES, UnitMap
+from src.runs import new_run_id
 
 log = logging.getLogger(__name__)
 
-IMAGE_KEY = "observation.images.front"
-STATE_KEY = "observation.state"
-ACTION_KEY = "action"
+STATE_KEY = conv.STATE_KEY
+ACTION_KEY = conv.ACTION_KEY
 SYNC_TOL_RAD = np.radians(3.0)
 SYNC_TIMEOUT_S = 10.0
 QUIT = "q"
@@ -150,17 +198,21 @@ With a leader: set teleop.leader to
 then run scripts/wo06_calibrate.py find-port/calibrate/verify --device leader."""
 
 
-def features(side: int) -> dict[str, dict[str, Any]]:
-    names = list(JOINT_NAMES)
-    return {
-        IMAGE_KEY: {
-            "dtype": "video",
-            "shape": (side, side, 3),
-            "names": ["height", "width", "channels"],
-        },
-        STATE_KEY: {"dtype": "float32", "shape": (6,), "names": names},
-        ACTION_KEY: {"dtype": "float32", "shape": (6,), "names": names},
-    }
+def features() -> dict[str, dict[str, Any]]:
+    """The dataset schema: ``convention.dataset_features`` (both cameras, state, action)."""
+    return conv.dataset_features()
+
+
+def create_dataset(repo_id: str, root: Path) -> Any:
+    """The recording LeRobotDataset (v3.0) in the frozen convention (``src/robot/recording.py``,
+    shared with the evaluation capture). ``root`` must not exist."""
+    return recording.create_dataset(repo_id, root)
+
+
+def _utc_now() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def protocol_instructions(tasks: Sequence[str]) -> dict[str, str]:
@@ -201,13 +253,14 @@ class Session:
         self,
         arm: So101Driver,
         leader: Any,
-        cam: OpenCVFrameSource,
+        cam: CameraRig,
         units: UnitMap,
         park: ParkSettings | None = None,
         torque_wait: TorqueWait | None = None,
         read: LineReader = timed_input,
     ):
-        self.arm, self.leader, self.cam, self.units = arm, leader, cam, units
+        self.arm, self.leader, self.units = arm, leader, units
+        self.cam = cam  # every camera of the convention (front + wrist), read together
         self.park = park  # healthy-end park pose; None = hold + support prompt only
         # bounded torque-on prompts (src/robot/prompts.py); torque_wait None = wait forever
         self.guard = TorqueGuard(arm, torque_wait, read=read)
@@ -218,6 +271,10 @@ class Session:
         self.period = 1.0 / arm.safety.config.control_hz
         self.target: np.ndarray | None = None  # last leader pose, canonical rad
         self.stop = False  # Ctrl-C under ctrl_c_as_flag; the loops check it between ticks
+        # saved episode index -> its demo-schedule placement (``--demo-schedule``)
+        self.placements: dict[str, dict[str, Any]] = {}
+        # after every saved episode, before the dataset is finalized: write the provenance
+        self.on_saved: Callable[[], None] | None = None
 
     @property
     def torque_released(self) -> bool:
@@ -243,8 +300,9 @@ class Session:
         the loss."""
         return INTERRUPTS.terminal_gone() is not None or self.stop
 
-    def tick(self) -> tuple[Any, StepResult]:
-        """One control step. Returns (camera frame or None, step result). The loops call
+    def tick(self) -> tuple[RigFrame | None, StepResult]:
+        """One control step. Returns (frame of every camera or None, step result). A fault on
+        either camera is no frame: the deadman trips in ``arm.step``. The loops call
         ``stop_requested`` first; ``arm.step`` calls it again after the camera, leader and servo
         reads, immediately before its goal write, and raises ``MotionStopped`` (nothing written)
         when it is True: a hang-up, a lost foreground or a Ctrl-C recorded while this tick waited
@@ -368,6 +426,18 @@ def torque_on_ask(sess: Session, msg: str) -> str:
     if reply.how == TIMEOUT:
         return QUIT  # torque already released (support message, grace, torque off)
     return reply.answer
+
+
+def save_durably(dataset: Any, hook: Callable[[int], None]) -> int:
+    """Save the buffered episode; ``hook(index)`` records it; a ``recording.DurableDataset`` is
+    then finalized and reopened (module doc). Returns the episode's index."""
+    if isinstance(dataset, recording.DurableDataset):
+        return dataset.save_episode(before_checkpoint=hook)
+    index = int(getattr(dataset, "num_episodes", 0))
+    with datasets_write_compat():
+        dataset.save_episode()
+    hook(index)
+    return index
 
 
 def discard_episode(dataset: Any) -> None:
@@ -508,16 +578,18 @@ def record_session(
     instructions: dict[str, str],
     n_eps: int,
     ep_time: float,
-    pipe: Callable[[Any], Any],
+    placements: Sequence[dict[str, Any]] | None = None,
 ) -> int:
-    """The interactive episode loop; returns the number of saved episodes. Ends through
+    """The interactive episode loop; returns the number of saved episodes. ``placements``
+    (``--demo-schedule``): episode k of the task is placed as ``placements[k]`` (prompted; a redo
+    keeps it) and recorded in ``sess.placements`` under its dataset episode index. Ends through
     ``end_session`` unless an exception (serial fault, torque-off deadman) ends it first. Any
-    other exception (a dataset or image-pipeline error, a bug) holds the follower and goes
+    other exception (a dataset or convention error, a bug) holds the follower and goes
     through ``end_session``'s support prompt before it propagates (``_unexpected_error``): the
     driver's ``with`` block would otherwise drop the arm at once."""
     with ctrl_c_as_flag(sess):
         try:
-            return _episodes(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
+            return _episodes(sess, dataset, tasks, instructions, n_eps, ep_time, placements)
         except (DeadmanTripped, SerialFault):
             raise  # torque already off (or not confirmed): nothing to hold or support
         except Exception as e:
@@ -553,14 +625,17 @@ def _episodes(
     instructions: dict[str, str],
     n_eps: int,
     ep_time: float,
-    pipe: Callable[[Any], Any],
+    placements: Sequence[dict[str, Any]] | None = None,
 ) -> int:
     arm = sess.arm
     saved = 0
     for task in tasks:
         k = 0
         while k < n_eps:
-            msg = f"[{task} {k + 1}/{n_eps}] arrange the scene, hold the leader, ENTER (q = end): "
+            scene = (
+                "arrange the scene" if placements is None else PR.placement_prompt(placements[k])
+            )
+            msg = f"[{task} {k + 1}/{n_eps}] {scene}, hold the leader, ENTER (q = end): "
             if torque_on_ask(sess, msg) == QUIT:  # servo health before and after the wait
                 end_session(arm, sess)
                 return saved
@@ -571,6 +646,7 @@ def _episodes(
                     print("follower holds; retry")
                     continue
                 t_start = time.perf_counter()
+                t_first: float | None = None  # the episode's first write (timing_s origin)
                 print(f"recording ({ep_time:.0f} s max, Ctrl-C to end) ...")
                 while time.perf_counter() - t_start < ep_time and not sess.stop_requested():
                     t0 = time.perf_counter()
@@ -578,15 +654,19 @@ def _episodes(
                         frame, out = sess.tick()
                     except MotionStopped:  # recorded mid-tick: no goal, no frame this tick
                         break
+                    t_write = time.perf_counter()  # the goal was written inside the tick
+                    t_first = t_write if t_first is None else t_first
                     assert frame is not None and out.safety.command is not None
-                    dataset.add_frame(
-                        {
-                            IMAGE_KEY: pipe(frame.image),
-                            STATE_KEY: out.measured.astype(np.float32),
-                            ACTION_KEY: out.safety.command.astype(np.float32),
-                            "task": instructions[task],
-                        }
+                    row = conv.recording_frame(  # refuses a frame without both cameras
+                        frame.images,
+                        out.measured,
+                        out.safety.command,
+                        instructions[task],
+                        write_time_s=t_write - t_first,
+                        frame_time_s=float(frame.capture_time) - t_first,
                     )
+                    with datasets_write_compat():
+                        dataset.add_frame(row)
                     sess.sleep_to(t0)
                 if sess.stop:
                     print("\nepisode ended")
@@ -617,8 +697,18 @@ def _episodes(
                 return saved
             if n_frames > 0 and keep in ("", "y", "yes"):
                 print("saving episode (encoding video, a few seconds; Ctrl-C is ignored) ...")
+
+                def on_saved(index: int, k: int = k) -> None:
+                    if placements is not None:  # only the demo schedule records the placement
+                        sess.placements[str(index)] = dict(placements[k])
+                    if sess.on_saved is not None:
+                        sess.on_saved()  # before the checkpoint: a kill keeps the map
+
                 try:
-                    dataset.save_episode()
+                    save_durably(dataset, on_saved)
+                except recording.CheckpointFailed:  # saved, but not durable: stop recording
+                    saved += 1
+                    raise
                 except Exception as e:  # noqa: BLE001 - the arm holds; never exit through __exit__
                     print(f"saving failed ({type(e).__name__}: {e}); episode discarded, redo it")
                     discard_episode(dataset)
@@ -631,6 +721,80 @@ def _episodes(
     return saved
 
 
+def recording_provenance(
+    cfg: dict[str, Any],
+    units: UnitMap,
+    instructions: dict[str, str],
+    config_instructions: dict[str, str | None],
+    *,
+    rehearsal: bool,
+    demo_schedule: bool,
+) -> dict[str, Any]:
+    """``meta/vla_rl_so101.json`` at the start of a session (``main`` adds the calibration copy,
+    the session end and the episode placements)."""
+    return {
+        "source": "scripts/wo06_teleop_record.py",
+        "convention": conv.citation(),
+        "units": dict(conv.DECLARED_UNITS),
+        "unit_map": dataclasses.asdict(units),
+        "cameras": {n: dict(cfg["cameras"][n]) for n in conv.CAMERA_NAMES},
+        "protocol_version": PROTOCOL_VERSION,
+        "protocol_hash": protocol_hash(),
+        "instructions": instructions,
+        "config_instructions": config_instructions,
+        "rehearsal": rehearsal,
+        # export inputs (scripts/wo07_export_bundle.py demo): nothing there is guessed
+        "purpose": "demonstration",
+        "session_id": new_run_id("WO-06", "teleop"),
+        "recorded_at": _utc_now(),
+        "robot_id": str(cfg["robot"]["id"]),
+        "demo_schedule": demo_schedule,
+        "protocol": PR.citation() if demo_schedule else None,
+        "episodes": {},
+        "sittings": [],
+    }
+
+
+PROVENANCE_FILE = "meta/vla_rl_so101.json"
+
+
+def resume_problems(
+    prov: dict[str, Any], units: UnitMap, num_episodes: int, placements: Sequence[dict[str, Any]]
+) -> list[str]:
+    """Why a recorded demo dataset may not be continued (empty = it may): the same protocol,
+    convention, demo schedule and ``robot.units``, and its placements = demos 0..N-1 in order."""
+    out = []
+    if not prov.get("demo_schedule"):
+        out.append("--resume continues a --demo-schedule recording only")
+    if prov.get("rehearsal"):
+        out.append("a rehearsal recording is never continued")
+    if (prov.get("protocol") or {}).get("hash") != PR.protocol_hash():
+        out.append(f"recorded under protocol hash {(prov.get('protocol') or {}).get('hash')}")
+    if (prov.get("convention") or {}).get("hash") != conv.convention_hash():
+        out.append(f"recorded under convention {(prov.get('convention') or {}).get('hash')}")
+    if prov.get("unit_map") != json.loads(json.dumps(dataclasses.asdict(units))):
+        out.append(f"robot.units changed: recorded {prov.get('unit_map')}")
+    eps = prov.get("episodes") or {}
+    if sorted(int(i) for i in eps) != list(range(num_episodes)):
+        out.append(f"episodes {sorted(eps, key=int)} != the dataset's 0..{num_episodes - 1}")
+    idx = [int(eps[str(i)].get("demo_idx", -1)) for i in range(num_episodes) if str(i) in eps]
+    if idx != list(range(len(idx))):
+        out.append(f"recorded demo indices {idx} are not 0..{len(idx) - 1} in order")
+    for i in range(min(num_episodes, len(placements))):
+        if str(i) in eps and eps[str(i)] != placements[i]:
+            out.append(f"episode {i}'s placement is not demo {i} of the frozen schedule")
+            break
+    return out
+
+
+def show_file(path: Path) -> None:
+    """Open a picture in Preview (macOS); harmless where ``open`` does not exist."""
+    try:
+        subprocess.run(["open", str(path)], check=False)
+    except OSError:
+        pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     add_config_args(parser)
@@ -640,6 +804,17 @@ def main() -> None:
     parser.add_argument("--push", action="store_true", help="upload to the Hub (private)")
     parser.add_argument(
         "--verbose", action="store_true", help="also log the safety filter's per-tick INFO clips"
+    )
+    parser.add_argument(
+        "--demo-schedule",
+        action="store_true",
+        help="WO-07 demos: protocol real-0.1's frozen demo schedule (PickPlace, 5 seen slots x 10, "
+        "fixed bowl); --episodes N records its first N",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue an interrupted --demo-schedule recording at its next demo (module doc)",
     )
     parser.add_argument(
         "--rehearsal",
@@ -657,6 +832,8 @@ def main() -> None:
         parser.error("WO-06 hardware scripts run with --preset real")
     if args.rehearsal and args.push:
         parser.error("--rehearsal is never pushed")
+    if args.resume and (args.rehearsal or args.overwrite or not args.demo_schedule):
+        parser.error("--resume continues a --demo-schedule recording (no --rehearsal/--overwrite)")
     require_terminal("wo06_teleop_record")  # before the leader, the dataset or the follower
     cfg = load_config(args.preset, args.config)
     tcfg = cfg.get("teleop") or {}
@@ -676,78 +853,160 @@ def main() -> None:
                 f"(teleop.instructions says {config_instructions.get(t)!r})"
             )
     n_eps = 1 if args.rehearsal else int(args.episodes or tcfg["episodes_per_task"])
+    placements: list[dict[str, Any]] | None = None
+    if args.demo_schedule:
+        if tasks != [PR.TASK]:
+            sys.exit(f"--demo-schedule records {PR.TASK} only: pass --task {PR.TASK}")
+        placements = PR.demo_schedule()
+        bowl = bowl_box_problem(cfg)  # every demo carries to the bowl (owner 2026-11-09)
+        if bowl is not None:
+            sys.exit(f"refusing the real-0.1 demo schedule; nothing was opened: {bowl}")
+        frozen = PR.freeze_problem()  # PR.FREEZE_STATUS: demos only on the frozen protocol
+        if frozen is not None:
+            sys.exit(f"refusing the real-0.1 demo schedule; nothing was opened: {frozen}")
+        locked = conv.camera_controls_problems(cfg)  # the scene's locked cameras (WO-06 step 7)
+        if locked:
+            sys.exit(
+                "refusing the real-0.1 demo schedule; nothing was opened: camera controls not "
+                "locked: " + "; ".join(locked)
+            )
+        n_eps = 1 if args.rehearsal else int(args.episodes or len(placements))
+        if not 1 <= n_eps <= len(placements):
+            sys.exit(f"--episodes must be in [1, {len(placements)}] with --demo-schedule")
     ep_time = float(tcfg["episode_time_s"])
+    problems = conv.check_config(cfg)
+    if problems:
+        sys.exit(
+            f"refusing to record: the config departs from {conv.CONVENTION_ID} "
+            f"{conv.CONVENTION_VERSION} (src/robot/convention.py):\n  " + "\n  ".join(problems)
+        )
     sim_cfg = load_config("sim")
     for m in sim_mismatches(cfg, sim_cfg):
-        print(f"WARNING camera config mismatch, {m}")
+        print(f"WARNING front camera config vs sim (pose / fov for the WO-08 sim match), {m}")
 
     fk = load_sim_fk()  # exits with instructions if WO-01's FK is not on this branch yet
-    pipe = PolicyImagePipeline.from_config(cfg)
     units = UnitMap.from_config(cfg)
     repo_id = str(tcfg["hub_repo"])
     root = REPO_ROOT / str(tcfg["dataset_root"]) / repo_id.split("/")[-1]
     if args.rehearsal:
         root = root.with_name(root.name + "-rehearsal")
-    if root.exists():
+    start = 0  # the first demo index of this sitting
+    recovery: dict[str, Any] | None = None
+    if args.resume:
+        if not (root / "meta" / "info.json").is_file():
+            sys.exit(f"--resume: no recording at {root}")
+        recovery = recording.recover_dataset(root)  # a kill mid-save: quarantine, rebuild meta
+        provenance = json.loads((root / PROVENANCE_FILE).read_text())
+        dropped = recording.prune_provenance(provenance, int(recovery["episodes"]))
+        assert placements is not None
+        problems = resume_problems(provenance, units, int(recovery["episodes"]), placements)
+        if recovery["episodes"] == 0:
+            problems.append("no episode was saved: record it anew with --overwrite")
+        if problems:
+            sys.exit("--resume refused; nothing was opened:\n  " + "\n  ".join(problems))
+        start = int(recovery["episodes"])
+        if start >= len(placements):
+            sys.exit(f"--resume: all {len(placements)} demos are recorded")
+        n_eps = min(int(args.episodes or len(placements) - start), len(placements) - start)
+        placements = placements[start:]
+        recovery["pruned_placements"] = dropped
+        print(f"resuming {root} at demo {start + 1}/{start + len(placements)}: {recovery}")
+    elif root.exists():
         if not (args.overwrite or args.rehearsal):
-            sys.exit(f"{root} exists; pass --overwrite to replace it")
+            sys.exit(f"{root} exists; pass --overwrite to replace it, or --resume to continue")
         shutil.rmtree(root)
     root.parent.mkdir(parents=True, exist_ok=True)
 
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
     leader = make_leader(dict(tcfg["leader"]))
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=int(cfg["robot"]["control_hz"]),
-        features=features(pipe.out_size),
-        root=root,
-        robot_type="so101_follower",
-        use_videos=True,
-        video_backend="torchcodec",
-        vcodec="libsvtav1",
-    )
-    provenance: dict[str, Any] = {
-        "source": "scripts/wo06_teleop_record.py",
-        "protocol_version": PROTOCOL_VERSION,
-        "protocol_hash": protocol_hash(),
-        "instructions": instructions,
-        "config_instructions": {t: config_instructions.get(t) for t in tasks},
-        "rehearsal": bool(args.rehearsal),
+    if args.resume:
+        dataset = recording.DurableDataset(recording.open_dataset(repo_id, root), repo_id)
+    else:
+        dataset = recording.DurableDataset(create_dataset(repo_id, root), repo_id)
+        provenance = recording_provenance(
+            cfg,
+            units,
+            instructions,
+            {t: config_instructions.get(t) for t in tasks},
+            rehearsal=bool(args.rehearsal),
+            demo_schedule=placements is not None,
+        )
+    cite = conv.citation()
+    print(f"recording in {cite['id']} {cite['version']} ({cite['module']}, sha256 {cite['hash']})")
+    sitting: dict[str, Any] = {
+        "started_utc": _utc_now(),
+        "first_episode": start,
+        "cameras": {n: dict(cfg["cameras"][n]) for n in conv.CAMERA_NAMES},
+        "recovery": recovery,
     }
-    (root / "meta").mkdir(parents=True, exist_ok=True)
-    (root / "meta" / "vla_rl_so101.json").write_text(json.dumps(provenance, indent=2) + "\n")
+    provenance.setdefault("sittings", []).append(sitting)
+    prov_path = root / PROVENANCE_FILE
+    recording.write_json(prov_path, provenance)
     leader.connect(calibrate=False)  # leader configure() leaves its torque off
     try:
         if not leader.is_calibrated:
             sys.exit("leader motors do not match its calibration file; recalibrate the leader")
         arm = So101Driver.from_config(cfg, fk)
+        # the follower's calibration as loaded (lerobot read <calibration_dir>/<id>.json)
+        if args.resume:
+            data, _src = recording.calibration_bytes(arm.follower)
+            if hashlib.sha256(data).hexdigest() != (provenance.get("calibration") or {}).get(
+                "sha256"
+            ):
+                sys.exit(
+                    "--resume refused: the follower loads another calibration than the recorded "
+                    "demos (its sha256 differs); torque was never enabled"
+                )
+        else:
+            provenance["calibration"] = recording.copy_calibration(arm.follower, root)
+        recording.write_json(prov_path, provenance)
         sess: Session | None = None
         # Ctrl-Z ignored, foreground watched: from before torque on until the session's record
         # is written, the TORQUE OFF UNCONFIRMED instruction included (review F3)
         with job_control():
             try:
-                with (
-                    OpenCVFrameSource(cfg["cameras"]["front"]) as cam,
-                    arm,  # torque ON from here, holding the pose
-                ):
-                    sess = Session(
-                        arm,
-                        leader,
-                        cam,
-                        units,
-                        park=park_from_config(cfg),  # None unless robot.park.enabled
-                        torque_wait=TorqueWait.from_config(cfg, "teleop", allow_none=True),
-                    )
-                    record_session(sess, dataset, tasks, instructions, n_eps, ep_time, pipe)
+                with CameraRig.from_config(cfg, conv.CAMERA_NAMES) as cam:  # front + wrist
+                    n_check = len(provenance["sittings"])
+                    try:  # before torque: which index is which camera (review conv-4)
+                        sitting["camera_check"] = confirm_camera_roles(
+                            cam,
+                            root / "meta" / f"camera_check_{n_check}.png",
+                            prompt_input,
+                            indices={n: cfg["cameras"][n].get("index") for n in conv.CAMERA_NAMES},
+                            show=show_file,
+                        )
+                    except CameraRoleError as e:
+                        sys.exit(str(e))
+                    recording.write_json(prov_path, provenance)
+                    with arm:  # torque ON from here, holding the pose
+                        sess = Session(
+                            arm,
+                            leader,
+                            cam,
+                            units,
+                            park=park_from_config(cfg),  # None unless robot.park.enabled
+                            torque_wait=TorqueWait.from_config(cfg, "teleop", allow_none=True),
+                        )
+                        sess.placements = dict(provenance.get("episodes") or {})  # a resume
+                        live = sess
+
+                        def save_provenance() -> None:
+                            provenance["episodes"] = dict(live.placements)
+                            recording.write_json(prov_path, provenance)
+
+                        sess.on_saved = save_provenance
+                        record_session(
+                            sess, dataset, tasks, instructions, n_eps, ep_time, placements
+                        )
             finally:
                 _torque_off_unconfirmed(arm)  # also after the driver's own torque-off on exit
-                provenance.update(session_record(arm, sess))
-                (root / "meta" / "vla_rl_so101.json").write_text(
-                    json.dumps(provenance, indent=2) + "\n"
-                )
+                ended = session_record(arm, sess)
+                provenance.update(ended)
+                sitting.update(ended)
+                if sess is not None:
+                    provenance["episodes"] = dict(sess.placements)
+                recording.write_json(prov_path, provenance)
     finally:
-        dataset.finalize()
+        dataset.close()
         if leader.is_connected:
             leader.disconnect()
         saved = int(dataset.num_episodes)

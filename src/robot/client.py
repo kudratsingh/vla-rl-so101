@@ -6,6 +6,12 @@
     home = loop.go_home()                                 # MOVES THE ARM (through safety)
     result = loop.run_trial(protocol.instruction("PickPlace", RED_CUBE))
 
+In-process policy (SmolVLA / ACT on the Mac, ``src/robot/local_policy.py``): a
+``LocalPolicyClient`` in place of ``PolicyClient`` and a ``CameraRig`` (front + wrist) in place of
+the front camera, with ``local_pipe``. Everything below applies unchanged; ``ServerFault`` then
+describes the in-process call (stop reasons ``server_timeout`` / ``server_error`` /
+``server_bad_reply``), and ``request_timeout_ms`` is ``local_policy.request_timeout_ms``.
+
 Every write goes through ``So101Driver.step`` (deadman frame check -> ``SafetyFilter`` -> bus);
 the only other writes are the driver's own hold-at-measured-pose responses.
 
@@ -77,7 +83,7 @@ before the wait and after the answer, and waits at most ``deploy.prompt_torque_t
 ``deploy.prompt_support_grace_s`` (default 10 s, ENTER = now), deadman TORQUE_OFF, torque off, and
 the session ends (``prompt_timeout``; no park). Mock runs use ``ScriptedOperator`` (instant).
 
-Scoring (``run_trials`` / ``_score``, judging rule real-judge-2 in scripts/wo07_real_eval.py):
+Scoring (``run_trials`` / ``_score``, judging rule real-judge-3 in scripts/wo07_real_eval.py):
 a trial counts once its policy started (``TrialResult.policy_started``: the goal write of the
 trial's first policy action was begun, ``So101Driver.goal_write_attempted``; a write that raised
 from inside counts, since the goal may have reached the bus; a step stopped before its write, by
@@ -141,7 +147,7 @@ import numpy.typing as npt
 
 from src.config import Config
 from src.eval import protocol
-from src.robot.camera import CameraFault, Frame
+from src.robot.camera import CameraFault, Frame, RigFrame
 from src.robot.driver import (
     SERVO_FAULT_PROMPT,
     TORQUE_OFF_UNCONFIRMED,
@@ -152,6 +158,7 @@ from src.robot.driver import (
     SerialFault,
     ServoFault,
     So101Driver,
+    StepResult,
     park_from_config,
 )
 from src.robot.prompts import (
@@ -392,7 +399,26 @@ def check_server(info: Mapping[str, Any], dcfg: DeployConfig) -> None:
 # Control loop
 # ------------------------------------------------------------------------------------------------
 class FrameSource(Protocol):
-    def read(self) -> Frame: ...
+    """One camera (``OpenCVFrameSource``: the gRPC path's front view) or a ``CameraRig`` (every
+    convention camera: the in-process path, ``src/robot/local_policy.py``)."""
+
+    def read(self) -> Frame | RigFrame: ...
+
+
+class PolicyBackend(Protocol):
+    """``PolicyClient`` (gRPC) or ``local_policy.LocalPolicyClient`` (in process): one chunk of
+    absolute joint targets (rad) per query, or ``ServerFault``."""
+
+    chunk_len: int
+    action_dim: int
+
+    def act(self, image: Any, state: npt.ArrayLike, instruction: str) -> ActReply: ...
+
+
+def policy_images(frame: Frame | RigFrame) -> Any:
+    """What ``DeployLoop.pipe`` is given: the one camera's image (``Frame``) or every camera's
+    by name (``RigFrame``)."""
+    return frame.images if isinstance(frame, RigFrame) else frame.image
 
 
 @dataclass
@@ -472,8 +498,8 @@ class DeployLoop:
         self,
         arm: So101Driver,
         cam: FrameSource,
-        pipe: Callable[[np.ndarray], np.ndarray],
-        client: PolicyClient,
+        pipe: Callable[[Any], Any],
+        client: PolicyBackend,
         dcfg: DeployConfig,
         *,
         clock: Callable[[], float] = time.perf_counter,
@@ -492,6 +518,14 @@ class DeployLoop:
         # recorded during the marker I/O, or the marker failed): the durable retraction row that
         # makes the attempt not_started for a resume (run_trials; load_prior)
         self.on_policy_start_retracted: Callable[[TrialResult, str], None] | None = None
+        # runs after every policy write with that tick's frame and step result (the evaluation
+        # capture, src/robot/recording.py: both cameras, measured state, written command). A
+        # failure in it is logged and never reaches the arm or the trial
+        self.on_write: Callable[[Frame | RigFrame | None, StepResult], None] | None = None
+        # runs once at the end of a clean trial's settling interval, before the servo read and
+        # the score prompt (the evaluation capture reads the end-state stills the rubric
+        # judges). A failure in it is logged and never reaches the arm or the score
+        self.on_settled: Callable[[], None] | None = None
         # the session's signal flags (src/robot/prompts.operator_signals; hardware only): a
         # Ctrl-C or a hang-up stops motion between ticks, never inside a bus transaction
         self.interrupts = interrupts
@@ -535,7 +569,7 @@ class DeployLoop:
             raise RuntimeError(f"MotionStopped without a recorded stop: {e}") from e
         return stop
 
-    def _read_frame(self) -> Frame | None:
+    def _read_frame(self) -> Frame | RigFrame | None:
         try:
             return self.cam.read()
         except CameraFault as e:
@@ -644,7 +678,7 @@ class DeployLoop:
             assert frame is not None  # check_frame raised otherwise
             t_capture = frame.capture_time
             state = self.arm.read_state()
-            image = self.pipe(frame.image)
+            image = self.pipe(policy_images(frame))
             t_pre = self.clock()
             try:
                 reply = self.client.act(image, state.astype(np.float32), instruction)
@@ -696,6 +730,7 @@ class DeployLoop:
                     t_write = self.clock()
                 except MotionStopped as e:  # nothing written: the top-of-tick stop's path
                     raise self._stopped(e) from e
+                self._wrote(frame, out)  # after the write and its stamp: never delays either
                 t_tick = t0
                 res.steps += 1
                 self._record_safety(res, out.safety)
@@ -725,7 +760,10 @@ class DeployLoop:
 
         1. the pre-write stop check: a stop recorded before it blocks the goal, no marker;
         2. the policy start (``_policy_started``): the stamp and the durable ``trial_started``
-           row. If saving it fails (any exception: I/O error, disk full), the goal is blocked
+           row, written AND synced to stable storage before ``on_policy_start`` returns
+           (``DURABLE_ROW_KINDS``; the real eval's ``Run.log_durable``: F_FULLFSYNC on macOS, and
+           required on the real arm there: no fsync fallback, src/runs.py ``SyncPolicy``).
+           If saving or syncing it fails (any exception: I/O error, disk full), the goal is blocked
            with ``START_MARKER_FAILED`` (a ``SessionStop``: hold, the session ends), since a
            started slot without its durable marker could be re-rolled by a resume;
         3. the freshness checks AGAIN, on the clock after the marker I/O (``_fresh_after_marker``):
@@ -745,8 +783,9 @@ class DeployLoop:
         killed between the marker and its retraction leaves a bare marker, which a resume scores
         a ``session_lost`` failure (the logs cannot show that the goal was blocked: doubt =
         started). A write that began counts as started even when it fails part-way. Cost: one
-        log write and one clock read before the first goal of each trial, inside that decision's
-        ``LATENCY_KEY``; ``policy_start_mark_ms`` is the stamp + marker I/O + freshness re-check
+        log write, its sync and one clock read before the first goal of each trial, inside that
+        decision's ``LATENCY_KEY``; ``policy_start_mark_ms`` is the stamp + marker I/O and sync +
+        freshness re-check
         (it excludes only the final stop check, the flag read and ``tcgetpgrp`` poll, so that
         nothing else runs between that check and the write). The stamp is taken when the marker
         I/O begins, that long before the write."""
@@ -829,6 +868,22 @@ class DeployLoop:
             log.exception("saving the start retraction failed")
             return f"; the retraction could not be saved ({type(e).__name__}: {e})"
         return ""
+
+    def settled(self) -> None:
+        if self.on_settled is None:
+            return
+        try:
+            self.on_settled()
+        except Exception:  # a recording failure must not stop the scoring
+            log.exception("recording the settled end state failed")
+
+    def _wrote(self, frame: Frame | RigFrame | None, out: StepResult) -> None:
+        if self.on_write is None:
+            return
+        try:
+            self.on_write(frame, out)
+        except Exception:  # a recording failure must not stop the trial
+            log.exception("recording the policy write failed")
 
     @staticmethod
     def _record_safety(res: TrialResult, safety: Any) -> None:
@@ -1210,7 +1265,7 @@ Scored = tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]
 def _score(
     loop: DeployLoop, operator: Operator, result: TrialResult, settle: dict[str, Any] | None
 ) -> Scored:
-    """Judging rule real-judge-2 (scripts/wo07_real_eval.py). A trial whose policy never started
+    """Judging rule real-judge-3 (scripts/wo07_real_eval.py). A trial whose policy never started
     is an attempt (``not_started``, never scored). A started trial that ended in a fault, or
     faults during the settle / at the score prompt, is a failure (``fault``) and the operator is
     not asked. A clean one settles, the servos are read, then the operator judges it; a score
@@ -1243,6 +1298,7 @@ def _score(
                 raise gone_error(stop.kind, stop.reason)
             if stop is not None:
                 raise KeyboardInterrupt
+            loop.settled()  # the end state, before the servo read and the score prompt
             try:
                 arm.check_servos()  # the arm held under torque while it settled
             except (ServoFault, SerialFault) as e:  # torque now off: the same physical event
@@ -1262,7 +1318,7 @@ def _score(
             how, why = EOF, f"stdin closed (EOF) during {stage}"
     except PromptTimeout as e:
         how, why = TIMEOUT, f"{e}; torque released"
-    return "failure", "unjudged", None, {"how": how, "reason": f"{why}: doubt = n (real-judge-2)"}
+    return "failure", "unjudged", None, {"how": how, "reason": f"{why}: doubt = n (real-judge-3)"}
 
 
 def _late_fault(result: TrialResult, e: BaseException, where: str) -> dict[str, Any]:
@@ -1292,6 +1348,8 @@ def run_trials(
     placement_fn: PlacementFn | None = None,
     record_extra: Mapping[str, Any] | None = None,
     settle_s: float | None = None,
+    object_fn: Callable[[int], protocol.ObjectSpec] | None = None,
+    record_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Home -> trial -> outcome for each trial index (``indices``, default ``range(n_trials)``).
     Returns (trial records, why the session ended). Records are appended to ``trials`` as they
@@ -1300,8 +1358,12 @@ def run_trials(
     prompt and record (scripts/wo07_real_eval.py); ``record_extra`` is merged into every record.
     ``settle_s``: after a clean trial the arm holds still this long (``loop.sleep``), the servos
     are read once, and only then is the operator asked to score it; recorded as ``settle``.
+    ``object_fn(k)``: the manipulated object (default ``trial_object``: protocol 0.1-draft's
+    objects; the real protocol ``src/eval/protocol_real.py`` passes its schedule's). ``record_hook``
+    runs on every trial record (not the ``trial_started`` marker) before it is appended and logged
+    (the evaluation capture adds its ``capture`` block there).
 
-    Scoring (``_score``, judging rule real-judge-2): ``policy_started`` (the goal write of the
+    Scoring (``_score``, judging rule real-judge-3): ``policy_started`` (the goal write of the
     trial's first policy action was begun: ``TrialResult.policy_started_t``) decides whether an
     attempt counts. Not started (home failed / faulted / Ctrl-C, a server failure or a stale first
     chunk before the first action, the first policy goal blocked by the pre-write stop check or
@@ -1324,7 +1386,8 @@ def run_trials(
     the record (a crash, a Ctrl-C without the flag handler) appends that record before it
     propagates. If the goal is blocked after the marker (a stop recorded during the marker I/O,
     seen by the stop check right before the write; a frame or chunk that went stale during it;
-    or the marker failed to save) nothing was sent: a ``trial_start_retracted`` row (same cell, trial_idx, start_utc) goes to ``log_row``,
+    or the marker failed to save) nothing was sent: a ``trial_start_retracted`` row (same cell,
+    trial_idx, start_utc and the ``RETRACTION_KEYS`` of ``record_extra``) goes to ``log_row``,
     the attempt is ``not_started``, and the resume retries the slot (``DeployLoop.
     _first_goal_check``). A marker that cannot be saved ends the session
     (``start_marker_failed``): without it a started slot could be re-rolled by a resume.
@@ -1344,7 +1407,7 @@ def run_trials(
     for k in range(n_trials) if indices is None else indices:
         if arm.torque_off_unconfirmed is not None:  # no motion is possible: never start a trial
             return trials, _torque_off_end(arm)
-        obj = trial_object(task, cell, k)
+        obj = trial_object(task, cell, k) if object_fn is None else object_fn(k)
         instruction = protocol.instruction(task, obj)
         tag = f"[{task}/{cell} {k + 1}/{n_trials}]"
         if placement_fn is None:
@@ -1396,6 +1459,8 @@ def run_trials(
                 rec["settle"] = dict(settle)
             if record_extra:
                 rec.update(record_extra)
+            if kind == "trial" and record_hook is not None:
+                record_hook(rec)
             stamp_torque_off_unconfirmed(rec, arm)  # last: nothing after it overwrites the flag
             if kind == "trial":
                 trials.append(rec)
@@ -1423,6 +1488,8 @@ def run_trials(
         ) -> None:
             slot["pending"] = None  # nothing was sent: no session_lost record for this attempt
             if log_row is not None:
+                # the attempt's key (load_prior: cell, trial_idx, start_utc, attempt) and id
+                ids = {key: v for key, v in (record_extra or {}).items() if key in RETRACTION_KEYS}
                 log_row(
                     kind="trial_start_retracted",
                     task=task,
@@ -1431,6 +1498,7 @@ def run_trials(
                     start_utc=start,
                     retracted_utc=utc_now(),
                     reason=why,
+                    **ids,
                 )
 
         loop.on_policy_start = on_policy_start
@@ -1527,6 +1595,14 @@ def run_trials(
             arm.safety.reset_reference()
     return trials, "completed"
 
+
+DURABLE_ROW_KINDS = ("trial_started", "trial_start_retracted")
+"""``run_trials``' rows a resume depends on: its ``log_row`` must have them on stable storage
+before it returns (scripts/wo07_real_eval.py: ``Run.log_durable``); an ``OSError`` from that sync
+blocks the first goal like a failed write (``DeployLoop._first_goal_check``)."""
+
+RETRACTION_KEYS = ("attempt", "trial_id", "schedule_pos")
+"""``record_extra`` keys a ``trial_start_retracted`` row carries: the attempt it retracts."""
 
 SESSION_LOST = {
     "kind": "session_lost",

@@ -1,0 +1,634 @@
+{
+  "run_id": "20261109T075342Z-wo07-local-latency-real-564e",
+  "work_order": "WO-07",
+  "script": "scripts/wo07_local_latency.py",
+  "argv": [
+    "--preset",
+    "real",
+    "--family",
+    "act"
+  ],
+  "preset": "real",
+  "config_hash": "0d912ade77518dec9d16bc3bf6ac58b8e15bd6a15d60d07b7563cf2ec017b19a",
+  "config": {
+    "preset": "real",
+    "robot": {
+      "type": "so101_follower",
+      "id": "so101_follower",
+      "port": "/dev/tty.usbmodemXXXX",
+      "calibration_dir": "~/.cache/huggingface/lerobot/calibration/robots/so_follower",
+      "use_degrees": true,
+      "control_hz": 15,
+      "units": {
+        "arm_sign": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "arm_offset_deg": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "gripper_closed_rad": -0.174533,
+        "gripper_open_rad": 1.74533
+      },
+      "safety": {
+        "joint_limits_deg": {},
+        "urdf_limit_margin_deg": 5.0,
+        "workspace_box_m": {
+          "x": [
+            0.1,
+            0.4
+          ],
+          "y": [
+            -0.2,
+            0.2
+          ],
+          "z": [
+            0.0,
+            0.25
+          ]
+        },
+        "max_joint_step_deg": 4.0,
+        "max_velocity_deg_s": 60.0,
+        "max_tracking_error_deg": 20.0,
+        "deadman_frame_timeout_ms": 300,
+        "torque_enable_tol_deg": {
+          "calibrated_range": 1.0,
+          "safety_limits": 6.0
+        }
+      },
+      "park": {
+        "enabled": false,
+        "qpos": null,
+        "tol_deg": 3.0,
+        "timeout_s": 20
+      },
+      "servo_monitor": {
+        "read_every_ticks": 4,
+        "max_temperature_c": 55,
+        "max_current_ma": 1500,
+        "current_trip_s": 1.0,
+        "current_ma_per_count": 6.5,
+        "bus_budget_ms": 10
+      }
+    },
+    "teleop": {
+      "leader": null,
+      "episodes_per_task": 5,
+      "episode_time_s": 30,
+      "prompt_torque_timeout_s": 60,
+      "prompt_support_grace_s": 10,
+      "dataset_root": "data/real_teleop",
+      "hub_repo": "KudratSingh22/vla-rl-so101-real-teleop",
+      "instructions": {
+        "PickPlace": "pick up the cube and place it in the bowl",
+        "Push": "push the cube to the target",
+        "Stack": "stack the red cube on the blue cube"
+      }
+    },
+    "cameras": {
+      "front": {
+        "index": 0,
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "intrinsics": null,
+        "pose": "front_left_45",
+        "crop_to": 224,
+        "fov_deg": 40
+      },
+      "wrist": {
+        "index": 1,
+        "width": 640,
+        "height": 480,
+        "fps": 30
+      }
+    },
+    "server": {
+      "host": "127.0.0.1",
+      "port": 50051,
+      "policy_checkpoint": null
+    },
+    "local_policy": {
+      "family": "smolvla",
+      "base": null,
+      "checkpoint_sha256": null,
+      "device": "mps",
+      "exec_steps": null,
+      "request_timeout_ms": 700,
+      "warmup": 2,
+      "latency_bases": {
+        "smolvla": "lerobot/smolvla_base",
+        "act": null
+      }
+    },
+    "deploy": {
+      "chunk_len": 8,
+      "action_dim": 6,
+      "exec_steps": null,
+      "request_timeout_ms": 400,
+      "max_chunk_age_ms": 800,
+      "trial_max_steps": 150,
+      "home_qpos": [
+        0.0,
+        -1.3,
+        0.6,
+        1.3,
+        0.0,
+        0.0
+      ],
+      "home_tol_deg": 3.0,
+      "home_timeout_s": 20,
+      "latency_target_ms": 150,
+      "capture_offset_ms": null,
+      "stop_on_reject": false,
+      "prompt_torque_timeout_s": 60,
+      "prompt_support_grace_s": 10,
+      "pilot": {
+        "task": "PickPlace",
+        "cell": "seen",
+        "trials": 5
+      }
+    },
+    "eval": {
+      "trials_per_cell": 50,
+      "cells": [
+        "seen",
+        "shifted",
+        "unseen_objects"
+      ],
+      "grid": "docs/assets/placement-grid-a3.pdf",
+      "slot_seed": 0,
+      "settle_s": 3.0
+    }
+  },
+  "git": {
+    "commit": "dc7d09c1ca2bcaf33d64383ea278527543dc8ebb",
+    "branch": "pr2-work",
+    "dirty": true
+  },
+  "device": {
+    "device": "mps",
+    "host": "Kudrats-MacBook-Pro-3.local",
+    "os": "macOS-26.5.2-arm64-arm-64bit",
+    "torch": "2.6.0",
+    "name": "Apple M3 Pro",
+    "runpod_pod_id": null
+  },
+  "start_utc": "2026-11-09T07:53:42Z",
+  "end_utc": "2026-11-09T07:54:11Z",
+  "wall_clock_s": 28.32,
+  "hourly_usd": 0.0,
+  "estimated_usd": 0.0,
+  "actual_usd": 0.0,
+  "status": "ok",
+  "results": {
+    "label": "MOCK RIG, single run: fake arm + two fake cameras, real deploy loop / safety filter / model on this Mac. EXCLUDES camera capture (exposure, USB, driver buffering). Not an arm number",
+    "policy_info": {
+      "transport": "in_process",
+      "chunk_len": 50,
+      "action_dim": 6,
+      "protocol_version": "0.1-draft",
+      "protocol_hash": "e9ce5bb47a88da03d3cad77c4084b32d7184eeb2d30efa4f93f6f487be7e517c",
+      "policy_id": "/private/tmp/claude-501/-Users-kudratsingh-Robotics-vla-rl-so101/70b70b41-8e42-4fcf-807c-34aeb7eab41a/scratchpad/wt-pr2/runs/20261109T075342Z-wo07-local-latency-real-564e/act_init",
+      "describe": {
+        "kind": "local",
+        "family": "act",
+        "type": "act",
+        "base": "/private/tmp/claude-501/-Users-kudratsingh-Robotics-vla-rl-so101/70b70b41-8e42-4fcf-807c-34aeb7eab41a/scratchpad/wt-pr2/runs/20261109T075342Z-wo07-local-latency-real-564e/act_init",
+        "device": "mps",
+        "dtype": "torch.float32",
+        "chunk_size": 50,
+        "n_action_steps": 50,
+        "image_features": [
+          "observation.images.front",
+          "observation.images.wrist"
+        ],
+        "rename_map": {},
+        "warmup_ms": [
+          311.335,
+          33.138
+        ],
+        "provenance": null,
+        "training_run_id": null,
+        "vlm": null
+      },
+      "server_run": {
+        "run_id": "20261109T075342Z-wo07-local-latency-real-564e",
+        "device": "mps"
+      },
+      "convention": null,
+      "checkpoint_sha256": "8b0085620836c40515619b752de59152fb269f85cdb8af41a57c41ab23faaae4",
+      "checkpoint_revision": null
+    },
+    "latency": {
+      "label": "MOCK RIG, single run: fake arm + two fake cameras, real deploy loop / safety filter / model on this Mac. EXCLUDES camera capture (exposure, USB, driver buffering). Not an arm number",
+      "family": "act",
+      "checkpoint": "fresh ACT (untrained, placeholder stats)",
+      "fresh_init": true,
+      "device": "mps",
+      "dtype": "torch.float32",
+      "mac": {
+        "chip": "Apple M3 Pro",
+        "model": "Mac15,7",
+        "memory_gb": 36.0,
+        "macos": "26.5.2",
+        "platform": "macOS-26.5.2-arm64-arm-64bit"
+      },
+      "load_s": 0.98,
+      "warmup_ms": [
+        311.335,
+        33.138
+      ],
+      "chunk_ms": {
+        "n": 28,
+        "p50": 53.82,
+        "p95": 62.067,
+        "max": 74.598
+      },
+      "model_ms": {
+        "n": 28,
+        "p50": 45.231,
+        "p95": 53.392,
+        "max": 56.954
+      },
+      "command_gap_ms": {
+        "n": 298,
+        "p50": 71.561,
+        "p95": 121.837,
+        "max": 130.803
+      },
+      "ticks": 300,
+      "decisions": 28,
+      "actions_per_chunk_mean": 10.71,
+      "trials": 2,
+      "stop_reasons": {
+        "max_steps": 2
+      },
+      "chunk_len": 50,
+      "exec_steps": 50,
+      "request_timeout_ms": 700.0,
+      "max_chunk_age_ms": 800.0,
+      "control_hz": 15.0,
+      "stop_on_reject": false,
+      "safety_status": {
+        "pass": 299,
+        "clipped": 1
+      },
+      "capture": {
+        "on": false
+      }
+    },
+    "summary": {
+      "protocol_version": "0.1-draft",
+      "protocol_hash": "e9ce5bb47a88da03d3cad77c4084b32d7184eeb2d30efa4f93f6f487be7e517c",
+      "cells": {
+        "PickPlace/seen": {
+          "task": "PickPlace",
+          "cell": "seen",
+          "n": 2,
+          "successes": 2,
+          "not_started": 0,
+          "faulted": 0,
+          "unjudged": 0,
+          "stop_reasons": {
+            "max_steps": 2
+          },
+          "faults_by_kind": {},
+          "success_rate": 1.0,
+          "wilson_95": [
+            0.3424,
+            1.0
+          ],
+          "diagnostic_excluding_faulted": {
+            "n": 2,
+            "successes": 2,
+            "success_rate": 1.0,
+            "note": "SECONDARY diagnostic, not the result: success rate over started trials that did not end in a fault. The primary metric (success_rate) counts every faulted trial as a failure."
+          }
+        }
+      },
+      "frame_return_to_first_write_ms": {
+        "n": 28,
+        "median": 54.852,
+        "p95": 63.133,
+        "max": 75.93
+      },
+      "write_hz": {
+        "n": 2,
+        "median": 13.287,
+        "p95": 13.29,
+        "max": 13.29
+      },
+      "primary_metric": "success_rate = successes / trials whose policy started (each slot scored once); a fault after the start (servo, serial, safety / deadman stop, server, torque off unconfirmed, Ctrl-C during motion) and an unjudged score prompt count as failures",
+      "latency_target_ms": 150.0,
+      "frame_return_p95_under_target": true,
+      "latency_note": "frame_return_to_first_write_ms: LeRobot's frame stamp (perf_counter in its read thread, after VideoCapture.read() returned and the BGR->RGB conversion) to the first bus write. EXCLUDES capture: exposure, sensor readout, USB transfer, AVFoundation buffering, decode. Not end-to-end; see docs/bringup/latency-measurement.md",
+      "end_to_end_estimate_ms": null,
+      "torque_off_unconfirmed": false
+    },
+    "session_end": "completed",
+    "trials": [
+      {
+        "task": "PickPlace",
+        "cell": "seen",
+        "trial_idx": 0,
+        "instruction": "pick up the red cube and place it in the bowl",
+        "protocol_version": "0.1-draft",
+        "protocol_hash": "e9ce5bb47a88da03d3cad77c4084b32d7184eeb2d30efa4f93f6f487be7e517c",
+        "policy_id": "/private/tmp/claude-501/-Users-kudratsingh-Robotics-vla-rl-so101/70b70b41-8e42-4fcf-807c-34aeb7eab41a/scratchpad/wt-pr2/runs/20261109T075342Z-wo07-local-latency-real-564e/act_init",
+        "server_describe": {
+          "kind": "local",
+          "family": "act",
+          "type": "act",
+          "base": "/private/tmp/claude-501/-Users-kudratsingh-Robotics-vla-rl-so101/70b70b41-8e42-4fcf-807c-34aeb7eab41a/scratchpad/wt-pr2/runs/20261109T075342Z-wo07-local-latency-real-564e/act_init",
+          "device": "mps",
+          "dtype": "torch.float32",
+          "chunk_size": 50,
+          "n_action_steps": 50,
+          "image_features": [
+            "observation.images.front",
+            "observation.images.wrist"
+          ],
+          "rename_map": {},
+          "warmup_ms": [
+            311.335,
+            33.138
+          ],
+          "provenance": null,
+          "training_run_id": null,
+          "vlm": null
+        },
+        "start_utc": "2026-11-09T07:53:47Z",
+        "end_utc": "2026-11-09T07:53:59Z",
+        "outcome": "success",
+        "outcome_source": "scripted",
+        "policy_started": true,
+        "policy_started_utc": "2026-11-09T07:53:48Z",
+        "fault": null,
+        "unjudged": null,
+        "steps": 150,
+        "decisions": 14,
+        "stop_reason": "max_steps",
+        "stop_detail": "",
+        "deadman_response": null,
+        "stale_chunk_drops": 13,
+        "home": {
+          "reached": true,
+          "rejected": false,
+          "steps": 19,
+          "residual_deg": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "safety": {
+          "status_counts": {
+            "pass": 150
+          },
+          "interventions_by_kind": {},
+          "interventions_by_group": {},
+          "first_interventions": []
+        },
+        "latency": {
+          "frame_return_to_first_write_ms": {
+            "n": 14,
+            "median": 54.852,
+            "p95": 67.688,
+            "max": 75.93
+          },
+          "rtt_ms": {
+            "n": 14,
+            "median": 53.931,
+            "p95": 66.841,
+            "max": 75.183
+          },
+          "infer_ms": {
+            "n": 14,
+            "median": 44.327,
+            "p95": 55.132,
+            "max": 56.954
+          },
+          "boundary_gap_ms": {
+            "n": 13,
+            "median": 124.154,
+            "p95": 129.205,
+            "max": 130.796
+          },
+          "write_hz": 13.285,
+          "max_frame_age_ms": 0.769,
+          "per_decision_frame_return_to_first_write_ms": [
+            75.93,
+            63.25,
+            56.236,
+            43.393,
+            53.298,
+            59.801,
+            58.087,
+            60.723,
+            48.662,
+            47.887,
+            39.339,
+            42.443,
+            55.145,
+            54.558
+          ],
+          "note": "frame_return_to_first_write_ms: LeRobot's frame stamp (perf_counter in its read thread, after VideoCapture.read() returned and the BGR->RGB conversion) to the first bus write. EXCLUDES capture: exposure, sensor readout, USB transfer, AVFoundation buffering, decode. Not end-to-end; see docs/bringup/latency-measurement.md"
+        },
+        "servo_health": {
+          "reads": 42,
+          "read_ms": {
+            "mean": 0.006,
+            "max": 0.022,
+            "over_budget": 0,
+            "budget": 10.0
+          },
+          "read_every_ticks": 4,
+          "register_period_s": 0.5333,
+          "max_temperature_c": {
+            "shoulder_pan": 35.0,
+            "shoulder_lift": 35.0,
+            "elbow_flex": 35.0,
+            "wrist_flex": 35.0,
+            "wrist_roll": 35.0,
+            "gripper": 35.0
+          },
+          "max_current_ma": {
+            "shoulder_pan": 97.5,
+            "shoulder_lift": 97.5,
+            "elbow_flex": 97.5,
+            "wrist_flex": 97.5,
+            "wrist_roll": 97.5,
+            "gripper": 97.5
+          }
+        },
+        "camera_calibrated": false,
+        "torque_off_unconfirmed": false
+      },
+      {
+        "task": "PickPlace",
+        "cell": "seen",
+        "trial_idx": 1,
+        "instruction": "pick up the red cube and place it in the bowl",
+        "protocol_version": "0.1-draft",
+        "protocol_hash": "e9ce5bb47a88da03d3cad77c4084b32d7184eeb2d30efa4f93f6f487be7e517c",
+        "policy_id": "/private/tmp/claude-501/-Users-kudratsingh-Robotics-vla-rl-so101/70b70b41-8e42-4fcf-807c-34aeb7eab41a/scratchpad/wt-pr2/runs/20261109T075342Z-wo07-local-latency-real-564e/act_init",
+        "server_describe": {
+          "kind": "local",
+          "family": "act",
+          "type": "act",
+          "base": "/private/tmp/claude-501/-Users-kudratsingh-Robotics-vla-rl-so101/70b70b41-8e42-4fcf-807c-34aeb7eab41a/scratchpad/wt-pr2/runs/20261109T075342Z-wo07-local-latency-real-564e/act_init",
+          "device": "mps",
+          "dtype": "torch.float32",
+          "chunk_size": 50,
+          "n_action_steps": 50,
+          "image_features": [
+            "observation.images.front",
+            "observation.images.wrist"
+          ],
+          "rename_map": {},
+          "warmup_ms": [
+            311.335,
+            33.138
+          ],
+          "provenance": null,
+          "training_run_id": null,
+          "vlm": null
+        },
+        "start_utc": "2026-11-09T07:53:59Z",
+        "end_utc": "2026-11-09T07:54:10Z",
+        "outcome": "success",
+        "outcome_source": "scripted",
+        "policy_started": true,
+        "policy_started_utc": "2026-11-09T07:53:59Z",
+        "fault": null,
+        "unjudged": null,
+        "steps": 150,
+        "decisions": 14,
+        "stop_reason": "max_steps",
+        "stop_detail": "",
+        "deadman_response": null,
+        "stale_chunk_drops": 13,
+        "home": {
+          "reached": true,
+          "rejected": false,
+          "steps": 2,
+          "residual_deg": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "safety": {
+          "status_counts": {
+            "clipped": 1,
+            "pass": 149
+          },
+          "interventions_by_kind": {
+            "velocity_cap": 1
+          },
+          "interventions_by_group": {
+            "arm": 1
+          },
+          "first_interventions": [
+            {
+              "step": 1,
+              "kind": "velocity_cap",
+              "joint": "elbow_flex",
+              "requested_deg": 37.93366170676773,
+              "applied_deg": 37.26964770775736,
+              "reason": "|step| limited to 2.89 deg (dt 48 ms)"
+            }
+          ]
+        },
+        "latency": {
+          "frame_return_to_first_write_ms": {
+            "n": 14,
+            "median": 54.457,
+            "p95": 62.235,
+            "max": 62.916
+          },
+          "rtt_ms": {
+            "n": 14,
+            "median": 53.558,
+            "p95": 61.243,
+            "max": 61.934
+          },
+          "infer_ms": {
+            "n": 14,
+            "median": 45.642,
+            "p95": 50.972,
+            "max": 51.672
+          },
+          "boundary_gap_ms": {
+            "n": 13,
+            "median": 122.041,
+            "p95": 128.439,
+            "max": 129.013
+          },
+          "write_hz": 13.29,
+          "max_frame_age_ms": 0.193,
+          "per_decision_frame_return_to_first_write_ms": [
+            47.259,
+            55.651,
+            50.896,
+            62.916,
+            45.214,
+            55.725,
+            61.868,
+            44.135,
+            53.039,
+            53.542,
+            58.596,
+            55.878,
+            52.217,
+            55.372
+          ],
+          "note": "frame_return_to_first_write_ms: LeRobot's frame stamp (perf_counter in its read thread, after VideoCapture.read() returned and the BGR->RGB conversion) to the first bus write. EXCLUDES capture: exposure, sensor readout, USB transfer, AVFoundation buffering, decode. Not end-to-end; see docs/bringup/latency-measurement.md"
+        },
+        "servo_health": {
+          "reads": 80,
+          "read_ms": {
+            "mean": 0.006,
+            "max": 0.022,
+            "over_budget": 0,
+            "budget": 10.0
+          },
+          "read_every_ticks": 4,
+          "register_period_s": 0.5333,
+          "max_temperature_c": {
+            "shoulder_pan": 35.0,
+            "shoulder_lift": 35.0,
+            "elbow_flex": 35.0,
+            "wrist_flex": 35.0,
+            "wrist_roll": 35.0,
+            "gripper": 35.0
+          },
+          "max_current_ma": {
+            "shoulder_pan": 97.5,
+            "shoulder_lift": 97.5,
+            "elbow_flex": 97.5,
+            "wrist_flex": 97.5,
+            "wrist_roll": 97.5,
+            "gripper": 97.5
+          }
+        },
+        "camera_calibrated": false,
+        "torque_off_unconfirmed": false
+      }
+    ]
+  }
+}

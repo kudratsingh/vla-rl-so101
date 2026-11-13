@@ -1,0 +1,45 @@
+# CPU check of scripts/wo07_train.py (`--preset tiny`, < 2 min per policy, never a result): a
+# synthetic two-camera dataset built through the convention's own schema and frame builder
+# (src/robot/convention.py dataset_features + recording_frame: identical features to a real demo),
+# a few training steps, save, reload, and the same chunk from the in-memory and the reloaded policy
+# on one observation (SmolVLA: the same explicit flow-matching noise for both calls).
+inherit: configs/wo07_train.yaml
+preset: tiny
+device: cpu
+
+dataset:
+  synthetic: true                    # built under runs/<id>/dataset; repo_id/root/revision unused
+  episodes: 2
+  frames_per_episode: 16
+
+train:
+  num_workers: 0
+  log_freq: 1
+  save_freq: 1000000                 # only the final step is saved
+  compare_atol: 1.0e-4               # rad, in-memory vs reloaded chunk (fp32 CPU)
+
+probe:
+  steps: 4
+  warmup_steps: 1
+  setup_h: 0.0
+
+cost:
+  gpu: cpu
+  usd_per_hour: 0.0
+
+policies:
+  smolvla:
+    steps: 3
+    batch_size: 2
+    precision: fp32                  # CPU: fp32 (cpu_fp32)
+  act:
+    steps: 3
+    batch_size: 2
+    overrides:                       # a small ACT, no ImageNet download; same chunk as the real one
+      pretrained_backbone_weights: null
+      dim_model: 64
+      n_heads: 2
+      dim_feedforward: 128
+      n_encoder_layers: 1
+      n_vae_encoder_layers: 1
+      latent_dim: 8

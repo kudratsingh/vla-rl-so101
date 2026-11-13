@@ -25,7 +25,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Protocol, Self
 
 import cv2
 import numpy as np
@@ -253,6 +253,99 @@ class OpenCVFrameSource:
         self.disconnect()
 
 
+class FrameReader(Protocol):
+    """One camera: ``OpenCVFrameSource`` or a test fake."""
+
+    def connect(self) -> None: ...
+
+    def read(self) -> Frame: ...
+
+    def disconnect(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class RigFrame:
+    """One frame from every camera of a ``CameraRig``, read on the same control tick."""
+
+    images: dict[str, ImageU8]  # camera name -> (H, W, 3) RGB
+    capture_times: dict[str, float]  # camera name -> time.perf_counter() stamp
+
+    @property
+    def capture_time(self) -> float:
+        """The OLDEST camera's stamp: the deadman's frame-age check covers every camera."""
+        return min(self.capture_times.values())
+
+
+class CameraRig:
+    """Named cameras read together (``src/robot/convention.py``: front + wrist).
+
+    ``read`` returns a frame only when EVERY camera delivered one; a fault on any camera raises
+    ``CameraFault`` naming it, so a control loop treats it as a lost frame (deadman) and nothing
+    is recorded or acted on with one camera missing.
+    """
+
+    def __init__(self, sources: Mapping[str, FrameReader]):
+        if not sources:
+            raise ValueError("a camera rig needs at least one camera")
+        self.sources = dict(sources)
+
+    @classmethod
+    def from_config(cls, cfg: Config, names: Sequence[str]) -> CameraRig:
+        cams = cfg.get("cameras") or {}
+        missing = [n for n in names if not cams.get(n) or cams[n].get("enabled", True) is False]
+        if missing:
+            raise ValueError(f"cameras {missing} missing or disabled in the config")
+        return cls({n: OpenCVFrameSource(cams[n]) for n in names})
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self.sources)
+
+    def connect(self) -> None:
+        opened: list[FrameReader] = []
+        try:
+            for src in self.sources.values():
+                src.connect()
+                opened.append(src)
+        except BaseException:
+            for src in opened:
+                src.disconnect()
+            raise
+
+    def read(self) -> RigFrame:
+        images: dict[str, ImageU8] = {}
+        stamps: dict[str, float] = {}
+        for name, src in self.sources.items():
+            try:
+                f = src.read()
+            except CameraFault as e:
+                raise CameraFault(f"{name} camera: {e}") from e
+            images[name], stamps[name] = f.image, float(f.capture_time)
+        return RigFrame(images, stamps)
+
+    def disconnect(self) -> None:
+        errors: list[BaseException] = []
+        for src in self.sources.values():
+            try:
+                src.disconnect()
+            except Exception as e:  # noqa: BLE001 - close every camera, then report
+                errors.append(e)
+        if errors:
+            raise errors[0]
+
+    def __enter__(self) -> Self:
+        self.connect()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.disconnect()
+
+
 # ------------------------------------------------------------------------------------------------
 # Checkerboard intrinsics
 # ------------------------------------------------------------------------------------------------
@@ -314,3 +407,73 @@ def calibrate_intrinsics(
         rms_px=float(rms),
     )
     return intr, found
+
+
+# ------------------------------------------------------------------------------------------------
+# Which physical camera is which (review conv-4)
+# ------------------------------------------------------------------------------------------------
+CAMERA_ROLES: dict[str, str] = {
+    "front": "the table, the grid and the arm from the front, about 45 deg above",
+    "wrist": "the gripper jaws close up (the module on the gripper)",
+}
+CAMERA_CHECK_ANSWER = "yes"
+
+
+class CameraRoleError(RuntimeError):
+    """The operator did not confirm that each camera name shows its view (nothing recorded)."""
+
+
+def camera_check_sheet(images: Mapping[str, ImageU8]) -> ImageU8:
+    """Every camera side by side, 320 x 240 each, its NAME printed large on it (RGB)."""
+    tiles = []
+    for name, img in images.items():
+        tile = cv2.resize(np.ascontiguousarray(img), (320, 240))
+        cv2.rectangle(tile, (0, 0), (319, 34), (0, 0, 0), -1)
+        cv2.putText(tile, name.upper(), (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+        tiles.append(tile)
+    sheet: ImageU8 = np.concatenate(tiles, axis=1)
+    return sheet
+
+
+def confirm_camera_roles(
+    rig: CameraRig,
+    out_path: Any,
+    ask: Any,
+    *,
+    indices: Mapping[str, Any] | None = None,
+    show: Any = None,
+) -> dict[str, Any]:
+    """Before anything is recorded: which OpenCV index is which camera is decided by USB
+    enumeration on macOS and can change after a re-plug or a reboot, and both cameras stream the
+    same 640 x 480 at 30 fps, so no setting tells them apart. One frame of every camera is written
+    as a labelled sheet (``out_path``, opened with ``show``), and the operator must type
+    ``CAMERA_CHECK_ANSWER`` to confirm that each name shows its view (``CAMERA_ROLES``); anything
+    else raises ``CameraRoleError``. Returns the record (sheet path, indices, time)."""
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    frame = rig.read()
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sheet = camera_check_sheet(frame.images)
+    cv2.imwrite(str(path), cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
+    if show is not None:
+        show(path)
+    print(f"camera check: {path}")
+    for name in frame.images:
+        print(f"  {name.upper()} must show {CAMERA_ROLES.get(name, name)}")
+    try:
+        answer = str(ask(f"type '{CAMERA_CHECK_ANSWER}' if every label matches its view: "))
+    except (KeyboardInterrupt, EOFError):
+        answer = ""
+    if answer.strip().lower() != CAMERA_CHECK_ANSWER:
+        raise CameraRoleError(
+            "camera roles not confirmed (front / wrist swapped?): fix cameras.<name>.index in "
+            "configs/real.yaml; nothing was recorded"
+        )
+    return {
+        "sheet": str(path),
+        "indices": dict(indices or {}),
+        "confirmed_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "method": "operator confirmed a labelled frame of every camera",
+    }

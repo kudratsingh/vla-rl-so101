@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -134,3 +135,58 @@ def test_yaml_value_written_in_place() -> None:
     assert yaml.safe_load(out3)["robot"]["safety"]["joint_limits_deg"] == lim
     with pytest.raises(KeyError):
         set_yaml_value(text, ["cameras", "side", "intrinsics"], 1)
+
+
+def test_intrinsics_script_needs_the_measured_square_and_does_both_cameras(
+    tmp_path: Path,
+) -> None:
+    """Owner kit list 2026-11-10: a 10 x 7-square board (9 x 6 inner corners) on letter paper
+    glued to cardboard, square size MEASURED and passed (no default), front AND wrist."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "wo06_intr_t", REPO_ROOT / "scripts" / "wo06_camera_intrinsics.py"
+    )
+    assert spec is not None and spec.loader is not None
+    intr_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(intr_mod)
+    cfg_path = tmp_path / "real.yaml"
+    cfg_path.write_text(placeholder_text((REPO_ROOT / "configs" / "real.yaml").read_text()))
+    with pytest.raises(SystemExit):  # --square-mm is required
+        intr_mod.main(["--preset", "real", "--config", str(cfg_path), "--images", str(tmp_path)])
+    pattern, sq_px, margin, square_m = (9, 6), 40, 40, 0.0235
+    board = _board(pattern, sq_px, margin)
+    k = np.array([[600.0, 0, 322.0], [0, 600.0, 238.0], [0, 0, 1]])
+    s = square_m / sq_px
+    w_m, h_m = board.shape[1] * s, board.shape[0] * s
+    rng = np.random.default_rng(1)
+    img_dir = tmp_path / "frames"
+    img_dir.mkdir()
+    for i in range(8):
+        rvec = np.array([*rng.uniform(-0.45, 0.45, 2), rng.uniform(-0.3, 0.3)])
+        r, _ = cv2.Rodrigues(rvec)
+        centre = np.array([rng.uniform(-0.02, 0.02), rng.uniform(-0.02, 0.02), 0.5])
+        t = centre - r @ np.array([w_m / 2, h_m / 2, 0.0])
+        view = _view(board, k, rvec, t, s, margin)
+        cv2.imwrite(str(img_dir / f"c{i}.png"), cv2.cvtColor(view, cv2.COLOR_RGB2BGR))
+    argv = ["--preset", "real", "--config", str(cfg_path), "--images", str(img_dir)]
+    out = intr_mod.main([*argv, "--camera", "wrist", "--square-mm", "23.5"])
+    written = yaml.safe_load(cfg_path.read_text())["cameras"]
+    assert written["wrist"]["intrinsics"] == out and written["front"]["intrinsics"] is None
+    assert out["board"]["square_mm"] == 23.5 and out["board"]["squares"] == "10x7"
+    assert out["board"]["inner_corners"] == "9x6" and out["fx"] == pytest.approx(600, rel=0.03)
+    assert Intrinsics.from_dict(out).width == 640  # the board record does not break loading
+    front = intr_mod.main([*argv, "--camera", "front", "--square-mm", "23.5", "--dry-run"])
+    assert front["board"]["square_mm"] == 23.5
+    assert yaml.safe_load(cfg_path.read_text())["cameras"]["front"]["intrinsics"] is None
+    # focus changes the intrinsics: the front camera refuses to write until focus is locked
+    with pytest.raises(SystemExit, match="focus"):
+        intr_mod.main([*argv, "--camera", "front", "--square-mm", "23.5"])
+    assert yaml.safe_load(cfg_path.read_text())["cameras"]["front"]["intrinsics"] is None
+    from src.robot.yamlio import update_yaml_file
+
+    update_yaml_file(cfg_path, ["cameras", "front", "controls", "focus"], 30)
+    front = intr_mod.main([*argv, "--camera", "front", "--square-mm", "23.5"])
+    controls = front["board"]["controls_at_capture"]
+    assert controls["focus"] == 30 and controls["autofocus"] is False
+    assert yaml.safe_load(cfg_path.read_text())["cameras"]["front"]["intrinsics"] == front

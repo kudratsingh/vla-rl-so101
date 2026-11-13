@@ -16,7 +16,7 @@ endobj
 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
 endobj
 6 0 obj
-<< /Length 10763 >>
+<< /Length 12488 >>
 stream
 0.71 w
 [] 0 d
@@ -106,6 +106,9 @@ BT /F2 8.0 Tf 176.31 592.72 Td (B1) Tj ET
 263.62 588.19 m 280.63 588.19 l S
 272.13 579.69 m 272.13 596.69 l S
 BT /F2 8.0 Tf 275.53 592.72 Td (B2) Tj ET
+3.40 w
+225.35 555.59 93.54 65.20 re S
+BT /F2 7.0 Tf 249.45 571.18 Td (SEEN) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -117,6 +120,7 @@ BT /F2 8.0 Tf 275.53 592.72 Td (B2) Tj ET
 362.83 588.19 m 379.84 588.19 l S
 371.34 579.69 m 371.34 596.69 l S
 BT /F2 8.0 Tf 374.74 592.72 Td (B3) Tj ET
+BT /F1 6.0 Tf 348.66 571.18 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -128,6 +132,7 @@ BT /F2 8.0 Tf 374.74 592.72 Td (B3) Tj ET
 462.05 588.19 m 479.06 588.19 l S
 470.55 579.69 m 470.55 596.69 l S
 BT /F2 8.0 Tf 473.95 592.72 Td (B4) Tj ET
+BT /F1 6.0 Tf 447.87 571.18 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -139,6 +144,9 @@ BT /F2 8.0 Tf 473.95 592.72 Td (B4) Tj ET
 561.26 588.19 m 578.27 588.19 l S
 569.76 579.69 m 569.76 596.69 l S
 BT /F2 8.0 Tf 573.17 592.72 Td (B5) Tj ET
+3.40 w
+522.99 555.59 93.54 65.20 re S
+BT /F2 7.0 Tf 547.09 571.18 Td (SEEN) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -172,6 +180,7 @@ BT /F2 8.0 Tf 176.31 663.59 Td (C1) Tj ET
 263.62 659.06 m 280.63 659.06 l S
 272.13 650.55 m 272.13 667.56 l S
 BT /F2 8.0 Tf 275.53 663.59 Td (C2) Tj ET
+BT /F1 6.0 Tf 249.45 642.05 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -183,6 +192,7 @@ BT /F2 8.0 Tf 275.53 663.59 Td (C2) Tj ET
 362.83 659.06 m 379.84 659.06 l S
 371.34 650.55 m 371.34 667.56 l S
 BT /F2 8.0 Tf 374.74 663.59 Td (C3) Tj ET
+BT /F1 6.0 Tf 348.66 642.05 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -194,6 +204,9 @@ BT /F2 8.0 Tf 374.74 663.59 Td (C3) Tj ET
 462.05 659.06 m 479.06 659.06 l S
 470.55 650.55 m 470.55 667.56 l S
 BT /F2 8.0 Tf 473.95 663.59 Td (C4) Tj ET
+3.40 w
+423.78 626.46 93.54 65.20 re S
+BT /F2 7.0 Tf 447.87 642.05 Td (SEEN) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -205,6 +218,7 @@ BT /F2 8.0 Tf 473.95 663.59 Td (C4) Tj ET
 561.26 659.06 m 578.27 659.06 l S
 569.76 650.55 m 569.76 667.56 l S
 BT /F2 8.0 Tf 573.17 663.59 Td (C5) Tj ET
+BT /F1 6.0 Tf 547.09 642.05 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -238,6 +252,7 @@ BT /F2 8.0 Tf 176.31 734.46 Td (D1) Tj ET
 263.62 729.92 m 280.63 729.92 l S
 272.13 721.42 m 272.13 738.43 l S
 BT /F2 8.0 Tf 275.53 734.46 Td (D2) Tj ET
+BT /F1 6.0 Tf 249.45 712.91 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -249,6 +264,7 @@ BT /F2 8.0 Tf 275.53 734.46 Td (D2) Tj ET
 362.83 729.92 m 379.84 729.92 l S
 371.34 721.42 m 371.34 738.43 l S
 BT /F2 8.0 Tf 374.74 734.46 Td (D3) Tj ET
+BT /F1 6.0 Tf 348.66 712.91 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -260,6 +276,7 @@ BT /F2 8.0 Tf 374.74 734.46 Td (D3) Tj ET
 462.05 729.92 m 479.06 729.92 l S
 470.55 721.42 m 470.55 738.43 l S
 BT /F2 8.0 Tf 473.95 734.46 Td (D4) Tj ET
+BT /F1 6.0 Tf 447.87 712.91 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -271,6 +288,7 @@ BT /F2 8.0 Tf 473.95 734.46 Td (D4) Tj ET
 561.26 729.92 m 578.27 729.92 l S
 569.76 721.42 m 569.76 738.43 l S
 BT /F2 8.0 Tf 573.17 734.46 Td (D5) Tj ET
+BT /F1 6.0 Tf 547.09 712.91 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -304,6 +322,9 @@ BT /F2 8.0 Tf 176.31 805.32 Td (E1) Tj ET
 263.62 800.79 m 280.63 800.79 l S
 272.13 792.28 m 272.13 809.29 l S
 BT /F2 8.0 Tf 275.53 805.32 Td (E2) Tj ET
+3.40 w
+225.35 768.19 93.54 65.20 re S
+BT /F2 7.0 Tf 249.45 783.78 Td (SEEN) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -315,6 +336,7 @@ BT /F2 8.0 Tf 275.53 805.32 Td (E2) Tj ET
 362.83 800.79 m 379.84 800.79 l S
 371.34 792.28 m 371.34 809.29 l S
 BT /F2 8.0 Tf 374.74 805.32 Td (E3) Tj ET
+BT /F1 6.0 Tf 348.66 783.78 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -326,6 +348,7 @@ BT /F2 8.0 Tf 374.74 805.32 Td (E3) Tj ET
 462.05 800.79 m 479.06 800.79 l S
 470.55 792.28 m 470.55 809.29 l S
 BT /F2 8.0 Tf 473.95 805.32 Td (E4) Tj ET
+BT /F1 6.0 Tf 447.87 783.78 Td (not used) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -337,6 +360,9 @@ BT /F2 8.0 Tf 473.95 805.32 Td (E4) Tj ET
 561.26 800.79 m 578.27 800.79 l S
 569.76 792.28 m 569.76 809.29 l S
 BT /F2 8.0 Tf 573.17 805.32 Td (E5) Tj ET
+3.40 w
+522.99 768.19 93.54 65.20 re S
+BT /F2 7.0 Tf 547.09 783.78 Td (SEEN) Tj ET
 0.71 w
 [] 0 d
 0.45 G
@@ -455,6 +481,17 @@ BT /F2 8.0 Tf 426.61 328.82 Td (+x \(forward\)) Tj ET
 208.35 113.39 m 216.05 109.79 l S
 208.35 113.39 m 216.05 116.98 l S
 BT /F2 8.0 Tf 199.84 119.06 Td (+y \(robot's left\)) Tj ET
+0.00 G
+1.42 w
+[8.50 4.25] 0 d
+123.31 666.14 m 0.00 666.14 l S
+[] 0 d
+2.27 w
+123.31 654.80 m 123.31 677.48 l S
+BT /F2 6.0 Tf 5.67 671.81 Td (BOWL LINE) Tj ET
+BT /F2 7.5 Tf 39.69 977.95 Td (BOWL, FIXED for every demo and trial \(real-0.1\): centre x = 0.195 m, y = +0.205 m.) Tj ET
+BT /F1 7.5 Tf 39.69 966.05 Td (Along the dashed BOWL LINE \(left, x = 0.195 m\) the centre is 100.0 mm left of the line's end tick \(y = +0.105 m\),) Tj ET
+BT /F1 7.5 Tf 39.69 954.14 Td (56.5 mm beyond this sheet's left edge. Mark it on the table once; the bowl stays on the mark.) Tj ET
 1.70 w
 39.69 1020.47 m 323.15 1020.47 l S
 39.69 1020.47 m 39.69 1028.98 l S
@@ -477,6 +514,7 @@ BT /F1 8.5 Tf 39.69 1131.02 Td (Place each object's CENTRE on its slot cross. Sl
 BT /F1 7.5 Tf 39.69 1116.85 Td (White = seen / unseen_objects slots \(SEEN_REGION centre \(0.205, 0.0\) m, half \(0.05, 0.07\) m\); shaded = shifted \(SHIFTED_REGION x1.5, outside seen\).) Tj ET
 BT /F1 7.5 Tf 39.69 1104.09 Td (Generated by scripts/make_placement_grid.py from src/eval/real_grid.py; src/eval/protocol.py 0.1-draft sha256 e9ce5bb47a88. Robot base frame, metres.) Tj ET
 BT /F1 7.5 Tf 39.69 1091.34 Td (Slots: 2.5 cm \(x\) by 3.5 cm \(y\) rectangles of the shifted region; row letter = x \(A nearest the base\), column = y \(1 = robot's left\).) Tj ET
+BT /F1 7.5 Tf 39.69 1078.58 Td (Protocol real-0.1 edee44aa957d: SEEN = B2 B5 E2 E5 C4 \(demos + seen + unseen-object trials\); shifted = the shaded ring; 'not used' = never in real-0.1; bowl FIXED \(bowl line\).) Tj ET
 
 endstream
 endobj
@@ -492,5 +530,5 @@ xref
 trailer
 << /Size 7 /Root 1 0 R >>
 startxref
-11279
+13004
 %%EOF

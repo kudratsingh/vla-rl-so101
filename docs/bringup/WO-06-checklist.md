@@ -7,6 +7,13 @@ the scripts on branch `fix/robot-safety` (PR #29) and against lerobot 0.4.4 as i
 exercised with fakes or on the CPU sim. None of it has run on the real arm yet, so the expected
 outputs are what the code prints, not observed hardware behaviour.
 
+**Kit.** The hardware used here, and what each item is for, is the owner's bill of materials of
+2026-11-10: [`docs/bringup/kit.md`](kit.md) (Seeed SO-ARM101 Pro: follower with 12 V STS3215 on
+its 12 V supply, leader with 7.4 V servos on its 5 V supply, two Waveshare boards, the 32 mm wrist
+module; a Logitech C920x front camera on a NEEWER UA057 magic arm; one LED clamp lamp set to
+5000 K; hand2mind 1-inch wood cubes; LE TAUCI 8 oz white bouillon cups as the bowl; an all-white
+table). Supply voltage is read over the servo bus (step 2b).
+
 **Motion markers.** Each marker cites the code that justifies it. Repo code is cited by symbol
 (function, class or config key), not by line number, so later edits do not break the citation.
 
@@ -48,8 +55,12 @@ not yet cover every item (the recorder is front-only today); the missing code is
   (the merged recorder is front-only and the real-eval path writes trial records only; both are
   deliverables, and a mock export is tested against the vishwaroop importer before the 50 demos).
 - Servo position P gain recorded (default 32); calibration drift check at the start of every
-  session; spare gripper servo on hand.
-- Exposure and white balance locked on both cameras before camera match; never auto.
+  session; spare gripper servo on hand (STS3215 **12 V**, the follower's variant, about $20: still
+  to buy, `docs/bringup/kit.md`).
+- One light: the LED clamp lamp set ONCE to 5000 K and never changed. Exposure and white balance
+  locked on both cameras at that light, and the C920x focus locked, before the intrinsics (step 6)
+  and the camera match (step 7); never auto. Recorded in `cameras.<name>.controls`; demos and
+  real-0.1 sessions refuse while they are not (`convention.camera_controls_problems`).
 - Shutdown and fault behaviour as merged in #29. Powered steps 9–10 only under supervision.
 
 Agent notes on these items:
@@ -67,6 +78,11 @@ Agent notes on these items:
   (PR 2) also comes before any camera-match frame (step 7) or teleop episode (step 10) that shows
   objects: until then step 7 runs with an empty table. Frames never show the unseen objects
   (purple cube, green cube) and use no slot outside the five seen slots.
+- **Camera roles and interrupted demos (PR 2 review round 1).** Every demo sitting and every real
+  eval session starts with a labelled frame of each camera (opened in Preview); type `yes` only
+  if FRONT shows the front view and WRIST the gripper (USB re-plugs and reboots can swap the
+  OpenCV indices). A demo sitting that ends early continues with `--task PickPlace --demo-schedule
+  --resume` at the next demo; saved demos survive a power loss (each is finalized when it is saved).
 
 ---
 
@@ -74,13 +90,16 @@ Agent notes on these items:
 
 **Physical checks.** Do these with the arms unpowered.
 
-1. **Servo voltage vs supply.** Read the label on one follower servo and one leader servo. A 7.4 V
-   STS3215 runs from the 5 V supply (`docs/ENVIRONMENT.md` Hardware). A 12 V STS3215 needs the 12 V
-   supply that came with it. Never swap the leader and follower supplies. Measure the supply with a
-   multimeter before the first connection, and **report the label text and the measured voltage**.
-2. **E-stop.** Put an inline switch (or a switched power strip) on the follower's servo supply,
-   within reach of the hand you don't use for the leader. Switching it off is the e-stop. It cuts
-   torque instantly, and the arm then drops.
+1. **Servo voltage vs supply: read the labels.** Read the label on one follower servo and one
+   leader servo, and the label on each supply. The kit (Seeed SO-ARM101 Pro): the FOLLOWER has
+   12 V STS3215 servos and runs on the **12 V** supply; the LEADER has 7.4 V servos and runs on the
+   **5 V** supply. Never cross them: put a piece of tape with "FOLLOWER 12 V" / "LEADER 5 V" on each
+   supply's plug and on each board. **Report the label text of both servos and both supplies.**
+   After the first connection (step 2b) each servo's own `Present_Voltage` is read over the bus
+   and reported.
+2. **E-stop.** Put the inline outlet switch on the follower's 12 V supply, within reach of the
+   hand you don't use for the leader. Switching it off is the e-stop. It cuts torque instantly,
+   and the arm then drops.
 3. **Clamp** the follower base to the table. Clear the workspace: nothing within the arm's reach
    except the task objects.
 4. **USB.** Connect each Waveshare board to the Mac directly, not through a hub carrying both
@@ -89,16 +108,17 @@ Agent notes on these items:
 
 **Software.** Use the main checkout, on this branch or on `main` once it merges.
 `configs/real.yaml` gets edited in place during bring-up. Do bring-up on a branch of its own
-(e.g. `git switch -c wo-06-hardware-values`) and commit those values through a PR. As of this
+(`git fetch origin && git switch -c wo-06-hardware-values origin/feat/smolvla-real`, before
+any value is written: runbook section A0) and commit those values through a PR. As of this
 branch, the tests no longer read those values (`tests/real_fixture.py`).
 
 ```bash
 brew install uv molten-vk ffmpeg@7
 cd ~/Robotics/vla-rl-so101
 source scripts/mac_env.sh
-# uv sync is EXACT: it uninstalls every extra you leave out. This set = CI (dev, gpu) + robot.
-# Add `--extra smolvla` only if you also want SmolVLA on the Mac. Never run a bare `uv sync --extra robot`.
-uv sync --frozen --extra dev --extra gpu --extra robot
+# uv sync is EXACT: it uninstalls every extra you leave out. This set = `make setup` = the Mac
+# runbook (docs/runbooks/real-arm-mac.md section A). Never run a bare `uv sync --extra robot`.
+uv sync --frozen --extra dev --extra gpu --extra robot --extra smolvla
 uv run python -c "import scservo_sdk, serial, cv2, grpc; print('robot deps ok')"
 uv run pytest -q tests/test_safety.py tests/test_driver.py tests/test_units.py tests/test_camera.py tests/test_teleop.py tests/test_calibrate.py
 ```
@@ -108,7 +128,7 @@ uv run pytest -q tests/test_safety.py tests/test_driver.py tests/test_units.py t
   grows as tests are added).
 - **Pass/fail:** any import error or test failure is a fail. Stop and send the agent the output.
 - **Why 🟢:** nothing opens a serial port. The tests use fakes only (`tests/robot_fakes.py:1`).
-- **Report back:** the servo label and the measured voltage, both arms, and the `pytest` summary line.
+- **Report back:** the servo and supply labels, both arms, and the `pytest` summary line.
 
 ---
 
@@ -170,6 +190,33 @@ the kit's servo-to-joint labels. Assemble the arm (SO-101 assembly guide) after 
   writes Goal_Position and never enables torque. `scan_port` only broadcast-pings
   (`LR/motors/motors_bus.py:552-574`). Never run `setup-motors` with more than one servo on the cable.
 - **Report back:** the final `scan_port` output for each arm.
+
+---
+
+## 2b. Supply voltage over the bus, both arms 🟢 NO MOTION
+
+After the first connection (step 2's scan shows IDs 1-6), servo power on, USB in. Follower now;
+the leader once its port is in the config (step 8, items 1-2).
+
+```bash
+uv run scripts/wo06_calibrate.py --preset real voltage                      # follower: 12 V supply
+uv run scripts/wo06_calibrate.py --preset real voltage --device leader      # leader: 5 V supply (after step 8.2)
+```
+
+- **Writes:** nothing.
+- **Expected:** a `motor | present V | min V | max V` table, one row per servo, then
+  `voltage check: OK`. Follower: every `present V` near 12 (`power.follower.supply_v`, within
+  `power.tolerance_frac` 15%). Leader: near 5.
+- **Pass/fail:** any `PROBLEM` line is a fail. `CROSSED SUPPLIES?` (a follower reading near 5 V,
+  or a leader near 12 V) means switch the supply off at once and swap the plugs. A reading
+  outside the servo's own `min V` / `max V` means that servo is in voltage alarm (e.g. a 7.4 V
+  servo on the 12 V bus): power off and replace it with the right variant.
+- **Why 🟢:** `cmd_voltage` (`scripts/wo06_calibrate.py`) opens the port only (`bus.connect()`, no
+  `configure()`), does three `sync_read(..., normalize=False)` of `Present_Voltage`,
+  `Min_Voltage_Limit`, `Max_Voltage_Limit` (`read_voltages` in `src/robot/servo_health.py`;
+  0.1 V per count, Feetech STS memory table) and closes with `disconnect(disable_torque=False)`:
+  no write, no torque change. Covered by `tests/test_calibrate.py`.
+- **Report back:** the table and the verdict line for each arm.
 
 ---
 
@@ -299,35 +346,102 @@ The expected directions come from the sim's FK (`src/env/kinematics.py`) evaluat
 
 ---
 
-## 6. Camera: index, then checkerboard intrinsics 🟢 NO MOTION
+## 6. Cameras: indices, then checkerboard intrinsics for BOTH 🟢 NO MOTION
+
+Both cameras: the Logitech C920x (FRONT) and the kit's 32 mm module (WRIST), each 640 × 480 at
+30 fps.
+
+**Do step 7 items 1-4 FIRST** (mount both cameras, set the lamp to 5000 K, lock the controls),
+then come back here. Focus changes the focal length (fx, fy) and the distortion, so the C920x's
+autofocus must be OFF with focus fixed at the table distance before any intrinsics capture, and
+the locked value recorded in `configs/real.yaml` `cameras.front.controls.focus`. The script
+refuses to write the front intrinsics while `autofocus` is not `false` or `focus` is null, and
+records the controls in effect with the result (`intrinsics.board.controls_at_capture`). If the
+focus is ever changed, redo this step. Run the indices first (below), since locking the controls
+needs the right camera.
 
 ```bash
 uv run lerobot-find-cameras opencv          # lists cameras, saves test frames to outputs/captured_images (git-ignored)
-# set the USB webcam's index (index 0 is usually the MacBook's own camera):
+# set each camera's index (index 0 is usually the MacBook's own camera):
 uv run python -c "from src.robot.yamlio import update_yaml_file as u; u('configs/real.yaml', ['cameras','front','index'], 1)"
+uv run python -c "from src.robot.yamlio import update_yaml_file as u; u('configs/real.yaml', ['cameras','wrist','index'], 2)"
 ```
 
-Print a 9×6-inner-corner checkerboard (10×7 squares), measure one printed square in mm, and tape
-it flat to something rigid. Then:
+**The board.** Print the 10 × 7-square checkerboard (9 × 6 inner corners) on letter paper at 100%
+and glue it flat to cardboard (no bubbles, no bend). Measure the printed square with a ruler over
+several squares (e.g. 9 squares, divide by 9) and use that number: `--square-mm` is required
+(there is no default), and it is recorded with the result (`intrinsics.board.square_mm`).
 
 ```bash
-uv run scripts/wo06_camera_intrinsics.py --preset real --capture 20 --square-mm <measured> --dry-run
+uv run scripts/wo06_camera_intrinsics.py --preset real --camera front --capture 20 --square-mm <measured> --dry-run
 #  vary distance, tilt ~30 deg each way, cover every image corner; ENTER per capture
-uv run scripts/wo06_camera_intrinsics.py --preset real --images data/camera_calib/<stamp> --square-mm <measured>
+uv run scripts/wo06_camera_intrinsics.py --preset real --camera front --images data/camera_calib/front-<stamp> --square-mm <measured>
+# the wrist module: hold the board in front of the gripper, same variety of poses
+uv run scripts/wo06_camera_intrinsics.py --preset real --camera wrist --capture 20 --square-mm <measured> --dry-run
+uv run scripts/wo06_camera_intrinsics.py --preset real --camera wrist --images data/camera_calib/wrist-<stamp> --square-mm <measured>
 ```
 
-- **Writes:** `cameras.front.index` and `cameras.front.intrinsics` in `configs/real.yaml`. Frames go to
-  `data/camera_calib/<stamp>/` (git-ignored).
-- **Expected:** `board found in N/20 images; reprojection rms <1 px`, then `fx=... fy=... full fov H x V deg`
-  and `sim fov 40 deg -> crop window x[..] y[..] px`.
+- **Writes:** `cameras.front.index`, `cameras.wrist.index` and `cameras.<camera>.intrinsics`
+  (with `board`: inner corners, squares, the measured `square_mm`, images used, the controls at
+  capture) in
+  `configs/real.yaml`. Frames go to `data/camera_calib/<camera>-<stamp>/` (git-ignored).
+- **Expected:** `board found in N/20 images; reprojection rms <1 px`, then
+  `cameras.<camera>: fx=... fy=... full fov H x V deg`, the `board {...}` line, and for the front
+  camera only `sim fov 40 deg -> crop window x[..] y[..] px` (the wrist stream is recorded
+  uncropped, so it has no crop check).
 - **Pass/fail:** rms ≤ 1 px. There must be no `WARNING the sim camera's 40.0 deg view needs ...` line, because
   that line means the lens is too narrow (`src/robot/camera.py:102-109`). A 40° vertical fov needs fy ≲ 659 px at
   480 px height. A narrower webcam makes the policy pipeline raise, which blocks steps 7 and 9-10.
 - **Why 🟢:** the scripts import no driver and open no bus. They only open the camera through
-  `OpenCVFrameSource` (`scripts/wo06_camera_intrinsics.py:31-39,60`; `src/robot/camera.py:203-221`).
-- **Report back:** the intrinsics output lines.
+  `OpenCVFrameSource` (`capture` in `scripts/wo06_camera_intrinsics.py`; `OpenCVFrameSource` in `src/robot/camera.py`).
+- **Report back:** the intrinsics output lines for both cameras, the measured square size, and the
+  locked C920x focus value.
 
 ## 7. Camera placement and the sim/real match
+
+**Mount, light and lock first (owner kit list 2026-11-10).** Do these once, in this order, before
+7a; after them nothing about the cameras or the light changes for the rest of the project.
+
+1. **Front camera.** Clamp the NEEWER UA057 22-inch magic arm's desk clamp to the table edge on the
+   robot's left-front and mount the Logitech C920x on it at the sim front pose `front_left_45`:
+   eye `[0.555, 0.350, 0.495]` m, looking at `[0.205, 0, 0]` m, robot base frame
+   (`src/env/cameras.py` `named_pose`, `configs/sim.yaml` `env.camera`). Measure the eye position
+   with a tape from the base origin (the `+` on the placement grid), aim at the seen-region centre,
+   then fine-tune with the 7a blend. Tighten every joint of the magic arm; nothing may touch it
+   afterwards.
+2. **Wrist camera.** Mount the kit's 32 mm module on the SO-101 gripper mount. If the kit has no
+   mount, 3D-print the wrist camera mount from the LeRobot SO-101 files (still to buy,
+   `docs/bringup/kit.md`). Route the USB cable along the arm with slack at every joint (sweep
+   each joint by hand, torque off, and check the cable never pulls or snags).
+3. **Light.** Clamp the 17-inch LED desk lamp where it lights the whole grid and the bowl mark
+   without hard shadows of the arm. Set it ONCE to 5000 K (and a fixed brightness) and never
+   change either again. Record its position (clamp point, height, aim) with a photo and a few
+   tape measurements; that is the lamp position of record. Keep other room light constant
+   (curtains, ceiling light the same every session) or off.
+4. **Lock exposure and white balance on BOTH cameras** at that light: manual exposure, manual
+   white balance at 5000 K where the camera exposes it (the C920x does: a UVC white-balance
+   temperature, 2000-6500 K per its UVC control list; unverified on this unit), autofocus off on
+   the C920x with focus set at the table distance (record it as `cameras.front.controls.focus`;
+   step 6 needs it), fixed gain. On the Mac, OpenCV's AVFoundation
+   backend (LeRobot's `OpenCVCamera`) cannot set these UVC controls, so set them with a UVC
+   controls tool and write the locked values into `configs/real.yaml` `cameras.front.controls`
+   and `cameras.wrist.controls` (`exposure`, `white_balance_k`, `gain`, `focus` (front),
+   `set_with`; null means not locked). A real-0.1 session and the demo schedule refuse while
+   either camera's auto exposure / auto white balance is not `false`, its `exposure` or
+   `set_with` is null, or the front's `autofocus` is not `false` / `focus` is null
+   (`src/robot/convention.py` `camera_controls_problems`). If the wrist module has no white-balance temperature control, set its
+   `white_balance_k: null` and record what it does lock. Check after a replug or reboot that
+   the controls stayed locked (some tools reset on reconnect); re-apply them every session if not.
+5. **White on white (risk).** The table is all white and the cup is white: the cup rim is low
+   contrast for both cameras. With the cup on its mark (only after the freeze; until then a cup
+   on a plain white sheet off the grid), check in BOTH cameras' frames, under the 5000 K lamp
+   with the controls locked, that the cup rim is clearly visible all the way round (the front
+   camera at its pose; the wrist camera from the carry height above the cup: hold the limp arm
+   there by hand, torque off). Save one frame per camera with
+   `uv run lerobot-find-cameras opencv` (it writes a test frame of every camera to
+   `outputs/captured_images`, git-ignored). If it is not,
+   adjust the lamp position or the locked exposure once, re-record them, and report it; do not
+   change the table or the cup.
 
 **7a. Real-only overlay 🟢 NO MOTION**
 
@@ -376,19 +490,25 @@ uv run scripts/wo06_camera_match.py --preset real --with-arm --task PickPlace   
   unsupported arm): if any servo is torqued it refuses with `follower torque is ON ...`. Then
   run step 5's `verify` (it asks you to support the arm before torque goes off) or power-cycle the
   servo supply, and retry. You pose the limp arm by hand.
-- **Gate for `docs/STATUS.md`** (WO-06 deliverable 4): camera match passed for the front camera
-  at `front_left_45` (and for the wrist module once it is mounted), with exposure and white
-  balance locked on both cameras (Hardware floor). The OFT-era randomization retrain decision is
+- **Gate for `docs/STATUS.md`** (WO-06 deliverable 4): camera match (7a / 7b) passed for the
+  front camera (C920x on the magic arm) at `front_left_45`; the wrist module mounted on its
+  gripper mount, its intrinsics done (step 6), its controls locked and the cup rim visible in a
+  saved wrist frame (item 5; `scripts/wo06_camera_match.py` matches the front camera only, the sim
+  has no wrist camera until WO-08, so there is no wrist blend yet); the lamp at 5000 K, exposure
+  and white balance locked on both cameras (Hardware floor), and the white cup rim visible in
+  both cameras' saved frames (item 5). The OFT-era randomization retrain decision is
   dropped (WO-06 work order, Notes).
 - **Report back:** the PNG and JSON paths, `mean_abs_diff`, a screenshot of one blend, whether
-  any object was on the table (and if so, that the freeze was committed first), and the locked
-  exposure / white balance values.
+  any object was on the table (and if so, that the freeze was committed first), the locked
+  exposure / white balance / gain / focus values of both cameras and the tool used, the lamp
+  position of record (photo + measurements), and one frame per camera showing the cup rim.
 
 ---
 
 ## 8. Leader: config, port, calibration, verify 🟡 TORQUE OFF, OWNER MOVES JOINTS BY HAND
 
-Leader on its own supply (step 0), IDs set (step 2).
+Leader on its own 5 V supply (step 0), IDs set (step 2). After item 2 (port), run step 2b's
+`voltage --device leader`.
 
 ```bash
 # 1. add the leader block (placeholder port; comments kept):
@@ -421,6 +541,9 @@ uv run scripts/wo06_calibrate.py --preset real verify --device leader
 ---
 
 ## 9. One discarded powered rehearsal 🔴 POWERED MOTION: OWNER IN PERSON
+
+Copy-paste order, gates and the decoder preflight for this step, step 10 and the WO-07 demos:
+[`docs/runbooks/real-arm-mac.md`](../runbooks/real-arm-mac.md) (sections A-C here).
 
 This is the first command that drives the arm. Prerequisites: steps 3-8 pass,
 `joint_limits_deg` and the intrinsics are written, and you are present with a hand on the
@@ -482,7 +605,9 @@ What happens and what you do:
    holding their last goal under torque until the switch is off). Teleop, the pilot and the real eval refuse to start unless
    stdin and stdout are the Terminal itself (no `| tee`, no `< file`, no `yes |`) and the
    process is the Terminal's foreground job (no trailing `&`, not resumed with `bg`): run them
-   directly in Terminal; to keep a log use `script -q log.txt uv run ...`. If the session ever
+   directly in Terminal as `.venv/bin/python scripts/...`; to keep a log use Terminal's Shell >
+   Export Text As... after the session (not `script ... uv run`, which brings back the `uv run`
+   Ctrl-Z problem above). If the session ever
    loses the foreground (e.g. another program takes the Terminal), it ends like a closed
    Terminal: motion stops, `LOST THE TERMINAL'S FOREGROUND ... SUPPORT THE ARM NOW`, torque off
    after 10 s, recorded as `released_unconfirmed` (cause `lost_foreground`). `null` restores the
@@ -532,7 +657,10 @@ What happens and what you do:
   episode. A `WARNING src.robot.safety: safety joint_limit gripper: -10.00 -> -5.00 deg (...)`
   every tick while the trigger is fully closed is expected: the follower stops at its safety floor.
   The -5 deg gripper floor (URDF -10 deg + the 5 deg margin) stays for this first rehearsal
-  (owner decision 2026-11-08). Note in the report whether a cube still slips at -5 deg.
+  (owner decision 2026-11-08). Note in the report whether a cube still slips at -5 deg (the
+hand2mind 1-inch cube is 25.4 mm, narrower than the sim's 3 cm, so the jaws close further before
+contact). If the gripper servo is damaged or runs hot repeatedly, swap in the spare 12 V STS3215
+(`docs/bringup/kit.md`), set its ID to 6 alone (step 2), then redo steps 3-5.
   The per-tick `INFO src.robot.safety: safety step_clip ...` / `velocity_cap` lines (the rate
   limiter at work during sync) print only with `--verbose`. Finally
   `saved 0 episodes to .../vla-rl-so101-real-teleop-rehearsal` (or 1 if you answered Y).
@@ -565,12 +693,29 @@ What happens and what you do:
 
 ## 10. Five teleop sanity episodes per task (PickPlace, Push, Stack) 🔴 POWERED MOTION: OWNER IN PERSON
 
-Prerequisite: step 9 went cleanly. Objects: 3 cm red and blue cubes, a bowl, and a Push
-target mark. These are sanity episodes, never training demos. Run step 10 after the PR 2
+Runbook: [`docs/runbooks/real-arm-mac.md`](../runbooks/real-arm-mac.md) section D (the decoder
+preflight before recording, the decode check after, and moving these episodes out of the demos'
+folder before WO-07).
+
+Prerequisite: step 9 went cleanly. Objects (`docs/bringup/kit.md`): the hand2mind 1-inch
+(25.4 mm nominal) red and blue wood cubes, the white LE TAUCI cup as the bowl, and the 2-inch
+(50.8 mm) matte black disc as the Push target (the sim's target disc is 5 cm). These are sanity
+episodes, never training demos. Run step 10 after the PR 2
 real-protocol freeze: place the PickPlace cube only at the five frozen seen slots and the bowl at
 its frozen position (D1, D2, D4); never use the other 11 inner slots, the 20 ring slots or the
 purple / green cube. Push and Stack objects stay inside the seen region (centre 0.205 m in front
 of the base, ±5 cm in x, ±7 cm in y; `src/eval/protocol.py:63`).
+
+> **WO-07 demos are different (protocol real-0.1, owner 2026-11-09).** The 50 PickPlace demos use
+> ONLY the five frozen seen slots `B2 B5 E2 E5 C4` (10 each) and the bowl FIXED on its mark at
+> x 0.195 m, y +0.205 m (the A3 sheet's "bowl line": 100 mm left of its end tick; on the two-tabloid
+> print, the BOWL CENTRE cross on sheet 2). Never the
+> other 11 inner slots, the shaded ring or the purple / green cube, in a demo or a camera-match
+> frame. Record them with `--task PickPlace --demo-schedule`: every episode's prompt names its slot
+> and yaw (`src/eval/protocol_real.py` `demo_schedule()`), and `meta/vla_rl_so101.json` records
+> each placement, the protocol hash, the session id and the follower calibration that
+> `scripts/wo07_export_bundle.py demo` needs. The five sanity episodes per task below stay as
+> they are.
 
 ```bash
 source scripts/mac_env.sh
@@ -599,7 +744,8 @@ wait. A current found over the limit is re-read after 1 s at once, so a sustaine
 trips before the prompt waits.
 
 - **Writes:** `data/real_teleop/vla-rl-so101-real-teleop/`, a LeRobotDataset v3.0 at 15 fps
-  with 224×224 video and float32[6] canonical-radian state/action. The per-frame `task` is the
+  with both cameras' 480×640 video (`observation.images.front`, `observation.images.wrist`) and
+  float32[6] canonical-radian state/action. The per-frame `task` is the
   protocol instruction (`pick up the red cube and place it in the bowl`, `push the red cube to the
   target`, `stack the red cube on the blue cube`; `src/eval/protocol.py:28-32,97-98`).
   `meta/vla_rl_so101.json` records the protocol version and hash and the `teleop.instructions`
@@ -669,7 +815,7 @@ trips before the prompt waits.
   the arm and waits for ENTER (bounded); the run record keeps how you answered
   (`shutdown_detail.ack`: `enter` / `ctrl_c` / `eof` / `timeout`). Scoring: you are asked y/n
   only for a trial whose policy started and that ended without a fault; a fault after the
-  policy started is a failure automatically (judging rule `real-judge-2`,
+  policy started is a failure automatically (judging rule `real-judge-3`,
   `scripts/wo07_real_eval.py`), and a score prompt that ends without your answer (Ctrl-C,
   closed input, timeout) is a failure too (doubt = n). A trial whose policy started is never
   re-run on a resume, even if the run was killed before its record was written (it is then a
@@ -689,14 +835,15 @@ trips before the prompt waits.
 
 | After | Send |
 |---|---|
-| 0 | servo label + measured supply voltage (both arms), `pytest` summary |
+| 0 | servo and supply labels (both arms), `pytest` summary |
 | 1 | follower port |
 | 2 | `scan_port` output per arm |
+| 2b | `voltage` table + verdict per arm (follower ~12 V, leader ~5 V) |
 | 3-4 | `check` table + effective limits |
 | 5 | verify lines (middle pose, resting pose) + any `robot.units` change; rest pose supported with torque off (y/n), park path clear (y/n), whether you set `robot.park.enabled: true` |
-| 6 | intrinsics lines (fx, fy, rms, crop window, any WARNING) |
-| 7 | camera-match PNG/JSON paths, `mean_abs_diff`, objects on the table (none before the freeze), camera-match gate (front at `front_left_45`, wrist once mounted, exposure / white balance locked) |
+| 6 | intrinsics lines for front AND wrist (fx, fy, rms, crop window for the front, any WARNING), the measured square size, the locked C920x focus |
+| 7 | camera-match PNG/JSON paths, `mean_abs_diff`, objects on the table (none before the freeze), camera-match gate (C920x at `front_left_45` matched; wrist module mounted, intrinsics done, rim visible in a saved wrist frame; lamp at 5000 K and its position of record, exposure / white balance locked on both, one saved frame per camera showing the cup rim) |
 | 8 | leader vs follower verify lines for the same pose |
 | 9 | rehearsal log (incl. the `Max_Temperature_Limit` line, any `TORQUE ENABLE REFUSED` / `SERVO FAULT` / `TORQUE OFF UNCONFIRMED`), end-of-session servo temperatures, whether a cube slips at the -5 deg gripper floor, anything unexpected |
 | 10 | `saved N episodes`, per-task notes, Hub URL if pushed |
-| Hardware floor | wrist + front camera indices and settings (640 × 480, 30 fps), locked exposure / white balance values, P gain read back from the servos, drift-check lines for the session, spare gripper servo on hand (y/n) |
+| Hardware floor | wrist + front camera indices and settings (640 × 480, 30 fps), locked exposure / white balance / focus values, P gain read back from the servos, drift-check lines for the session, spare 12 V gripper servo on hand (y/n) |
