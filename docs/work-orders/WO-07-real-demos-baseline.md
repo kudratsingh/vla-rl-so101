@@ -12,6 +12,10 @@ light: the owner's bill of materials, [`docs/bringup/kit.md`](../bringup/kit.md)
 50 PickPlace demos (10 per seen position, both cameras); SmolVLA and ACT fine-tuned on the same
 demos; 50 binary trials per cell (seen, shifted, unseen) for each; immutable export.
 
+Owner commands for the 50 demos (after the WO-06 rehearsal and sanity episodes, in that order,
+with the decoder preflight, the refusals before the freeze, resume and the export check):
+[`docs/runbooks/real-arm-mac.md`](../runbooks/real-arm-mac.md) section E.
+
 ## Seen cell, bowl and demos (D1, D2)
 
 - **Five seen slots** from the existing 16-slot inner block of `src/eval/real_grid.py` (rows B-E,

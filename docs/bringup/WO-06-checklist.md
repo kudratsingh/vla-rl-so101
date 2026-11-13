@@ -81,8 +81,8 @@ Agent notes on these items:
 - **Camera roles and interrupted demos (PR 2 review round 1).** Every demo sitting and every real
   eval session starts with a labelled frame of each camera (opened in Preview); type `yes` only
   if FRONT shows the front view and WRIST the gripper (USB re-plugs and reboots can swap the
-  OpenCV indices). A demo sitting that ends early continues with `--demo-schedule --resume` at
-  the next demo; saved demos survive a power loss (each is finalized when it is saved).
+  OpenCV indices). A demo sitting that ends early continues with `--task PickPlace --demo-schedule
+  --resume` at the next demo; saved demos survive a power loss (each is finalized when it is saved).
 
 ---
 
@@ -541,6 +541,9 @@ uv run scripts/wo06_calibrate.py --preset real verify --device leader
 
 ## 9. One discarded powered rehearsal 🔴 POWERED MOTION: OWNER IN PERSON
 
+Copy-paste order, gates and the decoder preflight for this step, step 10 and the WO-07 demos:
+[`docs/runbooks/real-arm-mac.md`](../runbooks/real-arm-mac.md) (sections A-C here).
+
 This is the first command that drives the arm. Prerequisites: steps 3-8 pass,
 `joint_limits_deg` and the intrinsics are written, and you are present with a hand on the
 follower's power switch.
@@ -687,6 +690,10 @@ contact). If the gripper servo is damaged or runs hot repeatedly, swap in the sp
 
 ## 10. Five teleop sanity episodes per task (PickPlace, Push, Stack) 🔴 POWERED MOTION: OWNER IN PERSON
 
+Runbook: [`docs/runbooks/real-arm-mac.md`](../runbooks/real-arm-mac.md) section D (the decoder
+preflight before recording, the decode check after, and moving these episodes out of the demos'
+folder before WO-07).
+
 Prerequisite: step 9 went cleanly. Objects (`docs/bringup/kit.md`): the hand2mind 1-inch
 (25.4 mm nominal) red and blue wood cubes, the white LE TAUCI cup as the bowl, and the 2-inch
 (50.8 mm) matte black disc as the Push target (the sim's target disc is 5 cm). These are sanity
@@ -734,7 +741,8 @@ wait. A current found over the limit is re-read after 1 s at once, so a sustaine
 trips before the prompt waits.
 
 - **Writes:** `data/real_teleop/vla-rl-so101-real-teleop/`, a LeRobotDataset v3.0 at 15 fps
-  with 224×224 video and float32[6] canonical-radian state/action. The per-frame `task` is the
+  with both cameras' 480×640 video (`observation.images.front`, `observation.images.wrist`) and
+  float32[6] canonical-radian state/action. The per-frame `task` is the
   protocol instruction (`pick up the red cube and place it in the bowl`, `push the red cube to the
   target`, `stack the red cube on the blue cube`; `src/eval/protocol.py:28-32,97-98`).
   `meta/vla_rl_so101.json` records the protocol version and hash and the `teleop.instructions`
