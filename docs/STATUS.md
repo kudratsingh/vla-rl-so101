@@ -2586,7 +2586,7 @@ reruns the bowl check and brings back any change to B' or the 9.83 cm separation
 freezing. Then the freeze, CI and the vishwaroop imports (including `real-0.1-mock`) on the final
 freeze commit, then merge review. Spend, RunPod credentials and powered steps 9-10 stay on hold.
 
-### PR 2: Mac runbook and decoder preflight (2026-11-12, $0)
+### PR 2: Mac runbook for the rehearsal, sanity recordings and scheduled demos (2026-11-12, $0)
 
 The owner is assembling the arm (WO-06 steps 0-8) and asked for the exact Mac commands for the
 first supervised rehearsal, the sanity recordings and the 50 scheduled PickPlace demos, with an
@@ -2618,9 +2618,32 @@ the pins are byte-identical.
   write to the same `data/real_teleop/vla-rl-so101-real-teleop`, and `--overwrite` would delete
   the sanity episodes. The runbook moves them aside. (4) No command prints servo temperatures
   after a teleop session, though the checklist asks for them. (5) `NOT_A_TERMINAL`'s log hint
-  says `script -q log.txt uv run ...`, against the `.venv/bin/python` rule.
-- **Gates:** full pytest **747 passed, 1 skipped** (11 min 59 s, exit code 0). `ruff check src
-  tests scripts`, `black --check .`, `mypy --strict src` are clean.
+  said `script -q log.txt uv run ...`, against the `.venv/bin/python` rule (fixed below).
+- **What refuses before the freeze:** only the `--demo-schedule` lines (first sitting and
+  `--resume`), before any port, camera or dataset folder opens, on the first failing gate: the
+  bowl (`... 1.93 cm outside the safety filter's workspace box ...`, true at this head), then the
+  freeze (`protocol real-0.1 is not frozen (pending: bowl fit check) ... MEASURED PENDING`), then
+  the camera controls (`camera controls not locked: ...`). The rehearsal (step 9) and the sanity
+  episodes (step 10) are not refused in code: their gate is the owner's in-person go.
+- **Follow-through (10 findings, all checked against the code; 10 applied, commit `cfb641e`):**
+  runbook A0 makes the bring-up branch from `origin/feat/smolvla-real` before steps 0-8 write
+  `configs/real.yaml` (the main checkout is on `main`, which lacks the commands; its two untracked
+  `docs/reviews/` files would block the switch, one of them differs from the branch copy). D and
+  E2 cover a sitting that saved 0 episodes (`--dataset ... --episodes 0`, then `mv` aside, never
+  `--overwrite`) and an interrupted sanity session (numbered parts, each checked on its count).
+  "Start of every session" now requires all of section B. E gates add the tabloid2 `--check`, the
+  P gain recorded or deferred, and the agent-side vishwaroop mock imports. `NOT_A_TERMINAL` and
+  checklist step 9 now say Shell > Export Text As...; the preflight fix lines and checklist step 0
+  use the four-extra `uv sync` (= `make setup`); the torchcodec FAIL detail no longer ends on
+  `Likely causes:`; A1 says 10-60 s. Rerun here: preflight PASS (exit 0) and, with DYLD unset,
+  `[torchcodec] FAIL: torchcodec cannot load FFmpeg: Could not load libtorchcodec.` + fix (exit 1);
+  the pipe refusal's new text; `--dataset --episodes 0` PASS on an empty dataset made by
+  `create_dataset`, FAIL with `--episodes 3`; both grid `--check`s exit 1 (stale / tabloid2 not
+  committed; the freeze commit regenerates and commits both).
+- **Unverified on hardware:** every powered command (C, D, E2) and A3; their expected text is
+  what the code prints. The pty / real-terminal refusal paths were not run here.
+- **Gates:** full pytest on `cfb641e` **747 passed, 1 skipped** (11 min 50 s, exit code 0). `ruff check src tests scripts`, `black --check .`,
+  `mypy --strict src` are clean.
 
 **Next (owner):** unchanged. Send the five measurements and the unpowered fit results. The agent
 then reruns the bowl check, flags any change to B' or the 9.83 cm separation, freezes, regenerates
