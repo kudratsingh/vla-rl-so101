@@ -4,6 +4,7 @@ and a torchcodec that cannot load FFmpeg is a FAIL line with the fix (exit 1), n
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -44,6 +45,40 @@ def test_preflight_passes_and_fails_cleanly(
     out = capsys.readouterr().out
     assert "[torchcodec] FAIL: torchcodec cannot load FFmpeg" in out and "  fix: " in out
     assert out.rstrip().endswith("FAIL") and "Traceback" not in out
+
+
+def test_dataset_mode_checks_a_recorded_demo_dataset(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from src.eval import protocol_real as PR
+    from src.robot import convention as conv
+
+    pf = _load()
+    pf.stage_record_decode(tmp_path)  # 2 episodes through the recorder's path, kept
+    ds = tmp_path / "dataset"
+    args = ["--preset", "real", "--dataset", str(ds), "--episodes", "2"]
+    assert pf.main(args) == 1  # no provenance: not a recording of this repo
+    assert "vla_rl_so101.json missing" in capsys.readouterr().out
+    sched = PR.demo_schedule()
+    prov = {
+        "demo_schedule": True,
+        "rehearsal": False,
+        "session_id": "s",
+        "protocol": PR.citation(),
+        "convention": conv.citation(),
+        "episodes": {"0": sched[0], "1": sched[1]},
+        "sittings": [{"session_end": "supported"}],
+    }
+    (ds / "meta" / "vla_rl_so101.json").write_text(json.dumps(prov))
+    assert pf.main(args) == 0
+    out = capsys.readouterr().out
+    assert "2 episodes; both cameras decode" in out and "= demos 1-2 of the frozen schedule" in out
+    assert pf.main([*args[:-1], "50"]) == 1  # the count is checked
+    assert "2 episodes, expected 50" in capsys.readouterr().out
+    prov["episodes"] = {"0": sched[1], "1": sched[0]}
+    (ds / "meta" / "vla_rl_so101.json").write_text(json.dumps(prov))
+    assert pf.main(args) == 1
+    assert "not demos [0, 1] of the frozen schedule" in capsys.readouterr().out
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="DYLD_FALLBACK_LIBRARY_PATH is macOS only")

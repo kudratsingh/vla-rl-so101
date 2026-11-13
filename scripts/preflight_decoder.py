@@ -24,6 +24,19 @@ the fix otherwise, never a traceback):
    ``recording.verify_episode_video`` (torchcodec, every frame of both clips) per episode, and a
    pixel check of the first and last decoded frame of each clip against what was written. The
    temp directory is removed at the end.
+
+``--dataset <dir>`` checks a RECORDED dataset instead (stages 1 and 5; read only, nothing written):
+
+5. ``dataset``: every episode readable and whole (``recording.episode_problem``) and both cameras'
+   clips decoded across every frame (``recording.verify_episode_video``), the episode count
+   (``--episodes N``: FAIL unless exactly N), and from ``meta/vla_rl_so101.json`` the recording
+   kind and how each sitting ended; for a ``--demo-schedule`` recording also the real-0.1 protocol
+   hash and the convention hash against this code (``scripts/wo07_export_bundle.py demo`` refuses
+   on either) and that episode i is demo i of the frozen schedule. The demo recorder itself does
+   not decode its saved episodes; this is that check.
+
+    .venv/bin/python scripts/preflight_decoder.py --preset real \\
+        --dataset data/real_teleop/vla-rl-so101-real-teleop --episodes 50
 """
 
 from __future__ import annotations
@@ -276,7 +289,69 @@ def stage_record_decode(tmp: Path) -> str:
     )
 
 
-def run(preset: str, config: Path | None) -> bool:
+def _jsonable(v: object) -> object:
+    return json.loads(json.dumps(v))
+
+
+def stage_dataset(root: Path, expect: int | None) -> str:
+    """Stage 5 (module doc): a recorded dataset, read only."""
+    from src.eval import protocol_real as PR
+    from src.robot import convention as conv
+    from src.robot import recording
+
+    info_path = root / "meta" / "info.json"
+    if not info_path.is_file():
+        raise StageFailed(f"{info_path} missing: not a LeRobot dataset", "check the --dataset path")
+    n = int(json.loads(info_path.read_text()).get("total_episodes", 0))
+    problems = [f"{n} episodes, expected {expect}"] if expect is not None and n != expect else []
+    for index in range(n):
+        bad = recording.episode_problem(root, index)
+        problems += [bad] if bad else recording.verify_episode_video(root, index)
+    notes = [f"{n} episodes; both cameras decode across every frame" if not problems else ""]
+    prov_path = root / recording.PROVENANCE
+    if not prov_path.is_file():
+        problems.append(f"{prov_path} missing: not a recording of this repo")
+    else:
+        prov = json.loads(prov_path.read_text())
+        kind = (
+            "rehearsal"
+            if prov.get("rehearsal")
+            else "demo schedule" if prov.get("demo_schedule") else "sanity / free teleop"
+        )
+        ends = [s.get("session_end") for s in prov.get("sittings") or []]
+        notes.append(f"{kind} recording, session {prov.get('session_id')}, sittings ended {ends}")
+        if prov.get("demo_schedule"):
+            got = (prov.get("protocol") or {}).get("hash")
+            if got != PR.protocol_hash():
+                problems.append(f"protocol hash {got} != this code's {PR.protocol_hash()}")
+            if (prov.get("convention") or {}).get("hash") != conv.convention_hash():
+                problems.append("convention hash differs from this code's")
+            sched = _jsonable(PR.demo_schedule())
+            eps = prov.get("episodes") or {}
+            off = [
+                i
+                for i in range(n)
+                if not isinstance(sched, list)
+                or i >= len(sched)
+                or _jsonable(eps.get(str(i))) != sched[i]
+            ]
+            if off:
+                problems.append(f"episodes {off} are not demos {off} of the frozen schedule")
+            else:
+                notes.append(f"episodes 0-{n - 1} = demos 1-{n} of the frozen schedule")
+            notes.append(f"{PR.PROTOCOL_VERSION} hash {PR.protocol_hash()[:12]}")
+    if problems:
+        raise StageFailed(
+            " | ".join(problems),
+            "do not export or train on it; send the agent this output (a clip that does not "
+            "decode is re-recorded: move the dataset aside first, never --overwrite it)",
+        )
+    return "; ".join(x for x in notes if x)
+
+
+def run(
+    preset: str, config: Path | None, dataset: Path | None = None, expect: int | None = None
+) -> bool:
     print(f"python {sys.version.split()[0]} {sys.executable}")
     print(f"DYLD_FALLBACK_LIBRARY_PATH={os.environ.get('DYLD_FALLBACK_LIBRARY_PATH')!r}")
     ok = True
@@ -287,6 +362,8 @@ def run(preset: str, config: Path | None) -> bool:
             ("config", lambda: stage_config(preset, config)),
             ("record + decode", lambda: stage_record_decode(Path(tmp))),
         ]
+        if dataset is not None:
+            stages = [stages[0], ("dataset", lambda: stage_dataset(dataset, expect))]
         for name, fn in stages:
             try:
                 print(f"[{name}] OK: {fn()}", flush=True)
@@ -298,18 +375,29 @@ def run(preset: str, config: Path | None) -> bool:
             except Exception as e:  # noqa: BLE001 - a FAIL line, never a traceback
                 ok = False
                 print(f"[{name}] FAIL: {type(e).__name__}: {e}\n  fix: send the agent this output")
-    print(f"temp dataset removed: {tmp}")
-    print("PASS: torchcodec + FFmpeg decode the recorder's two-camera clips" if ok else "FAIL")
+    if dataset is None:
+        print(f"temp dataset removed: {tmp}")
+        print("PASS: torchcodec + FFmpeg decode the recorder's two-camera clips" if ok else "FAIL")
+    else:
+        print(f"PASS: {dataset} checks out" if ok else "FAIL")
     return ok
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
     add_config_args(parser)
+    parser.add_argument(
+        "--dataset", type=Path, default=None, help="check a recorded dataset instead (read only)"
+    )
+    parser.add_argument(
+        "--episodes", type=int, default=None, help="with --dataset: FAIL unless exactly N"
+    )
     args = parser.parse_args(argv)
     if args.preset != "real":
         parser.error("the decoder preflight checks the real-arm recording: --preset real")
-    return 0 if run(args.preset, args.config) else 1
+    if args.episodes is not None and args.dataset is None:
+        parser.error("--episodes needs --dataset")
+    return 0 if run(args.preset, args.config, args.dataset, args.episodes) else 1
 
 
 if __name__ == "__main__":
